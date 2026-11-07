@@ -1,0 +1,30 @@
+[package]
+name = "pi-coding-agent"
+description = "Pi coding agent CLI: sessions, built-in tools, extensions, modes (port of @earendil-works/pi-coding-agent)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "pi"
+path = "src/main.rs"
+
+[dependencies]
+pi-agent = { workspace = true }
+pi-ai = { workspace = true }
+pi-codemode = { workspace = true }
+pi-mcp = { workspace = true }
+pi-schema = { workspace = true }
+pi-tui = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
