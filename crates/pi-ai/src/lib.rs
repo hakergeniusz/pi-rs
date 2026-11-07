@@ -15,12 +15,12 @@
 //! throw on request/model/runtime failures; failures are encoded as protocol
 //! events and a final assistant message with stop reason `error`/`aborted`.
 
-/// Unified assistant stop reasons (mirrors TS `StopReason`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StopReason {
-    Stop,
-    Length,
-    ToolUse,
-    Error,
-    Aborted,
-}
+pub mod event_stream;
+pub mod types;
+
+pub use event_stream::AssistantMessageEventStream;
+pub use types::{
+    AssistantContent, AssistantMessage, AssistantMessageEvent, ContentBlock, Context, InputContent,
+    KnownApi, Message, Model, StopReason, StreamOptions, SystemMessage, ThinkingLevel, Tool,
+    ToolCall, ToolChoice, ToolResultMessage, TranscriptContext, Usage, UserContent, UserMessage,
+};

@@ -54,6 +54,7 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
+large_enum_variant = "allow"
 
 [profile.release]
 lto = "thin"
