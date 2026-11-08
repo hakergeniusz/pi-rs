@@ -15,7 +15,11 @@
 //! throw on request/model/runtime failures; failures are encoded as protocol
 //! events and a final assistant message with stop reason `error`/`aborted`.
 
+pub mod cost;
 pub mod event_stream;
+pub mod providers;
+pub mod sse;
+pub mod streaming_json;
 pub mod types;
 
 pub use event_stream::AssistantMessageEventStream;
