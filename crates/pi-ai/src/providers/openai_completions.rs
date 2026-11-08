@@ -124,7 +124,12 @@ async fn request_and_stream(
         .await
         .map_err(|e| format!("request failed: {e}"))?;
 
-    let sse = read_sse_stream(response);
+    let sse = read_sse_stream(response).await.map_err(|e| e.to_string())?;
+    let _ = sender
+        .send(AssistantMessageEvent::Start {
+            partial: output.clone(),
+        })
+        .await;
 
     let mut state = StreamState::default();
     let mut has_finish_reason = false;

@@ -15,6 +15,7 @@
 //! throw on request/model/runtime failures; failures are encoded as protocol
 //! events and a final assistant message with stop reason `error`/`aborted`.
 
+pub mod catalog;
 pub mod cost;
 pub mod event_stream;
 pub mod providers;

@@ -130,27 +130,25 @@ impl SseParser {
 }
 
 /// Read an SSE stream from an HTTP response as an async stream of messages.
-/// A non-2xx response surfaces as a single `Err(SseError::Status)` item. The
-/// `[DONE]` sentinel is left to the caller (OpenAI-specific).
-pub fn read_sse_stream(
+/// The status check happens before any event is produced, so callers can emit
+/// their `start` event only after setup succeeds. The `[DONE]` sentinel is
+/// left to the caller (OpenAI-specific).
+pub async fn read_sse_stream(
     response: reqwest::Response,
-) -> impl futures::Stream<Item = Result<SseMessage, SseError>> + Send {
+) -> Result<impl futures::Stream<Item = Result<SseMessage, SseError>> + Send, SseError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let body: String = body.chars().take(2048).collect();
+        return Err(SseError::Status {
+            status: status.as_u16(),
+            body,
+        });
+    }
+
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseMessage, SseError>>(64);
 
     tokio::spawn(async move {
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let body: String = body.chars().take(2048).collect();
-            let _ = tx
-                .send(Err(SseError::Status {
-                    status: status.as_u16(),
-                    body,
-                }))
-                .await;
-            return;
-        }
-
         let mut byte_stream = response.bytes_stream();
         let mut parser = SseParser::default();
         let mut pending: VecDeque<SseMessage> = VecDeque::new();
@@ -182,7 +180,7 @@ pub fn read_sse_stream(
         }
     });
 
-    tokio_stream::wrappers::ReceiverStream::new(rx)
+    Ok(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
 #[cfg(test)]

@@ -263,20 +263,46 @@ pub enum ModelInputModality {
     Video,
 }
 
-/// Provider input limits (TS `ModelInputLimits`); all fields optional.
+/// Provider input limits (TS `ModelInputLimits`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInputLimits {
+    /// Maximum serialized provider request size in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<u64>,
+    pub max_request_bytes: Option<u64>,
+    /// Image-specific limits and cache-safe resize profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u64>,
+    pub images: Option<ModelImageInputLimits>,
+}
+
+/// Image input limits (TS `ModelImageInputLimits`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelImageInputLimits {
+    /// Cache-safe resize profile applied before a new image enters history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_images_per_request: Option<u64>,
+    pub resize: Option<ModelImageResizeOptions>,
+    /// Maximum images accepted in one provider message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_image_size_mb: Option<u64>,
+    pub max_per_message: Option<u64>,
+    /// Maximum images accepted across one provider request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_pdf_size_mb: Option<u64>,
+    pub max_per_request: Option<u64>,
+}
+
+/// Image resize profile (TS `ModelImageResizeOptions`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelImageResizeOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_width: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_height: Option<u64>,
+    /// Maximum base64-encoded payload size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jpeg_quality: Option<u64>,
 }
 
 /// Prompt cache lifetimes per retention tier (TS `ModelPromptCache`).
