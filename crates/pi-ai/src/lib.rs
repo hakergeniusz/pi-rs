@@ -16,6 +16,7 @@
 //! events and a final assistant message with stop reason `error`/`aborted`.
 
 pub mod catalog;
+pub mod constrained_sampling;
 pub mod cost;
 pub mod event_stream;
 pub mod providers;
@@ -23,6 +24,7 @@ pub mod sse;
 pub mod streaming_json;
 pub mod types;
 
+pub use constrained_sampling::{ConstrainedSampling, GrammarFormat, GrammarVariants, StrictMode};
 pub use event_stream::AssistantMessageEventStream;
 pub use types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, ContentBlock, Context, InputContent,

@@ -1,21 +1,71 @@
-//! Agent runtime: loop, tool calling, state management, steering.
+//! Agent runtime: the loop, tool calling, state management, steering.
 //!
-//! Rust port of `@earendil-works/pi-agent-core` (TS source:
-//! `packages/agent/src`: `agent-loop.ts`, `agent.ts`, `proxy.ts`,
-//! `stream-fn.ts`, `types.ts`).
+//! Rust port of `@mariozechner/pi-agent-core` (TS source:
+//! `packages/agent/src`: `agent.ts`, `agent-loop.ts`, `types.ts`,
+//! `stream-fn.ts`, `proxy.ts`).
 //!
-//! Core semantics to preserve (P2):
-//! - one turn = model request → streamed assistant response → tool execution
-//!   (sequential or parallel mode) → results → next request if needed
-//! - steering messages enter after the current assistant turn; follow-ups
-//!   after pending work finishes; abort returns queued messages
-//! - hooks: `beforeToolCall` (can block with reason, hint terminate),
-//!   `afterToolCall` (field-wise merge overrides), transforms
-//! - `StreamFn` failures are encoded in-band, never thrown
+//! The crate owns the loop and nothing else. The two seams it is written
+//! against are [`types::StreamFn`] (the provider) and [`types::ToolExecutor`]
+//! (the tools), so the loop is testable end to end without a network or a
+//! process. `pi-coding-agent` is the host; it wires a real provider and the
+//! built-in tools.
+//!
+//! Layout:
+//!
+//! * [`agent_message`] — the transcript message union (`AgentMessage`).
+//! * [`types`] — the seams, hooks, queues, and value types.
+//! * [`events`] — the `AgentEvent` union every consumer observes.
+//! * [`agent_loop`] — the loop itself (`run_agent_loop`, `run_agent_loop_continue`).
+//! * [`transcript`] — system-prompt and tool-declaration replay.
+//! * [`agent`] — the stateful facade (`Agent`).
+//! * [`state`] — pi's `Agent.state`, and the transitions that mutate it.
+//! * [`queues`] — pi's steering and follow-up queues, their transitions, and
+//!   the out-of-band [`queues::QueueHandle`] a caller steers through.
+//! * [`live_settings`] — the model and reasoning level the loop reads per
+//!   request, and the out-of-band [`live_settings::SettingsHandle`] a caller
+//!   writes them through mid-run.
+//! * [`json`] — serde for the crate's value types in pi's wire shapes, so
+//!   hosts encode events instead of reaching for `Debug`.
 
-/// How tool calls from a single assistant message execute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolExecutionMode {
-    Sequential,
-    Parallel,
-}
+#![forbid(unsafe_code)]
+
+pub mod agent;
+pub mod agent_loop;
+pub mod agent_message;
+pub mod events;
+pub mod json;
+pub mod live_settings;
+pub mod queues;
+pub mod state;
+pub mod transcript;
+pub mod types;
+
+pub use agent::Agent;
+pub use agent_loop::empty_assistant_message;
+pub use agent_loop::{
+    AgentLoopConfig, AsyncConvertToLlm, ConvertToLlm, DefaultConvertToLlm, FinishTurn,
+    PrepareNextTurn, PrepareRequest, TransformContext, default_convert_to_llm, run_agent_loop,
+    run_agent_loop_continue,
+};
+pub use events::{AgentEvent, AgentEventSink, CollectingSink, event_kinds};
+pub use live_settings::SettingsHandle;
+pub use queues::{ContinueDrain, QueueHandle, Queues};
+pub use state::AgentState;
+pub use transcript::{
+    create_initial_system_message, current_system_message, current_system_prompt, current_tools,
+    declare_tool_changes, tool_declaration, tool_state_changes, user_message,
+    user_message_with_images,
+};
+pub use types::{
+    AbortSignal, AfterToolCall, AfterToolCallOverride, AgentContext, AgentToolCall,
+    AgentToolResult, AgentTurnContext, BeforeToolCall, BeforeToolCallDecision, BoxFuture,
+    ConstrainedSampling, GrammarFormat, GrammarVariants, MessageQueue, PendingMessageQueue,
+    PrepareNextTurnContext, PrepareRequestContext, QueueMode, QueueSource, StreamFn, StreamRequest,
+    StrictMode, ThinkingLevel, ToolCallHooks, ToolExecutionMode, ToolExecutor, ToolSpec,
+    TurnDecision, TurnUpdate,
+};
+
+pub use agent_message::{
+    AgentMessage, BashExecutionMessage, BranchSummaryMessage, CompactionSummaryMessage,
+    CustomMessage,
+};

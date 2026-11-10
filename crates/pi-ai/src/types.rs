@@ -32,6 +32,21 @@ pub enum StopReason {
     Deferred,
 }
 
+impl StopReason {
+    /// The TS wire discriminant (`"stop"`, `"toolUse"`, ...).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StopReason::Pending => "pending",
+            StopReason::Stop => "stop",
+            StopReason::Length => "length",
+            StopReason::ToolUse => "toolUse",
+            StopReason::Error => "error",
+            StopReason::Aborted => "aborted",
+            StopReason::Deferred => "deferred",
+        }
+    }
+}
+
 /// pi thinking levels accepted by `streamSimple` (TS `ThinkingLevel`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -147,6 +162,36 @@ pub enum AssistantContent {
     ToolCall(ToolCall),
 }
 
+impl AssistantContent {
+    /// The block's text, if it is a text block.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            AssistantContent::Text(block) => Some(block.text.as_str()),
+            _ => None,
+        }
+    }
+}
+
+impl InputContent {
+    /// The block's text, if it is a text block.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            InputContent::Text(block) => Some(block.text.as_str()),
+            InputContent::Image(_) => None,
+        }
+    }
+}
+
+impl ContentBlock {
+    /// The block's text, if it is a text block.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            ContentBlock::Text(block) => Some(block.text.as_str()),
+            _ => None,
+        }
+    }
+}
+
 /// Any content block (loose union, mirroring all TS block types).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -218,7 +263,7 @@ pub struct Tool {
     pub description: String,
     pub parameters: JsonValue,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub constrained_sampling: Option<JsonValue>,
+    pub constrained_sampling: Option<crate::constrained_sampling::ConstrainedSampling>,
 }
 
 /// Reference to a tool being removed mid-transcript (TS `ToolReference`).
@@ -316,7 +361,7 @@ pub struct ModelPromptCache {
 }
 
 /// A chat model from the catalog (TS `Model`; image/classifier variants omitted for now).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Model {
     pub id: String,
@@ -414,6 +459,12 @@ pub struct UserMessage {
 pub enum UserContent {
     Text(String),
     Blocks(Vec<InputContent>),
+}
+
+impl Default for UserContent {
+    fn default() -> Self {
+        UserContent::Text(String::new())
+    }
 }
 
 /// Assistant message (TS `AssistantMessage`).
@@ -530,7 +581,11 @@ pub enum Message {
 /// `Done`. Failures terminate with `Error`, carrying an assistant message with
 /// stop reason `error`/`aborted`. `partial` is the live response-so-far.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all_fields = "camelCase",
+    rename_all = "snake_case"
+)]
 pub enum AssistantMessageEvent {
     Start {
         partial: AssistantMessage,
@@ -697,7 +752,9 @@ mod tests {
             partial: minimal_assistant(),
         };
         let json = serde_json::to_string(&e).unwrap();
-        assert!(json.starts_with("{\"type\":\"textDelta\""), "{json}");
+        // TS discriminants are snake_case (`text_delta`), fields camelCase (`contentIndex`).
+        assert!(json.starts_with("{\"type\":\"text_delta\""), "{json}");
+        assert!(json.contains("\"contentIndex\":0"), "{json}");
     }
 
     fn minimal_assistant() -> AssistantMessage {
