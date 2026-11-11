@@ -1,6 +1,7 @@
 # Handoff: Pi in Rust (`pi-rs`)
 
 > Written 2026-11-11, updated same day after gate attempts. Repo: `/home/hakergeniusz/Projects/pi-rs` on `acer`.
+> **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). `main` = P0–P3 gated history; **`wip/p4-pre-gate`** = snapshot branch with ALL uncommitted P4 work committed (`4853906 chore(pi-coding-agent): pre-gate snapshot of P4 work`, Assisted-by trailer). Local checkout is ON `wip/p4-pre-gate`. CI (GitHub Actions) queued on both pushes — run `gh run list` / `gh run watch --exit-status` to verify; unverified at handoff time.
 > ALL development happens on `acer` (per user). Reference checkout: `/tmp/ai-agent/pi` on `acer` — **WIPED (tmpfs); re-clone before P5 work: `gh repo clone earendil-works/pi /tmp/ai-agent/pi`** (was @ `b22e525b3`).
 
 ## Goal
@@ -56,8 +57,9 @@ P4 detail (uncommitted, in working tree):
    - `cargo fmt --all -- --check`
    - The capped run started in the writing session is **dead** (killed with the session; log empty, no rustc left running) — just start it fresh with the capped env above.
    - Free memory first: llama-swap is stopped (4-6G available should hold); if horizon-client (2.8G RSS) is also spiking, ask the user before proceeding.
-2. Delete stale `test-log.txt`, then commit:
+2. `test-log.txt` already deleted; the P4 code is already committed on branch `wip/p4-pre-gate` (snapshot `4853906`). After the gate passes: land P4 on `main` with
    `feat(pi-coding-agent): config, auth, sessions, tools, prompts, skills, print mode (P4)`
+   (either re-commit on main or fast-forward), push, and watch CI per the git workflow rules.
 3. **Re-clone the reference** before any P5 porting: `gh repo clone earendil-works/pi /tmp/ai-agent/pi` (tmpfs; was @ `b22e525b3`).
 4. **Phase P5 — Modes & Extensions**: JSON mode (`modes/json-event.ts`, ~61 lines), RPC mode (stdin/stdout JSONL, command schemas), extension host (decide: deno_core embedded JS vs Rust-native trait+WASM vs subprocess — plan recommendation: deno_core), MCP client (`pi-mcp` crate is a stub), codemode sandbox (`pi-codemode` stub), package-manager subset (`package-manager-cli.ts`, 41.6K), project trust gating (`cli/project-trust.ts`), `@file` args (`cli/file-processor.ts`), full per-provider env-key table (`packages/ai/src/env-api-keys.ts`; partial table already in `print_mode.rs::env_key_candidates`), OAuth bearer auth in adapters. Exit: RPC driven session matches TS behavior on the documented command set.
 5. **P6 — Interactive mode** (chat viewport, editor, slash commands, themes, /resume).
