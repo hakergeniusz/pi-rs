@@ -35,6 +35,16 @@ tokio = { version = "1", features = [
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
 
+# coding-agent core
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+similar = "2"
+globset = "0.4"
+walkdir = "2"
+regex = "1"
+tempfile = "3"
+
 # internal crates
 pi-schema = { path = "crates/pi-schema", version = "0.1.0" }
 pi-ai = { path = "crates/pi-ai", version = "0.1.0" }
