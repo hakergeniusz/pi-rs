@@ -1,6 +1,6 @@
 [package]
 name = "pi-tui"
-description = "Terminal UI framework with differential rendering (port of @earendil-works/pi-tui)"
+description = "Terminal UI: diff renderer, editor, components, alt screen (port of pi-tui)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,13 +8,17 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[dependencies]
-pi-schema = { workspace = true }
-futures = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
-
 [lints]
 workspace = true
+
+[dependencies]
+# pi's tui.ts talks to node's stdin/stdout directly; crossterm is the Rust
+# counterpart (and may contain internal unsafe — a dependency, not our code).
+crossterm = { version = "0.29", default-features = false, features = ["events"] }
+# utils.ts measures with Intl.Segmenter + get-east-asian-width. The Rust port
+# uses unicode-segmentation (graphemes) + unicode-width (East Asian width).
+# theme-json.ts parses the theme files (added in 5c for the theme loader).
+serde.workspace = true
+serde_json.workspace = true
+unicode-segmentation = "1"
+unicode-width = "0.2"
