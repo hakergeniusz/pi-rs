@@ -11,11 +11,12 @@ use pi_tui::theme::ThemeColor;
 
 use super::super::theme;
 
-/// `StatusIndicatorKind` (`status-indicator.ts:7`). Only `working` exists in
-/// this port yet; retry/compaction indicators land with their loops.
+/// `StatusIndicatorKind` (`status-indicator.ts:7`). Retry/branch indicators
+/// land with their loops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
     Working,
+    Compaction,
 }
 
 /// `StatusIndicator` (`status-indicator.ts:9-36`).
@@ -36,6 +37,22 @@ impl StatusIndicator {
                 None,
             ),
             kind: StatusKind::Working,
+        }
+    }
+
+    /// `CompactionStatusIndicator` (`status-indicator.ts:85-100`): accent
+    /// spinner, muted label.
+    pub fn compaction(message: &str) -> Self {
+        let spinner_theme = theme::theme();
+        let message_theme = theme::theme();
+        StatusIndicator {
+            loader: Loader::new(
+                move |text| spinner_theme.fg(ThemeColor::Accent, text),
+                move |text| message_theme.fg(ThemeColor::Muted, text),
+                message,
+                None,
+            ),
+            kind: StatusKind::Compaction,
         }
     }
 

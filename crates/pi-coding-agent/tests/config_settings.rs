@@ -2,8 +2,9 @@
 //! exercised over real files in tempdirs (`config.rs` / `config::settings`).
 
 use pi_coding_agent::config::settings::{
-    CompactionSettings, SettingsManager, SettingsManagerCreateOptions, SettingsScope,
+    SettingsManager, SettingsManagerCreateOptions, SettingsScope,
 };
+use pi_coding_agent::session::compaction::CompactionSettings;
 use serde_json::{Value, json};
 
 fn tempdir(tag: &str) -> tempfile::TempDir {

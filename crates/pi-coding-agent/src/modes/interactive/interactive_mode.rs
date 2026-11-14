@@ -225,6 +225,20 @@ struct AgentRun {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Outcome of a compaction worker thread (`compaction_end` event payload).
+enum CompactionOutcome {
+    Completed(Box<crate::session::compaction::CompactionResult>),
+    Failed(String),
+    Cancelled,
+}
+
+/// One compaction attempt on a worker thread (`session.compact`).
+struct CompactionRun {
+    abort: Arc<AbortSignal>,
+    events: std::sync::mpsc::Receiver<CompactionOutcome>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
 /// `QueueSource` over a mutex-shared [`Queues`]: the loop borrows it for the
 /// whole run while the UI keeps enqueueing (`agent.steer`/`followUp`).
 struct SharedQueues(Arc<Mutex<Queues>>);
@@ -273,6 +287,11 @@ pub struct InteractiveMode {
     streaming_index: Option<usize>,
     /// The run in flight, if any.
     agent_run: Option<AgentRun>,
+    /// The compaction attempt in flight, if any (`session.isCompacting`).
+    compaction_run: Option<CompactionRun>,
+    /// Messages queued while compaction runs
+    /// (`compactionQueuedMessages`), `(text, follow_up)`.
+    compaction_queued: Vec<(String, bool)>,
     /// ctrl+c twice within 500ms exits (`handleCtrlC`).
     last_sigint_time: Option<Instant>,
     /// Spinner-frame pacing, carried across `pump` calls.
@@ -371,6 +390,8 @@ impl InteractiveMode {
                 .unwrap_or_else(crate::config::get_auth_path),
             queues: Arc::new(Mutex::new(Queues::new())),
             queued_deliveries: Vec::new(),
+            compaction_run: None,
+            compaction_queued: Vec::new(),
             active_prompt: None,
         }
     }
@@ -419,6 +440,7 @@ impl InteractiveMode {
                         .collect();
                     if items.is_empty() { None } else { Some(items) }
                 })),
+            autocomplete::SlashCommand::new("compact", "Manually compact the session context"),
             autocomplete::SlashCommand::new("thinking", "Set thinking level")
                 .with_argument_hint("<level>")
                 .with_argument_completions(Arc::new(|prefix: &str| {
@@ -851,6 +873,15 @@ impl InteractiveMode {
             self.handle_model_command(rest.trim());
             return;
         }
+        // `/compact [instructions]` (`interactive-mode.ts:3434-3439`).
+        if text == "/compact" || text.starts_with("/compact ") {
+            let custom = text
+                .strip_prefix("/compact ")
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            self.handle_compact_command(custom);
+            return;
+        }
         if let Some(rest) = text.strip_prefix("/thinking") {
             self.handle_thinking_command(rest.trim());
             return;
@@ -867,6 +898,12 @@ impl InteractiveMode {
                 self.run_bash(&command, excluded);
                 return;
             }
+        }
+        // Queue input during compaction (`interactive-mode.ts:3489-3499`):
+        // built-in commands already dispatched above.
+        if self.compaction_run.is_some() {
+            self.queue_compaction_message(&text, false);
+            return;
         }
         if self.agent_run.is_some() {
             // Upstream Enter during streaming steers
@@ -895,6 +932,196 @@ impl InteractiveMode {
         }
         self.update_pending_messages();
         self.tui.request_render();
+    }
+
+    // --------------------------------------------------------------
+    // Compaction (`session.compact`, `agent-session.ts:2936`)
+    // --------------------------------------------------------------
+
+    /// `/compact` (`handleCompactCommand`, `interactive-mode.ts:7273-7281`):
+    /// abort the current run first (manual compaction never retries it),
+    /// then prepare + summarize on a worker thread. The session append
+    /// happens on the UI thread when the outcome lands, like upstream's
+    /// `compaction_end` handling.
+    fn handle_compact_command(&mut self, custom_instructions: Option<&str>) {
+        if self.compaction_run.is_some() {
+            return;
+        }
+        self.abort_active_run();
+
+        // Settings-driven tuning lands with a settings handle in this mode;
+        // `getCompactionSettings` itself is ported and tested.
+        let settings = crate::session::compaction::DEFAULT_COMPACTION_SETTINGS;
+
+        let path_entries = self.session.get_branch(None).unwrap_or_default();
+        let already_compacted = matches!(
+            path_entries.last(),
+            Some(crate::session::records::SessionEntry::Compaction(_))
+        );
+        let Some(preparation) =
+            crate::session::compaction::prepare_compaction(&path_entries, settings)
+        else {
+            // Check why we can't compact, like upstream (`:2962-2968`).
+            self.show_error(&format!(
+                "Compaction failed: {}",
+                if already_compacted {
+                    "Already compacted"
+                } else {
+                    "Nothing to compact (session too small)"
+                }
+            ));
+            return;
+        };
+
+        let model = self.model.clone();
+        let api_key = self.api_key.clone();
+        let access_token = self.access_token.clone();
+        let thinking_level = self.thinking_level;
+        let stream_fn = Arc::clone(&self.stream_fn);
+        let signal = Arc::new(AbortSignal::new());
+        let (tx, rx) = std::sync::mpsc::channel::<CompactionOutcome>();
+        let run_signal = Arc::clone(&signal);
+        let custom = custom_instructions.map(str::to_string);
+        let handle = std::thread::spawn(move || {
+            let outcome = match crate::runtime::block_on(crate::session::compaction::compact(
+                &preparation,
+                &model,
+                api_key.as_deref(),
+                access_token.as_deref(),
+                custom.as_deref(),
+                &run_signal,
+                thinking_level,
+                stream_fn.as_ref(),
+            )) {
+                Ok(result) => CompactionOutcome::Completed(Box::new(result)),
+                Err(crate::session::compaction::CompactionError::Cancelled) => {
+                    CompactionOutcome::Cancelled
+                }
+                Err(crate::session::compaction::CompactionError::Failed(message)) => {
+                    CompactionOutcome::Failed(message)
+                }
+            };
+            let _ = tx.send(outcome);
+        });
+        self.compaction_run = Some(CompactionRun {
+            abort: signal,
+            events: rx,
+            handle: Some(handle),
+        });
+        self.set_working_status(Some(StatusIndicator::compaction(
+            "Compacting context... (ctrl+c to cancel)",
+        )));
+        self.tui.request_render();
+    }
+
+    /// Abort the in-flight agent run and settle it: join the thread, then
+    /// persist whatever the loop already emitted (upstream `await
+    /// this.abort()` inside `session.compact`).
+    fn abort_active_run(&mut self) {
+        let Some(run) = self.agent_run.take() else {
+            return;
+        };
+        run.abort.abort();
+        if let Some(handle) = run.handle {
+            let _ = handle.join();
+        }
+        for event in run.events.try_iter() {
+            if let LoopEvent::Event(event) = event {
+                self.handle_agent_event(&event);
+            }
+        }
+        self.set_working_status(None);
+    }
+
+    /// `compaction_end` handling (`interactive-mode.ts:3820-3855`): persist
+    /// the summary, render the rows, flush the queue.
+    fn handle_compaction_outcome(&mut self, outcome: CompactionOutcome) {
+        match outcome {
+            CompactionOutcome::Completed(result) => {
+                let details = crate::session::compaction::details_json(&result);
+                if let Err(error) = self.session.append_compaction(
+                    &result.summary,
+                    Some(&result.first_kept_entry_id),
+                    result.tokens_before,
+                    Some(details),
+                    Some(false),
+                    result.usage,
+                ) {
+                    self.show_error(&format!("Compaction failed: {error}"));
+                } else {
+                    self.add_compaction_rows(&result);
+                    self.refresh_footer();
+                }
+            }
+            CompactionOutcome::Failed(message) => {
+                self.show_error(&format!("Compaction failed: {message}"));
+            }
+            CompactionOutcome::Cancelled => self.show_status("Compaction cancelled"),
+        }
+        self.flush_compaction_queue();
+    }
+
+    /// The summary row + the billed-tokens notice (`addCompactionCostNotice`,
+    /// `interactive-mode.ts:4305-4319`; its `showCacheMissNotices` gate is
+    /// not ported yet, so the notice always shows — documented deviation).
+    /// Deviation: the chat keeps its rendered history (upstream re-renders
+    /// and drops the summarized-away rows; that rebuild lands with the
+    /// `renderSessionEntries` port).
+    fn add_compaction_rows(&mut self, result: &crate::session::compaction::CompactionResult) {
+        self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        let mut row = super::components::compaction_summary::CompactionSummaryMessageComponent::new(
+            &result.summary,
+            result.tokens_before,
+            1,
+        );
+        row.set_expanded(self.tool_output_expanded);
+        self.add_to_chat(Box::new(row));
+        if let Some(usage) = &result.usage {
+            let tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+            let cost = if usage.cost.total >= 0.01 {
+                format!(" (~${:.2})", usage.cost.total)
+            } else {
+                String::new()
+            };
+            self.add_to_chat(Box::new(Text::new(
+                theme::theme().fg(
+                    pi_tui::theme::ThemeColor::Warning,
+                    &format!(
+                        "Compaction: {} tokens billed{cost}",
+                        super::components::footer::format_tokens(tokens)
+                    ),
+                ),
+                1,
+                0,
+            )));
+        }
+    }
+
+    /// `queueCompactionMessage` (`interactive-mode.ts:4951-4958`).
+    fn queue_compaction_message(&mut self, text: &str, follow_up: bool) {
+        self.compaction_queued.push((text.to_string(), follow_up));
+        self.editor_mut().editor.add_to_history(text);
+        self.editor_mut().editor.set_text("");
+        self.update_pending_messages();
+        self.show_status("Queued message for after compaction");
+    }
+
+    /// `flushCompactionQueue` (`interactive-mode.ts:4958-5000`): after a
+    /// compaction ends, the first queued message starts a run and the rest
+    /// ride the steering/follow-up queues.
+    fn flush_compaction_queue(&mut self) {
+        if self.compaction_queued.is_empty() {
+            return;
+        }
+        let queued = std::mem::take(&mut self.compaction_queued);
+        self.update_pending_messages();
+        let mut rest = queued.into_iter();
+        if let Some((first, _)) = rest.next() {
+            self.submit(&first);
+            for (text, follow_up) in rest {
+                self.queue_message(&text, follow_up);
+            }
+        }
     }
 
     /// `handleDequeue` (`interactive-mode.ts:4691-4699`) via
@@ -936,7 +1163,7 @@ impl InteractiveMode {
         // queue bookkeeping.
         let theme = theme::theme();
         let mut rows: Vec<Box<dyn Component>> = Vec::new();
-        if !self.queued_deliveries.is_empty() {
+        if !self.queued_deliveries.is_empty() || !self.compaction_queued.is_empty() {
             rows.push(Box::new(pi_tui::components::spacer::Spacer::new(1)));
             for (follow_up, message) in &self.queued_deliveries {
                 let AgentMessage::User(user) = message else {
@@ -946,6 +1173,16 @@ impl InteractiveMode {
                     pi_ai::types::UserContent::Text(text) => text.clone(),
                     pi_ai::types::UserContent::Blocks(_) => continue,
                 };
+                let label = if *follow_up { "Follow-up" } else { "Steering" };
+                rows.push(Box::new(
+                    pi_tui::components::truncated_text::TruncatedText::new(
+                        theme.fg(pi_tui::theme::ThemeColor::Dim, &format!("{label}: {text}")),
+                        1,
+                        0,
+                    ),
+                ));
+            }
+            for (text, follow_up) in &self.compaction_queued {
                 let label = if *follow_up { "Follow-up" } else { "Steering" };
                 rows.push(Box::new(
                     pi_tui::components::truncated_text::TruncatedText::new(
@@ -1447,6 +1684,38 @@ impl InteractiveMode {
             self.tui.request_render();
         }
 
+        // Compaction outcomes, collected first for the same borrow reason
+        // (`compaction_end` events). The run is retired before the handlers
+        // run: upstream clears the compaction promise before
+        // `flushCompactionQueue`, and the flushed message re-enters
+        // `submit`, whose guard must not see a live compaction.
+        let mut compaction_outcomes: Vec<CompactionOutcome> = Vec::new();
+        let mut compaction_finished = false;
+        if let Some(run) = &mut self.compaction_run {
+            loop {
+                match run.events.try_recv() {
+                    Ok(outcome) => compaction_outcomes.push(outcome),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        compaction_finished = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if compaction_finished {
+            if let Some(run) = self.compaction_run.take()
+                && let Some(handle) = run.handle
+            {
+                let _ = handle.join();
+            }
+            self.set_working_status(None);
+            self.tui.request_render();
+        }
+        for outcome in compaction_outcomes {
+            self.handle_compaction_outcome(outcome);
+        }
+
         // Spinner frames (host-driven, `Loader::tick`).
         if self.last_spinner_tick.elapsed() >= Duration::from_millis(80) {
             self.last_spinner_tick = Instant::now();
@@ -1478,7 +1747,12 @@ impl InteractiveMode {
             }
             AppAction::Exit => self.exiting = true,
             AppAction::Interrupt => {
-                if let Some(run) = &self.agent_run {
+                // While compacting, interrupt cancels the compaction
+                // (`CompactionStatusIndicator`'s cancel hint + the escape
+                // override at `interactive-mode.ts:3810-3813`).
+                if let Some(run) = &self.compaction_run {
+                    run.abort.abort();
+                } else if let Some(run) = &self.agent_run {
                     run.abort.abort();
                 }
             }
@@ -1495,7 +1769,9 @@ impl InteractiveMode {
                     return;
                 }
                 self.editor_mut().editor.set_text("");
-                if self.agent_run.is_some() {
+                if self.compaction_run.is_some() {
+                    self.queue_compaction_message(&text, true);
+                } else if self.agent_run.is_some() {
                     self.queue_message(&text, true);
                 } else {
                     self.submit(&text);
@@ -1508,6 +1784,11 @@ impl InteractiveMode {
                 let len = self.chat_len();
                 for index in 0..len {
                     if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
+                        component.set_expanded(expanded);
+                    }
+                    if let Some(component) =
+                        self.downcast_chat::<super::components::compaction_summary::CompactionSummaryMessageComponent>(index)
+                    {
                         component.set_expanded(expanded);
                     }
                 }
@@ -1741,6 +2022,15 @@ mod tests {
             calls: AtomicUsize::new(0),
             file_path: file_path.to_string(),
         });
+        fixture_with_stream(dir, stream)
+    }
+
+    /// A capture-terminal mode over a read-only executor in `dir`, driven by a
+    /// caller-supplied stream.
+    fn fixture_with_stream(
+        dir: &std::path::Path,
+        stream: Arc<dyn pi_agent::types::StreamFn>,
+    ) -> (InteractiveMode, FrameCapture) {
         let model = pi_ai::types::Model {
             id: "test-model".to_string(),
             name: "Test Model".to_string(),
@@ -1852,6 +2142,321 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         assert!(mode.agent_run.is_none(), "agent run did not finish");
+    }
+
+    /// The canned summary the content-aware stream returns for a
+    /// summarization request.
+    const CANNED_SUMMARY: &str =
+        "## Goal\ncompact the file chat\n\n## Context\nThe user asked what is in the file.";
+
+    /// Content-aware scripted model: a compaction request (the summarization
+    /// system prompt riding the stream seam) gets a canned summary; normal
+    /// turns behave like `ScriptedStream`. The agent loop, the real `read`
+    /// execution, the compaction pipeline, and the renderers are all the
+    /// production code path.
+    struct CompactingStream {
+        calls: AtomicUsize,
+        file_path: String,
+    }
+
+    impl CompactingStream {
+        fn summarization_events() -> Vec<AssistantMessageEvent> {
+            let partial = scripted_assistant(
+                &[pi_ai::types::AssistantContent::Text(TextContent {
+                    text: CANNED_SUMMARY.to_string(),
+                    text_signature: None,
+                })],
+                StopReason::Stop,
+            );
+            vec![
+                AssistantMessageEvent::Start {
+                    partial: partial.clone(),
+                },
+                AssistantMessageEvent::TextStart {
+                    content_index: 0,
+                    partial: partial.clone(),
+                },
+                AssistantMessageEvent::TextEnd {
+                    content_index: 0,
+                    content: CANNED_SUMMARY.to_string(),
+                    partial: partial.clone(),
+                },
+                AssistantMessageEvent::Done {
+                    reason: StopReason::Stop,
+                    message: partial,
+                },
+            ]
+        }
+    }
+
+    impl pi_agent::types::StreamFn for CompactingStream {
+        fn stream(
+            &self,
+            request: pi_agent::types::StreamRequest,
+        ) -> futures::stream::BoxStream<'static, AssistantMessageEvent> {
+            let summarizing = match request.messages.first() {
+                Some(AgentMessage::System(system)) => matches!(
+                    &system.content,
+                    pi_ai::types::StringOrTextBlocks::Text(text)
+                        if text.starts_with("You are a context summarization assistant")
+                ),
+                _ => false,
+            };
+            if summarizing {
+                // Hold the request open so the test can observe the status and
+                // queue a message mid-compaction.
+                std::thread::sleep(Duration::from_millis(150));
+                return Box::pin(futures::stream::iter(Self::summarization_events()));
+            }
+            let turn = self.calls.fetch_add(1, Ordering::SeqCst);
+            if turn == 0 {
+                std::thread::sleep(Duration::from_millis(150));
+                let tool_call: ToolCall = serde_json::from_value(serde_json::json!({
+                    "id": "call-1",
+                    "name": "read",
+                    "arguments": { "path": self.file_path }
+                }))
+                .expect("tool call");
+                let partial = scripted_assistant(
+                    &[
+                        pi_ai::types::AssistantContent::Text(TextContent {
+                            text: "Let me check the file.".to_string(),
+                            text_signature: None,
+                        }),
+                        pi_ai::types::AssistantContent::ToolCall(tool_call.clone()),
+                    ],
+                    StopReason::ToolUse,
+                );
+                Box::pin(futures::stream::iter(vec![
+                    AssistantMessageEvent::Start {
+                        partial: partial.clone(),
+                    },
+                    AssistantMessageEvent::ToolcallStart {
+                        content_index: 1,
+                        partial: partial.clone(),
+                    },
+                    AssistantMessageEvent::ToolcallEnd {
+                        content_index: 1,
+                        tool_call,
+                        partial: partial.clone(),
+                    },
+                    AssistantMessageEvent::Done {
+                        reason: StopReason::ToolUse,
+                        message: partial,
+                    },
+                ]))
+            } else {
+                let partial = scripted_assistant(
+                    &[pi_ai::types::AssistantContent::Text(TextContent {
+                        text: "The file says: hello from pi-rs".to_string(),
+                        text_signature: None,
+                    })],
+                    StopReason::Stop,
+                );
+                Box::pin(futures::stream::iter(vec![
+                    AssistantMessageEvent::Start {
+                        partial: partial.clone(),
+                    },
+                    AssistantMessageEvent::Done {
+                        reason: StopReason::Stop,
+                        message: partial,
+                    },
+                ]))
+            }
+        }
+    }
+
+    /// A capture-terminal mode driven by `CompactingStream`.
+    fn compact_fixture(dir: &std::path::Path, file_path: &str) -> (InteractiveMode, FrameCapture) {
+        let stream: Arc<dyn pi_agent::types::StreamFn> = Arc::new(CompactingStream {
+            calls: AtomicUsize::new(0),
+            file_path: file_path.to_string(),
+        });
+        fixture_with_stream(dir, stream)
+    }
+
+    /// Submit through the editor-event queue — the path a keystroke takes —
+    /// and wait for the agent run to settle.
+    fn run_to_completion(mode: &mut InteractiveMode, text: &str) {
+        mode.editor_events
+            .lock()
+            .expect("editor events")
+            .push(EditorEventOut::Submit(text.to_string()));
+        for _ in 0..400 {
+            mode.pump();
+            if mode.agent_run.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("run did not finish");
+    }
+
+    /// The budget-busting prompt: the keep-recent budget is 20000 tokens
+    /// (≈80k chars) and the read tool caps its result at 50KB, so the second
+    /// user turn is what pushes the backward walk past the budget.
+    fn big_prompt() -> String {
+        format!("please remember this: {}", "x".repeat(100_000))
+    }
+
+    #[test]
+    fn compact_command_summarizes_persists_and_reports_the_cost() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, "hello from pi-rs\n").expect("write");
+        let (mut mode, capture) = compact_fixture(dir.path(), &file.to_string_lossy());
+        mode.tui.start().expect("tui start");
+
+        // Two normal turns, so the cut has room before the budget overrun.
+        run_to_completion(&mut mode, "what is in the file?");
+        run_to_completion(&mut mode, &big_prompt());
+
+        // /compact starts a compaction run with its own status indicator.
+        mode.editor_events
+            .lock()
+            .expect("editor events")
+            .push(EditorEventOut::Submit("/compact".to_string()));
+        mode.pump();
+        mode.tui.render_now(false);
+        assert!(mode.compaction_run.is_some(), "compaction did not start");
+        let mid_flight = strip_terminal_sequences(&capture.output());
+        assert!(
+            mid_flight.contains("Compacting context... (ctrl+c to cancel)"),
+            "{mid_flight}"
+        );
+
+        // The outcome lands as chat rows through the real session path.
+        for _ in 0..400 {
+            mode.pump();
+            mode.tui.render_now(false);
+            if mode.compaction_run.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(mode.compaction_run.is_none(), "compaction did not finish");
+        mode.tui.render_now(false);
+
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("[compaction]"), "{plain}");
+        assert!(plain.contains("Compacted from"), "{plain}");
+        // The billed-tokens notice: input 10 + output 5 from the scripted usage.
+        assert!(plain.contains("Compaction: 15 tokens billed"), "{plain}");
+
+        // The summary persisted as a compaction entry.
+        let entries = mode.session.get_entries();
+        let compaction = entries
+            .iter()
+            .find_map(|entry| match entry {
+                SessionEntry::Compaction(compaction) => Some(compaction),
+                _ => None,
+            })
+            .expect("no persisted compaction entry");
+        // The summary rides with the read-files appendix built from the real
+        // `read` tool call.
+        assert_eq!(
+            compaction.summary,
+            format!(
+                "{CANNED_SUMMARY}\n\n<read-files>\n{path}\n</read-files>",
+                path = file.to_string_lossy()
+            )
+        );
+
+        // A second /compact is rejected: the branch ends in a compaction.
+        mode.editor_events
+            .lock()
+            .expect("editor events")
+            .push(EditorEventOut::Submit("/compact".to_string()));
+        mode.pump();
+        mode.tui.render_now(false);
+        assert!(
+            mode.compaction_run.is_none(),
+            "double compact started a run"
+        );
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(
+            plain.contains("Compaction failed: Already compacted"),
+            "{plain}"
+        );
+    }
+
+    #[test]
+    fn messages_submitted_during_compaction_queue_then_flush() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, "hello from pi-rs\n").expect("write");
+        let (mut mode, capture) = compact_fixture(dir.path(), &file.to_string_lossy());
+        mode.tui.start().expect("tui start");
+
+        run_to_completion(&mut mode, "what is in the file?");
+        run_to_completion(&mut mode, &big_prompt());
+
+        mode.editor_events
+            .lock()
+            .expect("editor events")
+            .push(EditorEventOut::Submit("/compact".to_string()));
+        mode.pump();
+        assert!(mode.compaction_run.is_some(), "compaction did not start");
+
+        // A submit while compaction runs queues instead of starting a run.
+        mode.editor_events
+            .lock()
+            .expect("editor events")
+            .push(EditorEventOut::Submit(
+                "after compaction please".to_string(),
+            ));
+        mode.pump();
+        mode.tui.render_now(false);
+        assert!(mode.compaction_run.is_some(), "compaction ended early");
+        assert!(mode.agent_run.is_none(), "queued message started a run");
+        let mid_flight = strip_terminal_sequences(&capture.output());
+        assert!(
+            mid_flight.contains("Queued message for after compaction"),
+            "{mid_flight}"
+        );
+
+        // The outcome flushes the queue: the queued message runs and answers.
+        for _ in 0..400 {
+            mode.pump();
+            if mode.compaction_run.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        for _ in 0..400 {
+            mode.pump();
+            mode.tui.render_now(false);
+            if mode.agent_run.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            mode.compaction_run.is_none() && mode.agent_run.is_none(),
+            "flush run did not finish"
+        );
+        mode.tui.render_now(false);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("[compaction]"), "{plain}");
+        assert!(plain.contains("after compaction please"), "{plain}");
+
+        // The flushed message persisted directly after the compaction entry.
+        let entries = mode.session.get_entries();
+        let compaction_index = entries
+            .iter()
+            .position(|entry| matches!(entry, SessionEntry::Compaction(_)))
+            .expect("no compaction entry");
+        let next = entries.get(compaction_index + 1);
+        assert!(
+            matches!(
+                next,
+                Some(SessionEntry::Message(entry))
+                    if matches!(&entry.message, AgentMessage::User(user)
+                        if matches!(&user.content,
+                            pi_ai::types::UserContent::Text(text) if text.contains("after compaction please")))
+            ),
+            "queued message did not persist after the compaction: {next:?}"
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
 use pi_agent::AgentMessage;
-use pi_ai::types::Usage;
+use pi_ai::types::{Model, Usage};
 use serde_json::Value;
 
 use super::migrate::migrate_to_current_version;
@@ -1661,6 +1661,75 @@ impl SessionManager {
         };
         self.append_record(SessionEntry::Compaction(entry).to_record())?;
         Ok(id)
+    }
+
+    /// `AgentSession.compact` (`agent-session.ts:2936-3060`) minus the
+    /// abort/event plumbing the UI owns: prepare → summarize → append.
+    /// `estimatedTokensAfter` mirrors upstream's post-append projection
+    /// estimate.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compact(
+        &mut self,
+        custom_instructions: Option<&str>,
+        model: &Model,
+        api_key: Option<&str>,
+        access_token: Option<&str>,
+        thinking_level: pi_agent::ThinkingLevel,
+        stream_fn: &dyn pi_agent::StreamFn,
+        signal: &pi_agent::AbortSignal,
+        settings: super::compaction::CompactionSettings,
+    ) -> Result<super::compaction::CompactionResult, super::compaction::CompactionError> {
+        use super::compaction::{CompactionError, estimate_tokens, prepare_compaction};
+
+        let path_entries = self
+            .get_branch(None)
+            .map_err(|error| CompactionError::Failed(error.to_string()))?;
+
+        let already_compacted = matches!(path_entries.last(), Some(SessionEntry::Compaction(_)));
+        let Some(preparation) = prepare_compaction(&path_entries, settings) else {
+            // Check why we can't compact, like upstream (`:2962-2968`).
+            return Err(CompactionError::Failed(
+                if already_compacted {
+                    "Already compacted"
+                } else {
+                    "Nothing to compact (session too small)"
+                }
+                .to_string(),
+            ));
+        };
+
+        let mut result = super::compaction::compact(
+            &preparation,
+            model,
+            api_key,
+            access_token,
+            custom_instructions,
+            signal,
+            thinking_level,
+            stream_fn,
+        )
+        .await?;
+
+        if signal.aborted() {
+            return Err(CompactionError::Cancelled);
+        }
+
+        let details = super::compaction::details_json(&result);
+        self.append_compaction(
+            &result.summary,
+            Some(&result.first_kept_entry_id),
+            result.tokens_before,
+            Some(details),
+            Some(false),
+            result.usage,
+        )
+        .map_err(|error| CompactionError::Failed(error.to_string()))?;
+        result.estimated_tokens_after = self
+            .build_session_projection()
+            .ok()
+            .map(|projection| projection.messages.iter().map(estimate_tokens).sum::<u64>());
+
+        Ok(result)
     }
 
     /// `appendCustomEntry` (`:1308-1319`): append an extension state entry.

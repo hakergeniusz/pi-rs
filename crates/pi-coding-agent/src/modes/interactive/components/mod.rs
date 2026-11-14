@@ -5,6 +5,7 @@
 //! [`super::interactive_mode`].
 
 pub mod assistant_message;
+pub mod compaction_summary;
 pub mod footer;
 pub mod header;
 pub mod model_selector;

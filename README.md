@@ -7,7 +7,7 @@ extensible agent harness — aiming for behavioral and on-disk compatibility
 **Status: pre-alpha.** The core pipeline is proven end-to-end against a live
 provider (`pi -p` prompt → answer, tool round-trips, JSON event mode), and bare
 `pi` renders the interactive chat TUI ported from upstream. Not at feature
-parity yet: selector dialogs beyond `/model`, extensions, compaction, and the
+parity yet: selector dialogs beyond `/model`, extensions, and the
 MCP tool bridge are still landing. See [PLAN.md](PLAN.md) for the phased plan
 and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
 
@@ -26,7 +26,9 @@ and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
   stats, editor autocomplete (`/` commands, `@file` fuzzy search via `fd`,
   path completion), the `/model` selector dialog, ctrl+p model cycling,
   steering/follow-up message queues (enter / alt+enter / alt+up), `!`/`!!`
-  bash mode, and session persistence (shutdown prints the resume command).
+  bash mode, `/compact` context compaction (status indicator, queued
+  submissions, ctrl+o expansion, billed-tokens notice), and session
+  persistence (shutdown prints the resume command).
 - **Sessions** — JSONL v3 transcript store under the XDG data root
   (`~/.local/share/pi-rs/sessions` by default), byte-compatible on the
   synthetic-fixture surface (golden fixtures from the TS pi still pending).

@@ -512,14 +512,6 @@ pub struct BranchSummarySettings {
     pub skip_prompt: bool,
 }
 
-/// `getCompactionSettings` (`settings-manager.ts:883-893`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompactionSettings {
-    pub enabled: bool,
-    pub reserve_tokens: i64,
-    pub keep_recent_tokens: i64,
-}
-
 /// The settings store. `SettingsManager` (`settings-manager.ts:378-1533`).
 pub struct SettingsManager {
     storage: Arc<dyn SettingsStorage>,
@@ -1161,15 +1153,18 @@ impl SettingsManager {
         self.compaction_token_setting("keepRecentTokens", model)
     }
 
-    /// `getCompactionSettings` (`:883-893`).
+    /// `getCompactionSettings` (`:883-893`). The token values were validated
+    /// as non-negative safe integers, so the narrowing cast cannot truncate.
     pub fn get_compaction_settings(
         &self,
         model: Option<(&str, &str)>,
-    ) -> Result<CompactionSettings, String> {
-        Ok(CompactionSettings {
+    ) -> Result<crate::session::compaction::CompactionSettings, String> {
+        Ok(crate::session::compaction::CompactionSettings {
             enabled: self.get_compaction_enabled(),
-            reserve_tokens: self.get_compaction_reserve_tokens(model)?,
-            keep_recent_tokens: self.get_compaction_keep_recent_tokens(model)?,
+            reserve_tokens: u64::try_from(self.get_compaction_reserve_tokens(model)?)
+                .unwrap_or_default(),
+            keep_recent_tokens: u64::try_from(self.get_compaction_keep_recent_tokens(model)?)
+                .unwrap_or_default(),
         })
     }
 
@@ -1436,7 +1431,7 @@ mod tests {
             manager
                 .get_compaction_settings(Some(("anthropic", "claude-test")))
                 .unwrap(),
-            CompactionSettings {
+            crate::session::compaction::CompactionSettings {
                 enabled: true,
                 reserve_tokens: 1000,
                 keep_recent_tokens: 500
@@ -1444,10 +1439,10 @@ mod tests {
         );
         assert_eq!(
             manager.get_compaction_settings(None).unwrap(),
-            CompactionSettings {
+            crate::session::compaction::CompactionSettings {
                 enabled: true,
                 reserve_tokens: 1000,
-                keep_recent_tokens: DEFAULT_COMPACTION_KEEP_RECENT_TOKENS
+                keep_recent_tokens: 20_000
             }
         );
 

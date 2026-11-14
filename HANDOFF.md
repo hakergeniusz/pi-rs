@@ -272,6 +272,63 @@ not touch the real TypeScript pi's `~/.pi` (the user runs real pi heavily).
   created**. (Session *file* is created lazily on first append — empty exit
   leaves only the dir; pre-existing part-1 behavior, unchanged.)
 
+## Compaction (landed on `feat/p6b-compaction`, 2026-11-14)
+
+Full port of `core/compaction/*` plus the interactive `/compact` flow.
+
+- `session/compaction.rs` (~1100 lines, 12 tests): settings
+  (`reserve_tokens` 16384 / `keep_recent_tokens` 20000, chars/4 estimate,
+  image = 4800 chars), `should_compact`, `prepare_compaction` (projection →
+  prev-compaction boundary → `find_projected_cut_point` with the backward
+  budget walk, recovery-omission suffix advance, split-turn handling), the
+  three verbatim prompts + `SUMMARIZATION_SYSTEM_PROMPT`,
+  `serialize_conversation` ([User]/[Assistant]/[Tool result] with 2000-char
+  truncation, thinking omitted), `compact()` as a single summarization call
+  over the `StreamFn` seam (convert_to_llm FIRST, AbortSignal honored
+  between events), the read-files/modified-files XML appendix (`\n\n` join,
+  `formatFileOperations` verbatim), `details_json`.
+  `SessionManager::compact` in store.rs orchestrates prepare → summarize →
+  append (the print/RPC/tests entry point).
+- Interactive wiring (`interactive_mode.rs`): `/compact [instructions]`
+  dispatch (after /model, before `!`), "Compacting context... (ctrl+c to
+  cancel)" via `StatusIndicator::compaction` in the editor border,
+  submissions during compaction queue ("Queued message for after
+  compaction"; built-in slash commands still dispatch), Interrupt aborts
+  compaction first, the outcome drain in `pump()` appends the compaction
+  entry on the UI thread, renders the `[compaction]` row (collapsed
+  "Compacted from N tokens (ctrl+o to expand)", ctrl+o expands to markdown)
+  plus the "Compaction: N tokens billed (~$X)" notice, then flushes the
+  queue (first message starts a run, the rest ride steer/follow-up).
+  "Compaction failed: {message}" wraps every error; "Compaction cancelled"
+  on aborts; "Already compacted" / "Nothing to compact (session too small)"
+  for prepare rejections.
+- **Deviation — UI split flow**: the worker thread can't own `&mut
+  SessionManager`, so the UI does prepare-on-main → LLM-on-worker →
+  append-on-main at outcome, NOT `SessionManager::compact`. Also:
+  single-attempt summarization (no retry), no session_before_compact /
+  session_compact extension hooks, cacheRetention left to the adapter, the
+  chat keeps rendered history instead of re-rendering from entries (the
+  renderSessionEntries port is pending), and DEFAULT_COMPACTION_SETTINGS is
+  used in interactive mode (no settings handle yet; the getter is ported
+  and tested).
+- **Pump-order gotcha**: retire the compaction run BEFORE
+  `handle_compaction_outcome` — the queue flush re-enters `submit`, whose
+  guard would re-queue the flushed message while the run still looks live
+  (upstream clears the promise before `flushCompactionQueue`). The e2e
+  caught this.
+- Verified: workspace gate green; two CaptureTerminal e2e tests with a
+  content-aware scripted stream keyed on the summarization system prompt
+  (full run → /compact → status → `[compaction]` row → cost notice →
+  persisted entry with the read-files appendix → "Already compacted" on
+  repeat; and queue-during-compaction → flush runs the queued message and
+  persists it right after the compaction entry). Real-PTY smoke
+  (`/tmp/pi-rs-compact-smoke.py`): /compact on an empty session prints
+  "Nothing to compact (session too small)" and the TUI survives.
+- **Test note**: the read tool caps its result at 50KB (≈12.5k estimated
+  tokens), so a read alone can never exceed the 20000-token keep-recent
+  budget — the e2e uses a 100KB second user prompt to push the backward
+  walk past it.
+
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
   slot shifted every later index — the `*_INDEX` consts are the single source of
