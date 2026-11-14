@@ -52,18 +52,38 @@ P4 detail (uncommitted, in working tree):
 
 ## Next steps (in order)
 1. **Finish the P4 gate** with the capped env from User rules:
-   - `cargo test -p pi-coding-agent` (expect 426+ green; the 2 fixes are in)
-   - `cargo clippy --workspace --all-targets -- -D warnings` (same env)
-   - `cargo fmt --all -- --check`
-   - The capped run started in the writing session is **dead** (killed with the session; log empty, no rustc left running) — just start it fresh with the capped env above.
-   - Free memory first: llama-swap is stopped (4-6G available should hold); if horizon-client (2.8G RSS) is also spiking, ask the user before proceeding.
-2. `test-log.txt` already deleted; the P4 code is already committed on branch `wip/p4-pre-gate` (snapshot `4853906`). After the gate passes: land P4 on `main` with
-   `feat(pi-coding-agent): config, auth, sessions, tools, prompts, skills, print mode (P4)`
-   (either re-commit on main or fast-forward), push, and watch CI per the git workflow rules.
-3. **Re-clone the reference** before any P5 porting: `gh repo clone earendil-works/pi /tmp/ai-agent/pi` (tmpfs; was @ `b22e525b3`).
-4. **Phase P5 — Modes & Extensions**: JSON mode (`modes/json-event.ts`, ~61 lines), RPC mode (stdin/stdout JSONL, command schemas), extension host (decide: deno_core embedded JS vs Rust-native trait+WASM vs subprocess — plan recommendation: deno_core), MCP client (`pi-mcp` crate is a stub), codemode sandbox (`pi-codemode` stub), package-manager subset (`package-manager-cli.ts`, 41.6K), project trust gating (`cli/project-trust.ts`), `@file` args (`cli/file-processor.ts`), full per-provider env-key table (`packages/ai/src/env-api-keys.ts`; partial table already in `print_mode.rs::env_key_candidates`), OAuth bearer auth in adapters. Exit: RPC driven session matches TS behavior on the documented command set.
-5. **P6 — Interactive mode** (chat viewport, editor, slash commands, themes, /resume).
-6. **P7 — Hardening** (compaction, cache warmer, crash log, signals/backpressure, release).
+## BUILD IN CONTAINER — the gate IS now green (2026-11-12)
+
+All builds/tests run inside the **`pi-rs-build` podman container** (rootless, hard caps: `--memory=4g --memory-swap=4g --cpus=4`) — container OOM kills the BUILD, never the host. It runs rustc 1.99.1 matching the host; mounts repo at `/work`, host `~/.cargo/registry` (rw), volume `pi-rs-build-target` at `/build-target` (CARGO_TARGET_DIR). Needs `rg`+`fd` installed (done) for the grep/find tests.
+
+Run the gate (all envs inside the container via `sh -c` — NEVER pass env via a zsh `$VAR` to `podman exec -e`; zsh does not word-split and cargo silently gets garbage, which caused a misleading OOM):
+
+```bash
+podman exec pi-rs-build sh -c 'export CARGO_TARGET_DIR=/build-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUGINFO=0; cd /work; nice -n 19 cargo fmt --all && nice -n 19 cargo clippy --workspace --all-targets -- -D warnings && nice -n 19 cargo test --workspace -- --test-threads=4 && nice -n 19 cargo fmt --all -- --check'
+```
+
+State when this handoff was updated: **workspace clippy-clean; full workspace test suite green (528 tests in the coding-agent lib alone; every integration target green; MCP unit tests green)** — this includes P4 (gate passed in-container) plus the P5 modules below. Remaining before landing on `main`:
+1. **Re-clone the TS reference** (`gh repo clone earendil-works/pi /tmp/ai-agent/pi`) and reconcile the `TODO(verify-vs-TS)` markers written without the reference: `modes/json_event.rs` (event wire casing/shapes), `modes/rpc.rs` (request/response envelope), `cli/file_processor.rs` (block format, size cap), `cli/project_trust.rs` (marker-file name), `pi-ai/src/providers/anthropic.rs` (oauth beta header `anthropic-beta: oauth-2025-04-20`), env-key table additions in `print_mode.rs::env_key_candidates`.
+2. Land P4+P5-part-1 on `main` (branch `wip/p4-pre-gate` has snapshot `4853906`; local checkout is on it), push, watch CI.
+3. EACCES test note: `tools_write_edit.rs::includes_eacces_for_read_only_files` skips when running as root (container) — documented in the test.
+
+## P5 progress (written 2026-11-12, all compiling + tested)
+- **`modes/json_event.rs`** — JSON mode: per-event JSONL wire serialization (`event_to_json`), `JsonEventSink`, `run_json_mode` on the print-runtime seams. Wired into `main.rs` (`--mode json`).
+- **`modes/rpc.rs`** — RPC mode: typed request/response envelope (`RpcRequest`/`RpcResponse`/`RpcCommand` with serde tags), `command_schemas()` table, stdin/stdout loop, per-command handlers (`prompt`/`steerable_prompt`/`followup_prompt`/`abort`/`set_model`/`set_thinking_level`/`get_state`/`get_messages`/`shutdown`). Steer/abort degrade to plain prompts until P6 queue plumbing. Wired into `main.rs` (`--mode rpc`).
+- **`cli/file_processor.rs`** — `@file` expansion: inline tokens expand only when the file exists (prose stays prose), bare `@file` args error on missing; binary files noted, 1MB cap, 6 unit tests.
+- **`cli/project_trust.rs`** — trust gating with agent-dir marker files, `_in` variants for dependency injection (no env mutation in tests), stdin/stdout confirm prompt, 5 unit tests. Not yet called from `main.rs` (wire with settings trust plumbing).
+- **`extensions/mod.rs`** — runtime-agnostic extension-host seam: `Extension` trait (tools/commands/flags/events), `ExtensionRegistry` aggregation + unknown-flag claiming, 3 unit tests. deno_core-vs-native decision still open; this seam serves either.
+- **`pi-mcp`** — real MCP client (was a stub): JSON-RPC 2.0 types + line classification, stdio subprocess transport (spawn, id correlation, notifications, EOF handling), `McpClient` with initialize handshake + `tools/list`/`tools/call`/`ping`, `McpServerConfig`. Unit tests on types/classification/serialization; HTTP transport + server-manager + tool-bridge into the agent registry still open.
+- **OAuth bearer pass-through** — `StreamOptions.access_token` (pi-ai) → `StreamRequest.access_token` (pi-agent) → `AgentLoopConfig.access_token` → `PrintRuntime.access_token`; auth ladder returns `WireCredential::{ApiKey, AccessToken}` (`resolve_wire_credential`); anthropic adapter sends `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20` for tokens, `x-api-key` for keys.
+
+## Next steps (in order)
+1. Re-clone reference; reconcile TODO markers above; run the container gate again.
+2. Land on `main` with `feat(pi-coding-agent): config, auth, sessions, tools, prompts, skills, print mode (P4) + P5 part 1 (json/rpc, extensions seam, mcp client, trust, @file, oauth)`, push, watch CI.
+3. **Real `pi -p` smoke test against a live provider** — still the first true end-to-end proof (never done).
+4. Golden session fixtures from the TS pi (byte-compat proof beyond synthetic fixtures).
+5. P5 remainder: MCP server-manager + tool bridge into the agent registry, package-manager subset (`package-manager-cli.ts`, 41.6K), codemode sandbox (`pi-codemode` stub, blocked on host decision), extension runtime host (decision pending).
+6. **P6 — Interactive mode** (chat viewport, editor, slash commands, themes, /resume).
+7. **P7 — Hardening** (compaction, cache warmer, crash log, signals/backpressure, release).
 
 ## Gotchas / decisions
 - Ported code once arrived with a systematic corruption: `map_or((default,` (extra `(` after `map_or(`) — fixed crate-wide by rewriting to `map_or(`. (Store.rs E0308 in old `test-log.txt` was another artifact of that batch, already fixed.)

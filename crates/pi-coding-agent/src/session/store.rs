@@ -1811,6 +1811,12 @@ impl SessionManager {
 
     // -- tree traversal ------------------------------------------------------
 
+    /// The backing JSONL file, if this session persists to disk (TS
+    /// `SessionManager` exposes the same via its `path`-style state).
+    pub fn session_file(&self) -> Option<&Path> {
+        self.session_file.as_deref()
+    }
+
     /// `getLeafId` (`:1422-1424`).
     pub fn get_leaf_id(&self) -> Option<&str> {
         self.leaf_id.as_deref()

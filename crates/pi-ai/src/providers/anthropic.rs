@@ -91,11 +91,25 @@ async fn request_and_stream(
     output: &mut AssistantMessage,
     sender: &EventSender,
 ) -> StreamResult<()> {
-    let api_key = options
-        .api_key
+    // Credential: an OAuth bearer token wins over an API key (TS
+    // `providers/anthropic.ts`: accessToken -> `Authorization: Bearer`,
+    // otherwise `x-api-key`). TODO(verify-vs-TS): confirm the oauth beta
+    // header name/value against the reference checkout.
+    let access_token = options
+        .access_token
         .clone()
-        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-        .ok_or_else(|| "Anthropic API key not set (set ANTHROPIC_API_KEY)".to_string())?;
+        .or_else(|| std::env::var("ANTHROPIC_OAUTH_TOKEN").ok());
+    let api_key = if access_token.is_some() {
+        None
+    } else {
+        Some(
+            options
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .ok_or_else(|| "Anthropic API key not set (set ANTHROPIC_API_KEY)".to_string())?,
+        )
+    };
 
     let body = build_request_body(model, context, options)?;
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
@@ -104,11 +118,18 @@ async fn request_and_stream(
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| format!("client build failed: {e}"))?;
-    let response = client
+    let mut request = client
         .post(&url)
         .header("content-type", "application/json")
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-version", "2023-06-01");
+    if let Some(token) = &access_token {
+        request = request
+            .header("authorization", format!("Bearer {token}"))
+            .header("anthropic-beta", "oauth-2025-04-20");
+    } else if let Some(key) = &api_key {
+        request = request.header("x-api-key", key);
+    }
+    let response = request
         .json(&body)
         .send()
         .await

@@ -1,21 +1,26 @@
 //! Pi coding agent CLI (Rust port of `@earendil-works/pi-coding-agent`).
 //!
-//! Binary `pi`. Phase P4 wires print mode (`pi -p`); JSON/RPC modes (P5) and
-//! interactive mode (P6) print a phase note and exit for now.
+//! Binary `pi`. Phase P4 wires print mode (`pi -p`); P5 adds JSON and RPC
+//! modes; interactive mode (P6) still exits with a phase note.
 
+use std::io::{BufReader, stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use pi_ai::catalog;
 use pi_ai::providers;
 
-use pi_coding_agent::cli::args::{DiagnosticKind, Mode, parse_args, print_help};
+use pi_coding_agent::cli::args::{Args, DiagnosticKind, Mode, parse_args, print_help};
+use pi_coding_agent::cli::file_processor::{expand_file_args, expand_file_references};
 use pi_coding_agent::config;
 use pi_coding_agent::config::settings::{SettingsManager, SettingsManagerCreateOptions};
+use pi_coding_agent::modes::json_event::run_json_mode;
 use pi_coding_agent::modes::print_mode::{
-    PrintModeOptions, PrintRuntime, ProviderStreamFn, parse_model_pattern, resolve_api_key,
-    resolve_model, run_print_mode, select_builtin_tools, system_prompt_for,
+    PrintModeOptions, PrintRuntime, ProviderStreamFn, WireCredential, parse_model_pattern,
+    resolve_model, resolve_wire_credential, run_print_mode, select_builtin_tools,
+    system_prompt_for, thinking_level_from_str,
 };
+use pi_coding_agent::modes::rpc::run_rpc_mode;
 use pi_coding_agent::session::store::{NewSessionOptions, SessionManager};
 use pi_coding_agent::tools::index::ToolRegistry;
 
@@ -56,16 +61,19 @@ fn main() {
         return;
     }
 
-    let print_mode_requested =
-        args.print || args.mode == Some(Mode::Json) || args.mode == Some(Mode::Rpc);
-    if !print_mode_requested {
+    if args.mode.is_none() && !args.print {
         eprintln!(
             "pi-rs: interactive mode is not implemented yet (phase P6); use -p for print mode"
         );
         std::process::exit(2);
     }
 
-    match run_print(&args, &cwd, &cwd_string) {
+    let outcome = match args.mode {
+        Some(Mode::Rpc) => run_rpc(&args, &cwd, &cwd_string),
+        Some(Mode::Json) => run_json(&args, &cwd, &cwd_string),
+        _ => run_print(&args, &cwd, &cwd_string),
+    };
+    match outcome {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("{error}");
@@ -88,14 +96,14 @@ fn list_models(search: Option<&str>) {
     }
 }
 
-/// Assemble the print-mode runtime and run it. Mirrors the startup path of
-/// upstream `cli.ts` for non-interactive runs: settings, model, credentials,
-/// session, tools, system prompt.
-fn run_print(
-    args: &pi_coding_agent::cli::args::Args,
+/// Assemble the runtime shared by print/JSON/RPC modes. Mirrors the startup
+/// path of upstream `cli.ts` for non-interactive runs: settings, model,
+/// credentials, session, tools, system prompt.
+fn build_runtime(
+    args: &Args,
     cwd: &std::path::Path,
     cwd_string: &str,
-) -> Result<i32, String> {
+) -> Result<PrintRuntime, String> {
     let agent_dir = config::get_agent_dir();
     let settings = SettingsManager::create(
         cwd,
@@ -113,19 +121,23 @@ fn run_print(
         settings.get_default_model().as_deref(),
     )?;
 
-    // Credential ladder: flag > auth.json > provider env vars.
-    let api_key = resolve_api_key(
+    // Credential ladder: flag > auth.json > provider env vars. OAuth tokens
+    // resolve as bearer credentials, distinct from API keys.
+    let (api_key, access_token) = resolve_wire_credential(
         &model.provider,
         args.api_key.as_deref(),
         &config::get_auth_path(),
     )
-    .map(|(key, source)| {
+    .map_or((None, None), |(credential, source)| {
         if source == "environment" {
             eprintln!("pi-rs: using {} key from environment", model.provider);
         }
-        key
+        match credential {
+            WireCredential::ApiKey(key) => (Some(key), None),
+            WireCredential::AccessToken(token) => (None, Some(token)),
+        }
     });
-    if api_key.is_none() {
+    if api_key.is_none() && access_token.is_none() {
         return Err(format!(
             "No API key for provider {}. Run `pi auth login --provider {}`, set the provider's environment variable, or pass --api-key.",
             model.provider, model.provider
@@ -172,31 +184,80 @@ fn run_print(
     let thinking_level = args
         .thinking
         .as_deref()
-        .map(pi_coding_agent::modes::print_mode::thinking_level_from_str)
+        .map(thinking_level_from_str)
         .transpose()?
         .unwrap_or_default();
 
-    // `-p` puts the prompt in messages[0]; upstream sends it as the initial
-    // message and any further positionals as follow-ups.
+    Ok(PrintRuntime {
+        model,
+        thinking_level,
+        api_key,
+        access_token,
+        stream_fn: Arc::new(ProviderStreamFn(stream_fn)),
+        executor,
+        system_prompt,
+        session,
+    })
+}
+
+/// `-p` puts the prompt in messages[0]; upstream sends it as the initial
+/// message and any further positionals as follow-ups. `@file` references
+/// expand inside every message; bare `@file` arguments attach their blocks
+/// to the first message (`cli/file-processor.ts`).
+fn resolve_prompt_messages(
+    args: &Args,
+    cwd: &std::path::Path,
+) -> Result<(Option<String>, Vec<String>), String> {
     let (initial, follow_ups) = match args.messages.split_first() {
         Some((first, rest)) if args.print && rest.is_empty() => (Some(first.clone()), Vec::new()),
         Some((first, rest)) if args.print => (Some(first.clone()), rest.to_vec()),
         _ => (None, args.messages.clone()),
     };
-    let mut runtime = PrintRuntime {
-        model,
-        thinking_level,
-        api_key,
-        stream_fn: Arc::new(ProviderStreamFn(stream_fn)),
-        executor,
-        system_prompt,
-        session,
+    let initial = match initial {
+        Some(text) => Some(expand_file_references(&text, cwd)?),
+        None => None,
     };
+    let follow_ups = follow_ups
+        .iter()
+        .map(|message| expand_file_references(message, cwd))
+        .collect::<Result<Vec<_>, _>>()?;
+    let initial = if args.file_args.is_empty() {
+        initial
+    } else {
+        let blocks = expand_file_args(&args.file_args, cwd)?;
+        Some(match initial {
+            Some(text) => format!("{text}\n\n{blocks}"),
+            None => blocks,
+        })
+    };
+    Ok((initial, follow_ups))
+}
+
+fn run_print(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
+    let mut runtime = build_runtime(args, cwd, cwd_string)?;
+    let (initial, follow_ups) = resolve_prompt_messages(args, cwd)?;
     let options = PrintModeOptions {
-        mode: args.mode.unwrap_or(Mode::Text),
+        mode: Mode::Text,
         messages: follow_ups,
         initial_message: initial,
     };
-
     run_print_mode(&mut runtime, &options)
+}
+
+fn run_json(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
+    let mut runtime = build_runtime(args, cwd, cwd_string)?;
+    let (initial, follow_ups) = resolve_prompt_messages(args, cwd)?;
+    let options = PrintModeOptions {
+        mode: Mode::Json,
+        messages: follow_ups,
+        initial_message: initial,
+    };
+    run_json_mode(&mut runtime, &options)
+}
+
+fn run_rpc(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
+    let mut runtime = build_runtime(args, cwd, cwd_string)?;
+    let mut stdin = BufReader::new(std::io::stdin());
+    let out = stdout();
+    run_rpc_mode(&mut runtime, &mut stdin, &mut out.lock())
 }

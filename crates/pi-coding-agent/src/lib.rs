@@ -15,15 +15,19 @@
 //! * [`prompt_templates`] — command prompt templates
 //!   (`core/prompt-templates.ts`).
 //! * [`skills`] — skill discovery and packaging (`core/skills.ts`).
-//! * [`cli`] — argument parsing (`cli/args.ts`).
-//! * [`modes`] — print mode (`modes/print-mode.ts`); JSON/RPC (P5) and
-//!   interactive (P6) later.
+//! * [`cli`] — argument parsing, `@file` processing, project trust
+//!   (`cli/args.ts`, `cli/file-processor.ts`, `cli/project-trust.ts`).
+//! * [`modes`] — print, JSON-event, and RPC modes (`modes/`); interactive
+//!   (P6) later.
+//! * [`extensions`] — runtime-agnostic extension host seam
+//!   (`extensions/index.ts` port decision pending at the P5 gate).
 
 #![forbid(unsafe_code)]
 
 pub mod auth;
 pub mod cli;
 pub mod config;
+pub mod extensions;
 pub mod modes;
 pub mod prompt;
 pub mod prompt_templates;

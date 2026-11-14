@@ -55,6 +55,9 @@ pub struct AgentLoopConfig {
     pub session_id: Option<String>,
     /// Wire credential, resolved through pi's auth ladder.
     pub api_key: Option<String>,
+    /// OAuth bearer credential (pi's `accessToken`): takes precedence over
+    /// `api_key` in the providers that support it.
+    pub access_token: Option<String>,
     pub tool_execution: ToolExecutionMode,
     pub hooks: ToolCallHooks,
     pub finish_turn: Option<Arc<dyn FinishTurn>>,
@@ -77,6 +80,7 @@ impl Default for AgentLoopConfig {
             live_settings: None,
             session_id: None,
             api_key: None,
+            access_token: None,
             tool_execution: ToolExecutionMode::Parallel,
             hooks: ToolCallHooks::default(),
             finish_turn: None,
@@ -97,6 +101,7 @@ impl std::fmt::Debug for AgentLoopConfig {
             .field("live_settings", &self.live_settings.is_some())
             .field("session_id", &self.session_id)
             .field("api_key_set", &self.api_key.is_some())
+            .field("access_token_set", &self.access_token.is_some())
             .field("tool_execution", &self.tool_execution)
             .field("hooks", &self.hooks)
             .field("finish_turn", &self.finish_turn.is_some())
@@ -641,6 +646,7 @@ async fn stream_assistant_response(
         thinking_level,
         session_id: config.session_id.clone(),
         api_key: config.api_key.clone(),
+        access_token: config.access_token.clone(),
     };
 
     let mut stream = stream_fn.stream(request);

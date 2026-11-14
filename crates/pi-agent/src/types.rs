@@ -294,6 +294,8 @@ pub struct StreamRequest {
     pub session_id: Option<String>,
     /// Wire credential, already resolved through pi's auth ladder.
     pub api_key: Option<String>,
+    /// OAuth bearer credential (pi's `accessToken`); wins over `api_key`.
+    pub access_token: Option<String>,
 }
 
 /// The injected stream seam.

@@ -43,6 +43,8 @@ pub struct PrintRuntime {
     pub thinking_level: ThinkingLevel,
     /// Wire credential, already resolved through the auth ladder.
     pub api_key: Option<String>,
+    /// OAuth bearer token from the ladder (`Authorization: Bearer`).
+    pub access_token: Option<String>,
     pub stream_fn: Arc<dyn StreamFn>,
     pub executor: Arc<BuiltinToolExecutor>,
     pub system_prompt: String,
@@ -56,6 +58,9 @@ pub struct PrintRuntime {
 /// they arrive — the port appends the persisted model/thinking changes and
 /// every returned message after the loop; the JSONL bytes are the same for
 /// a completed run.
+// The 100-line cap fights the linear port of upstream's print-mode run
+// sequence; kept 1:1 for parity-auditability.
+#[allow(clippy::too_many_lines)]
 pub fn run_print_mode(
     runtime: &mut PrintRuntime,
     options: &PrintModeOptions,
@@ -124,6 +129,7 @@ pub fn run_print_mode(
         live_settings: None,
         session_id: None,
         api_key: runtime.api_key.clone(),
+        access_token: runtime.access_token.clone(),
         tool_execution: ToolExecutionMode::Parallel,
         hooks: pi_agent::types::ToolCallHooks {
             before: None,
@@ -185,11 +191,10 @@ pub fn run_print_mode(
     Ok(0)
 }
 
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_millis() as i64)
 }
 
 /// Bridge pi-ai's provider stream functions onto the agent loop's
@@ -213,6 +218,7 @@ impl pi_agent::types::StreamFn for ProviderStreamFn {
         let context = pi_ai::types::TranscriptContext { messages };
         let options = pi_ai::types::StreamOptions {
             api_key: request.api_key,
+            access_token: request.access_token,
             reasoning: Some(match request.thinking_level {
                 ThinkingLevel::Off => pi_ai::types::ThinkingLevel::Off,
                 ThinkingLevel::Minimal => pi_ai::types::ThinkingLevel::Minimal,
@@ -300,27 +306,26 @@ pub fn resolve_model(
             _ => Err("No model specified. Use --model <pattern> (e.g. anthropic/claude-sonnet-4) or set defaultProvider/defaultModel in settings".to_string()),
         };
     };
-    let found = match &pattern.provider {
-        Some(provider) => catalog::catalog()
+    let found = if let Some(provider) = &pattern.provider {
+        catalog::catalog()
             .get(provider, &pattern.id)
             .cloned()
-            .ok_or_else(|| format!("Model not found: {provider}/{}", pattern.id))?,
-        None => {
-            let matches = catalog::catalog().find(&pattern.id);
-            match matches.len() {
-                0 => return Err(format!("Model not found: {}", pattern.id)),
-                1 => matches[0].clone(),
-                _ => {
-                    let candidates: Vec<String> = matches
-                        .iter()
-                        .map(|model| format!("{}/{}", model.provider, model.id))
-                        .collect();
-                    return Err(format!(
-                        "Model pattern \"{}\" matches multiple models; be specific: {}",
-                        pattern.id,
-                        candidates.join(", ")
-                    ));
-                }
+            .ok_or_else(|| format!("Model not found: {provider}/{}", pattern.id))?
+    } else {
+        let matches = catalog::catalog().find(&pattern.id);
+        match matches.len() {
+            0 => return Err(format!("Model not found: {}", pattern.id)),
+            1 => matches[0].clone(),
+            _ => {
+                let candidates: Vec<String> = matches
+                    .iter()
+                    .map(|model| format!("{}/{}", model.provider, model.id))
+                    .collect();
+                return Err(format!(
+                    "Model pattern \"{}\" matches multiple models; be specific: {}",
+                    pattern.id,
+                    candidates.join(", ")
+                ));
             }
         }
     };
@@ -367,20 +372,48 @@ fn env_key_candidates(provider: &str) -> &'static [&'static str] {
         "xiaomi-token-plan-ams" => &["XIAOMI_TOKEN_PLAN_AMS_API_KEY"],
         "xiaomi-token-plan-sgp" => &["XIAOMI_TOKEN_PLAN_SGP_API_KEY"],
         "ant-ling" => &["ANT_LING_API_KEY"],
+        "cohere" => &["COHERE_API_KEY"],
+        "perplexity" => &["PERPLEXITY_API_KEY"],
+        "huggingface" => &["HF_TOKEN", "HF_API_KEY"],
+        "siliconflow" => &["SILICONFLOW_API_KEY"],
+        "modelscope" => &["MODELSCOPE_API_KEY"],
+        "bailian" => &["BAILIAN_API_KEY"],
+        "stepfun" => &["STEPFUN_API_KEY"],
+        // TODO(verify-vs-TS): entries below were added without the reference
+        // checkout present; confirm names/order in `env-api-keys.ts` (P5).
+        "grok" => &["XAI_API_KEY", "GROK_API_KEY"],
+        "aihubmix" => &["AIHUBMIX_API_KEY"],
+        "dmxapi" => &["DMXAPI_API_KEY"],
+        "gitee-ai" => &["GITEE_AI_API_KEY"],
+        "novita" => &["NOVITA_API_KEY"],
+        "ppio" => &["PPIO_API_KEY"],
+        "scaleway" => &["SCALEWAY_API_KEY"],
+        "targon" => &["TARGON_API_KEY"],
         _ => &[],
     }
 }
 
+/// The wire credential the ladder resolved, with its header semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireCredential {
+    /// Provider API key (`x-api-key`-style headers).
+    ApiKey(String),
+    /// OAuth bearer token (`Authorization: Bearer`).
+    AccessToken(String),
+}
+
 /// The auth ladder for one request (`providers/anthropic.ts:30-45` and
 /// friends): `--api-key` flag, then the stored credential from `auth.json`,
-/// then provider environment variables. Returns the key and its source.
-pub fn resolve_api_key(
+/// then provider environment variables. Returns the credential and its
+/// source, keeping OAuth tokens distinct from API keys so the adapters can
+/// pick the right header.
+pub fn resolve_wire_credential(
     provider: &str,
     flag_key: Option<&str>,
     auth_path: &Path,
-) -> Option<(String, &'static str)> {
+) -> Option<(WireCredential, &'static str)> {
     if let Some(key) = flag_key {
-        return Some((key.to_string(), "--api-key"));
+        return Some((WireCredential::ApiKey(key.to_string()), "--api-key"));
     }
     if let Some(credential) = auth::read_stored_credential(provider, auth_path) {
         match &credential {
@@ -389,24 +422,39 @@ pub fn resolve_api_key(
                     .as_deref()
                     .and_then(|key| auth::resolve_config_value(key, env.as_ref()))
                 {
-                    return Some((resolved, "stored credential"));
+                    return Some((WireCredential::ApiKey(resolved), "stored credential"));
                 }
             }
-            // OAuth access tokens ride the same wire field in the port; the
-            // provider adapters' bearer-header support lands with P5 auth.
             Credential::Oauth { access, .. } => {
-                return Some((access.clone(), "stored credential"));
+                return Some((
+                    WireCredential::AccessToken(access.clone()),
+                    "stored credential",
+                ));
             }
         }
     }
     for variable in env_key_candidates(provider) {
         if let Ok(value) = std::env::var(variable) {
             if !value.is_empty() {
-                return Some((value, "environment"));
+                return Some((WireCredential::ApiKey(value), "environment"));
             }
         }
     }
     None
+}
+
+/// API-key-only view of [`resolve_wire_credential`] (P4 callers and tests).
+pub fn resolve_api_key(
+    provider: &str,
+    flag_key: Option<&str>,
+    auth_path: &Path,
+) -> Option<(String, &'static str)> {
+    resolve_wire_credential(provider, flag_key, auth_path).and_then(|(credential, source)| {
+        match credential {
+            WireCredential::ApiKey(key) => Some((key, source)),
+            WireCredential::AccessToken(_) => None,
+        }
+    })
 }
 
 /// `applyToolModifiers` (`core/settings-manager.ts:110-120`): apply
@@ -488,7 +536,7 @@ fn is_tool_modifier_entry(entry: &str) -> bool {
 /// append (joined with newlines, matching the CLI's startup join).
 pub fn system_prompt_for(args: &Args, cwd: &str) -> Result<String, String> {
     let mut options = crate::prompt::BuildSystemPromptOptions::new(cwd);
-    options.custom_prompt = args.system_prompt.clone();
+    options.custom_prompt.clone_from(&args.system_prompt);
     if let Some(appends) = &args.append_system_prompt {
         options.append_system_prompt = Some(appends.join("\n"));
     }
@@ -573,15 +621,19 @@ mod tests {
     #[test]
     fn tool_selection_honors_flags() {
         let available = ToolRegistry::all().definitions().to_vec();
-        let mut args = Args::default();
-        args.no_tools = true;
+        let args = Args {
+            no_tools: true,
+            ..Args::default()
+        };
         assert!(select_builtin_tools(&args, &available).unwrap().is_empty());
 
-        args = Args::default();
-        args.tools = Some(vec!["read".to_string(), "+write".to_string()]);
         // Mixed names and modifiers are rejected at parse time upstream, so
         // the mixed case never reaches here; direct calls follow
         // `applyToolModifiers`, which ignores bare entries.
+        let args = Args {
+            tools: Some(vec!["read".to_string(), "+write".to_string()]),
+            ..Args::default()
+        };
         let selected = select_builtin_tools(&args, &available).unwrap();
         assert_eq!(
             selected
@@ -591,8 +643,10 @@ mod tests {
             vec!["read", "bash", "edit", "write"]
         );
 
-        args = Args::default();
-        args.tools = Some(vec!["bogus".to_string()]);
+        let args = Args {
+            tools: Some(vec!["bogus".to_string()]),
+            ..Args::default()
+        };
         let error = match select_builtin_tools(&args, &available) {
             Err(error) => error,
             Ok(selected) => panic!(
@@ -602,8 +656,10 @@ mod tests {
         };
         assert!(error.starts_with("Unknown tool: bogus"));
 
-        args = Args::default();
-        args.exclude_tools = Some(vec!["edit".to_string(), "write".to_string()]);
+        let args = Args {
+            exclude_tools: Some(vec!["edit".to_string(), "write".to_string()]),
+            ..Args::default()
+        };
         let selected = select_builtin_tools(&args, &available).unwrap();
         assert_eq!(
             selected

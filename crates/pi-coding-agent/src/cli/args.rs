@@ -39,6 +39,8 @@ pub enum DiagnosticKind {
 /// tests pin the shape. `unknown_flags` captures unrecognized long flags so
 /// the extension host (P5) can claim them.
 #[derive(Debug, Clone, Default)]
+// Upstream's `Args` interface carries the same boolean flags 1:1.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Args {
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -146,6 +148,9 @@ fn split_comma_list(value: &str) -> Vec<String> {
 }
 
 /// `parseArgs` (`args.ts:72-271`).
+// Hand-rolled port of the upstream parser loop; kept 1:1 for
+// parity-auditability rather than split into helpers.
+#[allow(clippy::too_many_lines)]
 pub fn parse_args(input: &[String]) -> Args {
     let mut result = Args::default();
 
@@ -172,6 +177,9 @@ pub fn parse_args(input: &[String]) -> Args {
                     kind: DiagnosticKind::Error,
                     message: "--mode requires text, json, or rpc".to_string(),
                 });
+                // Consume the flag itself; the missing/flag-looking value stays
+                // for the next iteration (upstream's for-loop advances too).
+                index += 1;
                 continue;
             };
             index += 1;
@@ -318,6 +326,8 @@ pub fn parse_args(input: &[String]) -> Args {
                     kind: DiagnosticKind::Error,
                     message: "--use-theme requires a theme name".to_string(),
                 });
+                // Same as `--mode`: consume the flag, re-check the next token.
+                index += 1;
                 continue;
             };
             result.use_theme = Some(theme_name.clone());
@@ -382,15 +392,15 @@ pub fn parse_args(input: &[String]) -> Args {
             result.offline = true;
         } else if let Some(stripped) = arg.strip_prefix('@') {
             result.file_args.push(stripped.to_string());
-        } else if arg.starts_with("--") {
+        } else if let Some(long) = arg.strip_prefix("--") {
             // Unknown long flag (`args.ts:249-262`): captured for extensions.
-            if let Some(eq_index) = arg.find('=') {
+            if let Some(eq_index) = long.find('=') {
                 result.unknown_flags.insert(
-                    arg[2..eq_index].to_string(),
-                    Some(arg[eq_index + 1..].to_string()),
+                    long[..eq_index].to_string(),
+                    Some(long[eq_index + 1..].to_string()),
                 );
             } else {
-                let flag_name = arg[2..].to_string();
+                let flag_name = long.to_string();
                 match input.get(index + 1) {
                     Some(next) if !next.starts_with('-') && !next.starts_with('@') => {
                         result.unknown_flags.insert(flag_name, Some(next.clone()));
@@ -640,6 +650,9 @@ pub fn print_help() {
 
 #[cfg(test)]
 mod tests {
+    // `assert!(v.is_empty())` stays: clippy's `assert_eq!(v, [])` alternative
+    // is noisier for these port-fixture assertions.
+    #![allow(clippy::assert_is_empty)]
     use super::*;
 
     fn parse(items: &[&str]) -> Args {
@@ -739,9 +752,9 @@ mod tests {
 
     #[test]
     fn tool_flag_validation() {
-        assert_eq!(parse(&["--no-tools"]).no_tools, true);
-        assert_eq!(parse(&["-nt"]).no_tools, true);
-        assert_eq!(parse(&["-nbt"]).no_builtin_tools, true);
+        assert!(parse(&["--no-tools"]).no_tools);
+        assert!(parse(&["-nt"]).no_tools);
+        assert!(parse(&["-nbt"]).no_builtin_tools);
         assert_eq!(
             parse(&["--tools", "read,bash"]).tools,
             Some(vec!["read".to_string(), "bash".to_string()])
@@ -834,11 +847,11 @@ mod tests {
         let result = parse(&["--fork", "1234abcd"]);
         assert_eq!(result.fork.as_deref(), Some("1234abcd"));
         assert!(result.messages.is_empty());
-        assert_eq!(parse(&["--no-session"]).no_session, true);
-        assert_eq!(parse(&["--continue"]).r#continue, true);
-        assert_eq!(parse(&["-c"]).r#continue, true);
-        assert_eq!(parse(&["--resume"]).resume, true);
-        assert_eq!(parse(&["-r"]).resume, true);
+        assert!(parse(&["--no-session"]).no_session);
+        assert!(parse(&["--continue"]).r#continue);
+        assert!(parse(&["-c"]).r#continue);
+        assert!(parse(&["--resume"]).resume);
+        assert!(parse(&["-r"]).resume);
     }
 
     #[test]

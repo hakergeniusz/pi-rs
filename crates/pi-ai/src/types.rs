@@ -664,6 +664,9 @@ pub struct TranscriptContext {
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
     pub api_key: Option<String>,
+    /// OAuth bearer token (pi's `accessToken`): sent as
+    /// `Authorization: Bearer` instead of the provider's key header.
+    pub access_token: Option<String>,
     pub temperature: Option<f64>,
     /// Arbitrary sampling parameters merged into the request body as-is.
     pub sampling_params: Option<JsonObject>,
