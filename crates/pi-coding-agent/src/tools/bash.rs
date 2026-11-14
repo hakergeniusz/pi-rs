@@ -102,7 +102,7 @@ fn shell_config(custom: Option<&str>) -> Result<(String, Vec<String>), ToolError
 
 /// A PATH lookup, the job pi's `findExecutableOnPath` does for shell
 /// discovery.
-fn which(executable: &str) -> Option<PathBuf> {
+pub(crate) fn which(executable: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|directory| directory.join(executable))

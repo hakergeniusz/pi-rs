@@ -3,11 +3,11 @@
 //! Ground truth: `modes/interactive/interactive-mode.ts`. This port covers the
 //! regular (main-screen) chat loop — the startup header, user and assistant
 //! messages, tool execution rows, the working status embedded in the editor's
-//! top border, the footer, the `/`-commands this phase wires, and the `!` bash
-//! mode — one agent run at a time on a worker thread. Deferred to later P6
-//! parts: fullscreen mode, autocomplete dialogs (model/session/settings
-//! selectors), extensions, compaction, follow-up queues, and the
-//! mouse-driven toggles.
+//! top border, the footer, the `/`-commands this phase wires, the `!` bash
+//! mode, and the editor autocomplete (slash commands, `@` files, paths).
+//! Deferred to later P6 parts: fullscreen mode, selector dialogs
+//! (model/session/settings), extensions, compaction, follow-up queues, and
+//! the mouse-driven toggles.
 
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
@@ -31,9 +31,11 @@ use crate::modes::print_mode::PrintRuntime;
 use crate::session::store::{NewSessionOptions, SessionManager};
 use crate::tools::index::BuiltinToolExecutor;
 
+use super::autocomplete;
 use super::components::assistant_message::AssistantMessageComponent;
 use super::components::footer::{FooterComponent, FooterData, UsageTotals};
 use super::components::header::{BuiltInHeader, pi_logo_lines};
+use super::components::model_selector::{ModelSelectorComponent, ModelSelectorEvent};
 use super::components::status_indicator::{IdleStatus, StatusIndicator};
 use super::components::tool_execution::{ToolExecutionComponent, ToolResultView};
 use super::components::user_message::UserMessageComponent;
@@ -44,6 +46,9 @@ pub struct InteractiveOptions {
     pub version: String,
     /// A `--theme` override; the settings getter lands with the settings work.
     pub theme_name: Option<String>,
+    /// The `auth.json` path for the model-availability check. `None` uses the
+    /// real agent dir; tests inject a temp path to stay hermetic.
+    pub auth_path: Option<std::path::PathBuf>,
 }
 
 impl Default for InteractiveOptions {
@@ -51,6 +56,7 @@ impl Default for InteractiveOptions {
         InteractiveOptions {
             version: env!("CARGO_PKG_VERSION").to_string(),
             theme_name: None,
+            auth_path: None,
         }
     }
 }
@@ -65,6 +71,10 @@ enum AppAction {
     CycleModel(i32),
     ToggleThinking,
     ToolsExpand,
+    /// alt+enter (`app.message.followUp`): queue while streaming, else submit.
+    FollowUp,
+    /// alt+up (`app.message.dequeue`): restore queued messages to the editor.
+    Dequeue,
 }
 
 /// Events the editor host queues for the orchestrator.
@@ -149,6 +159,10 @@ impl Component for ChatEditor {
             Some(AppAction::ToggleThinking)
         } else if theme::app_keys::matches(data, theme::app_keys::TOOLS_EXPAND) {
             Some(AppAction::ToolsExpand)
+        } else if theme::app_keys::matches(data, theme::app_keys::MESSAGE_FOLLOW_UP) {
+            Some(AppAction::FollowUp)
+        } else if theme::app_keys::matches(data, theme::app_keys::MESSAGE_DEQUEUE) {
+            Some(AppAction::Dequeue)
         } else {
             None
         };
@@ -211,16 +225,32 @@ struct AgentRun {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// `QueueSource` over a mutex-shared [`Queues`]: the loop borrows it for the
+/// whole run while the UI keeps enqueueing (`agent.steer`/`followUp`).
+struct SharedQueues(Arc<Mutex<Queues>>);
+
+impl pi_agent::types::QueueSource for SharedQueues {
+    fn drain_steering(&mut self) -> Vec<AgentMessage> {
+        self.0.lock().expect("queues").drain_steering()
+    }
+
+    fn drain_follow_up(&mut self) -> Vec<AgentMessage> {
+        self.0.lock().expect("queues").drain_follow_up()
+    }
+}
+
 /// Tool-row bookkeeping: the row's index inside the chat container.
 struct PendingTool {
     chat_index: usize,
 }
 
-/// Tree child indices.
+/// Tree child indices. The pending-messages container sits between the chat
+/// and the status row (`interactive-mode.ts` `pendingMessagesContainer`).
 const HEADER_INDEX: usize = 0;
 const CHAT_INDEX: usize = 1;
-const EDITOR_INDEX: usize = 3;
-const FOOTER_INDEX: usize = 4;
+const PENDING_INDEX: usize = 2;
+const EDITOR_INDEX: usize = 4;
+const FOOTER_INDEX: usize = 5;
 
 /// The interactive mode (`InteractiveMode`, reduced to the chat core).
 pub struct InteractiveMode {
@@ -251,6 +281,21 @@ pub struct InteractiveMode {
     tool_output_expanded: bool,
     hide_thinking_block: bool,
     exiting: bool,
+    /// The mounted `/model` selector's event queue, while open.
+    model_selector_events: Option<Arc<Mutex<Vec<ModelSelectorEvent>>>>,
+    /// The editor, parked while the selector occupies its tree slot.
+    suspended_editor: Option<Box<dyn Component>>,
+    /// Where provider credentials live (`auth.json`).
+    auth_path: std::path::PathBuf,
+    /// The agent loop's steering/follow-up queues, shared with the worker
+    /// thread and persistent across runs (upstream: `agent.queues`).
+    queues: Arc<Mutex<Queues>>,
+    /// Queued messages awaiting loop delivery, with their queue mode; they
+    /// persist to the transcript when the loop declares them.
+    queued_deliveries: Vec<(bool, AgentMessage)>,
+    /// The running prompt's `(timestamp, text)`: its `MessageEnd` is skipped
+    /// (it persisted at submit) so same-millisecond steering cannot steal it.
+    active_prompt: Option<(i64, String)>,
 }
 
 impl InteractiveMode {
@@ -262,7 +307,20 @@ impl InteractiveMode {
         theme::init_theme(options.theme_name.as_deref());
         let editor_events = Arc::new(Mutex::new(Vec::new()));
         let status_handle: Arc<Mutex<Option<StatusIndicator>>> = Arc::new(Mutex::new(None));
-        let editor_host = ChatEditor::new(Arc::clone(&editor_events), Arc::clone(&status_handle));
+        let mut editor_host =
+            ChatEditor::new(Arc::clone(&editor_events), Arc::clone(&status_handle));
+
+        // `setupAutocompleteProvider` (`interactive-mode.ts:855-871`): the
+        // base provider is built once from the builtin commands, the session
+        // cwd, and the fd binary.
+        let provider = autocomplete::CombinedAutocompleteProvider::new(
+            Self::autocomplete_commands(),
+            runtime.session.get_cwd().to_path_buf(),
+            crate::tools::bash::which("fd"),
+        );
+        editor_host
+            .editor
+            .set_autocomplete_provider(Some(Arc::new(provider)));
 
         let mut tui = Tui::new(terminal);
         tui.set_clear_on_shrink(true);
@@ -270,6 +328,7 @@ impl InteractiveMode {
             &options.version,
             &runtime.model.id,
         )));
+        tui.add_child(Box::new(pi_tui::component::Container::new()));
         tui.add_child(Box::new(pi_tui::component::Container::new()));
         tui.add_child(Box::new(IdleStatus));
         tui.add_child(Box::new(editor_host));
@@ -304,7 +363,79 @@ impl InteractiveMode {
             tool_output_expanded: false,
             hide_thinking_block: false,
             exiting: false,
+            model_selector_events: None,
+            suspended_editor: None,
+            auth_path: options
+                .auth_path
+                .clone()
+                .unwrap_or_else(crate::config::get_auth_path),
+            queues: Arc::new(Mutex::new(Queues::new())),
+            queued_deliveries: Vec::new(),
+            active_prompt: None,
         }
+    }
+
+    /// The `/`-commands offered by autocomplete (`createBaseAutocompleteProvider`,
+    /// `interactive-mode.ts:743-853`). Only the commands this port implements
+    /// are listed — advertising upstream's unimplemented builtins would make
+    /// the picker lie. Argument completions: `/model` fuzzy-searches the
+    /// whole catalog (upstream: the scoped-models subset or the runtime
+    /// snapshot; the scoped-models setting lands later), `/thinking` the
+    /// valid levels.
+    fn autocomplete_commands() -> Vec<autocomplete::SlashCommand> {
+        let commands = vec![
+            autocomplete::SlashCommand::new("model", "Select model (opens selector UI)")
+                .with_argument_hint("<provider/model>")
+                .with_argument_completions(Arc::new(|prefix: &str| {
+                    let catalog = pi_ai::catalog::catalog();
+                    let mut models: Vec<(String, String, String)> = Vec::new(); // (id, provider, name)
+                    for provider in catalog.providers() {
+                        for model in catalog.models(provider) {
+                            models.push((
+                                model.id.clone(),
+                                provider.to_string(),
+                                model.name.clone(),
+                            ));
+                        }
+                    }
+                    // `getModelSearchText` (`model-search.ts:7-11`).
+                    let filtered =
+                        pi_tui::fuzzy::fuzzy_filter(&models, prefix, |(id, provider, name)| {
+                            if name.is_empty() {
+                                format!("{id} {provider} {provider}/{id} {provider} {id}")
+                            } else {
+                                format!("{id} {provider} {provider}/{id} {provider} {id} {name}")
+                            }
+                        });
+                    let items: Vec<pi_tui::components::select_list::SelectItem> = filtered
+                        .into_iter()
+                        .map(
+                            |(id, provider, _name)| pi_tui::components::select_list::SelectItem {
+                                value: format!("{provider}/{id}"),
+                                label: id,
+                                description: Some(provider),
+                            },
+                        )
+                        .collect();
+                    if items.is_empty() { None } else { Some(items) }
+                })),
+            autocomplete::SlashCommand::new("thinking", "Set thinking level")
+                .with_argument_hint("<level>")
+                .with_argument_completions(Arc::new(|prefix: &str| {
+                    let items: Vec<pi_tui::components::select_list::SelectItem> =
+                        crate::cli::args::VALID_THINKING_LEVELS
+                            .iter()
+                            .filter(|level| level.starts_with(prefix))
+                            .map(|level| {
+                                pi_tui::components::select_list::SelectItem::new(*level, *level)
+                            })
+                            .collect();
+                    if items.is_empty() { None } else { Some(items) }
+                })),
+            autocomplete::SlashCommand::new("new", "Start a new session"),
+            autocomplete::SlashCommand::new("quit", "Quit pi"),
+        ];
+        commands
     }
 
     /// The startup header (`interactive-mode.ts:1049-1122`): the logo carries
@@ -436,7 +567,7 @@ impl InteractiveMode {
 
     fn add_user_message(&mut self, text: &str) {
         if self.chat_len() > 0 {
-            self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new()));
+            self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
         }
         self.add_to_chat(Box::new(UserMessageComponent::new(text, 1)));
         self.tui.request_render();
@@ -514,8 +645,42 @@ impl InteractiveMode {
                 self.update_assistant_stream(message);
             }
             AgentEvent::MessageEnd { message } => match message {
-                AgentMessage::User(_) => {
-                    // User messages persist at submit time.
+                AgentMessage::User(user) => {
+                    // Queued (steer/follow-up) deliveries persist when the
+                    // loop declares them, so the transcript order matches
+                    // upstream (`agent-session.ts` appends at declaration);
+                    // the run's own first prompt persisted at submit. The
+                    // active-prompt marker tells them apart even when a
+                    // steering message shares its millisecond.
+                    let text = match &user.content {
+                        pi_ai::types::UserContent::Text(text) => Some(text.clone()),
+                        pi_ai::types::UserContent::Blocks(_) => None,
+                    };
+                    let is_active_prompt = text.is_some()
+                        && self
+                            .active_prompt
+                            .as_ref()
+                            .is_some_and(|(timestamp, prompt)| {
+                                *timestamp == user.timestamp && Some(prompt) == text.as_ref()
+                            });
+                    if is_active_prompt {
+                        self.active_prompt = None;
+                    } else {
+                        let delivered =
+                            self.queued_deliveries
+                                .iter()
+                                .position(|(_, queued)| match queued {
+                                    AgentMessage::User(queued) => {
+                                        queued.timestamp == user.timestamp
+                                    }
+                                    _ => false,
+                                });
+                        if let Some(index) = delivered {
+                            self.queued_deliveries.remove(index);
+                            let _ = self.session.append_message(message.clone());
+                            self.update_pending_messages();
+                        }
+                    }
                 }
                 AgentMessage::Assistant(assistant) => {
                     if let Some(index) = self.streaming_index.take()
@@ -704,53 +869,242 @@ impl InteractiveMode {
             }
         }
         if self.agent_run.is_some() {
-            // Upstream steers/queues; the queue UI lands with the queues work.
-            self.show_status("The agent is still responding — press escape to interrupt first.");
+            // Upstream Enter during streaming steers
+            // (`interactive-mode.ts:3500-3509`, `streamingBehavior: "steer"`).
+            self.queue_message(&text, false);
             return;
         }
         self.start_agent_run(&text);
     }
 
-    /// `/model [pattern]`: without a pattern show the current model; with one,
-    /// resolve and switch (`handleModelCommand`).
+    /// Queue a user message for the running agent (`session.prompt` with
+    /// `streamingBehavior`, `agent-session.ts:2240-2253`). The message rides
+    /// the loop's queue, shows in the pending display, and persists when the
+    /// loop declares it — so the transcript order matches upstream.
+    fn queue_message(&mut self, text: &str, follow_up: bool) {
+        self.editor_mut().editor.add_to_history(text);
+        let message = pi_agent::transcript::user_message(text, now_millis());
+        self.queued_deliveries.push((follow_up, message.clone()));
+        {
+            let mut queues = self.queues.lock().expect("queues");
+            if follow_up {
+                queues.follow_up(std::iter::once(message));
+            } else {
+                queues.steer(std::iter::once(message));
+            }
+        }
+        self.update_pending_messages();
+        self.tui.request_render();
+    }
+
+    /// `handleDequeue` (`interactive-mode.ts:4691-4699`) via
+    /// `restoreQueuedMessagesToEditor`: put every queued message back into
+    /// the editor, newest queue order first.
+    fn dequeue_queued(&mut self) {
+        let queued_texts: Vec<String> = self
+            .queued_deliveries
+            .iter()
+            .filter_map(|(_, message)| match message {
+                AgentMessage::User(user) => match &user.content {
+                    pi_ai::types::UserContent::Text(text) => Some(text.clone()),
+                    pi_ai::types::UserContent::Blocks(_) => None,
+                },
+                _ => None,
+            })
+            .collect();
+        if queued_texts.is_empty() {
+            self.show_status("No queued messages to restore");
+            return;
+        }
+        self.queues.lock().expect("queues").clear_all();
+        self.queued_deliveries.clear();
+        let current_text = self.editor_mut().editor.get_text();
+        let combined = queued_texts
+            .into_iter()
+            .chain(std::iter::once(current_text))
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.editor_mut().editor.set_text(&combined);
+        self.update_pending_messages();
+        self.tui.request_render();
+    }
+
+    /// `updatePendingMessagesDisplay` (`interactive-mode.ts:4887-4909`).
+    fn update_pending_messages(&mut self) {
+        // Build the rows first: the container borrow must not overlap the
+        // queue bookkeeping.
+        let theme = theme::theme();
+        let mut rows: Vec<Box<dyn Component>> = Vec::new();
+        if !self.queued_deliveries.is_empty() {
+            rows.push(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+            for (follow_up, message) in &self.queued_deliveries {
+                let AgentMessage::User(user) = message else {
+                    continue;
+                };
+                let text = match &user.content {
+                    pi_ai::types::UserContent::Text(text) => text.clone(),
+                    pi_ai::types::UserContent::Blocks(_) => continue,
+                };
+                let label = if *follow_up { "Follow-up" } else { "Steering" };
+                rows.push(Box::new(
+                    pi_tui::components::truncated_text::TruncatedText::new(
+                        theme.fg(pi_tui::theme::ThemeColor::Dim, &format!("{label}: {text}")),
+                        1,
+                        0,
+                    ),
+                ));
+            }
+            let dequeue_hint = theme::key_hint(
+                theme::app_keys::MESSAGE_DEQUEUE,
+                "to edit all queued messages",
+            );
+            rows.push(Box::new(
+                pi_tui::components::truncated_text::TruncatedText::new(
+                    theme.fg(pi_tui::theme::ThemeColor::Dim, &format!("↳ {dequeue_hint}")),
+                    1,
+                    0,
+                ),
+            ));
+        }
+        let pending = self
+            .downcast_tree::<pi_tui::component::Container>(PENDING_INDEX)
+            .expect("pending container");
+        pending.clear();
+        for row in rows {
+            pending.add_child(row);
+        }
+    }
+
+    /// `/model [pattern]` (`handleModelCommand`, `interactive-mode.ts:5386-5407`):
+    /// no pattern opens the selector; an exact match switches; anything else
+    /// opens the selector pre-filled with the search term.
     fn handle_model_command(&mut self, pattern: &str) {
         if pattern.is_empty() {
-            self.show_status(&format!(
-                "Current model: {}/{}",
-                self.model.provider, self.model.id
-            ));
+            self.open_model_selector(None);
             return;
         }
         let parsed = crate::modes::print_mode::parse_model_pattern(pattern);
         match crate::modes::print_mode::resolve_model(Some(&parsed), None, None) {
-            Ok(model) => {
-                if model.api != self.model.api {
-                    let Some(stream_fn) = pi_ai::providers::stream_fn_for(&model.api) else {
-                        self.show_error(&format!(
-                            "No provider adapter for api \"{}\" (model {}/{}).",
-                            model.api, model.provider, model.id
-                        ));
-                        return;
-                    };
-                    self.stream_fn =
-                        Arc::new(crate::modes::print_mode::ProviderStreamFn(stream_fn));
-                }
-                let changed = model.provider != self.model.provider || model.id != self.model.id;
-                self.model = model;
-                if changed {
-                    let _ = self
-                        .session
-                        .append_model_change(&self.model.provider, &self.model.id);
-                }
-                self.show_status(&format!(
-                    "Switched to {}/{}",
-                    self.model.provider, self.model.id
-                ));
-                self.refresh_footer();
-                self.tui.request_render();
-            }
-            Err(error) => self.show_error(&error),
+            Ok(model) => match self.apply_model(model) {
+                Ok(()) => self.show_status(&format!("Model: {}", self.model.id)),
+                Err(error) => self.show_error(&error),
+            },
+            Err(_) => self.open_model_selector(Some(pattern)),
         }
+    }
+
+    /// Swap the active model, including the provider adapter when the api
+    /// changes (`handleModelCommand` and `session.cycleModel` share the path).
+    fn apply_model(&mut self, model: pi_ai::types::Model) -> Result<(), String> {
+        if model.api != self.model.api {
+            let Some(stream_fn) = pi_ai::providers::stream_fn_for(&model.api) else {
+                return Err(format!(
+                    "No provider adapter for api \"{}\" (model {}/{}).",
+                    model.api, model.provider, model.id
+                ));
+            };
+            self.stream_fn = Arc::new(crate::modes::print_mode::ProviderStreamFn(stream_fn));
+        }
+        let changed = model.provider != self.model.provider || model.id != self.model.id;
+        self.model = model;
+        if changed {
+            let _ = self
+                .session
+                .append_model_change(&self.model.provider, &self.model.id);
+        }
+        self.refresh_footer();
+        self.tui.request_render();
+        Ok(())
+    }
+
+    /// `modelRuntime.getAvailableSnapshot()` — the cycle source
+    /// (`agent-session.ts` `_cycleAvailableModel`). Upstream auth-filters
+    /// through provider `checkAuth`; the port reuses the request-time
+    /// credential ladder (stored `auth.json` entry or provider env key),
+    /// with the `--api-key` flag counting for the initial provider only.
+    fn available_models(&self) -> Vec<pi_ai::types::Model> {
+        let auth_path = &self.auth_path;
+        let catalog = pi_ai::catalog::catalog();
+        let mut models = Vec::new();
+        for provider in catalog.providers() {
+            let flag_key = if provider == self.model.provider {
+                self.api_key.clone()
+            } else {
+                None
+            };
+            if crate::modes::print_mode::resolve_wire_credential(
+                provider,
+                flag_key.as_deref(),
+                auth_path,
+            )
+            .is_some()
+            {
+                models.extend(catalog.models(provider).into_iter().cloned());
+            }
+        }
+        models
+    }
+
+    /// ctrl+p / ctrl+shift+p cycling (`cycleModel`, `interactive-mode.ts:4722-4741`).
+    /// Upstream also applies per-model thinking defaults on the switch; those
+    /// land with the settings work.
+    fn cycle_model(&mut self, direction: i32) {
+        let available = self.available_models();
+        let Some(next) = cycle_next(&available, &self.model.provider, &self.model.id, direction)
+        else {
+            self.show_status("Only one model available");
+            return;
+        };
+        if let Err(error) = self.apply_model(next) {
+            self.show_error(&error);
+            return;
+        }
+        // `Switched to ${model.name || model.id}` + the thinking suffix
+        // (`interactive-mode.ts:4731-4735`).
+        let label = if self.model.name.is_empty() {
+            self.model.id.clone()
+        } else {
+            self.model.name.clone()
+        };
+        let thinking_suffix = if self.model.reasoning && self.thinking_level != ThinkingLevel::Off {
+            format!(" (thinking: {})", self.thinking_level.as_str())
+        } else {
+            String::new()
+        };
+        self.show_status(&format!("Switched to {label}{thinking_suffix}"));
+    }
+
+    /// Mount the `/model` selector in the editor's tree slot and focus it
+    /// (`showSelector`, `interactive-mode.ts:5072-5096`).
+    fn open_model_selector(&mut self, initial_search: Option<&str>) {
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let selector = ModelSelectorComponent::new(
+            &self.model,
+            self.available_models(),
+            initial_search,
+            Arc::clone(&events),
+        );
+        let editor = self.tui.replace_child(EDITOR_INDEX, Box::new(selector));
+        self.suspended_editor = Some(editor);
+        self.model_selector_events = Some(events);
+        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
+        self.tui.request_render();
+    }
+
+    /// Put the editor back (`showSelector`'s `done`).
+    fn close_model_selector(&mut self) {
+        if self.suspended_editor.is_none() {
+            return;
+        }
+        let editor = self.suspended_editor.take().expect("suspended editor");
+        let _ = self.tui.replace_child(EDITOR_INDEX, editor);
+        self.model_selector_events = None;
+        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
+        self.tui.request_render();
     }
 
     /// `/thinking [level]` (`handleThinkingCommand`).
@@ -896,6 +1250,10 @@ impl InteractiveMode {
 
         let user_message = pi_agent::transcript::user_message(text, now_millis());
         let _ = self.session.append_message(user_message.clone());
+        let AgentMessage::User(user) = &user_message else {
+            unreachable!("user_message builds a user message");
+        };
+        self.active_prompt = Some((user.timestamp, text.to_string()));
 
         let context = AgentContext {
             messages: context_messages,
@@ -925,15 +1283,16 @@ impl InteractiveMode {
         let executor = Arc::clone(&self.executor);
         let stream_fn = Arc::clone(&self.stream_fn);
         let run_signal = Arc::clone(&signal);
+        let shared_queues = SharedQueues(Arc::clone(&self.queues));
+        let mut shared_queues = shared_queues;
         let handle = std::thread::spawn(move || {
-            let mut queues = Queues::new();
             let mut sink = ChannelSink { tx: tx.clone() };
             let _messages = crate::runtime::block_on(pi_agent::run_agent_loop(
                 vec![user_message],
                 context,
                 executor.as_ref(),
                 &config,
-                &mut queues,
+                &mut shared_queues,
                 &mut sink,
                 &run_signal,
                 stream_fn.as_ref(),
@@ -1033,6 +1392,32 @@ impl InteractiveMode {
             }
         }
 
+        // Selector events, drained through the Arc the component publishes to
+        // (`showSelector`'s onSelect/onCancel callbacks).
+        if self.model_selector_events.is_some() {
+            let events = std::mem::take(
+                &mut *self
+                    .model_selector_events
+                    .as_ref()
+                    .expect("selector")
+                    .lock()
+                    .expect("selector events"),
+            );
+            for event in events {
+                match event {
+                    ModelSelectorEvent::Selected(model) => {
+                        self.close_model_selector();
+                        if let Err(error) = self.apply_model(model) {
+                            self.show_error(&error);
+                        } else {
+                            self.show_status(&format!("Model: {}", self.model.id));
+                        }
+                    }
+                    ModelSelectorEvent::Cancelled => self.close_model_selector(),
+                }
+            }
+        }
+
         // Agent events, without blocking the input loop: collect first,
         // then handle, so the run borrow ends before the handlers run.
         let mut incoming: Vec<AgentEvent> = Vec::new();
@@ -1097,14 +1482,26 @@ impl InteractiveMode {
                     run.abort.abort();
                 }
             }
-            AppAction::CycleModel(_direction) => {
-                // Model cycling over the catalog lands with the model
-                // selector (P6 part 2).
-            }
+            AppAction::CycleModel(direction) => self.cycle_model(*direction),
             AppAction::ToggleThinking => {
                 self.hide_thinking_block = !self.hide_thinking_block;
                 self.tui.request_render();
             }
+            AppAction::FollowUp => {
+                // `handleFollowUp` (`interactive-mode.ts:4655-4688`): queue
+                // while streaming, otherwise act like Enter.
+                let text = self.editor_mut().editor.get_text().trim().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                self.editor_mut().editor.set_text("");
+                if self.agent_run.is_some() {
+                    self.queue_message(&text, true);
+                } else {
+                    self.submit(&text);
+                }
+            }
+            AppAction::Dequeue => self.dequeue_queued(),
             AppAction::ToolsExpand => {
                 self.tool_output_expanded = !self.tool_output_expanded;
                 let expanded = self.tool_output_expanded;
@@ -1144,6 +1541,44 @@ impl InteractiveMode {
 }
 
 /// `runInteractiveMode`: the CLI entry point.
+/// `getNextCycleIndex` (`agent-session.ts:398-409`): when the current model
+/// is not in the list, forward picks the first entry and backward the last,
+/// so a one-entry list still selects its only model.
+fn next_cycle_index(current_index: isize, length: usize, forward: bool) -> Option<usize> {
+    if length == 0 {
+        return None;
+    }
+    if current_index == -1 {
+        return Some(if forward { 0 } else { length - 1 });
+    }
+    if length == 1 {
+        return None;
+    }
+    let length = length as isize;
+    let next = if forward {
+        (current_index + 1) % length
+    } else {
+        (current_index - 1 + length) % length
+    };
+    Some(next as usize)
+}
+
+/// One cycle step over a model list (`_cycleAvailableModel`): the next model
+/// in `direction`, or none when there is nothing to move to.
+fn cycle_next(
+    models: &[pi_ai::types::Model],
+    current_provider: &str,
+    current_id: &str,
+    direction: i32,
+) -> Option<pi_ai::types::Model> {
+    let current_index = models
+        .iter()
+        .position(|m| m.provider == current_provider && m.id == current_id)
+        .map_or(-1, |index| index as isize);
+    let next_index = next_cycle_index(current_index, models.len(), direction > 0)?;
+    Some(models[next_index].clone())
+}
+
 pub fn run_interactive_mode(
     runtime: &mut PrintRuntime,
     options: &InteractiveOptions,
@@ -1178,6 +1613,7 @@ fn git_branch(cwd: &std::path::Path) -> Option<String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(test, allow(clippy::assert_is_empty))]
 mod tests {
     use super::*;
     use pi_ai::types::{AssistantMessageEvent, StopReason, TextContent, ToolCall};
@@ -1331,11 +1767,11 @@ mod tests {
             rows: 40,
         });
         let capture = terminal.capture();
-        let mode = InteractiveMode::new(
-            &mut runtime,
-            &InteractiveOptions::default(),
-            Box::new(terminal),
-        );
+        let options = InteractiveOptions {
+            auth_path: Some(dir.join("auth.json")),
+            ..InteractiveOptions::default()
+        };
+        let mode = InteractiveMode::new(&mut runtime, &options, Box::new(terminal));
         (mode, capture)
     }
 
@@ -1416,6 +1852,225 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         assert!(mode.agent_run.is_none(), "agent run did not finish");
+    }
+
+    #[test]
+    fn cycle_indices_follow_upstream_semantics() {
+        // `getNextCycleIndex` (`agent-session.ts:398-409`).
+        assert_eq!(next_cycle_index(0, 3, true), Some(1));
+        assert_eq!(next_cycle_index(2, 3, true), Some(0));
+        assert_eq!(next_cycle_index(0, 3, false), Some(2));
+        assert_eq!(next_cycle_index(1, 1, true), None);
+        assert_eq!(next_cycle_index(0, 0, true), None);
+        // Current model missing from the list: forward → first, backward → last.
+        assert_eq!(next_cycle_index(-1, 3, true), Some(0));
+        assert_eq!(next_cycle_index(-1, 3, false), Some(2));
+        assert_eq!(next_cycle_index(-1, 1, true), Some(0));
+    }
+
+    #[test]
+    fn cycle_next_steps_through_the_list() {
+        fn model(provider: &str, id: &str) -> pi_ai::types::Model {
+            pi_ai::types::Model {
+                provider: provider.to_string(),
+                id: id.to_string(),
+                name: String::new(),
+                ..pi_ai::types::Model::default()
+            }
+        }
+        let models = vec![model("a", "one"), model("a", "two"), model("b", "three")];
+        let next = cycle_next(&models, "a", "one", 1).expect("forward");
+        assert_eq!((next.provider.as_str(), next.id.as_str()), ("a", "two"));
+        let previous = cycle_next(&models, "a", "one", -1).expect("backward");
+        assert_eq!(
+            (previous.provider.as_str(), previous.id.as_str()),
+            ("b", "three")
+        );
+        // Wrap-around.
+        let wrapped = cycle_next(&models, "b", "three", 1).expect("wrap");
+        assert_eq!(
+            (wrapped.provider.as_str(), wrapped.id.as_str()),
+            ("a", "one")
+        );
+        // The current model absent from the list → forward selects the first.
+        let fresh = cycle_next(&models, "zzz", "none", 1).expect("fresh");
+        assert_eq!((fresh.provider.as_str(), fresh.id.as_str()), ("a", "one"));
+        // Single-entry list → nothing to cycle.
+        let single = vec![model("a", "one")];
+        assert!(cycle_next(&single, "a", "one", 1).is_none());
+        // Empty list.
+        assert!(cycle_next(&[], "a", "one", 1).is_none());
+    }
+
+    #[test]
+    fn model_selector_mounts_in_place_of_the_editor_and_restores_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        // `/model` with no pattern opens the selector in the editor slot.
+        mode.submit("/model");
+        mode.tui.render_now(false);
+        assert!(mode.suspended_editor.is_some(), "selector not mounted");
+        let selector = mode
+            .downcast_tree::<ModelSelectorComponent>(EDITOR_INDEX)
+            .expect("selector in the editor slot");
+        let rendered = pi_tui::ansi::strip_terminal_sequences(&selector.render(100).join("\n"));
+        assert!(
+            rendered.contains("Only showing models from configured providers"),
+            "{rendered}"
+        );
+
+        // Selecting a model applies it and restores the editor.
+        let model = pi_ai::types::Model {
+            id: "test-model".to_string(),
+            name: "Test Model".to_string(),
+            api: "test".to_string(),
+            provider: "test".to_string(),
+            ..pi_ai::types::Model::default()
+        };
+        mode.model_selector_events
+            .as_ref()
+            .expect("selector events")
+            .lock()
+            .expect("selector events lock")
+            .push(ModelSelectorEvent::Selected(model));
+        mode.pump();
+        assert!(mode.suspended_editor.is_none(), "editor not restored");
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Model: test-model"), "{frame}");
+        let editor = mode
+            .downcast_tree::<ChatEditor>(EDITOR_INDEX)
+            .expect("editor back");
+        assert!(editor.has_input_handler(), "focus-able editor restored");
+
+        // Escape cancels without touching the model.
+        mode.submit("/model");
+        mode.model_selector_events
+            .as_ref()
+            .expect("selector events")
+            .lock()
+            .expect("selector events lock")
+            .push(ModelSelectorEvent::Cancelled);
+        mode.pump();
+        assert!(mode.suspended_editor.is_none(), "editor not restored");
+        assert_eq!(mode.model.id, "test-model");
+    }
+
+    #[test]
+    fn submitting_during_a_run_steers_and_persists_in_delivery_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("first question");
+        for _ in 0..100 {
+            mode.pump();
+            if mode.agent_run.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(mode.agent_run.is_some(), "run did not start");
+
+        // Plain Enter while streaming steers; the editor intercepts alt+enter
+        // into the follow-up action.
+        mode.submit("steered mid-run");
+        mode.editor_mut().editor.set_text("follow-up mid-run");
+        let mutation = Component::handle_input(mode.editor_mut(), "\x1b\r");
+        assert!(mutation.is_some(), "alt+enter consumed");
+        let events = mode.editor_events.lock().expect("editor events").clone();
+        assert!(events.contains(&EditorEventOut::Action(AppAction::FollowUp)));
+
+        mode.pump();
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Steering: steered mid-run"), "{frame}");
+        assert!(frame.contains("Follow-up: follow-up mid-run"), "{frame}");
+
+        for _ in 0..400 {
+            mode.pump();
+            if mode.agent_run.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(mode.agent_run.is_none(), "run did not finish");
+
+        // Transcript order: the first prompt, then the queued messages in
+        // delivery order (steering before follow-up).
+        let user_texts: Vec<String> = mode
+            .session
+            .get_entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                SessionEntry::Message(entry) => match &entry.message {
+                    AgentMessage::User(user) => match &user.content {
+                        pi_ai::types::UserContent::Text(text) => Some(text.clone()),
+                        pi_ai::types::UserContent::Blocks(_) => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec![
+                "first question".to_string(),
+                "steered mid-run".to_string(),
+                "follow-up mid-run".to_string()
+            ]
+        );
+
+        // The pending display cleared once everything was delivered (the
+        // capture stream keeps every frame, so assert on the live state).
+        assert!(mode.queued_deliveries.is_empty());
+        let pending = mode
+            .downcast_tree::<pi_tui::component::Container>(PENDING_INDEX)
+            .expect("pending container");
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn dequeue_restores_queued_messages_to_the_editor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("first question");
+        for _ in 0..100 {
+            mode.pump();
+            if mode.agent_run.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        mode.submit("queued one");
+        mode.editor_mut().editor.set_text("typed draft");
+        mode.handle_action(&AppAction::Dequeue);
+
+        // Queues cleared, editor carries both, pending display emptied.
+        assert!(!mode.queues.lock().expect("queues").has_items());
+        assert!(mode.queued_deliveries.is_empty());
+        let text = mode.editor_mut().editor.get_text();
+        assert_eq!(text, "queued one\n\ntyped draft");
+
+        // With nothing queued, dequeue reports and does nothing.
+        mode.handle_action(&AppAction::Dequeue);
+        assert_eq!(
+            mode.editor_mut().editor.get_text(),
+            "queued one\n\ntyped draft"
+        );
+
+        for _ in 0..400 {
+            mode.pump();
+            if mode.agent_run.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     #[test]

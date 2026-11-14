@@ -7,6 +7,7 @@
 pub mod assistant_message;
 pub mod footer;
 pub mod header;
+pub mod model_selector;
 pub mod status_indicator;
 pub mod tool_execution;
 pub mod user_message;

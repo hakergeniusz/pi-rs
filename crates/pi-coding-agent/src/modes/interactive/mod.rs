@@ -5,6 +5,7 @@
 //! orchestrator (`interactive-mode.ts`). The main-screen (regular) renderer
 //! is `pi_tui::Tui` itself; fullscreen (alt-screen) mode is P6 part 2.
 
+pub mod autocomplete;
 pub mod components;
 pub mod interactive_mode;
 pub mod theme;

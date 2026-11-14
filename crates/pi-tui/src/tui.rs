@@ -603,6 +603,23 @@ impl Tui {
         self.root_children_mut().remove(index)
     }
 
+    /// Swap the child at `index`, returning the old one. Hosts use this to
+    /// mount a selector dialog in place of the editor and put it back
+    /// (`showSelector`, `interactive-mode.ts:5072-5096`, swaps inside the
+    /// editor container).
+    pub fn replace_child(
+        &mut self,
+        index: usize,
+        component: Box<dyn Component>,
+    ) -> Box<dyn Component> {
+        if self.focused == Some(FocusTarget::Root(index)) {
+            self.set_focus(None);
+        }
+        self.request_render();
+        self.root_children_mut().insert(index, component);
+        self.root_children_mut().remove(index + 1)
+    }
+
     /// Drop every root child, as `Container.clear` does. `tui.ts:1066-1069`.
     pub fn clear_children(&mut self) {
         self.set_focus(None);

@@ -203,6 +203,8 @@ pub mod app_keys {
     pub const MODEL_CYCLE_BACKWARD: &str = "app.model.cycleBackward";
     pub const TOOLS_EXPAND: &str = "app.tools.expand";
     pub const THINKING_TOGGLE: &str = "app.thinking.toggle";
+    pub const MESSAGE_FOLLOW_UP: &str = "app.message.followUp";
+    pub const MESSAGE_DEQUEUE: &str = "app.message.dequeue";
 
     /// pi's default keys, in `APP_KEYBINDINGS` order.
     pub const DEFAULTS: &[(&str, &[&str])] = &[
@@ -215,6 +217,8 @@ pub mod app_keys {
         (MODEL_CYCLE_BACKWARD, &["ctrl+shift+p"]),
         (TOOLS_EXPAND, &["ctrl+o"]),
         (THINKING_TOGGLE, &["ctrl+t"]),
+        (MESSAGE_FOLLOW_UP, &["alt+enter"]),
+        (MESSAGE_DEQUEUE, &["alt+up"]),
     ];
 
     /// The keys bound to `action` (`keybindings.ts:60-70` getKeys).

@@ -29,6 +29,7 @@ pub mod color;
 pub mod component;
 pub mod components;
 pub mod frame;
+pub mod fuzzy;
 pub mod keybindings;
 pub mod keys;
 pub mod kill_ring;

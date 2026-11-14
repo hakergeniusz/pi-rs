@@ -36,8 +36,10 @@ impl Component for MouseRegion {
     }
 
     fn handle_mouse(&mut self, event: &MouseEvent) -> Option<MouseEventResult> {
-        let mut child =
-            std::mem::replace(&mut self.child, Box::new(crate::components::spacer::Spacer));
+        let mut child = std::mem::replace(
+            &mut self.child,
+            Box::new(crate::components::spacer::Spacer::new(1)),
+        );
         let dispatched = dispatch_mouse_event(child.as_mut(), event);
         self.child = child;
         let child_result = dispatched.map(|result| MouseEventResult {

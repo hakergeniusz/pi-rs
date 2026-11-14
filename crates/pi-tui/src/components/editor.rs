@@ -358,13 +358,25 @@ pub trait AutocompleteProvider: Send + Sync {
     fn trigger_characters(&self) -> Vec<char> {
         vec!['@', '#']
     }
-    /// Suggestions for the cursor position, or none.
+    /// Suggestions for the cursor position, or none. `force` is true for
+    /// explicit Tab requests (`editor.ts:2388`).
     fn suggest(
         &self,
         lines: &[String],
         cursor_line: usize,
         cursor_col: usize,
+        force: bool,
     ) -> Option<Suggestions>;
+    /// Gate on forced (Tab) completion; `autocomplete.ts:847-857` via
+    /// `editor.ts:2300-2309`.
+    fn should_trigger_file_completion(
+        &self,
+        _lines: &[String],
+        _cursor_line: usize,
+        _cursor_col: usize,
+    ) -> bool {
+        true
+    }
     /// Replace the token with `item`. Returns `(lines, cursor_line, cursor_col)`.
     fn apply_completion(
         &self,
@@ -1773,16 +1785,26 @@ impl Editor {
         self.request_autocomplete(force);
     }
 
-    /// pi's `requestAutocomplete` (`editor.ts:2286-2316`), minus the debounce
+    /// pi's `requestAutocomplete` (`editor.ts:2297-2316`), minus the debounce
     /// and the abort token: the provider is synchronous here.
     fn request_autocomplete(&mut self, force: bool) {
         let Some(provider) = self.provider.clone() else {
             return;
         };
+        if force
+            && !provider.should_trigger_file_completion(
+                &self.state.lines,
+                self.state.cursor_line,
+                self.state.cursor_col,
+            )
+        {
+            return;
+        }
         let suggestions = provider.suggest(
             &self.state.lines,
             self.state.cursor_line,
             self.state.cursor_col,
+            force,
         );
         match suggestions {
             Some(suggestions) if !suggestions.items.is_empty() => {
@@ -3214,6 +3236,7 @@ mod tests {
             lines: &[String],
             cursor_line: usize,
             cursor_col: usize,
+            _force: bool,
         ) -> Option<Suggestions> {
             let line = lines.get(cursor_line)?;
             let before = char_slice(line, 0, cursor_col)?;
