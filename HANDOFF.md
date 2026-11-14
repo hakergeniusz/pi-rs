@@ -1,7 +1,7 @@
 # Handoff: Pi in Rust (`pi-rs`)
 
 > Written 2026-11-11, updated same day after gate attempts. Repo: `/home/hakergeniusz/Projects/pi-rs` on `acer`.
-> **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). **`main` = P0–P5-part-1 + codex adapter + interactive TUI; E2E PROVEN LIVE** — `pi -p` smoke test PASSED 2026-11-14 (PONG / read-tool round-trip ALBATROSS / JSON event mode) with the openai-codex stored OAuth credential and default model `openai-codex/gpt-6-luna`; required (1) a new `openai-codex-responses` adapter in pi-ai (`8efb00b`) and (2) the agent loop driven on a process-wide tokio runtime (`4c4d62c`, was futures::executor::block_on → "no reactor running"). — landing fast-forwarded `39b22ad..37782d1` on 2026-11-14; first landing CI failed only because ubuntu-latest ships **neither rg nor fd** (12 grep tests: `which("rg")` failed) → fixed in ci.yml (`8c6d178`, installs `ripgrep` + `fd-find`); CI run `43578686739` on `8c6d178` = **ok**. Interactive TUI landed `27769a9..500302b` on 2026-11-14 (see P6 section). `wip/p4-pre-gate` == `main`; local checkout is ON `wip/p4-pre-gate`.
+> **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). **`main` = P0–P5-part-1 + codex adapter + interactive TUI (parts 1+2a); E2E PROVEN LIVE** — `pi -p` smoke test PASSED 2026-11-14 (PONG / read-tool round-trip ALBATROSS / JSON event mode) with the openai-codex stored OAuth credential and default model `openai-codex/gpt-6-luna`; required (1) a new `openai-codex-responses` adapter in pi-ai (`8efb00b`) and (2) the agent loop driven on a process-wide tokio runtime (`4c4d62c`, was futures::executor::block_on → "no reactor running"). — landing fast-forwarded `39b22ad..37782d1` on 2026-11-14; first landing CI failed only because ubuntu-latest ships **neither rg nor fd** (12 grep tests: `which("rg")` failed) → fixed in ci.yml (`8c6d178`, installs `ripgrep` + `fd-find`); CI run `43578686739` on `8c6d178` = **ok**. Interactive TUI landed `27769a9..500302b` + part 2a `8ae806d` on 2026-11-14 (see P6 sections). `wip/p4-pre-gate` == `main`; local checkout is ON `wip/p4-pre-gate`.
 > ALL development happens on `acer` (per user). Reference checkout: `/tmp/ai-agent/pi` on `acer` — **WIPED (tmpfs); re-clone before P5 work: `gh repo clone earendil-works/pi /tmp/ai-agent/pi`** (was @ `b22e525b3`).
 
 ## Goal
@@ -147,13 +147,86 @@ ported (P3) — the gap was entirely the coding-agent layer.
 - **Gate green + CI green** (clippy all+pedantic -D warnings, 44 test
   targets, fmt --check); landing CI run `43602314909` = **ok**.
 
+## P6 progress — part 2a: autocomplete, model selector, queues (landed `8ae806d` 2026-11-14)
+
+- **pi-tui `fuzzy.rs`** — port of `packages/tui/src/fuzzy.ts`:
+  `fuzzyMatch` (greedy alignment + best contiguous-occurrence rescoring,
+  word-boundary/gap/consecutive scoring, exact-match −100,
+  letters↔digits swap retry +5) and `fuzzyFilter` (whitespace/slash
+  tokens, all must match, stable best-first sort). Positions are char-,
+  not UTF-16-index-based (identical for ASCII).
+- **Editor trait fidelity** — `AutocompleteProvider::suggest` gained the
+  `force` flag and a defaulted `should_trigger_file_completion`; the
+  editor's Tab handler gates forced completion through it
+  (`editor.ts:2300-2309`, `:2388`).
+- **`modes/interactive/autocomplete.rs`** — port of `autocomplete.ts`
+  `CombinedAutocompleteProvider`: `@`-prefix quoted/unquoted extraction
+  (`findUnclosedQuoteStart`, `stripLeadingWrappers`, `isTokenStart`),
+  fuzzy file search via an `fd` subprocess (base-dir depth-1 + recursive,
+  dedupe, score 100/80/50/30 +10 dir bonus, top 20, scoped `dir/query`
+  display), readdir path completion (dirs-first, `~`/`./`/absolute
+  preserving), `applyCompletion`'s four branches (slash command `/x `,
+  @-attachment, argument context, plain path) and the quoted-value
+  requote. Synchronous — an `fd` run blocks for its few-ms duration
+  (upstream: 20ms debounce + abort tokens). CJK-punctuation separators
+  approximated by the fullwidth class (no unicode-script dep).
+- **Autocomplete command list** (`autocomplete_commands`) — model /
+  thinking / new / quit with upstream descriptions; only implemented
+  builtins are listed (advertising unimplemented ones would make the
+  picker lie). `/model` args fuzzy-search the whole catalog
+  (`getModelSearchText`); `/thinking` args = `VALID_THINKING_LEVELS`.
+- **Model cycling** — ctrl+p / ctrl+shift+p now cycle
+  (`getNextCycleIndex` + `_cycleAvailableModel`): credential-filtered
+  catalog models (`resolve_wire_credential` per provider; the `--api-key`
+  flag counts only for the initial provider — upstream auth-filters via
+  provider `checkAuth`), status `Switched to {name||id}` + thinking
+  suffix. `/model <pattern>`: exact resolve switches (status
+  `Model: {id}`, fixing part 1's "Switched to"), otherwise the pattern
+  prefills the selector.
+- **`components/model_selector.rs`** — `ModelSelectorComponent` port
+  minus the parts that need the runtime catalog refresh (embedded static
+  catalog) and scoped models (land with settings): search Input, fuzzy
+  filter (`getModelSelectorSearchText`), current-model-first sort,
+  `getDistinctModelName` annotation, 10-row window + scroll indicator,
+  enter/escape/page/tab semantics, published events drained by `pump`.
+  Mounted via `Tui::replace_child` in the editor's tree slot
+  (`showSelector`), editor parked in `suspended_editor`.
+- **Steering/follow-up queues** — `Queues` now shared orchestrator↔loop
+  via `Arc<Mutex<Queues>>` + a `QueueSource` adapter; Enter during a run
+  steers, alt+enter (`app.message.followUp`) queues a follow-up (or
+  submits when idle), alt+up (`app.message.dequeue`) restores all queued
+  messages into the editor, the pending-messages container (new tree slot
+  between chat and status) renders `Steering:`/`Follow-up:` rows + the
+  dequeue hint. Deliveries persist at loop-declaration time — the
+  `active_prompt` marker (timestamp+text) keeps the run's own prompt
+  (persisted at submit) from double-appending when a steer shares its
+  millisecond. Tree is now [header, chat, pending, status, editor,
+  footer] — the index consts moved.
+- **pi-tui fidelity fixes found while porting** — `Spacer::new(lines)`
+  renders its empty lines (was a no-op; upstream `Spacer(1)`), and
+  `TruncatedText` is a real Component (paddingX/Y, ANSI-aware truncation,
+  first line only) instead of a byte-slicing helper that would panic on
+  UTF-8.
+- **Tests** — 14 new: fuzzy engine (8), provider (8 incl. fd-gated),
+  model selector unit (6), cycle indices/step, selector mount/restore
+  e2e, steer/follow-up e2e (transcript order + pending display),
+  dequeue e2e. Workspace 1269 tests; PTY smokes: base header/exit +
+  autocomplete dropdown + model selector open/cancel — all pass.
+- **CI on the landing**: run `43606894650` on `8ae806d` = **ok**.
+
 ### P6 known deviations from upstream (documented in module docs)
 - No OSC terminal-color query yet (COLORFGBG → dark fallback); theme
-  controller lands in part 2.
-- No autocomplete/selector dialogs (/, /model open selectors are plain
-  text), no model cycling implementation (keys shown in hints), no
-  extension statuses in footer, no mouse toggles, no compaction UI, no
-  follow-up/steering queues (submit during a run shows a status line).
+  controller lands in part 2b.
+- Autocomplete lists only implemented builtins; no extension/prompt-
+  template/skill commands in the picker (they land with the extension
+  host), no `#` resource trigger, no `autocompleteMaxVisible` setting
+  wiring (default 5). Selector: no catalog refresh, no scoped models /
+  scope toggle / save-as-default / default badge, no `/login` hint
+  action. fd subprocess is synchronous (upstream debounces + aborts).
+- No extension statuses in footer, no mouse toggles, no compaction UI.
+- Queue: no bash-pending row in the pending display (`!` is synchronous),
+  dequeue does not abort the run (upstream's abort variant is used by the
+  extension/abort paths, not the alt+up handler).
 - `!` bash runs synchronously (upstream streams via PTY) — P7.
 - No syntax highlighting in tool output (no grammars); edit diffs render
   on result only (no live streaming preview).
@@ -162,6 +235,13 @@ ported (P3) — the gap was entirely the coding-agent layer.
   was needed.
 
 ## Gotchas / decisions
+- **Tree-index churn when inserting a container (part 2a)**: the pending-messages
+  slot shifted every later index — the `*_INDEX` consts are the single source of
+  truth; never hardcode numbers in tests or handlers.
+- **Same-millisecond message identity (part 2a)**: loop-delivered user messages
+  are matched to the UI's queued list by timestamp — two messages created in the
+  same ms collide, so the run's own prompt needs an explicit `active_prompt`
+  marker (timestamp+text) checked BEFORE the queued match.
 - **Global-init deadlock pattern (hit 2026-11-14)**: `static RwLock<Option<T>>` +
   `LOCK.read().clone().unwrap_or_else(|| init_that_writes())` deadlocks — the read
   guard temporary lives until the statement ends, so the write inside the closure
