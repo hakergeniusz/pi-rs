@@ -17,8 +17,7 @@
 //! * [`skills`] — skill discovery and packaging (`core/skills.ts`).
 //! * [`cli`] — argument parsing, `@file` processing, project trust
 //!   (`cli/args.ts`, `cli/file-processor.ts`, `cli/project-trust.ts`).
-//! * [`modes`] — print, JSON-event, and RPC modes (`modes/`); interactive
-//!   (P6) later.
+//! * [`modes`] — print, JSON-event, RPC, and interactive modes (`modes/`).
 //! * [`extensions`] — runtime-agnostic extension host seam
 //!   (`extensions/index.ts` port decision pending at the P5 gate).
 

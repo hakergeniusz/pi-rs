@@ -2,50 +2,60 @@
 //!
 //! Ground truth: pi-mono `packages/coding-agent/src/core/tools/renderers/bash.ts`.
 //!
-//! Shell renderers are shared by bash and powershell, which differ only in the
-//! prompt they display (`bash.ts:73-75`). The interactive component (a
-//! `Container` with a visual-line preview and a timer) is phase P6; what is
-//! ported here is the *shape*: the call line, the result output with the
-//! truncation footer stripped when a final result carries a full-output path,
-//! and the warning line.
+//! Shell renderers are shared by bash and powershell, which differ only in
+//! the prompt they display (`createShellRenderers`). The collapsed preview
+//! keeps the *last* five lines of output (`VisualLinePreview` keep:"end");
+//! the full-output-path footer is trimmed from the preview when a final
+//! truncated result would otherwise repeat it. Elapsed/Took timing lines
+//! arrive through the result context's `timer_text`.
+
+use std::fmt::Write as _;
 
 use pi_agent::types::AgentToolResult;
+use pi_tui::theme::{Theme, ThemeColor};
 use serde_json::Value;
 
 use crate::tools::render_utils::{get_text_output, str};
+use crate::tools::renderers::{CallContext, ResultContext};
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size};
-use std::fmt::Write as _;
 
-/// pi's `BASH_PREVIEW_LINES` (`bash.ts:7`).
+/// pi's `BASH_PREVIEW_LINES` (`bash.ts:18`).
 pub const BASH_PREVIEW_LINES: usize = 5;
-/// pi's `BASH_UPDATE_THROTTLE_MS` (`bash.ts:8`).
+/// pi's `BASH_UPDATE_THROTTLE_MS` (`bash.ts:19`).
 pub const BASH_UPDATE_THROTTLE_MS: u64 = 100;
 
-/// pi's `formatShellCall` (`bash.ts:11-17`): `${prompt} ${command}`, with the
-/// timeout suffix. Rendered as markdown, so the command is a fenced inline
-/// code span.
-fn format_shell_call(args: Option<&Value>, prompt: &str) -> String {
-    let command = str(args.and_then(|args| args.get("command")));
+/// `formatShellCall` (`bash.ts:20-26`).
+fn format_shell_call(args: Option<&Value>, prompt: &str, theme: &Theme) -> String {
+    let command = args.and_then(|args| str(args.get("command")));
     let timeout = args
         .and_then(|args| args.get("timeout"))
-        .and_then(Value::as_f64);
-    let timeout_suffix = match timeout {
-        Some(timeout) => format!(" (timeout {timeout}s)"),
-        None => String::new(),
+        .and_then(Value::as_u64);
+    let timeout_suffix = timeout
+        .map(|timeout| theme.fg(ThemeColor::Muted, &format!(" (timeout {timeout}s)")))
+        .unwrap_or_default();
+    let command_display = match command {
+        None => crate::tools::renderers::invalid_arg_text(theme),
+        Some(command) if command.is_empty() => theme.fg(ThemeColor::ToolOutput, "..."),
+        Some(command) => command,
     };
-    match command {
-        None => format!("**{prompt} [invalid arg]**{timeout_suffix}"),
-        Some(command) if command.is_empty() => format!("**{prompt} ...**{timeout_suffix}"),
-        Some(command) => format!("**{prompt} `{command}`**{timeout_suffix}"),
-    }
+    format!(
+        "{}{}",
+        theme.fg(
+            ThemeColor::ToolTitle,
+            &format!("\x1b[1m{prompt} {command_display}\x1b[22m")
+        ),
+        timeout_suffix
+    )
 }
 
-/// pi's `rebuildBashResultRenderComponent` (`bash.ts:20-69`), as markdown.
-///
-/// When a final result is truncated and carries a full-output path, the
-/// footer the tool appended is stripped from the output and re-stated as a
-/// warning line.
-fn format_shell_result(result: &AgentToolResult, expanded: bool) -> String {
+/// `rebuildBashResultRenderComponent` (`bash.ts:27-90`) as styled text.
+fn format_shell_result(
+    result: &AgentToolResult,
+    theme: &Theme,
+    expanded: bool,
+    timer_text: Option<String>,
+) -> String {
+    let mut text = String::new();
     let mut output = get_text_output(&result.content, false).trim().to_string();
     let truncation = result.details.get("truncation");
     let truncated = truncation
@@ -53,31 +63,39 @@ fn format_shell_result(result: &AgentToolResult, expanded: bool) -> String {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let full_output_path = result.details.get("fullOutputPath").and_then(Value::as_str);
-
-    if !truncated && full_output_path.is_some() && output.ends_with(']') {
+    if truncated && full_output_path.is_some() && output.ends_with(']') {
+        // Trim the "[Full output: ...]" footer the tool appended, so the
+        // preview does not repeat it (`bash.ts:42-47`).
         if let Some(footer_start) = output.rfind("\n\n[") {
-            if output[footer_start..].contains(full_output_path.unwrap_or("")) {
+            if output[footer_start..].contains(full_output_path.unwrap_or_default()) {
                 output = output[..footer_start].trim_end().to_string();
             }
         }
     }
 
-    let mut text = String::new();
     if !output.is_empty() {
+        let styled = output
+            .split('\n')
+            .map(|line| theme.fg(ThemeColor::ToolOutput, line))
+            .collect::<Vec<_>>()
+            .join("\n");
         if expanded {
-            let _ = write!(text, "\n{output}");
+            let _ = write!(text, "\n{styled}");
         } else {
-            // The collapsed preview keeps the last BASH_PREVIEW_LINES lines.
-            let lines: Vec<&str> = output.lines().collect();
+            // keep:"end" preview (`bash.ts:58-68`).
+            let lines: Vec<&str> = styled.split('\n').collect();
             if lines.len() > BASH_PREVIEW_LINES {
                 let hidden = lines.len() - BASH_PREVIEW_LINES;
                 let _ = write!(
                     text,
-                    "\n... ({hidden} earlier lines, to expand)\n{}",
-                    lines[hidden..].join("\n")
+                    "\n{} {}{}",
+                    theme.fg(ThemeColor::Muted, &format!("... ({hidden} earlier lines,")),
+                    theme.fg(ThemeColor::Dim, "ctrl+o to expand"),
+                    theme.fg(ThemeColor::Muted, ")")
                 );
+                let _ = write!(text, "\n{}", lines[hidden..].join("\n"));
             } else {
-                let _ = write!(text, "\n{output}");
+                let _ = write!(text, "\n{styled}");
             }
         }
     }
@@ -88,12 +106,6 @@ fn format_shell_result(result: &AgentToolResult, expanded: bool) -> String {
             warnings.push(format!("Full output: {path}"));
         }
         if truncated {
-            let total_lines = truncation
-                .and_then(|value| value.get("totalLines"))
-                .and_then(Value::as_u64);
-            let output_lines = truncation
-                .and_then(|value| value.get("outputLines"))
-                .and_then(Value::as_u64);
             let truncated_by = truncation
                 .and_then(|value| value.get("truncatedBy"))
                 .and_then(Value::as_str);
@@ -101,43 +113,60 @@ fn format_shell_result(result: &AgentToolResult, expanded: bool) -> String {
                 .and_then(|value| value.get("maxBytes"))
                 .and_then(Value::as_u64)
                 .unwrap_or(DEFAULT_MAX_BYTES as u64);
-            match (truncated_by, output_lines, total_lines) {
-                (Some("lines"), Some(shown), Some(total)) => {
-                    warnings.push(format!("Truncated: showing {shown} of {total} lines"));
-                }
-                _ => warnings.push(format!(
+            if truncated_by == Some("lines") {
+                let output_lines = truncation
+                    .and_then(|value| value.get("outputLines"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let total_lines = truncation
+                    .and_then(|value| value.get("totalLines"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                warnings.push(format!(
+                    "Truncated: showing {output_lines} of {total_lines} lines"
+                ));
+            } else {
+                warnings.push(format!(
                     "Truncated: {} lines shown ({} limit)",
-                    output_lines.unwrap_or(0),
+                    truncation
+                        .and_then(|value| value.get("outputLines"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
                     format_size(max_bytes as usize)
-                )),
+                ));
             }
         }
-        let _ = write!(text, "\n[{}]", warnings.join(". "));
+        let _ = write!(
+            text,
+            "\n{}",
+            theme.fg(ThemeColor::Warning, &format!("[{}]", warnings.join(". ")))
+        );
+    }
+
+    if let Some(timer_text) = timer_text {
+        let _ = write!(text, "\n{}", theme.fg(ThemeColor::Muted, &timer_text));
     }
     text
 }
 
-/// pi's `createShellRenderers("$")`.
-fn bash_call(args: Option<&Value>, _cwd: &str) -> String {
-    format_shell_call(args, "$")
-}
-
-/// pi's `createShellRenderers("PS>")` for the skipped Windows variant.
-fn powershell_call(args: Option<&Value>, _cwd: &str) -> String {
-    format_shell_call(args, "PS>")
-}
-
-/// pi's `createShellRenderers(prompt)` (`bash.ts:72-75`). pi threads an
-/// arbitrary prompt through a closure; the two prompts pi builds are `$` for
-/// bash and `PS>` for the skipped powershell variant, so a fn pointer pair
-/// covers both.
+/// Shell renderers shared by bash and powershell (`bash.ts:93-109`). pi
+/// threads an arbitrary prompt through a closure; the two prompts pi builds
+/// are `$` for bash and `PS>` for the skipped powershell variant, so a fn
+/// pointer pair covers both.
 pub fn create_shell_renderers(prompt: &'static str) -> crate::tools::renderers::ToolRenderers {
-    let render_call: fn(Option<&Value>, &str) -> String = match prompt {
-        "$" => bash_call,
-        _ => powershell_call,
+    let render_call: fn(Option<&Value>, &CallContext) -> String = match prompt {
+        "$" => |args, context: &CallContext| format_shell_call(args, "$", context.theme),
+        _ => |args, context: &CallContext| format_shell_call(args, "PS>", context.theme),
     };
     crate::tools::renderers::ToolRenderers {
         render_call,
-        render_result: format_shell_result,
+        render_result: |_args, result: &AgentToolResult, context: &ResultContext| {
+            format_shell_result(
+                result,
+                context.theme,
+                context.expanded,
+                context.timer_text.clone(),
+            )
+        },
     }
 }

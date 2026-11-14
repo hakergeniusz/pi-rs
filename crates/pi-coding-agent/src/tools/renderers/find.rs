@@ -2,52 +2,64 @@
 //!
 //! Ground truth: pi-mono `packages/coding-agent/src/core/tools/renderers/find.ts`.
 
+use std::fmt::Write as _;
+
 use pi_agent::types::AgentToolResult;
+use pi_tui::theme::{Theme, ThemeColor};
 use serde_json::Value;
 
-use crate::tools::render_utils::{get_text_output, str};
+use crate::tools::render_utils::{get_text_output, shorten_path, str};
+use crate::tools::renderers::read::expand_more_lines;
+use crate::tools::renderers::{CallContext, ResultContext};
 use crate::tools::truncate::{DEFAULT_MAX_BYTES, format_size};
-use std::fmt::Write as _;
 
 /// pi's collapsed preview line count (`find.ts:28`).
 const FIND_PREVIEW_LINES: usize = 20;
 
-/// pi's `formatFindCall` (`find.ts:16-35`): `find <pattern> in <path>` with an
-/// optional `(limit N)` suffix.
-fn format_find_call(args: Option<&Value>, _cwd: &str) -> String {
+/// pi's `formatFindCall` (`find.ts:17-32`): `find <pattern> in <path>` with
+/// an optional `(limit N)` suffix.
+fn format_find_call(args: Option<&Value>, theme: &Theme) -> String {
     let pattern = str(args.and_then(|args| args.get("pattern")));
     let raw_path = str(args.and_then(|args| args.get("path")));
     let path = raw_path.map(|path| {
         if path.is_empty() {
             ".".to_string()
         } else {
-            crate::tools::render_utils::shorten_path(&path)
+            shorten_path(&path)
         }
     });
     let limit = args
         .and_then(|args| args.get("limit"))
-        .and_then(Value::as_f64);
-    let mut text = String::from("**find** ");
+        .and_then(Value::as_u64);
+    let invalid_arg = crate::tools::renderers::invalid_arg_text(theme);
+    let mut text = format!(
+        "{} ",
+        theme.fg(ThemeColor::ToolTitle, "\x1b[1mfind\x1b[22m")
+    );
     match pattern {
-        None => text.push_str("[invalid arg]"),
-        Some(pattern) => {
-            let _ = write!(text, "`{pattern}`");
-        }
+        None => text.push_str(&invalid_arg),
+        Some(pattern) => text.push_str(&theme.fg(ThemeColor::Accent, &pattern)),
     }
-    match path {
-        None => text.push_str(" in [invalid arg]"),
-        Some(path) => {
-            let _ = write!(text, " in {path}");
-        }
-    }
+    let _ = write!(
+        text,
+        " {}",
+        theme.fg(
+            ThemeColor::ToolOutput,
+            &format!(" in {}", path.unwrap_or(invalid_arg))
+        )
+    );
     if let Some(limit) = limit {
-        let _ = write!(text, " (limit {limit})");
+        let _ = write!(
+            text,
+            "{}",
+            theme.fg(ThemeColor::ToolOutput, &format!(" (limit {limit})"))
+        );
     }
     text
 }
 
-/// pi's `formatFindResult` (`find.ts:37-64`).
-fn format_find_result(result: &AgentToolResult, expanded: bool) -> String {
+/// pi's `formatFindResult` (`find.ts:34-63`).
+fn format_find_result(result: &AgentToolResult, theme: &Theme, expanded: bool) -> String {
     let output = get_text_output(&result.content, false).trim().to_string();
     let mut text = String::new();
     if !output.is_empty() {
@@ -59,9 +71,17 @@ fn format_find_result(result: &AgentToolResult, expanded: bool) -> String {
         };
         let display_lines = &lines[..max_lines.min(lines.len())];
         let remaining = lines.len() - display_lines.len();
-        let _ = write!(text, "\n{}", display_lines.join("\n"));
+        let _ = write!(
+            text,
+            "\n{}",
+            display_lines
+                .iter()
+                .map(|line| theme.fg(ThemeColor::ToolOutput, line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         if remaining > 0 {
-            let _ = write!(text, "\n... ({remaining} more lines, to expand)");
+            let _ = write!(text, "{}", expand_more_lines(theme, remaining));
         }
     }
 
@@ -86,14 +106,23 @@ fn format_find_result(result: &AgentToolResult, expanded: bool) -> String {
                 .unwrap_or(DEFAULT_MAX_BYTES as u64);
             warnings.push(format!("{} limit", format_size(max_bytes as usize)));
         }
-        let _ = write!(text, "\n[Truncated: {}]", warnings.join(", "));
+        let _ = write!(
+            text,
+            "\n{}",
+            theme.fg(
+                ThemeColor::Warning,
+                &format!("[Truncated: {}]", warnings.join(", "))
+            )
+        );
     }
     text
 }
 
-/// pi's `findRenderers` (`find.ts:67-76`).
+/// pi's `findRenderers` (`find.ts:66-77`).
 pub const FIND_RENDERERS: crate::tools::renderers::ToolRenderers =
     crate::tools::renderers::ToolRenderers {
-        render_call: format_find_call,
-        render_result: format_find_result,
+        render_call: |args, context: &CallContext| format_find_call(args, context.theme),
+        render_result: |_args, result: &AgentToolResult, context: &ResultContext| {
+            format_find_result(result, context.theme, context.expanded)
+        },
     };

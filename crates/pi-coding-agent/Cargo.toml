@@ -23,6 +23,8 @@ pi-codemode = { workspace = true }
 pi-mcp = { workspace = true }
 pi-schema = { workspace = true }
 pi-tui = { workspace = true }
+# Interactive mode polls terminal events directly, like the tui-demo host.
+crossterm = { version = "0.29", default-features = false, features = ["events"] }
 clap = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }

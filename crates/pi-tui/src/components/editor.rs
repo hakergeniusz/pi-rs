@@ -433,8 +433,17 @@ pub struct Editor {
     undo_stack: UndoStack<EditorSnapshot>,
     /// `editor.ts:365`.
     pub disable_submit: bool,
+    /// Host seam for pi's `CustomEditor.renderTopBorder` override
+    /// (`components/custom-editor.ts:36-79`): receives `(width,
+    /// hidden_line_count)` and returns the full styled border line. When it
+    /// returns an empty string the built-in border renders instead.
+    pub top_border_decorator: Option<Arc<TopBorderDecorator>>,
     pending: Vec<EditorEvent>,
 }
+
+/// A decorator's output depends on live state (spinner frames), so it is a
+/// boxed closure rather than a pure styler.
+pub type TopBorderDecorator = dyn Fn(usize, usize) -> String + Send + Sync;
 
 /// `editor.ts:332`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,6 +496,7 @@ impl Editor {
             snapped_from_cursor_col: None,
             undo_stack: UndoStack::new(),
             disable_submit: false,
+            top_border_decorator: None,
             pending: Vec::new(),
         }
     }
@@ -1873,6 +1883,12 @@ impl Editor {
 
     /// `editor.ts:510-518`.
     fn render_top_border(&self, width: usize, hidden: usize) -> String {
+        if let Some(decorator) = &self.top_border_decorator {
+            let decorated = decorator(width, hidden);
+            if !decorated.is_empty() {
+                return decorated;
+            }
+        }
         let border = if hidden > 0 {
             Self::scroll_border("↑", hidden, width)
         } else {

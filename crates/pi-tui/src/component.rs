@@ -230,6 +230,12 @@ impl Component for Container {
         true
     }
 
+    /// Hosts reach into the tree with typed children (e.g. the chat
+    /// container), so containers opt into downcasting.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     /// `Container.handleMouse`, `tui.ts:372-392`. Walks the stacked bands and
     /// forwards to the child under the pointer.
     fn handle_mouse(&mut self, event: &MouseEvent) -> Option<MouseEventResult> {

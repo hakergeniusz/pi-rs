@@ -66,10 +66,19 @@ fn main() {
     }
 
     if args.mode.is_none() && !args.print {
-        eprintln!(
-            "pi-rs: interactive mode is not implemented yet (phase P6); use -p for print mode"
-        );
-        std::process::exit(2);
+        // Interactive mode requires a terminal; piped stdin stays a P7 item.
+        if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            eprintln!("pi-rs: no prompt given and stdout is not a terminal; use -p for print mode");
+            std::process::exit(2);
+        }
+        let outcome = run_interactive(&args, &cwd, &cwd_string);
+        match outcome {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let outcome = match args.mode {
@@ -254,6 +263,20 @@ fn run_print(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32
         initial_images: images,
     };
     run_print_mode(&mut runtime, &options)
+}
+
+/// Interactive mode: the chat TUI. Initial `@file`/message arguments ride
+/// along like upstream's `initialMessage` (P6 part 2).
+fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
+    let mut runtime = build_runtime(args, cwd, cwd_string)?;
+    let options = pi_coding_agent::modes::interactive::interactive_mode::InteractiveOptions {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        theme_name: None,
+    };
+    pi_coding_agent::modes::interactive::interactive_mode::run_interactive_mode(
+        &mut runtime,
+        &options,
+    )
 }
 
 fn run_json(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
