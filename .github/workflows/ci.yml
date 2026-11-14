@@ -17,13 +17,13 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      # The find-tool tests resolve `rg` and `fd` via `which()` (upstream
-      # `ensureTool`); ubuntu-latest ships rg but not fd, and apt names it
+      # The grep/find tools resolve `rg` and `fd` via `which()` (upstream
+      # `ensureTool`); ubuntu-latest ships neither, and apt names fd
       # `fdfind`.
-      - name: Install fd
+      - name: Install rg and fd
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y fd-find
+          sudo apt-get install -y ripgrep fd-find
           sudo ln -s "$(which fdfind)" /usr/local/bin/fd
       - name: Format
         run: cargo fmt --all -- --check
