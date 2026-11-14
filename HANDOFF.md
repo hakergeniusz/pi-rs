@@ -329,6 +329,48 @@ Full port of `core/compaction/*` plus the interactive `/compact` flow.
   budget — the e2e uses a 100KB second user prompt to push the backward
   walk past it.
 
+## OSC theme controller (landed on `feat/p6b-osc-theme`, 2026-11-14)
+
+The `theme-controller.ts` port: OSC 10/11/4 color queries, mode-2031 scheme
+reports, and auto light/dark pair settings, wired into the interactive mode.
+
+- pi-tui already carried the query machinery (`Tui::query_terminal_colors` /
+  `service_terminal_queries` / `take_terminal_colors`, scheme listeners);
+  this slice added the controller: `theme.rs` module state (reported colors,
+  pending flag, scheme — upstream keeps these module-level too) plus
+  `record_reported_colors`, and the mode-side controller fields
+  (`theme_setting`/`theme_active_name`/`theme_auto_sync`, late-report +
+  scheme-report queues, `theme_query_start` as the deadline clock) drained by
+  `pump_theme()` at the end of every pump.
+- **Two `TerminalColors` types**: the TUI query API reports
+  `pi_tui::tui::TerminalColors` (`RgbColor`, u8 channels, Copy) while the
+  theme loader consumes `pi_tui::color::TerminalColors` (`Rgb`, f64, palette
+  `Vec`). Upstream has one type; the port converts once at
+  `theme::record_reported_colors`. Controller queues/signatures use the tui
+  type; theme.rs stores the color type. `parse_auto_theme_setting` /
+  `resolve_theme_setting` are NOT duplicated — pi-tui's theme module already
+  exports them; the pi-coding-agent wrapper folds in
+  `terminal_appearance()`.
+- pi-tui's `CaptureTerminal` is now `Clone` (response store Arc-backed) so a
+  test keeps a handle to the terminal a mode owns — the affordance upstream
+  TS gets for free. `themed_fixture` builds on it.
+- Verified: theme.rs unit tests (merge/change/u8→f64 conversion,
+  scheme-vs-background precedence), three CaptureTerminal e2e (early reply
+  re-themes; reply arriving after the deadline rides the late sink;
+  mode-2031 report applies only when auto-sync), real-PTY smoke
+  (`/tmp/pi-rs-theme-smoke.py`): answers the queries with a full palette +
+  DA1 + a 997 report, asserts no reply text leaks into the editor and /exit
+  is clean.
+- **Deviations**: `/theme` persists nothing yet — the settings.json `theme`
+  write lands with the settings selector (upstream `/theme` opens that
+  selector); the setting IS read at startup (`--use-theme` > settings.json).
+  One shared deadline clock per mode instead of upstream's per-query timers
+  (the crate owns no timer; the host passes elapsed ms). Extension themes'
+  "<in-memory>" sentinel is unreachable (no extension host).
+- **Smoke gotcha**: a PTY smoke that typed into the editor must ctrl+u
+  before `/exit`, or the Enter submits the typed text as a user message (the
+  theme smoke's first run shipped a 401 to the real API).
+
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
   slot shifted every later index — the `*_INDEX` consts are the single source of

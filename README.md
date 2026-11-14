@@ -27,7 +27,10 @@ and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
   path completion), the `/model` selector dialog, ctrl+p model cycling,
   steering/follow-up message queues (enter / alt+enter / alt+up), `!`/`!!`
   bash mode, `/compact` context compaction (status indicator, queued
-  submissions, ctrl+o expansion, billed-tokens notice), and session
+  submissions, ctrl+o expansion, billed-tokens notice), the OSC
+  terminal-color theme controller (grayscale system theme while the query is
+  pending, re-theming on the reply, mode-2031 light/dark reports, `/theme`
+  switcher), and session
   persistence (shutdown prints the resume command).
 - **Sessions** — JSONL v3 transcript store under the XDG data root
   (`~/.local/share/pi-rs/sessions` by default), byte-compatible on the

@@ -7,11 +7,14 @@
 //! (`APP_KEYBINDINGS`), and `modes/interactive/components/keybinding-hints.ts`.
 
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use pi_tui::color::{TerminalColorMode, TerminalColors};
+use pi_tui::oklab::Rgb;
 use pi_tui::theme::{
-    Styler, Theme, ThemeAppearance, ThemePaths, ThemeRegistry, detect_terminal_theme, load_theme,
+    Styler, SystemThemeMode, Theme, ThemeAppearance, ThemePaths, ThemeRegistry,
+    detect_terminal_theme, load_theme_with_system,
 };
 
 use crate::config;
@@ -19,10 +22,15 @@ use crate::config;
 /// The global theme instance, pi's `theme` proxy (`theme.ts:648-659`).
 static THEME: RwLock<Option<Arc<Theme>>> = RwLock::new(None);
 
-/// The terminal colors reported so far (`theme.ts:133`). The OSC color query
-/// wiring lands with the theme controller (P6 part 2); until then this stays
-/// empty and the system theme renders from the detected appearance.
-static TERMINAL_COLORS: OnceLock<TerminalColors> = OnceLock::new();
+/// The terminal's reported colors (`theme.ts:131-136`): replaced, never
+/// mutated, on every OSC reply, and `None` until the first report.
+static TERMINAL_COLORS: RwLock<Option<TerminalColors>> = RwLock::new(None);
+/// While a color query is in flight, the system theme renders in grayscale
+/// (`theme.ts:137-139`).
+static TERMINAL_COLORS_PENDING: AtomicBool = AtomicBool::new(false);
+/// The terminal's last light/dark report (mode 2031); only consulted before
+/// it has reported a background (`theme.ts:140-143`).
+static TERMINAL_COLOR_SCHEME: RwLock<Option<ThemeAppearance>> = RwLock::new(None);
 
 /// `getTerminalColorMode()`: COLORTERM decides between 256-color and
 /// truecolor (`packages/tui/src/colors.ts:91-148`).
@@ -40,16 +48,28 @@ fn colorfgbg() -> Option<String> {
     std::env::var("COLORFGBG").ok()
 }
 
-/// `getTerminalTheme()` (`theme.ts:639-641`): dark or light from everything
-/// reported so far. Without an OSC report this falls back to COLORFGBG, then
-/// dark, exactly like upstream.
-pub fn terminal_theme() -> &'static str {
+/// The appearance [`terminal_theme`] reports, resolved by the loader's
+/// detector from everything the terminal reported so far.
+pub fn terminal_appearance() -> ThemeAppearance {
     // `detect_terminal_theme` consumes a borrowed string, so bind the env read.
     let colorfgbg = colorfgbg();
-    match detect_terminal_theme(&terminal_colors(), None, colorfgbg.as_deref()) {
+    detect_terminal_theme(&terminal_colors(), terminal_scheme(), colorfgbg.as_deref())
+}
+
+/// `getTerminalTheme()` (`theme.ts:639-641`): dark or light from everything
+/// reported so far. Without an OSC report this falls back to the mode-2031
+/// report, COLORFGBG, then dark, exactly like upstream.
+pub fn terminal_theme() -> &'static str {
+    match terminal_appearance() {
         ThemeAppearance::Light => "light",
         ThemeAppearance::Dark => "dark",
     }
+}
+
+/// `resolveThemeName` (`theme-controller.ts:168-171`): the setting resolved
+/// against the live terminal appearance.
+pub fn resolve_theme_setting(theme_setting: Option<&str>) -> Option<String> {
+    pi_tui::theme::resolve_theme_setting(theme_setting, terminal_appearance())
 }
 
 /// The directory custom themes load from: `<agentDir>/themes`
@@ -58,19 +78,112 @@ fn custom_themes_dir() -> PathBuf {
     config::get_agent_dir().join("themes")
 }
 
-/// The terminal colors reported so far (empty until the OSC query is wired).
+/// The terminal colors reported so far (empty until the controller records a
+/// reply).
 fn terminal_colors() -> TerminalColors {
-    TERMINAL_COLORS.get().cloned().unwrap_or_default()
+    TERMINAL_COLORS
+        .read()
+        .expect("terminal colors lock")
+        .clone()
+        .unwrap_or_default()
+}
+
+/// The terminal's light/dark report, when it made one.
+fn terminal_scheme() -> Option<ThemeAppearance> {
+    *TERMINAL_COLOR_SCHEME.read().expect("terminal scheme lock")
+}
+
+/// Whether a color query is still outstanding (grayscale system theme).
+fn colors_pending() -> bool {
+    TERMINAL_COLORS_PENDING.load(Ordering::SeqCst)
+}
+
+/// `sameTerminalColors` (`theme-controller.ts:56-64`): the derived equality
+/// is the same field-wise comparison upstream writes by hand.
+fn same_terminal_colors(a: &TerminalColors, b: &TerminalColors) -> bool {
+    a == b
+}
+
+/// `setTerminalColors` (`theme.ts:143-147`) plus the controller's merge and
+/// change check (`theme-controller.ts:187-203`): reported fields fall back to
+/// the previous report, and the result records only when something changed.
+/// Returns whether the report was new — the caller re-applies and re-renders.
+pub fn set_terminal_colors(colors: TerminalColors) -> bool {
+    let mut guard = TERMINAL_COLORS.write().expect("terminal colors lock");
+    let previous = guard.clone().unwrap_or_default();
+    let next = TerminalColors {
+        foreground: colors.foreground.or(previous.foreground),
+        background: colors.background.or(previous.background),
+        palette: colors.palette.or_else(|| previous.palette.clone()),
+    };
+    TERMINAL_COLORS_PENDING.store(false, Ordering::SeqCst);
+    if same_terminal_colors(&previous, &next) {
+        return false;
+    }
+    *guard = Some(next);
+    true
+}
+
+/// `setTerminalColorScheme` (`theme.ts:149-152`).
+pub fn set_terminal_color_scheme(scheme: ThemeAppearance) {
+    *TERMINAL_COLOR_SCHEME.write().expect("terminal scheme lock") = Some(scheme);
+}
+
+/// `markTerminalColorsPending` (`theme.ts:154-156`).
+pub fn mark_terminal_colors_pending() {
+    TERMINAL_COLORS_PENDING.store(true, Ordering::SeqCst);
+}
+
+/// The controller's `applyTerminalColors` seam: the TUI's query API reports
+/// the `tui` module's `TerminalColors` (`RgbColor`, u8 channels) while the
+/// loader consumes this module's shape (`Rgb`, f64). Upstream has a single
+/// type; the port converts here, then merges like `setTerminalColors`.
+pub fn record_reported_colors(reported: pi_tui::tui::TerminalColors) -> bool {
+    let rgb = |color: pi_tui::terminal_colors::RgbColor| Rgb {
+        r: f64::from(color.r),
+        g: f64::from(color.g),
+        b: f64::from(color.b),
+    };
+    set_terminal_colors(TerminalColors {
+        foreground: reported.foreground.map(rgb),
+        background: reported.background.map(rgb),
+        palette: reported.palette.map(|palette| palette.map(rgb).to_vec()),
+    })
+}
+
+// ============================================================
+// Test seams: the terminal-color state is process-wide, so the tests that
+// drive it (here and in the interactive-mode e2e) serialize on the lock and
+// reset the globals between cases.
+// ============================================================
+
+#[cfg(test)]
+pub(crate) static COLOR_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn reset_terminal_color_state() {
+    *TERMINAL_COLORS.write().expect("terminal colors lock") = None;
+    TERMINAL_COLORS_PENDING.store(false, Ordering::SeqCst);
+    *TERMINAL_COLOR_SCHEME.write().expect("terminal scheme lock") = None;
+}
+
+#[cfg(test)]
+pub(crate) fn terminal_scheme_for_tests() -> Option<ThemeAppearance> {
+    terminal_scheme()
 }
 
 fn load_theme_by_name(name: &str) -> Result<Theme, String> {
     let terminal = terminal_colors();
-    load_theme(
+    load_theme_with_system(
         &ThemePaths::new("/nonexistent", custom_themes_dir()),
         &ThemeRegistry::new(),
         name,
         terminal_color_mode(),
         &terminal,
+        SystemThemeMode {
+            colors_pending: colors_pending(),
+            appearance_hint: terminal_scheme(),
+        },
     )
 }
 
@@ -276,6 +389,96 @@ pub fn raw_key_hint(key: &str, description: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reported_colors_merge_change_and_convert() {
+        let _guard = COLOR_STATE_LOCK.lock().expect("color state lock");
+        reset_terminal_color_state();
+        mark_terminal_colors_pending();
+
+        // First report: recorded, pending cleared, the TUI's u8 channels
+        // converted to the loader's f64 shape.
+        assert!(record_reported_colors(pi_tui::tui::TerminalColors {
+            foreground: Some(pi_tui::terminal_colors::RgbColor {
+                r: 255,
+                g: 255,
+                b: 255
+            }),
+            background: Some(pi_tui::terminal_colors::RgbColor { r: 0, g: 0, b: 0 }),
+            palette: None,
+        }));
+        assert!(!colors_pending(), "a report clears the pending flag");
+        assert_eq!(terminal_theme(), "dark");
+        assert_eq!(
+            terminal_colors().foreground.map(|color| color.r),
+            Some(255.0)
+        );
+
+        // The same colors again: the merge fills the gaps and finds no change.
+        assert!(!record_reported_colors(pi_tui::tui::TerminalColors {
+            foreground: None,
+            background: Some(pi_tui::terminal_colors::RgbColor { r: 0, g: 0, b: 0 }),
+            palette: None,
+        }));
+
+        // A palette-only report changes the record and keeps fg/bg.
+        assert!(set_terminal_colors(TerminalColors {
+            foreground: None,
+            background: None,
+            palette: Some(vec![Rgb {
+                r: 1.0,
+                g: 2.0,
+                b: 3.0
+            }]),
+        }));
+        let stored = terminal_colors();
+        assert_eq!(
+            stored.palette,
+            Some(vec![Rgb {
+                r: 1.0,
+                g: 2.0,
+                b: 3.0
+            }])
+        );
+        assert!(stored.foreground.is_some() && stored.background.is_some());
+
+        // A changed background re-records and re-themes.
+        assert!(record_reported_colors(pi_tui::tui::TerminalColors {
+            foreground: None,
+            background: Some(pi_tui::terminal_colors::RgbColor {
+                r: 255,
+                g: 255,
+                b: 255
+            }),
+            palette: None,
+        }));
+        assert_eq!(terminal_theme(), "light");
+
+        reset_terminal_color_state();
+    }
+
+    #[test]
+    fn terminal_theme_schemes_sit_below_a_background() {
+        let _guard = COLOR_STATE_LOCK.lock().expect("color state lock");
+        reset_terminal_color_state();
+
+        // Without a background report, the mode-2031 report decides.
+        set_terminal_color_scheme(ThemeAppearance::Light);
+        assert_eq!(terminal_theme(), "light");
+        // A background report outranks the scheme report.
+        assert!(set_terminal_colors(TerminalColors {
+            foreground: None,
+            background: Some(Rgb {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0
+            }),
+            palette: None,
+        }));
+        assert_eq!(terminal_theme(), "dark");
+
+        reset_terminal_color_state();
+    }
 
     #[test]
     fn app_keybinding_defaults_match_pi() {

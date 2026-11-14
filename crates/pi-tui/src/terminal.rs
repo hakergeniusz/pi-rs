@@ -372,11 +372,13 @@ pub fn query_reply_matches(query: &str, response: &str) -> bool {
 /// The handler a backend runs for a query response.
 type ResponseCallback = Box<dyn Fn(String) + Send>;
 
-#[derive(Default)]
+/// Cloneable so a test can keep a handle to a terminal that was moved into
+/// a component: pushes and expectations reach the same store.
+#[derive(Clone, Default)]
 struct ResponseStore {
-    responses: Mutex<Vec<String>>,
-    callbacks: Mutex<HashMap<String, ResponseCallback>>,
-    expected: Mutex<Vec<(String, String)>>,
+    responses: Arc<Mutex<Vec<String>>>,
+    callbacks: Arc<Mutex<HashMap<String, ResponseCallback>>>,
+    expected: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl ResponseStore {
@@ -889,6 +891,9 @@ fn control_character(key: char) -> Option<char> {
 }
 
 /// In-memory terminal: no TTY, deterministic output, frame-capture seams.
+/// Cloneable — clones share the response store, so a handle kept by the test
+/// pushes replies to the terminal the component owns.
+#[derive(Clone)]
 pub struct CaptureTerminal {
     capture: FrameCapture,
     responses: ResponseStore,

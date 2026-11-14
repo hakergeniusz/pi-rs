@@ -25,8 +25,10 @@ use pi_tui::components::text::Text;
 use pi_tui::mouse::{MouseEvent, MouseEventResult};
 use pi_tui::stdin_buffer::{StdinBuffer, StdinBufferOptions, StdinEvent};
 use pi_tui::terminal::CrosstermTerminal;
+use pi_tui::terminal_colors::TerminalColorScheme;
+use pi_tui::theme::ThemeAppearance;
 use pi_tui::tui::FocusTarget;
-use pi_tui::tui::{Tui, TuiStopOptions};
+use pi_tui::tui::{TerminalColors, Tui, TuiStopOptions};
 
 use crate::modes::print_mode::PrintRuntime;
 use crate::session::store::{NewSessionOptions, SessionManager};
@@ -268,6 +270,8 @@ const EDITOR_INDEX: usize = 4;
 const FOOTER_INDEX: usize = 5;
 
 /// The interactive mode (`InteractiveMode`, reduced to the chat core).
+// The booleans mirror upstream TS state flags; the port keeps them one-to-one.
+#[allow(clippy::struct_excessive_bools)]
 pub struct InteractiveMode {
     tui: Tui,
     editor_events: Arc<Mutex<Vec<EditorEventOut>>>,
@@ -324,6 +328,20 @@ pub struct InteractiveMode {
     stdin_pending: Vec<u8>,
     /// When the last stdin chunk arrived, for the buffer's sequence timeout.
     stdin_last_input: Option<Instant>,
+    /// The theme setting in force: `--use-theme`, else settings.json's
+    /// `theme` (a name, or a `light/dark` pair). Upstream keeps the settings
+    /// manager itself in the controller.
+    theme_setting: Option<String>,
+    /// The active theme's name (`theme-controller.ts`).
+    theme_active_name: String,
+    /// Whether mode-2031 reports re-apply the theme (system/auto themes).
+    theme_auto_sync: bool,
+    /// Late OSC color replies, pushed by the query's `onLateReply` sink.
+    theme_late_reports: Arc<Mutex<Vec<TerminalColors>>>,
+    /// Mode-2031 reports from the TUI's scheme listener.
+    theme_scheme_reports: Arc<Mutex<Vec<TerminalColorScheme>>>,
+    /// When the current color query was issued — the 100 ms deadline clock.
+    theme_query_start: Option<Instant>,
 }
 
 impl InteractiveMode {
@@ -332,7 +350,21 @@ impl InteractiveMode {
         options: &InteractiveOptions,
         terminal: Box<dyn pi_tui::terminal::Terminal>,
     ) -> Self {
-        theme::init_theme(options.theme_name.as_deref());
+        // The controller's constructor (`theme-controller.ts:76-91`): mark
+        // colors pending — the system theme's first frame renders grayscale —
+        // then resolve the setting and load that theme.
+        theme::mark_terminal_colors_pending();
+        let theme_setting = options.theme_name.clone();
+        let theme_active_name = theme::resolve_theme_setting(theme_setting.as_deref())
+            .unwrap_or_else(|| pi_tui::theme::SYSTEM_THEME_NAME.to_string());
+        theme::init_theme(Some(&theme_active_name));
+        let theme_auto_sync = pi_tui::theme::parse_auto_theme_setting(theme_setting.as_deref())
+            .is_some()
+            || theme_active_name == pi_tui::theme::SYSTEM_THEME_NAME;
+        let theme_late_reports: Arc<Mutex<Vec<TerminalColors>>> = Arc::new(Mutex::new(Vec::new()));
+        let theme_scheme_reports: Arc<Mutex<Vec<TerminalColorScheme>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
         let editor_events = Arc::new(Mutex::new(Vec::new()));
         let status_handle: Arc<Mutex<Option<StatusIndicator>>> = Arc::new(Mutex::new(None));
         let mut editor_host =
@@ -362,6 +394,27 @@ impl InteractiveMode {
         tui.add_child(Box::new(editor_host));
         tui.add_child(Box::new(FooterComponent::new(Self::footer_data(runtime))));
         tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
+
+        // Mode-2031 reports reach the controller through a listener the TUI
+        // dispatches (`bindTerminalColorSchemeListener`); the closure cannot
+        // borrow the mode, so it queues.
+        let scheme_queue = Arc::clone(&theme_scheme_reports);
+        tui.add_color_scheme_listener(Arc::new(move |scheme| {
+            if let Ok(mut pending) = scheme_queue.lock() {
+                pending.push(scheme);
+            }
+        }));
+        // The initial color query (`applyFromSettings` →
+        // `requestTerminalColors`); late replies ride the sink.
+        let theme_query_start = Some(Instant::now());
+        let late_queue = Arc::clone(&theme_late_reports);
+        let sink = Box::new(move |colors: TerminalColors| {
+            if let Ok(mut pending) = late_queue.lock() {
+                pending.push(colors);
+            }
+        });
+        let _ = tui.query_terminal_colors(100, Some(sink));
+        tui.set_color_scheme_notifications(theme_auto_sync);
 
         InteractiveMode {
             tui,
@@ -405,6 +458,12 @@ impl InteractiveMode {
             stdin_buffer: StdinBuffer::new(StdinBufferOptions::default()),
             stdin_pending: Vec::new(),
             stdin_last_input: None,
+            theme_setting,
+            theme_active_name,
+            theme_auto_sync,
+            theme_late_reports,
+            theme_scheme_reports,
+            theme_query_start,
         }
     }
 
@@ -1377,15 +1436,141 @@ impl InteractiveMode {
     /// `/theme [name]`.
     fn handle_theme_command(&mut self, name: &str) {
         if name.is_empty() {
-            self.show_status("Usage: /theme <system|dark|light>");
+            self.show_status("Usage: /theme <system|dark|light|light/dark>");
             return;
         }
-        match theme::set_theme(name) {
-            Ok(()) => {
-                self.show_status(&format!("Theme: {name}"));
-                self.tui.request_render();
+        // `setThemeSetting` (`theme-controller.ts:111-115`): record the
+        // setting, re-resolve against the terminal, re-query. Persistence to
+        // settings.json lands with the settings work.
+        self.theme_setting = Some(name.to_string());
+        if let Ok(()) = self.theme_apply_from_settings(true) {
+            self.show_status(&format!("Theme: {name}"));
+        }
+    }
+
+    // --------------------------------------------------------------
+    // Theme controller (`theme/theme-controller.ts`)
+    // --------------------------------------------------------------
+
+    /// `applyFromSettings` (`theme-controller.ts:96-104`): resolve the
+    /// setting against the terminal, sync mode-2031 notifications, apply,
+    /// and issue a fresh color query.
+    fn theme_apply_from_settings(&mut self, show_error: bool) -> Result<(), String> {
+        let name = self.theme_resolve_name();
+        self.theme_auto_sync =
+            pi_tui::theme::parse_auto_theme_setting(self.theme_setting.as_deref()).is_some()
+                || name == pi_tui::theme::SYSTEM_THEME_NAME;
+        self.tui
+            .set_color_scheme_notifications(self.theme_auto_sync);
+        let result = self.theme_apply_name(&name, show_error);
+        self.theme_issue_query();
+        result
+    }
+
+    /// `resolveThemeName` (`theme-controller.ts:168-171`): the theme for the
+    /// current setting and terminal appearance, defaulting to the system
+    /// theme.
+    fn theme_resolve_name(&self) -> String {
+        theme::resolve_theme_setting(self.theme_setting.as_deref())
+            .unwrap_or_else(|| pi_tui::theme::SYSTEM_THEME_NAME.to_string())
+    }
+
+    /// `applyThemeName` (`theme-controller.ts:173-183`): switch the global
+    /// theme; a failure keeps the system theme. Returns the load result for
+    /// callers that report it.
+    fn theme_apply_name(&mut self, name: &str, show_error: bool) -> Result<(), String> {
+        let result = theme::set_theme(name);
+        self.theme_active_name = match &result {
+            Ok(()) => name.to_string(),
+            Err(_) => pi_tui::theme::SYSTEM_THEME_NAME.to_string(),
+        };
+        self.tui.invalidate();
+        self.tui.request_render();
+        if let Err(error) = &result
+            && show_error
+        {
+            self.show_error(&format!(
+                "Failed to load theme \"{name}\": {error}\nFell back to the system theme."
+            ));
+        }
+        result
+    }
+
+    /// `requestTerminalColors` (`theme-controller.ts:28-46`): query the
+    /// terminal's colors with the 100 ms budget; replies that arrive after
+    /// the deadline ride the sink (`onLateReply`).
+    fn theme_issue_query(&mut self) {
+        self.theme_query_start = Some(Instant::now());
+        let queue = Arc::clone(&self.theme_late_reports);
+        let sink = Box::new(move |colors: TerminalColors| {
+            if let Ok(mut pending) = queue.lock() {
+                pending.push(colors);
             }
-            Err(error) => self.show_error(&error),
+        });
+        let _ = self.tui.query_terminal_colors(100, Some(sink));
+    }
+
+    /// `applyTerminalColors` (`theme-controller.ts:187-205`): record the
+    /// report; re-render only when it changed.
+    fn theme_apply_colors(&mut self, colors: TerminalColors) {
+        if !theme::record_reported_colors(colors) {
+            return;
+        }
+        self.theme_reapply_for_terminal();
+        self.tui.invalidate();
+        self.tui.request_render();
+    }
+
+    /// `reapplyForTerminal` (`theme-controller.ts:207-216`): regenerate the
+    /// system theme or switch a pair's theme after the terminal's colors or
+    /// appearance changed.
+    fn theme_reapply_for_terminal(&mut self) {
+        let name = self.theme_resolve_name();
+        if name == pi_tui::theme::SYSTEM_THEME_NAME || name != self.theme_active_name {
+            let _ = self.theme_apply_name(&name, false);
+        }
+    }
+
+    /// `applyTerminalColorSchemeChange` (`theme-controller.ts:224-231`): the
+    /// terminal reported a light/dark switch; its colors changed too, so
+    /// re-apply the setting and query again.
+    fn theme_apply_scheme(&mut self, scheme: TerminalColorScheme) {
+        if !self.theme_auto_sync {
+            return;
+        }
+        let appearance = match scheme {
+            TerminalColorScheme::Dark => ThemeAppearance::Dark,
+            TerminalColorScheme::Light => ThemeAppearance::Light,
+        };
+        let previous = theme::terminal_theme();
+        theme::set_terminal_color_scheme(appearance);
+        if theme::terminal_theme() != previous {
+            self.theme_reapply_for_terminal();
+        }
+        self.theme_issue_query();
+    }
+
+    /// Drain terminal replies and theme queues. `pump` calls this so the
+    /// controller runs on the UI thread like upstream's callbacks.
+    fn pump_theme(&mut self) {
+        while self.tui.poll_terminal_response() {}
+        if let Some(start) = self.theme_query_start {
+            let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.tui.service_terminal_queries(elapsed);
+        }
+        while let Some(colors) = self.tui.take_terminal_colors() {
+            self.theme_apply_colors(colors);
+        }
+        // The drained Vec is bound first: a `for` over the `mem::take`
+        // expression would keep the mutex guard's borrow of `self` alive
+        // across the `&mut self` body.
+        let late = std::mem::take(&mut *self.theme_late_reports.lock().expect("late colors"));
+        for colors in late {
+            self.theme_apply_colors(colors);
+        }
+        let schemes = std::mem::take(&mut *self.theme_scheme_reports.lock().expect("schemes"));
+        for scheme in schemes {
+            self.theme_apply_scheme(scheme);
         }
     }
 
@@ -1817,6 +2002,10 @@ impl InteractiveMode {
             self.handle_compaction_outcome(outcome);
         }
 
+        // Terminal replies and the theme controller's deadline
+        // (`tui.ts:1069-1071`; the controller runs on the UI thread).
+        self.pump_theme();
+
         // Spinner frames (host-driven, `Loader::tick`).
         if self.last_spinner_tick.elapsed() >= Duration::from_millis(80) {
             self.last_spinner_tick = Instant::now();
@@ -2128,10 +2317,12 @@ mod tests {
 
     /// A capture-terminal mode over a read-only executor in `dir`, driven by a
     /// caller-supplied stream.
-    fn fixture_with_stream(
+    /// The runtime behind the fixtures: a scripted model over a read-only
+    /// executor in `dir`.
+    fn test_runtime(
         dir: &std::path::Path,
         stream: Arc<dyn pi_agent::types::StreamFn>,
-    ) -> (InteractiveMode, FrameCapture) {
+    ) -> PrintRuntime {
         let model = pi_ai::types::Model {
             id: "test-model".to_string(),
             name: "Test Model".to_string(),
@@ -2142,7 +2333,7 @@ mod tests {
             max_tokens: 8192,
             ..pi_ai::types::Model::default()
         };
-        let mut runtime = PrintRuntime {
+        PrintRuntime {
             model,
             thinking_level: ThinkingLevel::default(),
             api_key: Some("test".to_string()),
@@ -2152,7 +2343,13 @@ mod tests {
             system_prompt: "test".to_string(),
             session: SessionManager::in_memory(dir, &NewSessionOptions::default(), Vec::new())
                 .expect("session"),
-        };
+        }
+    }
+
+    fn fixture_with_stream(
+        dir: &std::path::Path,
+        stream: Arc<dyn pi_agent::types::StreamFn>,
+    ) -> (InteractiveMode, FrameCapture) {
         let terminal = CaptureTerminal::with_size(TerminalSize {
             columns: 100,
             rows: 40,
@@ -2162,8 +2359,33 @@ mod tests {
             auth_path: Some(dir.join("auth.json")),
             ..InteractiveOptions::default()
         };
+        let mut runtime = test_runtime(dir, stream);
         let mode = InteractiveMode::new(&mut runtime, &options, Box::new(terminal));
         (mode, capture)
+    }
+
+    /// A mode over a capture terminal whose response store the test still
+    /// holds: replies pushed after construction drive the theme wire exactly
+    /// like a terminal answering the mode's queries.
+    fn themed_fixture(dir: &std::path::Path) -> (InteractiveMode, CaptureTerminal) {
+        let terminal = CaptureTerminal::with_size(TerminalSize {
+            columns: 100,
+            rows: 40,
+        });
+        let handle = terminal.clone();
+        let options = InteractiveOptions {
+            auth_path: Some(dir.join("auth.json")),
+            ..InteractiveOptions::default()
+        };
+        let mut runtime = test_runtime(
+            dir,
+            Arc::new(ScriptedStream {
+                calls: AtomicUsize::new(0),
+                file_path: "unused".to_string(),
+            }),
+        );
+        let mode = InteractiveMode::new(&mut runtime, &options, Box::new(terminal));
+        (mode, handle)
     }
 
     #[test]
@@ -2243,6 +2465,89 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         assert!(mode.agent_run.is_none(), "agent run did not finish");
+    }
+
+    // --------------------------------------------------------------
+    // The OSC theme controller (`theme/theme-controller.ts`): the replies a
+    // real terminal sends to the mode's queries re-theme it like pi.
+    // --------------------------------------------------------------
+
+    #[test]
+    fn osc_color_reply_rethemes_the_system_theme() {
+        let _guard = theme::COLOR_STATE_LOCK.lock().expect("color state lock");
+        theme::reset_terminal_color_state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, terminal) = themed_fixture(dir.path());
+        mode.tui.start().expect("tui start");
+
+        // White on black — what a dark terminal answers to the OSC 10/11
+        // query — closed by the DA1 fence.
+        terminal.push_response("\x1b]10;rgb:ffff/ffff/ffff\x1b\\");
+        terminal.push_response("\x1b]11;rgb:0000/0000/0000\x1b\\");
+        terminal.push_response("\x1b[?1;2c");
+        mode.pump();
+        mode.pump();
+        // The black background resolved the system theme.
+        assert_eq!(theme::terminal_theme(), "dark");
+        // A later unrequested reply is swallowed by the parser, not treated
+        // as keystrokes, and leaves the theme alone.
+        terminal.push_response("\x1b]11;rgb:0000/0000/0000\x1b\\");
+        mode.pump();
+        assert_eq!(theme::terminal_theme(), "dark");
+
+        theme::reset_terminal_color_state();
+    }
+
+    #[test]
+    fn late_color_reply_after_the_deadline_still_applies() {
+        let _guard = theme::COLOR_STATE_LOCK.lock().expect("color state lock");
+        theme::reset_terminal_color_state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, terminal) = themed_fixture(dir.path());
+        mode.tui.start().expect("tui start");
+
+        // The initial query outlives its 100 ms budget with nothing recorded:
+        // the deadline arms the query's onLateReply sink.
+        std::thread::sleep(Duration::from_millis(150));
+        mode.pump();
+        // Replies that arrive after the settlement ride the sink into the
+        // same apply path.
+        terminal.push_response("\x1b]10;rgb:ffff/ffff/ffff\x1b\\");
+        terminal.push_response("\x1b]11;rgb:0000/0000/0000\x1b\\");
+        terminal.push_response("\x1b[?1;2c");
+        mode.pump();
+        assert_eq!(theme::terminal_theme(), "dark");
+
+        theme::reset_terminal_color_state();
+    }
+
+    #[test]
+    fn mode_2031_scheme_report_applies_only_when_auto_sync() {
+        let _guard = theme::COLOR_STATE_LOCK.lock().expect("color state lock");
+        theme::reset_terminal_color_state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, terminal) = themed_fixture(dir.path());
+        mode.tui.start().expect("tui start");
+
+        // The default setting (system) auto-syncs, so the report records.
+        assert!(mode.theme_auto_sync);
+        terminal.push_response("\x1b[?997;2n");
+        mode.pump();
+        assert_eq!(
+            theme::terminal_scheme_for_tests(),
+            Some(ThemeAppearance::Light)
+        );
+        // With auto-sync off the report is ignored entirely.
+        mode.theme_auto_sync = false;
+        terminal.push_response("\x1b[?997;1n");
+        mode.pump();
+        assert_eq!(
+            theme::terminal_scheme_for_tests(),
+            Some(ThemeAppearance::Light),
+            "auto-sync off ignores the report"
+        );
+
+        theme::reset_terminal_color_state();
     }
 
     /// The canned summary the content-aware stream returns for a
