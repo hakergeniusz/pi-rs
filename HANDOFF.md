@@ -62,9 +62,17 @@ Run the gate (all envs inside the container via `sh -c` — NEVER pass env via a
 podman exec pi-rs-build sh -c 'export CARGO_TARGET_DIR=/build-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUGINFO=0; cd /work; nice -n 19 cargo fmt --all && nice -n 19 cargo clippy --workspace --all-targets -- -D warnings && nice -n 19 cargo test --workspace -- --test-threads=4 && nice -n 19 cargo fmt --all -- --check'
 ```
 
-State when this handoff was updated: **workspace clippy-clean; full workspace test suite green (528 tests in the coding-agent lib alone; every integration target green; MCP unit tests green)** — this includes P4 (gate passed in-container) plus the P5 modules below. Remaining before landing on `main`:
-1. **Re-clone the TS reference** (`gh repo clone earendil-works/pi /tmp/ai-agent/pi`) and reconcile the `TODO(verify-vs-TS)` markers written without the reference: `modes/json_event.rs` (event wire casing/shapes), `modes/rpc.rs` (request/response envelope), `cli/file_processor.rs` (block format, size cap), `cli/project_trust.rs` (marker-file name), `pi-ai/src/providers/anthropic.rs` (oauth beta header `anthropic-beta: oauth-2025-04-20`), env-key table additions in `print_mode.rs::env_key_candidates`.
-2. Land P4+P5-part-1 on `main` (branch `wip/p4-pre-gate` has snapshot `4853906`; local checkout is on it), push, watch CI.
+State when this handoff was updated: **workspace clippy-clean; full workspace test suite green (1202 tests, 44 targets; every integration target green; MCP unit tests green)** — P4 gate passed in-container, P5 part 1 committed as `c8e1818` on `wip/p4-pre-gate` and pushed. **TODO(verify-vs-TS) markers: all reconciled (2026-11-14, reference re-cloned to /tmp/ai-agent/pi, shallow).** What the reconciliation changed:
+- **`cli/file_processor.rs` rewritten to upstream** (`file-processor.ts`): NO size cap, `<file name="{abs}">\n{content}\n</file>\n` blocks, empty files skipped, BOM stripped, invalid UTF-8 → U+FFFD (Node semantics), image sniff (jpeg/png/gif/webp/bmp magic bytes incl. animated-png + isBmp) → `ImageContent` attachments + `<file name="..."></file>` refs, bmp → upstream's could-not-convert text (no sharp pipeline). **No inline `@token` scanning exists upstream** — prompt text is never scanned; only bare `@file` args. RPC mode rejects file args (`main.ts:708`). `buildInitialMessage` joins stdin+fileText+first message with `""` (`initial-message.ts:40`) — `resolve_prompt_messages` now mirrors it; stdin piping is a P7 note. New dep: `base64`.
+- **`modes/json_event.rs`**: `message_update` wire shape fixed to `json-event.ts` — `{type, usage, assistantMessageEvent}` with `partial` stripped and `toolcall_start` gaining `id`/`toolName`. Remaining honest deviations (doc'd): `agent_end` without `willRetry`, synchronous sink vs mid-loop subscription.
+- **`cli/project_trust.rs` rewritten**: upstream uses **`<agentDir>/trust.json`** (map canonical cwd → bool, `null` deletes, sorted keys, nearest-ancestor lookup, `findNearestTrustEntry`) + `hasTrustRequiringProjectResources` (`.pi/` entries list + `.agents/skills` ancestor walk excluding `$HOME/.agents/skills`) + `resolveProjectTrusted` ladder (override → resources??true → store → `defaultProjectTrust` always/never/ask → non-UI = **false**, no prompting). Marker files + stdin confirm were invented; gone. Wired into `build_runtime` (`project_trusted: Some(...)`. The `defaultProjectTrust` setting getter is still open).
+- **`print_mode.rs::env_key_candidates`**: verified against `env-api-keys.ts:73-129`; hallucinated arms removed (grok/aihubmix/dmxapi/gitee-ai/novita/ppio/scaleway/targon/cohere/perplexity/siliconflow/modelscope/bailian/stepfun had NO TS entries); `minimax-cn`→`MINIMAX_CN_API_KEY`; `huggingface`→`HF_TOKEN` only; added `google-vertex`, `github-copilot`, `radius`, `typesafe`, full qwen pairs. Auth ladder semantics fixed: `ANTHROPIC_AUTH_TOKEN` → Bearer; `ANTHROPIC_OAUTH_TOKEN` → **x-api-key** (`anthropic.ts:43-45`); stored OAuth creds → `toAuth().apiKey` = x-api-key (`auth/oauth/anthropic.ts:304-306`) EXCEPT kimi-coding (Bearer headers, `kimi-coding.ts:275-277`).
+- **`pi-ai/src/providers/anthropic.rs`**: the `anthropic-beta: oauth-2025-04-20` header **does not exist** in the current reference — removed. Bearer = plain `Authorization` (no beta); key wins when both set; env fallbacks removed from the adapter (the caller's ladder owns env). `openai_completions.rs` now honors `access_token` (kimi-style Bearer) ahead of api_key.
+- **rpc.rs** request/response envelope is NOT yet reconciled against `rpc-entry.ts` (no marker; doc note says before P5 exit gate).
+
+Remaining before landing on `main`:
+1. Run the container gate (reconciliations above are unverified by rustc yet), fix fallout.
+2. Land P4+P5-part-1 on `main` (branch `wip/p4-pre-gate` has `c8e1818`; local checkout is on it), push, watch CI. **ci.yml needs `fd` added when pi-coding-agent lands on main** (ubuntu-latest ships `rg` but not `fd`; apt gives `fdfind` → symlink).
 3. EACCES test note: `tools_write_edit.rs::includes_eacces_for_read_only_files` skips when running as root (container) — documented in the test.
 
 ## P5 progress (written 2026-11-12, all compiling + tested)
@@ -77,13 +85,13 @@ State when this handoff was updated: **workspace clippy-clean; full workspace te
 - **OAuth bearer pass-through** — `StreamOptions.access_token` (pi-ai) → `StreamRequest.access_token` (pi-agent) → `AgentLoopConfig.access_token` → `PrintRuntime.access_token`; auth ladder returns `WireCredential::{ApiKey, AccessToken}` (`resolve_wire_credential`); anthropic adapter sends `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20` for tokens, `x-api-key` for keys.
 
 ## Next steps (in order)
-1. Re-clone reference; reconcile TODO markers above; run the container gate again.
-2. Land on `main` with `feat(pi-coding-agent): config, auth, sessions, tools, prompts, skills, print mode (P4) + P5 part 1 (json/rpc, extensions seam, mcp client, trust, @file, oauth)`, push, watch CI.
+1. Run the container gate after the 2026-11-14 reconciliation (edits are rustc-unverified yet); fix fallout, commit to `wip/p4-pre-gate`, push.
+2. Land on `main` with `feat(pi-coding-agent): config, auth, sessions, tools, prompts, skills, print mode (P4) + P5 part 1 (json/rpc, extensions seam, mcp client, trust, @file, oauth)`, push, watch CI; add `fd` install to ci.yml in the same landing.
 3. **Real `pi -p` smoke test against a live provider** — still the first true end-to-end proof (never done).
 4. Golden session fixtures from the TS pi (byte-compat proof beyond synthetic fixtures).
-5. P5 remainder: MCP server-manager + tool bridge into the agent registry, package-manager subset (`package-manager-cli.ts`, 41.6K), codemode sandbox (`pi-codemode` stub, blocked on host decision), extension runtime host (decision pending).
-6. **P6 — Interactive mode** (chat viewport, editor, slash commands, themes, /resume).
-7. **P7 — Hardening** (compaction, cache warmer, crash log, signals/backpressure, release).
+5. P5 remainder: reconcile `rpc.rs` against `rpc-entry.ts`; MCP server-manager + tool bridge into the agent registry, package-manager subset (`package-manager-cli.ts`, 41.6K), codemode sandbox (`pi-codemode` stub, blocked on host decision), extension runtime host (decision pending), `defaultProjectTrust` settings getter.
+6. **P6 — Interactive mode** (chat viewport, editor, slash commands, themes, /resume; the trust selector prompt lands here).
+7. **P7 — Hardening** (compaction, cache warmer, crash log, signals/backpressure + stdin piping, release).
 
 ## Gotchas / decisions
 - Ported code once arrived with a systematic corruption: `map_or((default,` (extra `(` after `map_or(`) — fixed crate-wide by rewriting to `map_or(`. (Store.rs E0308 in old `test-log.txt` was another artifact of that batch, already fixed.)

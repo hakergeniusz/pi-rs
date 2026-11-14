@@ -10,8 +10,12 @@ use std::sync::Arc;
 use pi_ai::catalog;
 use pi_ai::providers;
 
+use pi_ai::types::ImageContent;
 use pi_coding_agent::cli::args::{Args, DiagnosticKind, Mode, parse_args, print_help};
-use pi_coding_agent::cli::file_processor::{expand_file_args, expand_file_references};
+use pi_coding_agent::cli::file_processor::process_file_arguments;
+use pi_coding_agent::cli::project_trust::{
+    ProjectTrustStore, ResolveProjectTrustedOptions, resolve_project_trusted,
+};
 use pi_coding_agent::config;
 use pi_coding_agent::config::settings::{SettingsManager, SettingsManagerCreateOptions};
 use pi_coding_agent::modes::json_event::run_json_mode;
@@ -105,11 +109,22 @@ fn build_runtime(
     cwd_string: &str,
 ) -> Result<PrintRuntime, String> {
     let agent_dir = config::get_agent_dir();
+    // `resolveProjectTrusted` (`project-trust.ts:47-97`): the `--approve`
+    // override, the trust store, then the `defaultProjectTrust` setting (the
+    // setting itself lands with the settings-schema work; "ask" without a UI
+    // resolves to not-trusted, like upstream's non-interactive paths).
+    let trust_store = ProjectTrustStore::new(&agent_dir);
+    let project_trusted = resolve_project_trusted(&ResolveProjectTrustedOptions {
+        cwd,
+        store: &trust_store,
+        trust_override: args.project_trust_override,
+        default_project_trust: None,
+    })?;
     let settings = SettingsManager::create(
         cwd,
         &agent_dir,
         SettingsManagerCreateOptions {
-            project_trusted: None,
+            project_trusted: Some(project_trusted),
         },
     );
 
@@ -200,62 +215,64 @@ fn build_runtime(
     })
 }
 
-/// `-p` puts the prompt in messages[0]; upstream sends it as the initial
-/// message and any further positionals as follow-ups. `@file` references
-/// expand inside every message; bare `@file` arguments attach their blocks
-/// to the first message (`cli/file-processor.ts`).
-fn resolve_prompt_messages(
-    args: &Args,
-    cwd: &std::path::Path,
-) -> Result<(Option<String>, Vec<String>), String> {
-    let (initial, follow_ups) = match args.messages.split_first() {
-        Some((first, rest)) if args.print && rest.is_empty() => (Some(first.clone()), Vec::new()),
-        Some((first, rest)) if args.print => (Some(first.clone()), rest.to_vec()),
-        _ => (None, args.messages.clone()),
-    };
-    let initial = match initial {
-        Some(text) => Some(expand_file_references(&text, cwd)?),
-        None => None,
-    };
-    let follow_ups = follow_ups
-        .iter()
-        .map(|message| expand_file_references(message, cwd))
-        .collect::<Result<Vec<_>, _>>()?;
-    let initial = if args.file_args.is_empty() {
-        initial
+/// Combines `@file` text, image attachments, and the first CLI message into
+/// the initial prompt (`cli/initial-message.ts` `buildInitialMessage`): the
+/// parts join with no separator, remaining messages become follow-ups.
+/// Upstream also prepends piped stdin content here; stdin handling lands
+/// with P7's output-guard work.
+type PromptParts = (Option<String>, Vec<ImageContent>, Vec<String>);
+
+fn resolve_prompt_messages(args: &Args, cwd: &std::path::Path) -> Result<PromptParts, String> {
+    let mut messages = args.messages.clone();
+    let mut images = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    if !args.file_args.is_empty() {
+        let files = process_file_arguments(&args.file_args, cwd)?;
+        images = files.images;
+        if !files.text.is_empty() {
+            parts.push(files.text);
+        }
+    }
+    if !messages.is_empty() {
+        parts.push(messages.remove(0));
+    }
+    let initial = if parts.is_empty() {
+        None
     } else {
-        let blocks = expand_file_args(&args.file_args, cwd)?;
-        Some(match initial {
-            Some(text) => format!("{text}\n\n{blocks}"),
-            None => blocks,
-        })
+        Some(parts.concat())
     };
-    Ok((initial, follow_ups))
+    Ok((initial, images, messages))
 }
 
 fn run_print(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
     let mut runtime = build_runtime(args, cwd, cwd_string)?;
-    let (initial, follow_ups) = resolve_prompt_messages(args, cwd)?;
+    let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd)?;
     let options = PrintModeOptions {
         mode: Mode::Text,
         messages: follow_ups,
         initial_message: initial,
+        initial_images: images,
     };
     run_print_mode(&mut runtime, &options)
 }
 
 fn run_json(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
     let mut runtime = build_runtime(args, cwd, cwd_string)?;
-    let (initial, follow_ups) = resolve_prompt_messages(args, cwd)?;
+    let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd)?;
     let options = PrintModeOptions {
         mode: Mode::Json,
         messages: follow_ups,
         initial_message: initial,
+        initial_images: images,
     };
     run_json_mode(&mut runtime, &options)
 }
 
 fn run_rpc(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
+    if !args.file_args.is_empty() {
+        // `main.ts:708-711`.
+        return Err("Error: @file arguments are not supported in RPC mode".to_string());
+    }
     let mut runtime = build_runtime(args, cwd, cwd_string)?;
     let mut stdin = BufReader::new(std::io::stdin());
     let out = stdout();

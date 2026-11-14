@@ -4,8 +4,8 @@
 //! resolution the CLI host performs before it. Faithful where P4 can be:
 //! text mode with the same output/exit-code contract. Deferred, tracked for
 //! later phases: JSON event output (`--mode json`, P5), signal handlers and
-//! stdout backpressure (`core/output-guard.ts`, P7), extension binding (P5),
-//! `@file` expansion (`cli/file-processor.ts`, P5).
+//! stdout backpressure (`core/output-guard.ts`, P7), extension binding (P5).
+//! `@file` attachments are handled (`cli/file-processor.ts`).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use pi_agent::types::{
     AbortSignal, AgentContext, StreamFn, ThinkingLevel, ToolExecutionMode, ToolExecutor, ToolSpec,
 };
 use pi_ai::catalog;
-use pi_ai::types::{Model, StopReason};
+use pi_ai::types::{ImageContent, Model, StopReason};
 
 use crate::auth::{self, Credential};
 use crate::cli::args::{Args, Mode};
@@ -35,6 +35,9 @@ pub struct PrintModeOptions {
     pub messages: Vec<String>,
     /// First message to send (`print-mode.ts:23`).
     pub initial_message: Option<String>,
+    /// `@file` image attachments riding with `initial_message`
+    /// (`initialImages`, `main.ts:268-277`).
+    pub initial_images: Vec<ImageContent>,
 }
 
 /// Everything one print run needs, resolved by the CLI host before the loop.
@@ -114,7 +117,15 @@ pub fn run_print_mode(
     let mut prompts: Vec<AgentMessage> = Vec::new();
     let now = now_millis();
     if let Some(initial) = &options.initial_message {
-        prompts.push(pi_agent::transcript::user_message(initial, now));
+        if options.initial_images.is_empty() {
+            prompts.push(pi_agent::transcript::user_message(initial, now));
+        } else {
+            prompts.push(pi_agent::transcript::user_message_with_images(
+                initial,
+                &options.initial_images,
+                now,
+            ));
+        }
     }
     for message in &options.messages {
         prompts.push(pi_agent::transcript::user_message(message, now));
@@ -333,9 +344,10 @@ pub fn resolve_model(
 }
 
 /// Provider-specific API-key environment variables, in the order each TS
-/// provider checks them (`packages/ai/src/env-api-keys.ts` + provider files).
-/// The full table ports with the provider work in P5; the ladder covers the
-/// catalog's key-auth providers.
+/// provider checks them (`packages/ai/src/env-api-keys.ts:73-129`, verified).
+/// `ANTHROPIC_AUTH_TOKEN` participates in discovery but rides the wire as a
+/// Bearer header (see [`resolve_wire_credential`]); `amazon-bedrock` and
+/// `google-vertex` ADC paths stay out of this table.
 fn env_key_candidates(provider: &str) -> &'static [&'static str] {
     match provider {
         "anthropic" => &[
@@ -348,6 +360,7 @@ fn env_key_candidates(provider: &str) -> &'static [&'static str] {
         "deepseek" => &["DEEPSEEK_API_KEY"],
         "nvidia" => &["NVIDIA_API_KEY"],
         "google" => &["GEMINI_API_KEY"],
+        "google-vertex" => &["GOOGLE_CLOUD_API_KEY"],
         "groq" => &["GROQ_API_KEY"],
         "cerebras" => &["CEREBRAS_API_KEY"],
         "xai" => &["XAI_API_KEY"],
@@ -359,36 +372,37 @@ fn env_key_candidates(provider: &str) -> &'static [&'static str] {
         "zai" => &["ZAI_API_KEY"],
         "zai-coding-cn" => &["ZAI_CODING_CN_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
-        "minimax" | "minimax-cn" => &["MINIMAX_API_KEY"],
+        "minimax" => &["MINIMAX_API_KEY"],
+        "minimax-cn" => &["MINIMAX_CN_API_KEY"],
         "moonshotai" | "moonshotai-cn" => &["MOONSHOT_API_KEY"],
         "opencode" | "opencode-go" => &["OPENCODE_API_KEY"],
         "kimi-coding" => &["KIMI_API_KEY"],
         "meta" => &["META_API_KEY"],
         "cloudflare-workers-ai" | "cloudflare-ai-gateway" => &["CLOUDFLARE_API_KEY"],
-        "qwen-token-plan" | "qwen-token-plan-individual" => &["QWEN_TOKEN_PLAN_API_KEY"],
-        "qwen-token-plan-cn" | "qwen-token-plan-individual-cn" => &["QWEN_TOKEN_PLAN_CN_API_KEY"],
+        // Qwen Token Plan: the per-plan variable first, then the region
+        // variable both plans used to share (`env-api-keys.ts:84-90`).
+        "qwen-token-plan" => &["QWEN_TOKEN_PLAN_TEAM_API_KEY", "QWEN_TOKEN_PLAN_API_KEY"],
+        "qwen-token-plan-cn" => &[
+            "QWEN_TOKEN_PLAN_TEAM_CN_API_KEY",
+            "QWEN_TOKEN_PLAN_CN_API_KEY",
+        ],
+        "qwen-token-plan-individual" => &[
+            "QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY",
+            "QWEN_TOKEN_PLAN_API_KEY",
+        ],
+        "qwen-token-plan-individual-cn" => &[
+            "QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY",
+            "QWEN_TOKEN_PLAN_CN_API_KEY",
+        ],
         "xiaomi" => &["XIAOMI_API_KEY"],
         "xiaomi-token-plan-cn" => &["XIAOMI_TOKEN_PLAN_CN_API_KEY"],
         "xiaomi-token-plan-ams" => &["XIAOMI_TOKEN_PLAN_AMS_API_KEY"],
         "xiaomi-token-plan-sgp" => &["XIAOMI_TOKEN_PLAN_SGP_API_KEY"],
         "ant-ling" => &["ANT_LING_API_KEY"],
-        "cohere" => &["COHERE_API_KEY"],
-        "perplexity" => &["PERPLEXITY_API_KEY"],
-        "huggingface" => &["HF_TOKEN", "HF_API_KEY"],
-        "siliconflow" => &["SILICONFLOW_API_KEY"],
-        "modelscope" => &["MODELSCOPE_API_KEY"],
-        "bailian" => &["BAILIAN_API_KEY"],
-        "stepfun" => &["STEPFUN_API_KEY"],
-        // TODO(verify-vs-TS): entries below were added without the reference
-        // checkout present; confirm names/order in `env-api-keys.ts` (P5).
-        "grok" => &["XAI_API_KEY", "GROK_API_KEY"],
-        "aihubmix" => &["AIHUBMIX_API_KEY"],
-        "dmxapi" => &["DMXAPI_API_KEY"],
-        "gitee-ai" => &["GITEE_AI_API_KEY"],
-        "novita" => &["NOVITA_API_KEY"],
-        "ppio" => &["PPIO_API_KEY"],
-        "scaleway" => &["SCALEWAY_API_KEY"],
-        "targon" => &["TARGON_API_KEY"],
+        "github-copilot" => &["COPILOT_GITHUB_TOKEN"],
+        "huggingface" => &["HF_TOKEN"],
+        "radius" => &["RADIUS_API_KEY"],
+        "typesafe" => &["TYPESAFE_API_KEY"],
         _ => &[],
     }
 }
@@ -405,7 +419,7 @@ pub enum WireCredential {
 /// The auth ladder for one request (`providers/anthropic.ts:30-45` and
 /// friends): `--api-key` flag, then the stored credential from `auth.json`,
 /// then provider environment variables. Returns the credential and its
-/// source, keeping OAuth tokens distinct from API keys so the adapters can
+/// source, keeping bearer tokens distinct from API keys so the adapters can
 /// pick the right header.
 pub fn resolve_wire_credential(
     provider: &str,
@@ -426,18 +440,35 @@ pub fn resolve_wire_credential(
                 }
             }
             Credential::Oauth { access, .. } => {
-                return Some((
-                    WireCredential::AccessToken(access.clone()),
-                    "stored credential",
-                ));
+                // The OAuth flows hand the access token to the request
+                // through `toAuth`: most providers yield `auth.apiKey` (the
+                // provider's standard key header — `x-api-key` for
+                // anthropic, `auth/oauth/anthropic.ts:304-306`); kimi-coding
+                // yields an explicit Bearer header
+                // (`auth/oauth/kimi-coding.ts:275-277`).
+                let wire = if provider == "kimi-coding" {
+                    WireCredential::AccessToken(access.clone())
+                } else {
+                    WireCredential::ApiKey(access.clone())
+                };
+                return Some((wire, "stored credential"));
             }
         }
     }
     for variable in env_key_candidates(provider) {
         if let Ok(value) = std::env::var(variable) {
-            if !value.is_empty() {
-                return Some((WireCredential::ApiKey(value), "environment"));
+            if value.is_empty() {
+                continue;
             }
+            // `ANTHROPIC_AUTH_TOKEN` rides as a custom Bearer header, ahead
+            // of the key variables (`providers/anthropic.ts:36-40`); every
+            // other env key is the provider's standard key auth.
+            let wire = if provider == "anthropic" && *variable == "ANTHROPIC_AUTH_TOKEN" {
+                WireCredential::AccessToken(value)
+            } else {
+                WireCredential::ApiKey(value)
+            };
+            return Some((wire, "environment"));
         }
     }
     None
@@ -598,11 +629,11 @@ mod tests {
         let auth_path = dir.path().join("auth.json");
         // No flag, no stored credential, no env in the test process for this
         // provider id -> None (env vars like OPENAI_API_KEY may exist in the
-        // ambient environment, so use a provider with no env candidates).
-        assert!(resolve_api_key("radius", None, &auth_path).is_none());
+        // ambient environment, so use an id with no env candidates).
+        assert!(resolve_api_key("bogus-provider", None, &auth_path).is_none());
         // The flag always wins.
         assert_eq!(
-            resolve_api_key("radius", Some("sk-test"), &auth_path)
+            resolve_api_key("bogus-provider", Some("sk-test"), &auth_path)
                 .map(|(key, source)| (key, source == "--api-key")),
             Some(("sk-test".to_string(), true))
         );

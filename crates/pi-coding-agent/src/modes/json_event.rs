@@ -2,9 +2,10 @@
 //! stdout.
 //!
 //! Port of `modes/json-event.ts` (61 lines) on top of the same runtime
-//! resolution as print mode. Each line is one `AgentEvent` serialized with
-//! pi's wire casing (`camelCase`, discriminant in `type`). Deviations, to
-//! reconcile when the reference checkout is back:
+//! resolution as print mode. Each line is one event serialized with pi's
+//! wire shape (`snake_case` `type` discriminant, `camelCase` payload; the
+//! `message_update` line carries `usage` plus the `partial`-less assistant
+//! event, exactly `json-event.ts`). Remaining deviations:
 //! - upstream emits the coding-agent's extended `agent_end` (with
 //!   `willRetry`); the port emits the loop's plain event.
 //! - upstream subscribes mid-loop (events stream as they happen); the port
@@ -60,18 +61,23 @@ pub fn event_to_json(event: &AgentEvent) -> JsonObject {
             );
         }
         AgentEvent::MessageUpdate {
+            message,
             assistant_message_event,
-            ..
         } => {
-            // `message_update` flattens the assistant message event's own
-            // fields (pi forwards the update object verbatim).
-            if let Ok(serde_json::Value::Object(fields)) =
-                serde_json::to_value(assistant_message_event)
-            {
-                for (key, value) in fields {
-                    object.insert(key, value);
-                }
-            }
+            // `message_update` does not forward the event verbatim: the wire
+            // carries `usage` from the in-flight message plus the assistant
+            // event with the cumulative `partial` snapshot removed
+            // (`json-event.ts:46-61`); `toolcall_start` additionally carries
+            // the started call's `id`/`toolName` so clients can react without
+            // the snapshot (`json-event.ts:23-30`).
+            object.insert(
+                "usage".to_string(),
+                serde_json::to_value(message.usage).unwrap_or_default(),
+            );
+            object.insert(
+                "assistantMessageEvent".to_string(),
+                json_assistant_message_event(assistant_message_event),
+            );
         }
         AgentEvent::ToolExecutionStart {
             tool_call_id,
@@ -150,6 +156,38 @@ fn insert_tool_identity(
             object.insert("parentToolCallId".to_string(), serde_json::json!(id));
         }
     }
+}
+
+/// `toJsonAssistantMessageEvent` (`json-event.ts:20-38`): the streaming event
+/// without its cumulative `partial` snapshot; `toolcall_start` gains the
+/// started call's `id`/`toolName` in their place.
+fn json_assistant_message_event(event: &pi_ai::types::AssistantMessageEvent) -> serde_json::Value {
+    let mut value = serde_json::to_value(event).unwrap_or_default();
+    if let serde_json::Value::Object(fields) = &mut value {
+        let partial = fields.remove("partial");
+        if let pi_ai::types::AssistantMessageEvent::ToolcallStart { content_index, .. } = event {
+            // Upstream throws when the content at the index is not a tool
+            // call (`json-event.ts:25-27`); the loop's own invariant makes
+            // the missing-call case unreachable, so the port leaves the ids
+            // out rather than panic.
+            let call = partial
+                .as_ref()
+                .and_then(|partial| partial.get("content"))
+                .and_then(|content| content.get(*content_index))
+                .filter(|block| {
+                    block.get("type").and_then(serde_json::Value::as_str) == Some("toolCall")
+                });
+            if let Some(call) = call {
+                if let Some(id) = call.get("id") {
+                    fields.insert("id".to_string(), id.clone());
+                }
+                if let Some(name) = call.get("name") {
+                    fields.insert("toolName".to_string(), name.clone());
+                }
+            }
+        }
+    }
+    value
 }
 
 /// Sink writing one JSON line per event (`json-event.ts:20-40`).
@@ -233,7 +271,15 @@ pub fn run_json_mode(
     let mut prompts: Vec<AgentMessage> = Vec::new();
     let now = now_millis();
     if let Some(initial) = &options.initial_message {
-        prompts.push(pi_agent::transcript::user_message(initial, now));
+        if options.initial_images.is_empty() {
+            prompts.push(pi_agent::transcript::user_message(initial, now));
+        } else {
+            prompts.push(pi_agent::transcript::user_message_with_images(
+                initial,
+                &options.initial_images,
+                now,
+            ));
+        }
     }
     for message in &options.messages {
         prompts.push(pi_agent::transcript::user_message(message, now));

@@ -102,9 +102,13 @@ async fn request_and_stream(
     output: &mut AssistantMessage,
     sender: &EventSender,
 ) -> StreamResult<()> {
-    let api_key = options
-        .api_key
+    // OpenAI-style key auth is `Authorization: Bearer`; a resolved bearer
+    // token (kimi-coding's OAuth `toAuth.headers`) takes precedence, then the
+    // key, then the ambient env fallback.
+    let bearer = options
+        .access_token
         .clone()
+        .or_else(|| options.api_key.clone())
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
         .ok_or_else(|| "OpenAI API key not set (set OPENAI_API_KEY)".to_string())?;
 
@@ -118,7 +122,7 @@ async fn request_and_stream(
     let response = client
         .post(&url)
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {api_key}"))
+        .header("authorization", format!("Bearer {bearer}"))
         .json(&body)
         .send()
         .await
