@@ -4,10 +4,11 @@
 //! regular (main-screen) chat loop — the startup header, user and assistant
 //! messages, tool execution rows, the working status embedded in the editor's
 //! top border, the footer, the `/`-commands this phase wires, the `!` bash
-//! mode, and the editor autocomplete (slash commands, `@` files, paths).
-//! Deferred to later P6 parts: fullscreen mode, selector dialogs
-//! (model/session/settings), extensions, compaction, follow-up queues, and
-//! the mouse-driven toggles.
+//! mode, the editor autocomplete (slash commands, `@` files, paths), context
+//! compaction, and the OSC theme controller. Deferred to later P6 parts:
+//! fullscreen mode (the mouse handlers on the shared components are ported;
+//! only the fullscreen TUI enables tracking and delivers reports), the
+//! selector dialogs beyond `/model`, and the extension host.
 
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};

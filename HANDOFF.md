@@ -371,6 +371,33 @@ reports, and auto light/dark pair settings, wired into the interactive mode.
   before `/exit`, or the Enter submits the typed text as a user message (the
   theme smoke's first run shipped a 401 to the real API).
 
+## Mouse-driven toggles (landed on `feat/p6b-mouse-toggles`, 2026-11-14)
+
+The component-side mouse handlers, ported ahead of the fullscreen renderer
+that actually delivers mouse events.
+
+- **Upstream scoping finding**: in pi 1.5.2 the main-screen chat TUI NEVER
+  enables terminal mouse tracking (`TuiMainScreen` takes no mouse option;
+  `TuiAltScreen` does, `mouse ?? true`). The click-to-expand and logo-click
+  handlers live on shared components and are inert in the main screen — the
+  port reproduces exactly that. There is no keybinding toggle upstream.
+- `ToolExecutionComponent` wraps every displayed child (call line, result
+  body) in pi-tui's already-ported `MouseRegion`; a left click toggles the
+  row's expansion (`tool-execution.ts:116-124`, wrapping at
+  `:228`/`:235`/`:240`/`:249`/`:257`/`:264`). Rust ownership note: the
+  region callbacks cannot borrow the component, so they flip a shared
+  `Arc<AtomicBool>` that `handle_mouse` reconciles into `set_expanded`.
+- `BuiltInHeader::handle_mouse` recognizes clicks on the four logo cells
+  (y ≤ 1, x within this component's padding offset — upstream's header pads
+  one column; `interactive-mode.ts:249-256`) and hands the logo's screen
+  position to `on_logo_click` — unset, because the 3D easter egg
+  (`easter-egg-3d.ts`) is deferred with fullscreen.
+- Verified: unit tests for the click toggle (left click expands/collapses;
+  middle click and press pass through) and the logo-cell geometry (screen
+  coordinate math, outside-clip, unset callback). The alt-screen Tui's mouse
+  state machine is already ported in pi-tui; its delivery lands with the
+  fullscreen mode slice.
+
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
   slot shifted every later index — the `*_INDEX` consts are the single source of

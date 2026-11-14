@@ -11,11 +11,15 @@
 //! for the result body, rebuilt on updates — the rendered bytes are the same.
 //! The image-block display of results is deferred with the image work.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use pi_tui::component::Component;
 use pi_tui::components::box_component::BoxComponent;
+use pi_tui::components::mouse_region::MouseRegion;
 use pi_tui::components::text::Text;
+use pi_tui::mouse::{MouseButton, MouseEvent, MouseEventKind, MouseEventResult};
 
 use crate::tools::renderers::ToolRenderers;
 
@@ -111,6 +115,9 @@ pub struct ToolExecutionComponent {
     renderers: Option<ToolRenderers>,
     /// The rendered box; rebuilt on every display update.
     content_box: BoxComponent,
+    /// The expansion a region click asked for; the closure cannot borrow the
+    /// component, so `handle_mouse` reconciles it with `self.expanded`.
+    click_toggle: Arc<AtomicBool>,
 }
 
 impl ToolExecutionComponent {
@@ -137,6 +144,7 @@ impl ToolExecutionComponent {
             started_at: None,
             renderers,
             content_box: BoxComponent::new(1, 1),
+            click_toggle: Arc::new(AtomicBool::new(false)),
         };
         component.update_display();
         component
@@ -277,9 +285,21 @@ impl ToolExecutionComponent {
 
         let bg_fn = move |text: &str| bg(text);
         let mut content_box = BoxComponent::with_bg(self.output_pad.max(1), 1, bg_fn);
-        content_box.add_child(Box::new(Text::new(call_text, 0, 0)));
+        // Every displayed child rides a `MouseRegion` whose left click
+        // toggles the row's expansion (`tool-execution.ts:116-124`; the
+        // wrapping covers the call at `:228`/`:240` and the result at
+        // `:235`/`:249`/`:257`/`:264`).
+        let click_toggle = Arc::clone(&self.click_toggle);
+        content_box.add_child(Box::new(MouseRegion::new(
+            Box::new(Text::new(call_text, 0, 0)),
+            Box::new(move |event| toggle_on_left_click(event, &click_toggle)),
+        )));
         if !result_text.is_empty() {
-            content_box.add_child(Box::new(Text::new(result_text, 0, 0)));
+            let click_toggle = Arc::clone(&self.click_toggle);
+            content_box.add_child(Box::new(MouseRegion::new(
+                Box::new(Text::new(result_text, 0, 0)),
+                Box::new(move |event| toggle_on_left_click(event, &click_toggle)),
+            )));
         }
         self.content_box = content_box;
     }
@@ -292,12 +312,35 @@ impl ToolExecutionComponent {
     }
 }
 
+/// The result region's click toggle (`tool-execution.ts:117-123`): a left
+/// click flips the shared flag and reports the event handled; everything
+/// else passes through.
+fn toggle_on_left_click(event: &MouseEvent, flag: &AtomicBool) -> Option<MouseEventResult> {
+    if event.kind != MouseEventKind::Click || event.button != MouseButton::Left {
+        return None;
+    }
+    flag.store(!flag.load(Ordering::Relaxed), Ordering::Relaxed);
+    Some(MouseEventResult::handled())
+}
+
 impl Component for ToolExecutionComponent {
     fn render(&self, width: usize) -> Vec<String> {
         // `tool-execution.ts:87`: the row opens with a blank line.
         let mut lines = vec![String::new()];
         lines.extend(self.content_box.render(width));
         lines
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent) -> Option<MouseEventResult> {
+        // The regions' callbacks cannot borrow the component: seed the flag
+        // with the current expansion, let a click flip it, then reconcile
+        // (`setExpanded` also rebuilds the display).
+        self.click_toggle.store(self.expanded, Ordering::Relaxed);
+        let result = self.content_box.handle_mouse(event);
+        if self.click_toggle.load(Ordering::Relaxed) != self.expanded {
+            self.set_expanded(!self.expanded);
+        }
+        result
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -381,5 +424,30 @@ mod tests {
             format_tool_duration(std::time::Duration::from_secs(7384)),
             "2h 3m 4s"
         );
+    }
+
+    #[test]
+    fn a_left_click_on_the_row_toggles_expansion() {
+        let mut component = ToolExecutionComponent::new(
+            "read",
+            "call-1",
+            serde_json::json!({ "path": "/tmp/example.txt" }),
+            1,
+            "/tmp",
+            crate::tools::renderers::renderers_for("read"),
+        );
+        assert!(!component.expanded());
+        // The box pads one line; the first content row is the call region.
+        let click = MouseEvent::new(MouseEventKind::Click, 0, 2, 1, 60, 3);
+        component.handle_mouse(&click).expect("handled");
+        assert!(component.expanded(), "a left click expanded the row");
+        component.handle_mouse(&click).expect("handled");
+        assert!(!component.expanded(), "a second click collapsed it");
+        // Other buttons and kinds pass through untouched.
+        let middle = MouseEvent::new(MouseEventKind::Click, 1, 2, 1, 60, 3);
+        assert!(component.handle_mouse(&middle).is_none());
+        let press = MouseEvent::new(MouseEventKind::Press, 0, 2, 1, 60, 3);
+        assert!(component.handle_mouse(&press).is_none());
+        assert!(!component.expanded());
     }
 }
