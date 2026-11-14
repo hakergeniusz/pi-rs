@@ -153,7 +153,7 @@ pub fn run_print_mode(
         convert_to_llm: Arc::new(DefaultConvertToLlm),
     };
 
-    let new_messages = futures::executor::block_on(pi_agent::run_agent_loop(
+    let new_messages = crate::runtime::block_on(pi_agent::run_agent_loop(
         prompts,
         context,
         executor.as_ref(),

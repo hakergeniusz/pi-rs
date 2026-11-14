@@ -31,6 +31,7 @@ pub mod extensions;
 pub mod modes;
 pub mod prompt;
 pub mod prompt_templates;
+pub mod runtime;
 pub mod session;
 pub mod skills;
 pub mod tools;
