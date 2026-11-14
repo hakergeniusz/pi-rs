@@ -1,7 +1,7 @@
 # Handoff: Pi in Rust (`pi-rs`)
 
 > Written 2026-11-11, updated same day after gate attempts. Repo: `/home/hakergeniusz/Projects/pi-rs` on `acer`.
-> **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). **`main` = P0–P5-part-1 history** — fast-forwarded `39b22ad..37782d1` on 2026-11-14 (P4 + P5 part 1, reconciliation commit `a6b9934`, `ci: install fd` `37782d1`). `wip/p4-pre-gate` == `main` now; local checkout is ON `wip/p4-pre-gate`. CI on the landing push — run `gh run list --branch main` / `gh run watch --exit-status`; **unverified at handoff time**.
+> **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). **`main` = P0–P5-part-1 history, CI-VERIFIED GREEN** — landing fast-forwarded `39b22ad..37782d1` on 2026-11-14; first landing CI failed only because ubuntu-latest ships **neither rg nor fd** (12 grep tests: `which("rg")` failed) → fixed in ci.yml (`8c6d178`, installs `ripgrep` + `fd-find`); CI run `43578686739` on `8c6d178` = **ok**. `wip/p4-pre-gate` == `main`; local checkout is ON `wip/p4-pre-gate`.
 > ALL development happens on `acer` (per user). Reference checkout: `/tmp/ai-agent/pi` on `acer` — **WIPED (tmpfs); re-clone before P5 work: `gh repo clone earendil-works/pi /tmp/ai-agent/pi`** (was @ `b22e525b3`).
 
 ## Goal
@@ -73,7 +73,7 @@ State when this handoff was updated: **workspace clippy-clean; full workspace te
 
 Remaining before landing on `main` — **ALL DONE 2026-11-14**:
 1. ~~Container gate~~ green (1205 tests, 44 targets, clippy+fmt clean) → committed `a6b9934`, pushed.
-2. ~~Land on `main`~~ fast-forwarded `39b22ad..37782d1`, pushed; `fd` install step added to ci.yml (`37782d1`). CI run `43578349132` — watch pending at handoff time (`gh run watch 43578349132 --exit-status`).
+2. ~~Land on `main`~~ fast-forwarded `39b22ad..37782d1`, pushed; ci.yml needed **ripgrep AND fd** (first run `43578349132` FAILED — 12 grep tests, `rg` missing on the runner) → `8c6d178` → CI run `43578686739` **GREEN**.
 3. EACCES test note (kept): `tools_write_edit.rs::includes_eacces_for_read_only_files` skips when running as root (container) — documented in the test.
 
 ## P5 progress (written 2026-11-12, all compiling + tested)
