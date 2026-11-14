@@ -398,6 +398,40 @@ that actually delivers mouse events.
   state machine is already ported in pi-tui; its delivery lands with the
   fullscreen mode slice.
 
+## Project trust selector (landed on `feat/p6b-trust-selector`, 2026-11-14)
+
+The `/trust` dialog: the third selector following the established mount
+pattern (`Tui::replace_child(EDITOR_INDEX, selector)` + suspended editor +
+per-selector `Arc<Mutex<Vec<Event>>>` queue drained in the pump).
+
+- `cli/project_trust.rs` gained the option builder: `project_trust_options`
+  ports `getProjectTrustOptions` (Trust = project entry set true; Trust
+  parent folder = parent entry set true + project entry DELETED, offered
+  whenever the parent exists — only the filesystem root has none; Do not
+  trust = project entry set false), and `project_trust_parent_path` ports
+  `getProjectTrustParentPath` (canonicalized parent, `None` for `/`).
+- `TrustSelectorComponent` (`components/trust-selector.ts`) renders the
+  saved decision (`formatDecision`: "none" / "{label} (inherited from
+  {path})" when the saved path differs from the project's) and the current
+  session state, preselects the option matching the saved decision, and
+  keeps the upstream `j`/`k` literal fallbacks beside the `tui.select.*`
+  keybindings. Confirm emits `{ trusted, updates }`; the mode persists via
+  `ProjectTrustStore::set_many` and prints "Saved trust decision:
+  trusted|untrusted. Restart pi for this to take effect." (upstream's
+  restart note — the port likewise does not re-resolve trust live).
+- `main.rs::run_interactive` resolves the trust ladder once and threads
+  `agent_dir`/`project_trusted` through `InteractiveOptions` (test seams
+  default them), so the selector displays real state without re-reading
+  the store.
+- Gotcha (gate tooling): appending `| tail -3` to the clippy step MASKS its
+  exit status — a failing chain still printed "GATE-GREEN". Keep clippy
+  unpiped in the gate, or check `${PIPESTATUS}`.
+- Not ported (documented, upstream-copied text): the `pi auth login`
+  subcommand. The "Run `pi auth login --provider X`" error hint in print
+  mode is upstream's own wording and is misleading in the port until auth
+  login lands — the working path is copying auth.json into
+  `~/.config/pi-rs/`.
+
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
   slot shifted every later index — the `*_INDEX` consts are the single source of

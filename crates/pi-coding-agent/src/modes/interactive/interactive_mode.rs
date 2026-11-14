@@ -31,6 +31,7 @@ use pi_tui::theme::ThemeAppearance;
 use pi_tui::tui::FocusTarget;
 use pi_tui::tui::{TerminalColors, Tui, TuiStopOptions};
 
+use crate::cli::project_trust::ProjectTrustStore;
 use crate::modes::print_mode::PrintRuntime;
 use crate::session::store::{NewSessionOptions, SessionManager};
 use crate::tools::index::BuiltinToolExecutor;
@@ -42,6 +43,7 @@ use super::components::header::{BuiltInHeader, pi_logo_lines};
 use super::components::model_selector::{ModelSelectorComponent, ModelSelectorEvent};
 use super::components::status_indicator::{IdleStatus, StatusIndicator};
 use super::components::tool_execution::{ToolExecutionComponent, ToolResultView};
+use super::components::trust_selector::{TrustSelectorComponent, TrustSelectorEvent};
 use super::components::user_message::UserMessageComponent;
 use super::theme;
 
@@ -53,6 +55,12 @@ pub struct InteractiveOptions {
     /// The `auth.json` path for the model-availability check. `None` uses the
     /// real agent dir; tests inject a temp path to stay hermetic.
     pub auth_path: Option<std::path::PathBuf>,
+    /// The agent dir the trust selector writes to. `None` uses the real one;
+    /// tests inject a temp path to stay hermetic.
+    pub agent_dir: Option<std::path::PathBuf>,
+    /// Whether this project is trusted in the current session (the
+    /// "Current session" line of the trust selector).
+    pub project_trusted: bool,
 }
 
 impl Default for InteractiveOptions {
@@ -61,6 +69,8 @@ impl Default for InteractiveOptions {
             version: env!("CARGO_PKG_VERSION").to_string(),
             theme_name: None,
             auth_path: None,
+            agent_dir: None,
+            project_trusted: false,
         }
     }
 }
@@ -308,10 +318,16 @@ pub struct InteractiveMode {
     exiting: bool,
     /// The mounted `/model` selector's event queue, while open.
     model_selector_events: Option<Arc<Mutex<Vec<ModelSelectorEvent>>>>,
+    /// Events from the mounted `/trust` selector, same queue pattern.
+    trust_selector_events: Option<Arc<Mutex<Vec<TrustSelectorEvent>>>>,
     /// The editor, parked while the selector occupies its tree slot.
     suspended_editor: Option<Box<dyn Component>>,
     /// Where provider credentials live (`auth.json`).
     auth_path: std::path::PathBuf,
+    /// The agent dir the trust selector reads and writes (`trust.json`).
+    agent_dir: std::path::PathBuf,
+    /// Whether this project is trusted in the current session.
+    project_trusted: bool,
     /// The agent loop's steering/follow-up queues, shared with the worker
     /// thread and persistent across runs (upstream: `agent.queues`).
     queues: Arc<Mutex<Queues>>,
@@ -396,26 +412,12 @@ impl InteractiveMode {
         tui.add_child(Box::new(FooterComponent::new(Self::footer_data(runtime))));
         tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
 
-        // Mode-2031 reports reach the controller through a listener the TUI
-        // dispatches (`bindTerminalColorSchemeListener`); the closure cannot
-        // borrow the mode, so it queues.
-        let scheme_queue = Arc::clone(&theme_scheme_reports);
-        tui.add_color_scheme_listener(Arc::new(move |scheme| {
-            if let Ok(mut pending) = scheme_queue.lock() {
-                pending.push(scheme);
-            }
-        }));
-        // The initial color query (`applyFromSettings` →
-        // `requestTerminalColors`); late replies ride the sink.
-        let theme_query_start = Some(Instant::now());
-        let late_queue = Arc::clone(&theme_late_reports);
-        let sink = Box::new(move |colors: TerminalColors| {
-            if let Ok(mut pending) = late_queue.lock() {
-                pending.push(colors);
-            }
-        });
-        let _ = tui.query_terminal_colors(100, Some(sink));
-        tui.set_color_scheme_notifications(theme_auto_sync);
+        let theme_query_start = Self::arm_theme_queries(
+            &mut tui,
+            theme_auto_sync,
+            &theme_late_reports,
+            &theme_scheme_reports,
+        );
 
         InteractiveMode {
             tui,
@@ -446,11 +448,17 @@ impl InteractiveMode {
             hide_thinking_block: false,
             exiting: false,
             model_selector_events: None,
+            trust_selector_events: None,
             suspended_editor: None,
             auth_path: options
                 .auth_path
                 .clone()
                 .unwrap_or_else(crate::config::get_auth_path),
+            agent_dir: options
+                .agent_dir
+                .clone()
+                .unwrap_or_else(crate::config::get_agent_dir),
+            project_trusted: options.project_trusted,
             queues: Arc::new(Mutex::new(Queues::new())),
             queued_deliveries: Vec::new(),
             compaction_run: None,
@@ -466,6 +474,38 @@ impl InteractiveMode {
             theme_scheme_reports,
             theme_query_start,
         }
+    }
+
+    /// Arms the theme controller's terminal plumbing: the mode-2031 scheme
+    /// listener, then the initial color query with its late-reply sink. The
+    /// closures cannot borrow the mode, so they queue into the mode's
+    /// report lists. Returns the query's start instant — the deadline clock.
+    fn arm_theme_queries(
+        tui: &mut Tui,
+        auto_sync: bool,
+        late_reports: &Arc<Mutex<Vec<TerminalColors>>>,
+        scheme_reports: &Arc<Mutex<Vec<TerminalColorScheme>>>,
+    ) -> Option<Instant> {
+        // Mode-2031 reports reach the controller through a listener the TUI
+        // dispatches (`bindTerminalColorSchemeListener`).
+        let scheme_queue = Arc::clone(scheme_reports);
+        tui.add_color_scheme_listener(Arc::new(move |scheme| {
+            if let Ok(mut pending) = scheme_queue.lock() {
+                pending.push(scheme);
+            }
+        }));
+        // The initial color query (`applyFromSettings` →
+        // `requestTerminalColors`); late replies ride the sink.
+        let query_start = Some(Instant::now());
+        let late_queue = Arc::clone(late_reports);
+        let sink = Box::new(move |colors: TerminalColors| {
+            if let Ok(mut pending) = late_queue.lock() {
+                pending.push(colors);
+            }
+        });
+        let _ = tui.query_terminal_colors(100, Some(sink));
+        tui.set_color_scheme_notifications(auto_sync);
+        query_start
     }
 
     /// The `/`-commands offered by autocomplete (`createBaseAutocompleteProvider`,
@@ -513,6 +553,7 @@ impl InteractiveMode {
                     if items.is_empty() { None } else { Some(items) }
                 })),
             autocomplete::SlashCommand::new("compact", "Manually compact the session context"),
+            autocomplete::SlashCommand::new("trust", "Show the project trust options"),
             autocomplete::SlashCommand::new("thinking", "Set thinking level")
                 .with_argument_hint("<level>")
                 .with_argument_completions(Arc::new(|prefix: &str| {
@@ -943,6 +984,11 @@ impl InteractiveMode {
         }
         if let Some(rest) = text.strip_prefix("/model") {
             self.handle_model_command(rest.trim());
+            return;
+        }
+        // `/trust` (`interactive-mode.ts:2736-2739`).
+        if text == "/trust" {
+            self.open_trust_selector();
             return;
         }
         // `/compact [instructions]` (`interactive-mode.ts:3434-3439`).
@@ -1412,6 +1458,41 @@ impl InteractiveMode {
         let editor = self.suspended_editor.take().expect("suspended editor");
         let _ = self.tui.replace_child(EDITOR_INDEX, editor);
         self.model_selector_events = None;
+        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
+        self.tui.request_render();
+    }
+
+    /// Mount the `/trust` selector in the editor's tree slot
+    /// (`showTrustSelector`, `interactive-mode.ts:4567-4589`).
+    fn open_trust_selector(&mut self) {
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let cwd = self.session.get_cwd().to_path_buf();
+        let store = ProjectTrustStore::new(&self.agent_dir);
+        let saved_decision = store.get_entry(&cwd).ok().flatten();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let selector = TrustSelectorComponent::new(
+            &cwd,
+            saved_decision,
+            self.project_trusted,
+            Arc::clone(&events),
+        );
+        let editor = self.tui.replace_child(EDITOR_INDEX, Box::new(selector));
+        self.suspended_editor = Some(editor);
+        self.trust_selector_events = Some(events);
+        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
+        self.tui.request_render();
+    }
+
+    /// Put the editor back after a trust decision or a cancel.
+    fn close_trust_selector(&mut self) {
+        if self.suspended_editor.is_none() {
+            return;
+        }
+        let editor = self.suspended_editor.take().expect("suspended editor");
+        let _ = self.tui.replace_child(EDITOR_INDEX, editor);
+        self.trust_selector_events = None;
         self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
         self.tui.request_render();
     }
@@ -1899,6 +1980,75 @@ impl InteractiveMode {
         }
     }
 
+    /// The model-selector drain (`showSelector`'s onSelect/onCancel
+    /// callbacks). Takes the queued events out first, so the mutex guard
+    /// does not pin `self` across the handlers.
+    fn pump_model_selector(&mut self) {
+        if self.model_selector_events.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .model_selector_events
+                .as_ref()
+                .expect("selector")
+                .lock()
+                .expect("selector events"),
+        );
+        for event in events {
+            match event {
+                ModelSelectorEvent::Selected(model) => {
+                    self.close_model_selector();
+                    if let Err(error) = self.apply_model(model) {
+                        self.show_error(&error);
+                    } else {
+                        self.show_status(&format!("Model: {}", self.model.id));
+                    }
+                }
+                ModelSelectorEvent::Cancelled => self.close_model_selector(),
+            }
+        }
+    }
+
+    /// The `/trust` selector's drain (`showTrustSelector`'s
+    /// onSelect/onCancel): the decision persists to trust.json and the
+    /// status tells the user a restart applies it.
+    fn pump_trust_selector(&mut self) {
+        if self.trust_selector_events.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .trust_selector_events
+                .as_ref()
+                .expect("trust selector")
+                .lock()
+                .expect("trust selector events"),
+        );
+        for event in events {
+            match event {
+                TrustSelectorEvent::Select { trusted, updates } => {
+                    self.close_trust_selector();
+                    let store = ProjectTrustStore::new(&self.agent_dir);
+                    match store.set_many(&updates) {
+                        Ok(()) => {
+                            let label = if trusted { "trusted" } else { "untrusted" };
+                            self.show_status(&format!(
+                                "Saved trust decision: {label}. Restart {} for this to take effect.",
+                                crate::config::APP_NAME
+                            ));
+                        }
+                        Err(error) => self.show_error(&error),
+                    }
+                }
+                TrustSelectorEvent::Cancel => {
+                    self.close_trust_selector();
+                    self.tui.request_render();
+                }
+            }
+        }
+    }
+
     /// One loop iteration without terminal input: editor events, agent
     /// events, spinner frames. `run` calls this between input polls; the
     /// scripted tests drive it directly with a capture terminal.
@@ -1916,31 +2066,10 @@ impl InteractiveMode {
             }
         }
 
-        // Selector events, drained through the Arc the component publishes to
-        // (`showSelector`'s onSelect/onCancel callbacks).
-        if self.model_selector_events.is_some() {
-            let events = std::mem::take(
-                &mut *self
-                    .model_selector_events
-                    .as_ref()
-                    .expect("selector")
-                    .lock()
-                    .expect("selector events"),
-            );
-            for event in events {
-                match event {
-                    ModelSelectorEvent::Selected(model) => {
-                        self.close_model_selector();
-                        if let Err(error) = self.apply_model(model) {
-                            self.show_error(&error);
-                        } else {
-                            self.show_status(&format!("Model: {}", self.model.id));
-                        }
-                    }
-                    ModelSelectorEvent::Cancelled => self.close_model_selector(),
-                }
-            }
-        }
+        // Selector events, drained through the Arcs the components publish
+        // to (`showSelector`'s onSelect/onCancel callbacks).
+        self.pump_model_selector();
+        self.pump_trust_selector();
 
         // Agent events, without blocking the input loop: collect first,
         // then handle, so the run borrow ends before the handlers run.
@@ -2968,6 +3097,65 @@ mod tests {
         mode.pump();
         assert!(mode.suspended_editor.is_none(), "editor not restored");
         assert_eq!(mode.model.id, "test-model");
+    }
+
+    #[test]
+    fn trust_selector_saves_the_decision_and_restores_the_editor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let mut runtime = test_runtime(
+            dir.path(),
+            Arc::new(ScriptedStream {
+                calls: AtomicUsize::new(0),
+                file_path: "unused".to_string(),
+            }),
+        );
+        let options = InteractiveOptions {
+            auth_path: Some(dir.path().join("auth.json")),
+            agent_dir: Some(agent_dir.path().to_path_buf()),
+            ..InteractiveOptions::default()
+        };
+        let terminal = CaptureTerminal::with_size(TerminalSize {
+            columns: 100,
+            rows: 40,
+        });
+        let capture = terminal.capture();
+        let mut mode = InteractiveMode::new(&mut runtime, &options, Box::new(terminal));
+        mode.tui.start().expect("tui start");
+
+        // `/trust` opens the selector in the editor slot.
+        mode.submit("/trust");
+        mode.tui.render_now(false);
+        assert!(mode.suspended_editor.is_some(), "selector not mounted");
+        let selector = mode
+            .downcast_tree::<TrustSelectorComponent>(EDITOR_INDEX)
+            .expect("selector in the editor slot");
+        let rendered = strip_terminal_sequences(&selector.render(100).join("\n"));
+        assert!(rendered.contains("Project trust"), "{rendered}");
+
+        // Confirming the highlighted "Trust" option persists the decision to
+        // the injected agent dir and reports the restart note.
+        mode.trust_selector_events
+            .as_ref()
+            .expect("trust events")
+            .lock()
+            .expect("trust events lock")
+            .push(TrustSelectorEvent::Select {
+                trusted: true,
+                updates: crate::cli::project_trust::project_trust_options(dir.path())[0]
+                    .updates
+                    .clone(),
+            });
+        mode.pump();
+        assert!(mode.suspended_editor.is_none(), "editor not restored");
+        mode.tui.render_now(false);
+        let frame = strip_terminal_sequences(&capture.output());
+        assert!(
+            frame.contains("Saved trust decision: trusted. Restart pi for this to take effect."),
+            "{frame}"
+        );
+        let store = ProjectTrustStore::new(agent_dir.path());
+        assert_eq!(store.get(dir.path()), Ok(Some(true)));
     }
 
     #[test]

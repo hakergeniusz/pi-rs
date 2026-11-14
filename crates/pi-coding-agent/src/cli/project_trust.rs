@@ -70,6 +70,16 @@ impl ProjectTrustStore {
         Ok(find_nearest_trust_entry(&data, cwd))
     }
 
+    /// `getEntry`: the nearest recorded ancestor decision with the path that
+    /// recorded it — the trust selector's "saved decision" display.
+    ///
+    /// # Errors
+    /// When `trust.json` exists but cannot be parsed.
+    pub fn get_entry(&self, cwd: &Path) -> Result<Option<(String, bool)>, String> {
+        let data = self.read()?;
+        Ok(find_nearest_trust_entry_with_path(&data, cwd))
+    }
+
     /// `set(cwd, decision)`.
     ///
     /// # Errors
@@ -153,10 +163,17 @@ impl ProjectTrustStore {
 /// `findNearestTrustEntry`: walk from the cwd upward; the first recorded
 /// ancestor wins.
 fn find_nearest_trust_entry(data: &BTreeMap<String, bool>, cwd: &Path) -> Option<bool> {
+    find_nearest_trust_entry_with_path(data, cwd).map(|(_, decision)| decision)
+}
+
+fn find_nearest_trust_entry_with_path(
+    data: &BTreeMap<String, bool>,
+    cwd: &Path,
+) -> Option<(String, bool)> {
     let mut current = canonical_dir(cwd);
     loop {
         if let Some(decision) = data.get(&current) {
-            return Some(*decision);
+            return Some((current, *decision));
         }
         let parent = PathBuf::from(&current)
             .parent()
@@ -166,6 +183,64 @@ fn find_nearest_trust_entry(data: &BTreeMap<String, bool>, cwd: &Path) -> Option
         }
         current = parent;
     }
+}
+
+/// `getProjectTrustParentPath` (`trust-manager.ts:41-44`): the parent
+/// directory's store key, unless `cwd` already is the root.
+pub fn project_trust_parent_path(cwd: &Path) -> Option<String> {
+    let trust_path = canonical_dir(cwd);
+    let parent = Path::new(&trust_path)
+        .parent()
+        .map_or_else(|| trust_path.clone(), canonical_dir);
+    if parent == trust_path {
+        None
+    } else {
+        Some(parent)
+    }
+}
+
+/// One option row: `ProjectTrustOption` (`trust-manager.ts:30-36`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrustOption {
+    pub label: String,
+    pub trusted: bool,
+    /// `(path, decision)` pairs `set_many` applies on confirm; `None`
+    /// deletes the entry.
+    pub updates: Vec<(PathBuf, Option<bool>)>,
+    /// The store path that would hold the decision, when one would.
+    pub saved_path: Option<String>,
+}
+
+/// `getProjectTrustOptions` (`trust-manager.ts:46-76`): trust, trust the
+/// parent folder (when there is one, deleting the project's own entry so
+/// the parent's decision applies), do not trust. Upstream's session-only
+/// variants exist for startup prompts; `/trust` omits them.
+pub fn project_trust_options(cwd: &Path) -> Vec<TrustOption> {
+    let trust_path = canonical_dir(cwd);
+    let mut options = vec![TrustOption {
+        label: "Trust".to_string(),
+        trusted: true,
+        updates: vec![(PathBuf::from(&trust_path), Some(true))],
+        saved_path: Some(trust_path.clone()),
+    }];
+    if let Some(parent_path) = project_trust_parent_path(cwd) {
+        options.push(TrustOption {
+            label: format!("Trust parent folder ({parent_path})"),
+            trusted: true,
+            updates: vec![
+                (PathBuf::from(&parent_path), Some(true)),
+                (PathBuf::from(&trust_path), None),
+            ],
+            saved_path: Some(parent_path),
+        });
+    }
+    options.push(TrustOption {
+        label: "Do not trust".to_string(),
+        trusted: false,
+        updates: vec![(PathBuf::from(&trust_path), Some(false))],
+        saved_path: Some(trust_path),
+    });
+    options
 }
 
 /// `normalizeCwd` (`trust-manager.ts:41-43`): resolve the real path when the

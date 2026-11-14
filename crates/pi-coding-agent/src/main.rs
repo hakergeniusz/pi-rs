@@ -269,19 +269,21 @@ fn run_print(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32
 /// along like upstream's `initialMessage` (P6 part 2).
 fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
     let mut runtime = build_runtime(args, cwd, cwd_string)?;
+    // The trust ladder resolved once: the selector displays the session's
+    // state and the theme seeding uses the same settings access.
+    let agent_dir = config::get_agent_dir();
+    let trust_store = ProjectTrustStore::new(&agent_dir);
+    let project_trusted = resolve_project_trusted(&ResolveProjectTrustedOptions {
+        cwd,
+        store: &trust_store,
+        trust_override: args.project_trust_override,
+        default_project_trust: None,
+    })
+    .unwrap_or(false);
     // The theme setting seeds the controller: `--use-theme` wins, else
     // settings.json's `theme` (upstream passes the settings manager into the
     // mode; the port funnels the resolved setting through options).
     let theme_name = args.use_theme.clone().or_else(|| {
-        let agent_dir = config::get_agent_dir();
-        let trust_store = ProjectTrustStore::new(&agent_dir);
-        let project_trusted = resolve_project_trusted(&ResolveProjectTrustedOptions {
-            cwd,
-            store: &trust_store,
-            trust_override: args.project_trust_override,
-            default_project_trust: None,
-        })
-        .ok()?;
         let settings = SettingsManager::create(
             cwd,
             &agent_dir,
@@ -298,6 +300,8 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
         version: env!("CARGO_PKG_VERSION").to_string(),
         theme_name,
         auth_path: None,
+        agent_dir: None,
+        project_trusted,
     };
     pi_coding_agent::modes::interactive::interactive_mode::run_interactive_mode(
         &mut runtime,
