@@ -96,7 +96,8 @@ pub struct SubmenuClose {
 pub struct SubmenuDone(Arc<Mutex<Option<SubmenuClose>>>);
 
 impl SubmenuDone {
-    fn new() -> Self {
+    /// An empty mailbox. Hosts and tests create one to hand to a factory.
+    pub fn new() -> Self {
         Self(Arc::new(Mutex::new(None)))
     }
 
@@ -108,7 +109,9 @@ impl SubmenuDone {
         });
     }
 
-    fn take(&self) -> Option<SubmenuClose> {
+    /// Take the pending close, if any. Tests and hosts read what a submenu
+    /// delivered.
+    pub fn take_close(&self) -> Option<SubmenuClose> {
         self.0.lock().expect("submenu done").take()
     }
 }
@@ -369,7 +372,7 @@ impl SettingsList {
         let Some(done) = &self.submenu_done else {
             return SettingsListAction::None;
         };
-        match done.take() {
+        match done.take_close() {
             Some(close) => self.close_submenu(close),
             None => SettingsListAction::None,
         }

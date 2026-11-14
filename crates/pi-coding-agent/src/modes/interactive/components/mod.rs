@@ -9,6 +9,7 @@ pub mod compaction_summary;
 pub mod footer;
 pub mod header;
 pub mod model_selector;
+pub mod settings_submenu;
 pub mod status_indicator;
 pub mod tool_execution;
 pub mod trust_selector;

@@ -263,6 +263,48 @@ pub fn select_list_theme() -> pi_tui::components::select_list::SelectListTheme {
     }
 }
 
+/// `getSettingsListTheme` (`theme.ts:908-916`).
+pub fn settings_list_theme() -> pi_tui::components::settings_list::SettingsListTheme {
+    use pi_tui::theme::ThemeColor as C;
+    let theme = theme();
+    pi_tui::components::settings_list::SettingsListTheme {
+        label: {
+            let styler = theme.fg_styler(C::Accent);
+            Arc::new(move |text: &str, selected: bool| {
+                if selected {
+                    styler(text)
+                } else {
+                    text.to_string()
+                }
+            })
+        },
+        value: {
+            let accent = theme.fg_styler(C::Accent);
+            let muted = theme.fg_styler(C::Muted);
+            Arc::new(
+                move |text: &str, selected: bool| {
+                    if selected { accent(text) } else { muted(text) }
+                },
+            )
+        },
+        description: theme.fg_styler(C::Dim),
+        cursor: theme.fg(C::Accent, "→ "),
+        hint: theme.fg_styler(C::Dim),
+    }
+}
+
+/// `getAvailableThemes` (`theme.ts`): the system theme plus every loadable
+/// theme from the custom themes directory. The same paths
+/// [`load_theme_by_name`] resolves against.
+pub fn available_theme_names() -> Vec<String> {
+    let paths = pi_tui::theme::ThemePaths::new("/nonexistent", custom_themes_dir());
+    let registry = pi_tui::theme::ThemeRegistry::new();
+    pi_tui::theme::available_themes(&paths, &registry)
+        .into_iter()
+        .map(|info| info.name)
+        .collect()
+}
+
 /// `getEditorTheme` (`theme.ts:1095-1100`).
 pub fn editor_theme() -> pi_tui::components::editor::EditorTheme {
     use pi_tui::theme::ThemeColor as C;
