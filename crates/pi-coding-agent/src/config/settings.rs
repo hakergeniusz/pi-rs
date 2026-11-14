@@ -384,7 +384,7 @@ impl FileSettingsStorage {
         FileSettingsStorage {
             global_path: agent_dir.join("settings.json"),
             project_path: cwd
-                .join(crate::config::CONFIG_DIR_NAME)
+                .join(crate::config::PROJECT_CONFIG_DIR_NAME)
                 .join("settings.json"),
         }
     }
@@ -561,7 +561,7 @@ impl SettingsManager {
         paths.insert(
             SettingsScope::Project,
             resolved_cwd
-                .join(crate::config::CONFIG_DIR_NAME)
+                .join(crate::config::PROJECT_CONFIG_DIR_NAME)
                 .join("settings.json"),
         );
         SettingsManager::from_storage_with_paths(storage, options, paths)

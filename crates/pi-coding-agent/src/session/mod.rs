@@ -6,9 +6,10 @@
 //!
 //! Entries form a tree via `id`/`parentId`; the "leaf" pointer tracks the
 //! current position and `branch` moves it without rewriting history. Sessions
-//! load from and persist to `~/.pi/agent/sessions/--<cwd>--/<ts>_<id>.jsonl`
-//! (override the root with `PI_CODING_AGENT_DIR` /
-//! `PI_CODING_AGENT_SESSION_DIR` via [`crate::config`]).
+//! load from and persist to
+//! `~/.local/share/pi-rs/sessions/--<cwd>--/<ts>_<id>.jsonl` under the XDG
+//! defaults (upstream: `~/.pi/agent/sessions/...`; override the root with
+//! `PI_CODING_AGENT_DIR` / `PI_CODING_AGENT_SESSION_DIR` via [`crate::config`]).
 //!
 //! Layout:
 //!

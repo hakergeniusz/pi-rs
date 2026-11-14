@@ -221,39 +221,25 @@ pub fn parent_environment() -> Vec<(String, String)> {
     std::env::vars().collect()
 }
 
-/// pi's `getBinDir` (`config.ts:597-599`): `<agent dir>/bin`, where pi
-/// installs the shims a session's own `pi` resolves to. Local mirror of
-/// `config.ts` until the config module lands.
+/// pi's `getBinDir` (`config.ts:597-599`): where pi installs the shims a
+/// session's own `pi` resolves to. Delegated to
+/// [`crate::config::get_bin_dir`] — the XDG cache root by default, the agent
+/// dir when `PI_CODING_AGENT_DIR` is set.
 pub fn bin_dir() -> PathBuf {
-    agent_dir().join("bin")
+    crate::config::get_bin_dir()
 }
 
 /// pi's `CONFIG_DIR_NAME` (`config.ts:606`): the project config directory,
-/// `.pi` unless the package config renames it.
-pub const CONFIG_DIR_NAME: &str = ".pi";
+/// `.pi` unless the package config renames it. Aliased from
+/// [`crate::config::PROJECT_CONFIG_DIR_NAME`] so there is one source of
+/// truth; the user-level XDG leaf is `crate::config::CONFIG_DIR_NAME`.
+pub const CONFIG_DIR_NAME: &str = crate::config::PROJECT_CONFIG_DIR_NAME;
 
-/// pi's `getAgentDir` (`config.ts:630-635`): `$PI_CODING_AGENT_DIR` when set,
-/// else `~/.pi/agent`.
+/// pi's `getAgentDir` (`config.ts:630-635`), delegated to
+/// [`crate::config::get_agent_dir`]: `$PI_CODING_AGENT_DIR` when set, else
+/// the XDG config root (upstream: `~/.pi/agent`).
 pub fn agent_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("PI_CODING_AGENT_DIR") {
-        return expand_tilde(&dir.to_string_lossy());
-    }
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
-    home.join(CONFIG_DIR_NAME).join("agent")
-}
-
-/// pi's `expandTildePath` (`config.ts:618-620`) — tilde expansion.
-fn expand_tilde(path: &str) -> PathBuf {
-    if path == "~" {
-        return std::env::var_os("HOME").map_or_else(|| PathBuf::from(path), PathBuf::from);
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return std::env::var_os("HOME").map_or_else(
-            || PathBuf::from(path),
-            |home| PathBuf::from(home).join(rest),
-        );
-    }
-    PathBuf::from(path)
+    crate::config::get_agent_dir()
 }
 
 /// pi's `getShellEnv` (`utils/shell.ts:138-151`): the process environment with

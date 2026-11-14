@@ -1,7 +1,7 @@
 # Handoff: Pi in Rust (`pi-rs`)
 
 > Written 2026-11-11, updated same day after gate attempts. Repo: `/home/hakergeniusz/Projects/pi-rs` on `acer`.
-> **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). **`main` = P0–P5-part-1 + codex adapter + interactive TUI (parts 1+2a); E2E PROVEN LIVE** — `pi -p` smoke test PASSED 2026-11-14 (PONG / read-tool round-trip ALBATROSS / JSON event mode) with the openai-codex stored OAuth credential and default model `openai-codex/gpt-6-luna`; required (1) a new `openai-codex-responses` adapter in pi-ai (`8efb00b`) and (2) the agent loop driven on a process-wide tokio runtime (`4c4d62c`, was futures::executor::block_on → "no reactor running"). — landing fast-forwarded `39b22ad..37782d1` on 2026-11-14; first landing CI failed only because ubuntu-latest ships **neither rg nor fd** (12 grep tests: `which("rg")` failed) → fixed in ci.yml (`8c6d178`, installs `ripgrep` + `fd-find`); CI run `43578686739` on `8c6d178` = **ok**. Interactive TUI landed `27769a9..500302b` + part 2a `8ae806d` on 2026-11-14 (see P6 sections). `wip/p4-pre-gate` == `main`; local checkout is ON `wip/p4-pre-gate`.
+> **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). **`main` = P0–P5-part-1 + codex adapter + interactive TUI (parts 1+2a) + XDG paths; E2E PROVEN LIVE** — `pi -p` smoke test PASSED 2026-11-14 (PONG / read-tool round-trip ALBATROSS / JSON event mode) with the openai-codex stored OAuth credential and default model `openai-codex/gpt-6-luna`; required (1) a new `openai-codex-responses` adapter in pi-ai (`8efb00b`) and (2) the agent loop driven on a process-wide tokio runtime (`4c4d62c`, was futures::executor::block_on → "no reactor running"). — landing fast-forwarded `39b22ad..37782d1` on 2026-11-14; first landing CI failed only because ubuntu-latest ships **neither rg nor fd** (12 grep tests: `which("rg")` failed) → fixed in ci.yml (`8c6d178`, installs `ripgrep` + `fd-find`); CI run `43578686739` on `8c6d178` = **ok**. Interactive TUI landed `27769a9..500302b` + part 2a `8ae806d` on 2026-11-14 (see P6 sections). `wip/p4-pre-gate` == `main`; local checkout is ON `wip/p4-pre-gate`.
 > ALL development happens on `acer` (per user). Reference checkout: `/tmp/ai-agent/pi` on `acer` — **WIPED (tmpfs); re-clone before P5 work: `gh repo clone earendil-works/pi /tmp/ai-agent/pi`** (was @ `b22e525b3`).
 
 ## Goal
@@ -233,6 +233,44 @@ ported (P3) — the gap was entirely the coding-agent layer.
 - `Tui::do_render` already contained the main-screen differential
   renderer (P3 port of `tui-main-screen.ts`) — no new main-screen port
   was needed.
+
+## XDG paths (landed on `feat/xdg-paths`, 2026-11-14)
+
+User request: "Make it use its own path that follows XDG rules" — pi-rs must
+not touch the real TypeScript pi's `~/.pi` (the user runs real pi heavily).
+
+- `config.rs` rewritten as the single XDG resolver. Roles: **config**
+  `$XDG_CONFIG_HOME/pi-rs` else `~/.config/pi-rs` (settings, auth, models,
+  themes, prompts, tools, skills, trust); **data** `~/.local/share/pi-rs`
+  (sessions); **cache** `~/.cache/pi-rs` (managed fd/rg); **state**
+  `~/.local/state/pi-rs` (debug log). XDG values must be absolute + non-empty
+  else the default applies (per spec). `PI_CODING_AGENT_DIR` collapses every
+  role into one dir — upstream's exact single-dir layout when set.
+  `PI_CODING_AGENT_SESSION_DIR` unchanged. Pure cores (`xdg_base_dir_for`,
+  `config_dir_for`, `agent_dir_for(env, xdg, home)`, `sessions_dir_for`,
+  `bin_dir_for`, `debug_log_path_for`) take env as `Option<&str>` — no
+  `set_var` in tests (edition 2024 / cross-thread races).
+- `CONFIG_DIR_NAME` = `"pi-rs"` (user XDG leaf); NEW
+  `PROJECT_CONFIG_DIR_NAME` = `".pi"` for project-local dirs. Project-scope
+  users of the old constant switched: `settings.rs` (×2), `project_trust.rs`;
+  `tools::CONFIG_DIR_NAME` now aliases `PROJECT_CONFIG_DIR_NAME`.
+  `args.rs --help` env table updated.
+- `tools/mod.rs`: `agent_dir()` delegates to `config::get_agent_dir()`;
+  `bin_dir()` to `config::get_bin_dir()`; local `expand_tilde` deleted
+  (duplicate of config's). Session layout: `default_session_dir_path(cwd,
+  sessions_dir)` now takes the SESSIONS ROOT (was agent dir + internal
+  `join("sessions")`); all callers pass `get_sessions_dir()`;
+  `SessionLayout::from_env` removed (zero callers; semantics didn't survive
+  the role split — sessions no longer hang off the agent dir).
+- **Deliberate deviation, no migration**: pi-rs will not read or write `~/.pi`
+  at all. File formats stay byte-compatible; the root moves. README "Paths"
+  section documents the table.
+- Verified: workspace gate green (clippy -D warnings, all tests, fmt);
+  real-PTY smoke (`/tmp/pi-rs-xdg-smoke.py`, driver outside the repo) with a
+  synthetic HOME and all XDG_*/PI_CODING_AGENT_* unset — session dir created
+  under `<home>/.local/share/pi-rs/sessions/--<cwd>--/`, **no `<home>/.pi`
+  created**. (Session *file* is created lazily on first append — empty exit
+  leaves only the dir; pre-existing part-1 behavior, unchanged.)
 
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages

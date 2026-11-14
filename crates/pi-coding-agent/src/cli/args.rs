@@ -625,7 +625,7 @@ pub fn print_help() {
     println!("  DEEPSEEK_API_KEY                 - DeepSeek API key");
     println!("  OPENROUTER_API_KEY               - OpenRouter API key");
     println!(
-        "  {:<32} - Config directory (default: ~/{}/agent)",
+        "  {:<32} - Agent dir override: all state under one dir (default: XDG roots like ~/.config/{})",
         crate::config::ENV_AGENT_DIR,
         crate::config::CONFIG_DIR_NAME
     );

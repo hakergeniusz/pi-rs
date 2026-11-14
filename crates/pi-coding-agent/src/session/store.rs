@@ -169,23 +169,22 @@ pub fn create_session_id() -> String {
 // Session layout
 // ---------------------------------------------------------------------------
 
-/// Where session files live for one agent dir.
+/// Where session files live for one parent directory.
+///
+/// Under the XDG layout the sessions root is
+/// `~/.local/share/pi-rs/sessions` (or the agent override's `sessions/`),
+/// not the config root — see [`crate::config::get_sessions_dir`].
 #[derive(Clone, Debug)]
 pub struct SessionLayout {
     agent_dir: PathBuf,
 }
 
 impl SessionLayout {
-    /// Pin the layout to an explicit agent dir (tests pass a tempdir).
+    /// Pin the layout to an explicit parent dir (tests pass a tempdir).
     pub fn new(agent_dir: impl Into<PathBuf>) -> Self {
         Self {
             agent_dir: agent_dir.into(),
         }
-    }
-
-    /// [`crate::config::get_agent_dir`] based layout.
-    pub fn from_env() -> Self {
-        Self::new(crate::config::get_agent_dir())
     }
 
     /// The agent dir this layout resolves against.
@@ -242,19 +241,19 @@ impl SessionLayout {
 }
 
 /// `getDefaultSessionDirPath` (`:590-595`): encode the cwd into a safe
-/// directory name under `<agentDir>/sessions/`.
-pub fn default_session_dir_path(cwd: &Path, agent_dir: &Path) -> PathBuf {
+/// directory name under the given sessions root. Upstream builds this off
+/// `getSessionsDir()`, so pass [`crate::config::get_sessions_dir`] (which
+/// follows the XDG data root / both env overrides).
+pub fn default_session_dir_path(cwd: &Path, sessions_dir: &Path) -> PathBuf {
     let resolved_cwd = resolve_path(cwd);
-    let resolved_agent_dir = resolve_path(agent_dir);
-    resolved_agent_dir
-        .join("sessions")
-        .join(SessionLayout::dir_name(&resolved_cwd))
+    let resolved_sessions_dir = resolve_path(sessions_dir);
+    resolved_sessions_dir.join(SessionLayout::dir_name(&resolved_cwd))
 }
 
 /// `getDefaultSessionDir` (`:597-603`): create the per-cwd directory when
 /// missing, then return it.
 pub fn default_session_dir(cwd: &Path) -> SessionResult<PathBuf> {
-    let dir = default_session_dir_path(cwd, &crate::config::get_agent_dir());
+    let dir = default_session_dir_path(cwd, &crate::config::get_sessions_dir());
     fs::create_dir_all(&dir).map_err(|source| SessionError::Io {
         action: "create session dir",
         path: dir.clone(),
@@ -1110,7 +1109,7 @@ impl SessionManager {
         let filter_cwd = session_dir.is_some()
             && !paths_equal(
                 &dir,
-                &default_session_dir_path(cwd, &crate::config::get_agent_dir()),
+                &default_session_dir_path(cwd, &crate::config::get_sessions_dir()),
             );
         let most_recent = find_most_recent_session(&dir, filter_cwd.then_some(cwd));
         Self::construct(
@@ -1227,7 +1226,7 @@ impl SessionManager {
         let filter_cwd = session_dir.is_some()
             && !paths_equal(
                 &dir,
-                &default_session_dir_path(cwd, &crate::config::get_agent_dir()),
+                &default_session_dir_path(cwd, &crate::config::get_sessions_dir()),
             );
         let resolved_cwd = resolve_path(cwd);
         let entries = fs::read_dir(&dir).ok()?;
@@ -1264,7 +1263,7 @@ impl SessionManager {
         let filter_cwd = session_dir.is_some()
             && !paths_equal(
                 &dir,
-                &default_session_dir_path(cwd, &crate::config::get_agent_dir()),
+                &default_session_dir_path(cwd, &crate::config::get_sessions_dir()),
             );
         let resolved_cwd = resolve_path(cwd);
         let sessions = if filter_cwd {
@@ -2246,7 +2245,7 @@ impl SessionManager {
     pub fn uses_default_session_dir(&self) -> bool {
         paths_equal(
             &self.session_dir,
-            &default_session_dir_path(&self.cwd, &crate::config::get_agent_dir()),
+            &default_session_dir_path(&self.cwd, &crate::config::get_sessions_dir()),
         )
     }
 

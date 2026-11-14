@@ -2,7 +2,7 @@
 
 A Rust rewrite of [Pi](https://github.com/earendil-works/pi) — the minimal,
 extensible agent harness — aiming for behavioral and on-disk compatibility
-(session JSONL v3, print/JSON/RPC output schemas, `~/.pi` config directories).
+(session JSONL v3, print/JSON/RPC output schemas, project `.pi/` layout).
 
 **Status: pre-alpha.** The core pipeline is proven end-to-end against a live
 provider (`pi -p` prompt → answer, tool round-trips, JSON event mode), and bare
@@ -27,8 +27,9 @@ and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
   path completion), the `/model` selector dialog, ctrl+p model cycling,
   steering/follow-up message queues (enter / alt+enter / alt+up), `!`/`!!`
   bash mode, and session persistence (shutdown prints the resume command).
-- **Sessions** — JSONL v3 transcript store under `~/.pi`, byte-compatible on
-  the synthetic-fixture surface (golden fixtures from the TS pi still pending).
+- **Sessions** — JSONL v3 transcript store under the XDG data root
+  (`~/.local/share/pi-rs/sessions` by default), byte-compatible on the
+  synthetic-fixture surface (golden fixtures from the TS pi still pending).
 
 ## Crates
 
@@ -60,10 +61,30 @@ runs in CI on every push to `main`. Heavy builds should run in a
 memory-capped container; the interactive-mode tests need `fd` and `rg` on
 `PATH` (installed by CI, used via `which()` like upstream's `ensureTool`).
 
+## Paths
+
+pi-rs follows the [XDG Base Directory spec](https://specifications.freedesktop.org/basedir-spec/latest/)
+under a `pi-rs` leaf, so it never touches a real TypeScript pi install
+(`~/.pi`):
+
+| Role | Default | Contents |
+|---|---|---|
+| config | `~/.config/pi-rs` | `settings.json`, `auth.json`, `models.json`, `themes/`, `prompts/`, `tools/`, skills, `trust.json` |
+| data | `~/.local/share/pi-rs` | `sessions/` |
+| cache | `~/.cache/pi-rs` | managed binaries (fd, rg) |
+| state | `~/.local/state/pi-rs` | `pi-debug.log` |
+
+Each root honors its `XDG_*` env var when absolute. `PI_CODING_AGENT_DIR`
+(upstream's override) collapses every role into one directory — with it set,
+the layout is exactly upstream's. Project-local `.pi/` directories
+(`.pi/settings.json`, `.pi/skills/`, …) are upstream-compatible and
+unaffected.
+
 ## Ground rules
 
 - MIT licensed (original Pi by Mario Zechner is MIT; attribution preserved).
-- Session files, CLI output schemas and config dirs stay byte/shape-compatible
-  with the TypeScript implementation.
+- Session files and CLI output schemas stay byte/shape-compatible with the
+  TypeScript implementation; the user-level directory root is the one
+  deliberate deviation (XDG, see [Paths](#paths)).
 - Provider integration tests run only against free or local endpoints; test
   fixtures are synthetic and never touch real `~/.pi` credentials.

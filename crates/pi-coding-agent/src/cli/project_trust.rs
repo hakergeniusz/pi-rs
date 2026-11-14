@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::config::CONFIG_DIR_NAME;
+use crate::config::PROJECT_CONFIG_DIR_NAME;
 
 /// `TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES` (`trust-manager.ts:30-39`): the
 /// `.pi/` entries whose presence makes a project trust-gated.
@@ -194,7 +194,7 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 /// trust-requiring `.pi/` entries, or `.agents/skills` in the cwd or an
 /// ancestor (the user-global `$HOME/.agents/skills` never counts).
 pub fn has_trust_requiring_project_resources(cwd: &Path) -> bool {
-    let config_dir = cwd.join(CONFIG_DIR_NAME);
+    let config_dir = cwd.join(PROJECT_CONFIG_DIR_NAME);
     if TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES
         .iter()
         .any(|entry| config_dir.join(entry).exists())
