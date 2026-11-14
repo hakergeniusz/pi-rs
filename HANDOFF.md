@@ -1,7 +1,7 @@
 # Handoff: Pi in Rust (`pi-rs`)
 
 > Written 2026-11-11, updated same day after gate attempts. Repo: `/home/hakergeniusz/Projects/pi-rs` on `acer`.
-> **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). **`main` = P0–P5-part-1 + codex adapter; E2E PROVEN LIVE** — `pi -p` smoke test PASSED 2026-11-14 (PONG / read-tool round-trip ALBATROSS / JSON event mode) with the openai-codex stored OAuth credential and default model `openai-codex/gpt-6-luna`; required (1) a new `openai-codex-responses` adapter in pi-ai (`8efb00b`) and (2) the agent loop driven on a process-wide tokio runtime (`4c4d62c`, was futures::executor::block_on → "no reactor running"). — landing fast-forwarded `39b22ad..37782d1` on 2026-11-14; first landing CI failed only because ubuntu-latest ships **neither rg nor fd** (12 grep tests: `which("rg")` failed) → fixed in ci.yml (`8c6d178`, installs `ripgrep` + `fd-find`); CI run `43578686739` on `8c6d178` = **ok**. `wip/p4-pre-gate` == `main`; local checkout is ON `wip/p4-pre-gate`.
+> **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). **`main` = P0–P5-part-1 + codex adapter + interactive TUI; E2E PROVEN LIVE** — `pi -p` smoke test PASSED 2026-11-14 (PONG / read-tool round-trip ALBATROSS / JSON event mode) with the openai-codex stored OAuth credential and default model `openai-codex/gpt-6-luna`; required (1) a new `openai-codex-responses` adapter in pi-ai (`8efb00b`) and (2) the agent loop driven on a process-wide tokio runtime (`4c4d62c`, was futures::executor::block_on → "no reactor running"). — landing fast-forwarded `39b22ad..37782d1` on 2026-11-14; first landing CI failed only because ubuntu-latest ships **neither rg nor fd** (12 grep tests: `which("rg")` failed) → fixed in ci.yml (`8c6d178`, installs `ripgrep` + `fd-find`); CI run `43578686739` on `8c6d178` = **ok**. Interactive TUI landed `27769a9..500302b` on 2026-11-14 (see P6 section). `wip/p4-pre-gate` == `main`; local checkout is ON `wip/p4-pre-gate`.
 > ALL development happens on `acer` (per user). Reference checkout: `/tmp/ai-agent/pi` on `acer` — **WIPED (tmpfs); re-clone before P5 work: `gh repo clone earendil-works/pi /tmp/ai-agent/pi`** (was @ `b22e525b3`).
 
 ## Goal
@@ -17,6 +17,7 @@ Rewrite Pi (earendil-works/pi — TypeScript coding-agent harness monorepo, ~236
 | P3 | `pi-tui` full TUI crate (~40.5K lines, 17 components, themes, keys, alt screen) | ✅ committed `39b22ad` — 740 workspace tests, clippy all+pedantic clean, fmt clean |
 | P4 | `pi-coding-agent`: config, auth, sessions (JSONL v3 byte-compat), built-in tools, system prompt, prompt templates, skills, CLI args, print mode (`pi -p`) | ✅ committed — gate green in-container (1205 tests, 44 targets), landed on `main` 2026-11-14 |
 | P5 | JSON/RPC modes, extensions seam, MCP client, trust, `@file`, OAuth | ⚠️ part 1 landed on `main` (`c8e1818` + reconciliation `a6b9934`); remainder open (rpc envelope, MCP server-manager/tool-bridge, package-manager, codemode, ext host, `defaultProjectTrust` getter) |
+| P6 | Interactive mode | ⚠️ **part 1 landed on `main` (`500302b`)** — regular chat TUI 1:1 (theme, components, orchestrator, themed renderers, CaptureTerminal e2e, real-PTY smoke); remainder open (fullscreen mode, autocomplete/selector dialogs, extensions, compaction, queues, mouse toggles, OSC theme query) |
 
 P4 detail (uncommitted, in working tree):
 - `src/session/` (`records.rs` byte-exact Record envelope + V8-exact JSON writer in `session/json.rs`, `store.rs` SessionManager, `migrate.rs` v1→v3, `mod.rs`), `src/auth.rs` (auth.json store, lock protocol, `$VAR`/`!cmd` config-value resolution), `src/config.rs` + `src/config/settings.rs` (SettingsManager).
@@ -90,10 +91,90 @@ Remaining before landing on `main` — **ALL DONE 2026-11-14**:
 2. ~~Real `pi -p` smoke test~~ **DONE 2026-11-14** — first true end-to-end proof PASSED: `pi -p "Reply with exactly: PONG"` → `PONG`; read-tool round-trip → `ALBATROSS`; `--mode json` → correct JSONL wire. (Working binary: build in the container, `podman cp` out, run from a temp dir with `--no-session`.)
 3. Golden session fixtures from the TS pi (byte-compat proof beyond synthetic fixtures).
 4. P5 remainder: reconcile `rpc.rs` against `rpc-entry.ts`; MCP server-manager + tool bridge into the agent registry, package-manager subset (`package-manager-cli.ts`, 41.6K), codemode sandbox (`pi-codemode` stub, blocked on host decision), extension runtime host (decision pending), `defaultProjectTrust` settings getter.
-5. **P6 — Interactive mode** (chat viewport, editor, slash commands, themes, /resume; the trust selector prompt lands here).
+5. ~~**P6 — Interactive mode**~~ **part 1 DONE 2026-11-14** (see P6 section below); part 2 remains.
 6. **P7 — Hardening** (compaction, cache warmer, crash log, signals/backpressure + stdin piping, release).
 
+## P6 progress — interactive chat TUI (part 1, landed `500302b` 2026-11-14)
+
+Bare `pi` (no args, stdout a TTY) now renders the 1:1 port of upstream's
+regular chat mode from `packages/coding-agent/src/modes/interactive/`
+(~4.4K lines added). The pi-tui framework and theme engine were already
+ported (P3) — the gap was entirely the coding-agent layer.
+
+- **`modes/interactive/theme.rs`** — global theme (`THEME` RwLock; see the
+  deadlock gotcha below), `init_theme`/`set_theme` with silent system
+  fallback, markdown/select-list/editor theme getters, chalk-equivalent
+  bold/italic/inverse helpers, `app_keys` module = `APP_KEYBINDINGS`
+  subset (escape interrupt, ctrl+c clear/×2-exit, ctrl+d exit-empty,
+  ctrl+z suspend, shift+tab thinking cycle, ctrl+p/ctrl+shift+p model
+  cycle, ctrl+o tools expand, ctrl+t thinking toggle), `keyHint` helpers.
+- **`modes/interactive/components/`** — `user_message` (Markdown on
+  UserMessageBg), `assistant_message` (streaming markdown-slot reuse,
+  thinking runs, hidden label, stop-reason footers), `tool_execution`
+  (pending/success/error backgrounds, `toolTimerText` port: final
+  duration wins, `Elapsed` while partial; `formatToolDuration` 4.2s /
+  1m 30s / 2h 3m 4s), `footer` (↑↓R W CH% $ / context% color thresholds
+  70/90 / right-aligned model ` • thinking level`), `header` (half-block
+  pi logo, BuiltInHeader compact↔expanded via ctrl+o), `status_indicator`
+  (Loader spinner in the editor's top border).
+- **`modes/interactive/interactive_mode.rs`** — the orchestrator: tree
+  [header, chat container, idle status, ChatEditor, footer]; agent run on
+  a worker thread (`run_agent_loop` + mpsc sink), editor-event queue for
+  submits/app-actions, spinner host-driven via `Loader::tick` every 80ms,
+  crossterm poll(25ms) input loop with `key_to_terminal_data`; commands
+  `/new /clear /exit /quit /model /thinking /theme` and `!`/`!!` bash;
+  shutdown prints `To resume this session: pi --session <id>`.
+- **`tools/renderers/`** — themed ports with `CallContext`/`ResultContext`
+  fn-pointer `ToolRenderers`: compact read classification (SKILL.md →
+  `[skill] dir`, AGENTS/CLAUDE.md → `read resource`), bash keep-end-5
+  preview, edit diff with LCS word diff + inverse highlighting
+  (`parse_diff_line` ports the upstream regex `^([+-\s])(\s*\d*)\s(.*)$`
+  WITH backtracking), write/grep/find/ls previews + truncation warnings.
+- **pi-tui seams** — `Editor.top_border_decorator` (the
+  `renderTopBorder` override), `Container::as_any_mut` opt-in so hosts
+  downcast typed children out of the tree.
+- **Tests** — CaptureTerminal e2e in `interactive_mode.rs`: real agent
+  loop + scripted `StreamFn` (tool-use turn calling `read` on a temp
+  file, then a final turn), driving submit→pump()→render; asserts header
+  hints, user message, both assistant turns, tool row call+result,
+  footer usage totals, session persistence. Plus a mid-run working-status
+  test and an app-actions (ctrl+o/ctrl+d) test.
+- **Real-PTY smoke PASSED 2026-11-14** — `/tmp/pi-rs-pty-smoke.py`
+  (openpty, winsize set BEFORE fork; `pty.fork` raced the size and
+  hung): temp HOME, synthetic `--api-key`, asserts logo half-blocks +
+  ctrl+o hint + interrupt hint, then ctrl+d exit + `To resume this
+  session:` line. Driver kept in /tmp, not committed.
+- **Gate green + CI green** (clippy all+pedantic -D warnings, 44 test
+  targets, fmt --check); landing CI run `43602314909` = **ok**.
+
+### P6 known deviations from upstream (documented in module docs)
+- No OSC terminal-color query yet (COLORFGBG → dark fallback); theme
+  controller lands in part 2.
+- No autocomplete/selector dialogs (/, /model open selectors are plain
+  text), no model cycling implementation (keys shown in hints), no
+  extension statuses in footer, no mouse toggles, no compaction UI, no
+  follow-up/steering queues (submit during a run shows a status line).
+- `!` bash runs synchronously (upstream streams via PTY) — P7.
+- No syntax highlighting in tool output (no grammars); edit diffs render
+  on result only (no live streaming preview).
+- `Tui::do_render` already contained the main-screen differential
+  renderer (P3 port of `tui-main-screen.ts`) — no new main-screen port
+  was needed.
+
 ## Gotchas / decisions
+- **Global-init deadlock pattern (hit 2026-11-14)**: `static RwLock<Option<T>>` +
+  `LOCK.read().clone().unwrap_or_else(|| init_that_writes())` deadlocks — the read
+  guard temporary lives until the statement ends, so the write inside the closure
+  blocks the same thread. Bind the guard in a block, drop, then init
+  (`interactive/theme.rs::theme()`). A test that forces the cold path
+  (`theme_lazy_init_from_cold_does_not_deadlock`) guards it.
+- **Interactive tests drove 6 first-run fixes** (they were never executed before —
+  the previous test run hung on the deadlock above): markdown cold-path slot never
+  called `set_text`; `format_tool_duration` missed `% 60` on minutes; `timer_text`
+  ordered `started_at` before the final-duration check (upstream: final duration
+  wins first); `parse_diff_line` absorbed the separator space (regex backtracking
+  port needed); BuiltInHeader/Footer needed `as_any_mut` opt-ins (downcasts
+  silently no-oped). Lesson: run the full suite, not just the new crate's subset.
 - Ported code once arrived with a systematic corruption: `map_or((default,` (extra `(` after `map_or(`) — fixed crate-wide by rewriting to `map_or(`. (Store.rs E0308 in old `test-log.txt` was another artifact of that batch, already fixed.)
 - Workspace lints: clippy `all+pedantic`, CI `-D warnings`, `cargo fmt --check`, MSRV 1.85 (`rust-version = "1.85"`). Newer-API fixes must respect MSRV (e.g. `f64::midpoint` 1.87 → scoped `#[allow]`).
 - `ToolDefinition.name` is `&'static str`; `Mode`/`PrintModeOptions` have no `Default`.
