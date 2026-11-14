@@ -1,7 +1,7 @@
 # Handoff: Pi in Rust (`pi-rs`)
 
 > Written 2026-11-11, updated same day after gate attempts. Repo: `/home/hakergeniusz/Projects/pi-rs` on `acer`.
-> **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). `main` = P0–P3 gated history; **`wip/p4-pre-gate`** = snapshot branch with ALL uncommitted P4 work committed (`4853906 chore(pi-coding-agent): pre-gate snapshot of P4 work`, Assisted-by trailer). Local checkout is ON `wip/p4-pre-gate`. CI (GitHub Actions) queued on both pushes — run `gh run list` / `gh run watch --exit-status` to verify; unverified at handoff time.
+> **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). **`main` = P0–P5-part-1 history** — fast-forwarded `39b22ad..37782d1` on 2026-11-14 (P4 + P5 part 1, reconciliation commit `a6b9934`, `ci: install fd` `37782d1`). `wip/p4-pre-gate` == `main` now; local checkout is ON `wip/p4-pre-gate`. CI on the landing push — run `gh run list --branch main` / `gh run watch --exit-status`; **unverified at handoff time**.
 > ALL development happens on `acer` (per user). Reference checkout: `/tmp/ai-agent/pi` on `acer` — **WIPED (tmpfs); re-clone before P5 work: `gh repo clone earendil-works/pi /tmp/ai-agent/pi`** (was @ `b22e525b3`).
 
 ## Goal
@@ -15,7 +15,8 @@ Rewrite Pi (earendil-works/pi — TypeScript coding-agent harness monorepo, ~236
 | P1 | `pi-ai` wire types, SSE, adapters, catalog (43 providers) | ✅ committed |
 | P2 | `pi-agent` loop, tools seam, queues, hooks | ✅ committed `4ad169d` |
 | P3 | `pi-tui` full TUI crate (~40.5K lines, 17 components, themes, keys, alt screen) | ✅ committed `39b22ad` — 740 workspace tests, clippy all+pedantic clean, fmt clean |
-| P4 | `pi-coding-agent`: config, auth, sessions (JSONL v3 byte-compat), built-in tools, system prompt, prompt templates, skills, CLI args, print mode (`pi -p`) | ⚠️ code complete, in working tree, uncommitted — **gate blocked by machine OOM storms; 2 test fixes applied, final gate run still pending** (see Next steps) |
+| P4 | `pi-coding-agent`: config, auth, sessions (JSONL v3 byte-compat), built-in tools, system prompt, prompt templates, skills, CLI args, print mode (`pi -p`) | ✅ committed — gate green in-container (1205 tests, 44 targets), landed on `main` 2026-11-14 |
+| P5 | JSON/RPC modes, extensions seam, MCP client, trust, `@file`, OAuth | ⚠️ part 1 landed on `main` (`c8e1818` + reconciliation `a6b9934`); remainder open (rpc envelope, MCP server-manager/tool-bridge, package-manager, codemode, ext host, `defaultProjectTrust` getter) |
 
 P4 detail (uncommitted, in working tree):
 - `src/session/` (`records.rs` byte-exact Record envelope + V8-exact JSON writer in `session/json.rs`, `store.rs` SessionManager, `migrate.rs` v1→v3, `mod.rs`), `src/auth.rs` (auth.json store, lock protocol, `$VAR`/`!cmd` config-value resolution), `src/config.rs` + `src/config/settings.rs` (SettingsManager).
@@ -51,7 +52,7 @@ P4 detail (uncommitted, in working tree):
 - Standing rules: run everything on `acer`; `nice -n 19` for all rustc/cargo; never read real `~/.pi` auth/session data; test fixtures must be synthetic.
 
 ## Next steps (in order)
-1. **Finish the P4 gate** with the capped env from User rules:
+1. ~~Finish the P4 gate~~ — **DONE 2026-11-14**: gate green in-container after reconciliation commit `a6b9934` (clippy fallout fixed: `assert_is_empty` module allows, `single_match_else`→if/else, `format_push_string`→`writeln!`, `map_unwrap_or`, `match_same_arms`, `implicit_clone`, `type_complexity` alias).
 ## BUILD IN CONTAINER — the gate IS now green (2026-11-12)
 
 All builds/tests run inside the **`pi-rs-build` podman container** (rootless, hard caps: `--memory=4g --memory-swap=4g --cpus=4`) — container OOM kills the BUILD, never the host. It runs rustc 1.99.1 matching the host; mounts repo at `/work`, host `~/.cargo/registry` (rw), volume `pi-rs-build-target` at `/build-target` (CARGO_TARGET_DIR). Needs `rg`+`fd` installed (done) for the grep/find tests.
@@ -70,10 +71,10 @@ State when this handoff was updated: **workspace clippy-clean; full workspace te
 - **`pi-ai/src/providers/anthropic.rs`**: the `anthropic-beta: oauth-2025-04-20` header **does not exist** in the current reference — removed. Bearer = plain `Authorization` (no beta); key wins when both set; env fallbacks removed from the adapter (the caller's ladder owns env). `openai_completions.rs` now honors `access_token` (kimi-style Bearer) ahead of api_key.
 - **rpc.rs** request/response envelope is NOT yet reconciled against `rpc-entry.ts` (no marker; doc note says before P5 exit gate).
 
-Remaining before landing on `main`:
-1. Run the container gate (reconciliations above are unverified by rustc yet), fix fallout.
-2. Land P4+P5-part-1 on `main` (branch `wip/p4-pre-gate` has `c8e1818`; local checkout is on it), push, watch CI. **ci.yml needs `fd` added when pi-coding-agent lands on main** (ubuntu-latest ships `rg` but not `fd`; apt gives `fdfind` → symlink).
-3. EACCES test note: `tools_write_edit.rs::includes_eacces_for_read_only_files` skips when running as root (container) — documented in the test.
+Remaining before landing on `main` — **ALL DONE 2026-11-14**:
+1. ~~Container gate~~ green (1205 tests, 44 targets, clippy+fmt clean) → committed `a6b9934`, pushed.
+2. ~~Land on `main`~~ fast-forwarded `39b22ad..37782d1`, pushed; `fd` install step added to ci.yml (`37782d1`). CI run `43578349132` — watch pending at handoff time (`gh run watch 43578349132 --exit-status`).
+3. EACCES test note (kept): `tools_write_edit.rs::includes_eacces_for_read_only_files` skips when running as root (container) — documented in the test.
 
 ## P5 progress (written 2026-11-12, all compiling + tested)
 - **`modes/json_event.rs`** — JSON mode: per-event JSONL wire serialization (`event_to_json`), `JsonEventSink`, `run_json_mode` on the print-runtime seams. Wired into `main.rs` (`--mode json`).
@@ -85,13 +86,12 @@ Remaining before landing on `main`:
 - **OAuth bearer pass-through** — `StreamOptions.access_token` (pi-ai) → `StreamRequest.access_token` (pi-agent) → `AgentLoopConfig.access_token` → `PrintRuntime.access_token`; auth ladder returns `WireCredential::{ApiKey, AccessToken}` (`resolve_wire_credential`); anthropic adapter sends `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20` for tokens, `x-api-key` for keys.
 
 ## Next steps (in order)
-1. Run the container gate after the 2026-11-14 reconciliation (edits are rustc-unverified yet); fix fallout, commit to `wip/p4-pre-gate`, push.
-2. Land on `main` with `feat(pi-coding-agent): config, auth, sessions, tools, prompts, skills, print mode (P4) + P5 part 1 (json/rpc, extensions seam, mcp client, trust, @file, oauth)`, push, watch CI; add `fd` install to ci.yml in the same landing.
-3. **Real `pi -p` smoke test against a live provider** — still the first true end-to-end proof (never done).
-4. Golden session fixtures from the TS pi (byte-compat proof beyond synthetic fixtures).
-5. P5 remainder: reconcile `rpc.rs` against `rpc-entry.ts`; MCP server-manager + tool bridge into the agent registry, package-manager subset (`package-manager-cli.ts`, 41.6K), codemode sandbox (`pi-codemode` stub, blocked on host decision), extension runtime host (decision pending), `defaultProjectTrust` settings getter.
-6. **P6 — Interactive mode** (chat viewport, editor, slash commands, themes, /resume; the trust selector prompt lands here).
-7. **P7 — Hardening** (compaction, cache warmer, crash log, signals/backpressure + stdin piping, release).
+1. ~~Container gate after the reconciliation~~ DONE (`a6b9934`); ~~land on `main` with fd in ci.yml~~ DONE (`37782d1`).
+2. **Real `pi -p` smoke test against a live provider** — still the first true end-to-end proof (never done).
+3. Golden session fixtures from the TS pi (byte-compat proof beyond synthetic fixtures).
+4. P5 remainder: reconcile `rpc.rs` against `rpc-entry.ts`; MCP server-manager + tool bridge into the agent registry, package-manager subset (`package-manager-cli.ts`, 41.6K), codemode sandbox (`pi-codemode` stub, blocked on host decision), extension runtime host (decision pending), `defaultProjectTrust` settings getter.
+5. **P6 — Interactive mode** (chat viewport, editor, slash commands, themes, /resume; the trust selector prompt lands here).
+6. **P7 — Hardening** (compaction, cache warmer, crash log, signals/backpressure + stdin piping, release).
 
 ## Gotchas / decisions
 - Ported code once arrived with a systematic corruption: `map_or((default,` (extra `(` after `map_or(`) — fixed crate-wide by rewriting to `map_or(`. (Store.rs E0308 in old `test-log.txt` was another artifact of that batch, already fixed.)
