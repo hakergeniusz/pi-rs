@@ -23,7 +23,8 @@ use pi_tui::component::{Component, ComponentMutation};
 use pi_tui::components::editor::{Editor, EditorOptions};
 use pi_tui::components::text::Text;
 use pi_tui::mouse::{MouseEvent, MouseEventResult};
-use pi_tui::terminal::{CrosstermTerminal, key_to_terminal_data};
+use pi_tui::stdin_buffer::{StdinBuffer, StdinBufferOptions, StdinEvent};
+use pi_tui::terminal::CrosstermTerminal;
 use pi_tui::tui::FocusTarget;
 use pi_tui::tui::{Tui, TuiStopOptions};
 
@@ -315,6 +316,14 @@ pub struct InteractiveMode {
     /// The running prompt's `(timestamp, text)`: its `MessageEnd` is skipped
     /// (it persisted at submit) so same-millisecond steering cannot steal it.
     active_prompt: Option<(i64, String)>,
+    /// pi's stdin buffer: raw stdin bytes decode into complete sequences
+    /// (`stdin_buffer.rs`), terminal replies included — crossterm's event
+    /// parser would eat them and never deliver them.
+    stdin_buffer: StdinBuffer,
+    /// Undecoded UTF-8 carried over between chunks.
+    stdin_pending: Vec<u8>,
+    /// When the last stdin chunk arrived, for the buffer's sequence timeout.
+    stdin_last_input: Option<Instant>,
 }
 
 impl InteractiveMode {
@@ -393,6 +402,9 @@ impl InteractiveMode {
             compaction_run: None,
             compaction_queued: Vec::new(),
             active_prompt: None,
+            stdin_buffer: StdinBuffer::new(StdinBufferOptions::default()),
+            stdin_pending: Vec::new(),
+            stdin_last_input: None,
         }
     }
 
@@ -1575,41 +1587,130 @@ impl InteractiveMode {
     // --------------------------------------------------------------
 
     fn run(&mut self) -> Result<(), String> {
+        use std::io::Read as _;
         self.tui
             .start()
             .map_err(|error| format!("failed to start the terminal: {error}"))?;
         self.tui.request_render();
+        // Raw stdin on its own thread: in raw mode the bytes are the
+        // terminal's, and pi's stdin buffer needs them whole. crossterm's
+        // event parser would eat terminal replies (OSC colors, mode 2031)
+        // and deliver escape-sequence garbage instead.
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let spawned = std::thread::Builder::new()
+            .name("stdin".to_string())
+            .spawn(move || {
+                let mut stdin = std::io::stdin().lock();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match stdin.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            if tx.send(chunk[..count].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .is_ok();
+        let stdin_rx = spawned.then_some(rx);
         loop {
             self.pump();
             if self.exiting {
                 break;
             }
-
-            // Terminal input.
-            if !crossterm::event::poll(Duration::from_millis(25))
-                .map_err(|error| format!("input poll failed: {error}"))?
-            {
-                self.tui.render_now(false);
-                continue;
-            }
-            let event = match crossterm::event::read() {
-                Ok(event) => event,
-                Err(error) => return Err(format!("input read failed: {error}")),
-            };
-            let crossterm::event::Event::Key(key) = event else {
-                continue;
-            };
-            if key.kind == crossterm::event::KeyEventKind::Release {
-                continue;
-            }
-            let Some(data) = key_to_terminal_data(key) else {
-                continue;
-            };
-            self.tui.handle_input(&data);
+            self.await_stdin(stdin_rx.as_ref());
             self.tui.render_now(false);
         }
 
         self.shutdown()
+    }
+
+    /// Wait for stdin bytes (25 ms budget), decode and dispatch them, and
+    /// flush the stdin buffer once a pending sequence outlives its budget
+    /// (`stdin-buffer.ts:380-390` — the host owns the clock).
+    fn await_stdin(&mut self, rx: Option<&std::sync::mpsc::Receiver<Vec<u8>>>) {
+        let Some(rx) = rx else {
+            std::thread::sleep(Duration::from_millis(25));
+            return;
+        };
+        let received = rx.recv_timeout(Duration::from_millis(25));
+        match received {
+            Ok(bytes) => {
+                self.stdin_last_input = Some(Instant::now());
+                self.feed_stdin_bytes(&bytes);
+                // A burst arrives as several chunks; drain what is queued so
+                // it is one frame.
+                while let Ok(more) = rx.try_recv() {
+                    self.stdin_last_input = Some(Instant::now());
+                    self.feed_stdin_bytes(&more);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        if let Some(timeout_ms) = self.stdin_buffer.pending_timeout_ms()
+            && self
+                .stdin_last_input
+                .is_some_and(|at| at.elapsed() >= Duration::from_millis(timeout_ms))
+        {
+            let mut events = Vec::new();
+            self.stdin_buffer.flush(&mut events);
+            self.dispatch_stdin_events(events);
+        }
+    }
+
+    /// Decode raw bytes as UTF-8 (keeping an incomplete tail for the next
+    /// chunk) and run the decoded text through the stdin buffer.
+    fn feed_stdin_bytes(&mut self, bytes: &[u8]) {
+        self.stdin_pending.extend_from_slice(bytes);
+        loop {
+            match std::str::from_utf8(&self.stdin_pending) {
+                Ok(text) => {
+                    let mut events = Vec::new();
+                    self.stdin_buffer.process(text, &mut events);
+                    self.dispatch_stdin_events(events);
+                    self.stdin_pending.clear();
+                    return;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    if valid > 0 {
+                        // `error` does not borrow, but the slice does: copy
+                        // the valid prefix out before draining.
+                        let text =
+                            String::from_utf8_lossy(&self.stdin_pending[..valid]).to_string();
+                        let mut events = Vec::new();
+                        self.stdin_buffer.process(&text, &mut events);
+                        self.dispatch_stdin_events(events);
+                        self.stdin_pending.drain(..valid);
+                    }
+                    match error.error_len() {
+                        Some(skip) => {
+                            self.stdin_pending.drain(..skip);
+                        }
+                        None => return,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Route decoded events: sequences straight to the TUI, pastes re-wrapped
+    /// with their markers for the editor (`terminal.ts:252-278`).
+    fn dispatch_stdin_events(&mut self, events: Vec<StdinEvent>) {
+        for event in events {
+            match event {
+                StdinEvent::Data(sequence) => {
+                    self.tui.handle_input(&sequence);
+                }
+                StdinEvent::Paste(content) => {
+                    let wrapped = format!("\x1b[200~{content}\x1b[201~");
+                    self.tui.handle_input(&wrapped);
+                }
+            }
+        }
     }
 
     /// One loop iteration without terminal input: editor events, agent

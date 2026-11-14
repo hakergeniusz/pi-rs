@@ -697,7 +697,12 @@ impl Terminal for CrosstermTerminal {
             crossterm::terminal::enable_raw_mode()?;
         }
         write!(out, "\x1b[?2004h")?; // Enable bracketed paste mode
-        out.write_all(ENABLE_MOUSE_TRACKING.as_bytes())?; // Enable mouse tracking
+        // Mouse tracking is opt-in (upstream owns the sequences in the alt
+        // screen's toggles); unconditional tracking would push SGR reports
+        // into the raw-stdin path of a host that never reads mouse.
+        if self.mouse_mode {
+            out.write_all(ENABLE_MOUSE_TRACKING.as_bytes())?;
+        }
         if self.hide_cursor {
             write!(out, "\x1b[?25l")?; // Hide the cursor
         }
