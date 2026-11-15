@@ -571,6 +571,43 @@ impl Tui {
         self.enter_alt_screen_with(options, MultiplexerEnv::from_process())
     }
 
+    /// `switchTuiMode`'s renderer swap for the port's single-`Tui` shape
+    /// (`interactive-mode.ts:661`): leave the alt screen for the main screen
+    /// *without* stopping the terminal. The alt screen's before/after stop
+    /// hooks run with `options` (`preserveScreen` decides between handing the
+    /// terminal back untouched and repainting the transcript), the alt state
+    /// is dropped so child operations route flat again, and any root children
+    /// the host did not unmount first come back for re-mounting.
+    pub fn exit_alt_screen(
+        &mut self,
+        options: TuiStopOptions,
+    ) -> Vec<Box<dyn crate::component::Component>> {
+        if self.alt_screen_active() {
+            self.before_alt_screen_stop();
+            self.after_alt_screen_stop(options);
+        }
+        self.alt_root = None;
+        let Some(mut alt) = self.alt_screen.take() else {
+            return self.take_root_children();
+        };
+        // The implicit scroll view owns the document; hand back whatever is
+        // still mounted inside it. An explicit layout root lives among these.
+        let mut document = alt.implicit_root.take().map(|mut view| view.take_child());
+        let children = document
+            .as_mut()
+            .and_then(|document| {
+                document
+                    .as_any_mut()
+                    .and_then(|any| any.downcast_mut::<crate::component::ImplicitDocument>())
+            })
+            .map(crate::component::ImplicitDocument::take_children)
+            .unwrap_or_default();
+        // The regular renderer starts from a blank slate, exactly like the
+        // fresh `TuiMainScreen` a switch builds (`interactive-mode.ts:665`).
+        self.reset_render_state();
+        children
+    }
+
     /// `implicitScrollView`, `tui-alt-screen.ts:261-268`. pi builds it in the
     /// constructor; here it is built the first time the alt screen is entered
     /// and then kept, because the mouse precedence compares its identity

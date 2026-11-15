@@ -444,7 +444,7 @@ pub struct Tui {
     /// main-screen path pays nothing.
     pub alt_screen: Option<crate::tui_alt_screen::AltScreenState>,
     /// Which root child the alt screen mounted, if any.
-    alt_root: Option<usize>,
+    pub(crate) alt_root: Option<usize>,
     /// The primary scroll view of the last alt-screen layout pass.
     alt_primary_scroll_view: Option<ComponentId>,
 }

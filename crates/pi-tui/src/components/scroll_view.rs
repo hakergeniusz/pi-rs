@@ -454,7 +454,10 @@ impl ScrollView {
     /// disassemble reaches the scroll view by identity, so ownership has to
     /// move through `&mut self`.
     pub fn take_child(&mut self) -> Box<dyn Component> {
-        std::mem::replace(&mut self.child, Box::new(crate::components::spacer::Spacer::new(0)))
+        std::mem::replace(
+            &mut self.child,
+            Box::new(crate::components::spacer::Spacer::new(0)),
+        )
     }
 
     /// Give the child back. `implicitScrollView`, `tui-alt-screen.ts:268`: the

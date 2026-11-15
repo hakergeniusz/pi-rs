@@ -617,3 +617,42 @@ fn the_runtime_setters_and_the_root_mount_apply_to_the_live_alt_screen() {
     assert_eq!(alt.tui.alt_screen_root(), None, "cleared back to implicit");
     alt.stop();
 }
+
+/// `exitAltScreen` for the mode switch (`interactive-mode.ts:661`): the
+/// terminal leaves the alt screen with `preserveScreen`, the alt state drops
+/// so child operations route flat again, and whatever the implicit document
+/// still held comes back for re-mounting — all without stopping the terminal.
+#[test]
+fn exit_alt_screen_switches_back_to_the_flat_tree_without_stopping() {
+    let mut alt = alt((20, 3));
+    alt.tui.add_child(Box::new(Lines(vec!["flat".to_string()])));
+    alt.tui
+        .set_alt_screen_root(Box::new(Lines(vec!["root".to_string()])));
+    let mark = alt.capture.output().len();
+    let returned = alt.tui.exit_alt_screen(TuiStopOptions {
+        preserve_screen: true,
+    });
+    assert!(!alt.tui.alt_screen_active(), "the alt screen is gone");
+    assert_eq!(
+        returned.len(),
+        2,
+        "the flat child and the explicit root come back"
+    );
+    // The terminal saw the alt screen left; nothing else was painted.
+    let bytes = alt.capture.output();
+    assert!(
+        bytes[mark..].contains(EXIT_ALT_SCREEN),
+        "the exit sequence went out: {:?}",
+        &bytes[mark..]
+    );
+    // The Tui keeps working as the regular renderer: children route flat and
+    // a frame paints them onto the main screen.
+    alt.tui
+        .add_child(Box::new(Lines(vec!["second".to_string()])));
+    let frame = alt.render();
+    assert!(
+        frame.contains("second"),
+        "the flat tree renders after the exit: {frame:?}"
+    );
+    alt.stop();
+}

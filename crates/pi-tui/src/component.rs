@@ -341,6 +341,12 @@ impl ImplicitDocument {
         &self.children
     }
 
+    /// Empty the document, handing its children back — [`Tui::exit_alt_screen`]
+    /// returns whatever the host left mounted when it leaves the alt screen.
+    pub(crate) fn take_children(&mut self) -> Vec<Box<dyn Component>> {
+        std::mem::take(&mut self.children)
+    }
+
     pub(crate) fn children_mut(&mut self) -> &mut Vec<Box<dyn Component>> {
         &mut self.children
     }
