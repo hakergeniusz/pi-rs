@@ -695,6 +695,35 @@ pump cadence stands in for upstream's `setInterval`).
   stale citations `editor.ts:2665-2282` (reversed range) and the module doc's
   "2,472 lines" claim.
 
+## Extensions-host recon (landed on `docs/extensions-recon`, 2026-11-15)
+- **Deliverable: `docs/EXTENSIONS.md`** — the recon + design decision PLAN.md
+  §2 required at the P5 gate. No code changed; the seam
+  (`crates/pi-coding-agent/src/extensions/mod.rs`) is untouched scaffolding.
+- **Decision: embedded JS engine — `deno_core` (V8)** behind a feature-gated
+  `pi-ext-js` crate, phased E0→E4 (spike → headless core → UI-over-protocol →
+  TUI bridging → completeness). `rquickjs`+swc recorded as fallback if the
+  spike fails on the memory-capped machine. Rust-native trait and subprocess
+  host rejected (evidence in §6.2).
+- **Evidence base** (all cited in the doc): full read of upstream
+  `core/extensions/{runner,types}.ts` (3925 lines) + `docs/extensions.md`
+  (3367 lines) + two agent surveys (API-surface inventory; loader + bundled
+  extensions). Key facts: 37 typed events, each with distinct dispatch
+  semantics (§2 table); no LLM-sampling surface in `pi` (providers/virtual
+  models only); tool exposure has 5 values incl. `hidden` (the only
+  "unregister"); session mutation is command-context-only; upstream already
+  serves extensions from a bundled virtual-module table when the host is a
+  compiled binary (`virtual-modules.ts:14`) — the exact shape a Rust+V8 host
+  replicates; the whole boundary is JSON/strings, incl. TUI components
+  (`render(width) → string[]`); bundled-extension API usage defines the
+  de-facto E1 core subset (§5.3).
+- **Seam gap analysis** (§7): current trait models the easy 20%; six gap
+  classes (event model, tool registration richness, command context, missing
+  registration surfaces, lifecycle/staleness, error plumbing). Keepers: the
+  `Arc<dyn Fn>` executor signature, registry fan-out shape, flag claiming.
+- **Spike checklist for E0** (next unit): deno_core builds in-container under
+  memory caps (prebuilt v8), MSRV vs 1.85, tokio alignment, binary growth +
+  RSS, hello-world op round-trip.
+
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
   slot shifted every later index — the `*_INDEX` consts are the single source of
