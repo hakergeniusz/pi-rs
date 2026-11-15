@@ -771,6 +771,109 @@ pump cadence stands in for upstream's `setInterval`).
   semantics, loader (§5), de-facto core API subset (§5.3); exit = the
   bundled `tool-search` extension runs identically to upstream.
 
+## E1 headless extensions core (landed on `feat/e1-ext-core`, 2026-11-15)
+
+- **What landed** (commits `42b3342` headless core + `1b020f7` tests/exit
+  gate; all in `crates/pi-ext-js`, ~6,900 lines):
+  - `transpile.rs` — the jiti transform replacement: **oxc 0.158** (parse →
+    TS strip → codegen; enums/namespaces lowered via
+    `SemanticBuilder::with_enum_eval(true)`, module syntax untouched, ESM
+    out). §6.3's swc-vs-oxc pick resolved to **oxc** (lighter build under
+    the 4 GB cap; the whole oxc stack cold-builds in ~24 s at `-j2`).
+  - `resolver.rs` — virtual-module table (`typebox`,
+    `@earendil-works/pi-codemode/declarations`), relative/absolute
+    resolution with the entry rules, `pi.extensions` manifest reading
+    (`pi-manifest.ts`), and the E1 rejection messages for `node:*` and
+    host packages (E4).
+  - `engine.rs` + `glue.rs` — the QuickJS runtime, the Rust op table (the
+    `pi` API: registration with `createExtensionAPI`'s exact error
+    strings, action methods guarded by the not-initialized-throw until
+    `bind`, `exec`, MCP, flags, settings, session metadata), the headless
+    contexts (base/tool/command/trust + the `noOpUIContext` matrix), the
+    **dispatch-session protocol** (event objects stay live across
+    handlers so in-place mutation chains, results land in a slot the
+    runner reads after draining jobs), the `Intl.Segmenter` shim, the
+    console shim, and the extension event bus.
+  - `runner.rs` — the `ExtensionRunner` port: `emit`,
+    `emitToolCall` (in-place input mutation, `block` short-circuit,
+    errors propagate), `emitToolResult` (middleware chain, content
+    replacement drops `structuredContent`), `emitInput` (transform chain,
+    `handled`), `emitBeforeAgentStart` (message collection +
+    `forceSystemPrompt` chain, per-handler `systemPrompt` render),
+    `emitMessageEnd` (role guard), `emitBoundary`
+    (entries/continue threading, preview rebuild, invalid ⇒ discard),
+    `emitProjectTrustEvent` (first decided wins), first-wins tools/flags,
+    `name:occurrence` commands with the collision loop, tool execution,
+    staleness invalidation.
+  - `loader.rs` — discovery order (project `.pi/extensions` → user
+    `extensions` → explicit; one level deep, manifest/index entries),
+    the pre-trust split (`split_for_trust`), errors-as-values.
+  - `mcp_registry.rs` — `mcpNamespace` + `validateMcpServerConfig` port
+    (verbatim error strings), owner/namespace-clash registration rules.
+  - `exec.rs` — `execCommand` port: combined `maxBuffer` cap with
+    truncation-kill, timeout SIGTERM → SIGKILL after the 5 s grace,
+    `128+signal` exit codes, ENOENT as a failed execution (code 1).
+- **Exit gate met**: upstream's bundled `tool-search` extension vendored
+  **verbatim** (`tests/fixtures/tool-search/`, MIT attribution headers)
+  loads unmodified through the full pipeline — oxc transpile, relative
+  import, both virtual modules, the `Intl.Segmenter` shim — and behaves
+  identically: the BM25 ranker/tokenizer/$ref schema-text cases ported
+  from `test/tool-search.test.ts` all pass (one documented `#[ignore]`
+  for ICU-dependent segmentation), and the end-to-end gate registers it
+  inactive, activates it, executes it (relevance/name/namespace queries,
+  exact-name-first, limits, activation bookkeeping, validation errors,
+  upstream result text). 56 tests green.
+- **E1 deviations** (each recorded where it is implemented):
+  1. `Intl.Segmenter` is a shim (QuickJS-NG ships no `Intl`); unspaced
+     scripts (CJK/Thai) segment as one run. Upstream reaches the
+     segmenter only outside its ASCII fast path, so ASCII behavior is
+     byte-identical. E4 replaces the shim.
+  2. `node:*` built-ins and host packages (`@earendil-works/*`) reject
+     imports with the documented E1 error; no `node_modules` resolution.
+     E4.
+  3. `ctx.executeTool` returns upstream's unbound-runner result
+     (`runner.ts:988-999`, "Nested tool calls are not available in this
+     context"); the real nested path binds with the agent loop (E2) —
+     rquickjs's runtime lock (a `RefCell` without the `parallel` feature)
+     forbids re-entering the context from inside an op.
+  4. `ctx.signal` is `undefined` (no host abort signal crosses the
+     boundary yet); `pi.exec` accepts and ignores the `signal` option.
+     E2.
+  5. `setActiveTools` filters to registered non-hidden names; the full
+     loadout logic (`_applyToolLoadout`, `--tools` patterns) belongs to
+     agent-session and lands at host wiring. E1's `bind()` seeds the
+     active set with declared (`direct`/`model-only`) tools whose
+     `defaultActive !== false` — which is what makes `tool_search`'s
+     candidate pool correct.
+  6. Dispatch reads handler indexes from `__piInspect` snapshots but
+     resolves them against the live JS registries; upstream slices the
+     handler array once per dispatch. Divergence is only observable when
+     a handler unsubscribes mid-dispatch; `/reload` semantics land in E4.
+  7. `ToolInfo` carries name/description/parameters/exposure/namespace/
+     defaultActive; `promptGuidelines`, `reachesTools`, `annotations`
+     are host concerns (E2+).
+  8. CJS interop not attempted (upstream extensions are ESM; §6.3).
+- **rquickjs/oxc API notes banked (for E2+)**: the `loader` feature flag
+  is required for `rt.set_loader`; `Function::call::<Args, R>` takes
+  **only tuple args** (`IntoArgs` is implemented for tuples, not scalars);
+  `Resolver::resolve(&mut self, ctx, base, name, attributes)`;
+  `Loader::load` returns a declared `Module` directly;
+  `Ctx::throw(value)` + `ctx.catch()` for JS-exception message
+  extraction; `ctx.json_stringify` returns `Result<Option<String>>`;
+  the runtime lock is a `RefCell` (non-`parallel`) — **never nest
+  `ctx.with`**; workspace `unsafe_code = "forbid"` means signals go
+  through `nix` (exec), not `libc`. oxc: `Transformer::new(&allocator,
+  path, &options)`, `build_with_scoping(scoping, &mut program)`,
+  diagnostics on `ParserReturn`/`TransformerReturn`, `Codegen::build` →
+  `.code`; TS `Source` type = `SourceType::mjs().with_typescript(true)`.
+- **Next: E2 — UI over protocol + host wiring**: dialogs/notify/
+  setStatus/setWidget/setTitle via the no-op matrix headless and the RPC
+  subprotocol (`docs/rpc-extension-ui.md`); `ui_prompt_start/end`;
+  providers/virtual models incl. OAuth-config; `session_before_*` gates;
+  `user_bash` interception; `context`/`context_with_system` transforms;
+  feature-gate `pi-ext-js` behind `ext-js` on `pi-coding-agent` and
+  replace the seam (`crates/pi-coding-agent/src/extensions/mod.rs`).
+
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
   slot shifted every later index — the `*_INDEX` consts are the single source of
