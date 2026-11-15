@@ -30,7 +30,9 @@ phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
   bash mode, `/compact` context compaction (status indicator, queued
   submissions, ctrl+o expansion, billed-tokens notice), the `/trust`
   project-trust dialog (trust / trust parent / distrust, persisted to
-  trust.json), the OSC
+  trust.json), the `/settings` dialog (steering/follow-up modes, hide
+  thinking, default project trust, per-model thinking levels, theme —
+  persisted to settings.json), the OSC
   terminal-color theme controller (grayscale system theme while the query is
   pending, re-theming on the reply, mode-2031 light/dark reports, `/theme`
   switcher), and session

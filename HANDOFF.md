@@ -432,6 +432,51 @@ per-selector `Arc<Mutex<Vec<Event>>>` queue drained in the pump).
   login lands — the working path is copying auth.json into
   `~/.config/pi-rs/`.
 
+## Settings selector (landed on `feat/p6b-settings-selector`, 2026-11-15)
+
+The `/settings` dialog (`settings-selector.ts`, 752 lines): the fourth
+selector, same mount pattern. Landed as three component commits + one
+wiring commit + the version cut (`v0.1.0-alpha.1`).
+
+- **Honest row scoping** ("the picker must not lie"): the dialog carries only
+  the rows that work end-to-end — steering mode, follow-up mode, hide
+  thinking, default project trust, per-model thinking level, theme. Upstream
+  rows whose backend the port doesn't have yet are omitted (autocompact is
+  display-only here, images/transport/share/http-timeout/cache-warming/
+  mermaid/telemetry/etc. have no ported backend). The component test asserts
+  the absence of unported rows so the scope can't silently drift.
+- **pi-tui settings-list debt** (`f066f46`): `with_search()` (Input row +
+  fuzzy filter + row-offset mouse) and `with_submenu` factories. Rust
+  divergence fixed: upstream's `filteredItems` alias the same item objects,
+  so the port filters `Vec<usize>` indices into `items` instead of cloning —
+  mutations (e.g. the model-thinking summary) stay visible through both
+  views. `with_values` no longer clobbers `current_value`.
+- **Submenu callback shape** (`73f8554`): Rust can't call back into the list
+  from a factory closure, so `SubmenuDone` is a shared mailbox drained right
+  after input forwarding (`SubmenuClose { value, navigate_to }`; navigate_to
+  re-selects + re-activates, close-without-value restores the opener's
+  selection). `settings_submenu.rs` ports `SelectSubmenu` (rebuilds its
+  SelectList on filter — upstream does too) and `SteppedSubmenu`
+  (`SubmenuContext` = BTreeMap, loop=true for the model-thinking steps).
+- **ThemeSubmenu**: single menu (system/automatic/themes, "automatic" does
+  NOT close — `with_done_manual`) + the automatic menu (light/dark submenus,
+  apply row); previews resolve + `set_theme` + render WITHOUT persisting;
+  cancel restores the original. `/theme` persistence deviation CLOSED: the
+  selector writes `theme` via `SettingsManager::set`.
+- **Model thinking**: `getSupportedThinkingLevels` ported into pi-ai
+  (`models.js:702-712`: non-reasoning → off; xhigh/max only when the
+  `thinkingLevelMap` entry exists and is non-null). The stepped submenu
+  persists `modelThinkingLevels[provider/id]` (clear-override row reverts to
+  the global default); the orchestrator live-re-applies when the current
+  model is touched.
+- **Read sides** (`dae34d2`): interactive startup reads hideThinkingBlock +
+  steering/follow-up modes (persisting upstream-style via settings);
+  `build_runtime` bootstraps a settings manager BEFORE trust resolution to
+  feed `defaultProjectTrust` into the ladder (main.js:583/669) and resolves
+  the initial thinking level flag > per-model override >
+  `defaultThinkingLevel` > off (model-resolver.js:386-421) — previously
+  always "off" for non-interactive runs.
+
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
   slot shifted every later index — the `*_INDEX` consts are the single source of
