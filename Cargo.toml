@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
 authors = ["pi-rs contributors"]
@@ -47,12 +47,12 @@ base64 = "0.22"
 tempfile = "3"
 
 # internal crates
-pi-schema = { path = "crates/pi-schema", version = "0.1.0" }
-pi-ai = { path = "crates/pi-ai", version = "0.1.0" }
-pi-agent = { path = "crates/pi-agent", version = "0.1.0" }
-pi-tui = { path = "crates/pi-tui", version = "0.1.0" }
-pi-mcp = { path = "crates/pi-mcp", version = "0.1.0" }
-pi-codemode = { path = "crates/pi-codemode", version = "0.1.0" }
+pi-schema = { path = "crates/pi-schema", version = "0.1.0-alpha.1" }
+pi-ai = { path = "crates/pi-ai", version = "0.1.0-alpha.1" }
+pi-agent = { path = "crates/pi-agent", version = "0.1.0-alpha.1" }
+pi-tui = { path = "crates/pi-tui", version = "0.1.0-alpha.1" }
+pi-mcp = { path = "crates/pi-mcp", version = "0.1.0-alpha.1" }
+pi-codemode = { path = "crates/pi-codemode", version = "0.1.0-alpha.1" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
