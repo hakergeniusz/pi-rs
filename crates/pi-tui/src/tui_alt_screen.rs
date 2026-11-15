@@ -457,6 +457,23 @@ impl Tui {
         self.alt().is_some_and(|alt| alt.alt_screen_active)
     }
 
+    /// Copy a completed selection when it finishes. `setCopyOnSelect`,
+    /// `tui-alt-screen.ts:237-239`; pi re-applies it from the settings
+    /// selector (`applyRuntimeSettings`, `interactive-mode.ts:1674-1677`).
+    pub fn set_copy_on_select(&mut self, enabled: bool) {
+        if let Some(alt) = self.alt_screen.as_mut() {
+            alt.copy_on_select = enabled;
+        }
+    }
+
+    /// Lines per wheel event. `setWheelScrollLines`, `tui-alt-screen.ts:233-235`;
+    /// resets the accelerator so a mid-gesture change starts a new gesture.
+    pub fn set_wheel_scroll_lines(&mut self, lines: WheelScrollLines) {
+        if let Some(alt) = self.alt_screen.as_mut() {
+            alt.wheel_scroll.set_lines(lines);
+        }
+    }
+
     // ---------------------------------------------------------- enter/exit
 
     /// `beforeTerminalStart`, `tui-alt-screen.ts:337-366`.
@@ -700,6 +717,16 @@ impl Tui {
     /// The identity of the mounted root, if any.
     pub fn alt_screen_root(&self) -> Option<ComponentId> {
         self.alt().and_then(|alt| alt.root)
+    }
+
+    /// Drop the explicit layout root, back to the implicit scroll view.
+    /// `setLayoutRoot(undefined)`, `interactive-mode.ts:672` — the host
+    /// unmounts the chat viewport when it switches renderers.
+    pub fn clear_alt_screen_root(&mut self) {
+        if let Some(alt) = self.alt_screen.as_mut() {
+            alt.root = None;
+        }
+        self.request_render();
     }
 
     /// `render`, `:322-324`: the document, at the width the viewport gives it.

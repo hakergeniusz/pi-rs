@@ -596,3 +596,24 @@ fn the_kitty_cache_evicts_offscreen_images_and_retransmits_them() {
     );
     alt.stop();
 }
+
+/// The runtime setters the settings selector re-applies
+/// (`applyRuntimeSettings`, `interactive-mode.ts:1673-1677`) mutate the live
+/// alt-screen state, and the explicit root mounts and unmounts.
+#[test]
+fn the_runtime_setters_and_the_root_mount_apply_to_the_live_alt_screen() {
+    let mut alt = alt((20, 3));
+    alt.tui.set_copy_on_select(false);
+    alt.tui
+        .set_wheel_scroll_lines(pi_tui::wheel_scroll::WheelScrollLines::Fixed(3.0));
+    assert_eq!(alt.tui.alt_screen_root(), None, "no root until mounted");
+    alt.tui
+        .set_alt_screen_root(Box::new(Lines(vec!["root".to_string()])));
+    assert!(
+        alt.tui.alt_screen_root().is_some(),
+        "the viewport root is mounted"
+    );
+    alt.tui.clear_alt_screen_root();
+    assert_eq!(alt.tui.alt_screen_root(), None, "cleared back to implicit");
+    alt.stop();
+}

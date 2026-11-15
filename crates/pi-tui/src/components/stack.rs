@@ -108,6 +108,23 @@ impl Stack {
         self.children.remove(index)
     }
 
+    /// Swap the child at `index`, keeping its entry options. Upstream swaps
+    /// the editor for a selector dialog by reference inside the editor
+    /// container; the port's fullscreen dock owns the host directly, so the
+    /// swap goes through here (`showSelector`, `interactive-mode.ts:5072`).
+    pub fn replace_child(
+        &mut self,
+        index: usize,
+        component: Box<dyn Component>,
+    ) -> Box<dyn Component> {
+        std::mem::replace(&mut self.children[index], component)
+    }
+
+    /// The size constraints of the entry at `index`. `stack.ts:10-17`.
+    pub fn entry_options(&self, index: usize) -> StackEntryOptions {
+        self.entries[index]
+    }
+
     /// `stack.ts:94-97`.
     pub fn clear(&mut self) {
         self.children.clear();
@@ -218,6 +235,21 @@ impl VStack {
 
     pub fn add_child(&mut self, component: Box<dyn Component>, options: StackEntryOptions) {
         self.inner.add_child(component, options);
+    }
+
+    /// Swap the child at `index`, keeping its entry options. See
+    /// [`Stack::replace_child`].
+    pub fn replace_child(
+        &mut self,
+        index: usize,
+        component: Box<dyn Component>,
+    ) -> Box<dyn Component> {
+        self.inner.replace_child(index, component)
+    }
+
+    /// The size constraints of the entry at `index`. See [`Stack::entry_options`].
+    pub fn entry_options(&self, index: usize) -> StackEntryOptions {
+        self.inner.entry_options(index)
     }
 
     pub fn render_lines(&self, width: usize) -> Vec<String> {
@@ -582,6 +614,28 @@ mod tests {
             stack.layout_node(),
             Some(LayoutNode::VStack { .. })
         ));
+    }
+
+    /// The fullscreen dock swaps the editor host for a selector dialog in
+    /// place; the entry's own options (the editor's min size) stay put.
+    #[test]
+    fn replace_child_swaps_in_place_keeping_the_entry_options() {
+        let mut stack = VStack::new(vec![]);
+        stack.add_child(
+            Box::new(Fixed(2)),
+            StackEntryOptions {
+                min_size: Some(3),
+                ..Default::default()
+            },
+        );
+        let old = stack.replace_child(0, Box::new(Fixed(1)));
+        assert_eq!(old.render(4).len(), 2, "the old child comes back");
+        assert_eq!(stack.render_lines(4).len(), 1, "the new child renders");
+        assert_eq!(
+            stack.entry_options(0).min_size,
+            Some(3),
+            "the entry options survive the swap"
+        );
     }
 
     #[test]

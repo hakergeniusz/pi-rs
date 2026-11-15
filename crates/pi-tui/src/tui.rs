@@ -315,10 +315,19 @@ pub enum OverlayFocusRestorePolicy {
 }
 
 /// Who has the keyboard. `tui.ts:583-586`.
+///
+/// The `Id` arm is the port's fullscreen adaptation: upstream focuses
+/// component *objects*, which stay valid when the chat viewport mounts them
+/// inside its dock. Rust ownership moves those components under the viewport
+/// root, out of the flat root-children list, so a nested focus target (the
+/// editor, or a selector dialog swapped into the editor's dock slot) can only
+/// be named by identity. [`Tui::component_mut`] deep-walks the tree for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusTarget {
     Root(usize),
     Overlay(OverlayId),
+    /// A mounted component by identity, at any depth.
+    Id(ComponentId),
 }
 
 /// Cursor position taken from the render output. `tui.ts:1442`.
@@ -643,7 +652,11 @@ impl Tui {
     /// once it exists (`tui-alt-screen.ts:261-268`) and in the TUI itself
     /// otherwise. pi has exactly one list either way; where it is *stored*
     /// here is a Rust detail no caller may observe.
-    pub(crate) fn take_root_children(&mut self) -> Vec<Box<dyn crate::component::Component>> {
+    /// Take the flat root children out, leaving the list empty. `take_root_children`
+    /// stays an internal helper upstream (the chat viewport shares the tree by
+    /// reference); the port's viewport has to *own* the hosts, so the fullscreen
+    /// mount pulls them out this way.
+    pub fn take_root_children(&mut self) -> Vec<Box<dyn crate::component::Component>> {
         std::mem::take(self.root_children_mut())
     }
 
@@ -1060,6 +1073,7 @@ impl Tui {
                 .find_overlay(id)
                 .and_then(|index| self.overlays.get(index))
                 .map(|entry| component_id(entry.component.as_ref())),
+            FocusTarget::Id(id) => Some(id),
         }
         .unwrap_or(0)
     }
@@ -1099,12 +1113,62 @@ impl Tui {
             let child = self.root_children_mut().get_mut(index)?;
             return Some(&mut **child);
         }
+        let overlay_index = self
+            .overlays
+            .iter()
+            .position(|entry| component_id(entry.component.as_ref()) == id);
+        if let Some(index) = overlay_index {
+            return Some(self.overlays[index].component.as_mut());
+        }
+        // The fullscreen chat viewport mounts the host's flat components
+        // inside its own tree (upstream shares them by reference), so a
+        // nested component — the editor in the dock, a selector in the
+        // editor's slot — is only reachable by walking layout children.
+        // Direct field access keeps the two walks disjoint to borrowck.
+        let nested: Option<&mut Vec<Box<dyn Component>>> = match self.alt_screen.as_mut() {
+            Some(alt) => alt.implicit_document_mut(),
+            None => Some(&mut self.children),
+        };
+        if let Some(children) = nested {
+            for child in children.iter_mut() {
+                if let Some(found) = Self::component_mut_deep(&mut **child, id) {
+                    return Some(found);
+                }
+            }
+        }
         for entry in &mut self.overlays {
-            if component_id(entry.component.as_ref()) == id {
-                return Some(entry.component.as_mut());
+            if let Some(found) = Self::component_mut_deep(&mut *entry.component, id) {
+                return Some(found);
             }
         }
         None
+    }
+
+    /// Depth-first search for `id` through a subtree, following layout
+    /// children (containers, stacks, scroll views). The name-by-identity
+    /// counterpart of upstream's direct object references.
+    fn component_mut_deep(
+        component: &mut crate::component::DynComponent,
+        id: ComponentId,
+    ) -> Option<&mut dyn Component> {
+        // `component` is already `&mut dyn Component`; identity and return
+        // need no downcast.
+        if component_id(component) == id {
+            return Some(component);
+        }
+        for child in component.layout_children_mut() {
+            if let Some(found) = Self::component_mut_deep(child, id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Mutably borrow a mounted component by identity, at any depth. The
+    /// host-facing form of the deep walk that backs
+    /// [`FocusTarget::Id`] delivery.
+    pub fn component_by_id_deep_mut(&mut self, id: ComponentId) -> Option<&mut dyn Component> {
+        self.component_mut(id)
     }
 
     /// `isComponentMounted`, `tui.ts:669-679`: the component is a root child or
@@ -1304,6 +1368,12 @@ impl Tui {
                 self.set_focus(Some(FocusTarget::Overlay(entry.id())));
                 return true;
             }
+        }
+        // A nested component (fullscreen dock) can only be focused by
+        // identity; the deep walk in `component_mut` verifies it is mounted.
+        if self.component_mut(id).is_some() {
+            self.set_focus(Some(FocusTarget::Id(id)));
+            return true;
         }
         false
     }
@@ -1903,6 +1973,15 @@ impl Tui {
         !self.overlays.is_empty()
     }
 
+    /// Hide the most recently shown overlay, whatever its visibility.
+    /// `hideOverlay()` with no argument (`tui.ts:739`), which the fullscreen
+    /// exit walks to drain the stack (`interactive-mode.ts:634-636`).
+    pub fn hide_topmost_overlay(&mut self) {
+        if let Some(id) = self.overlays.last().map(OverlayEntry::id) {
+            self.hide_overlay(id);
+        }
+    }
+
     /// `tui.ts:839` (`hasOverlay`): any *visible* overlay. Where pi gates on
     /// this rather than on `hasOverlayEntries`, a hidden or size-excluded
     /// overlay does not count.
@@ -1994,6 +2073,9 @@ impl Tui {
                 .find_overlay(id)
                 .and_then(|index| self.overlays.get(index))
                 .map(|entry| entry.component.wants_key_release()),
+            Some(FocusTarget::Id(id)) => self
+                .component_mut(id)
+                .map(|component| component.wants_key_release()),
             None => None,
         };
         if wants_release != Some(true) && is_key_release(data) {
@@ -2008,6 +2090,9 @@ impl Tui {
                 Some(index) => self.overlays[index].component.handle_input(data),
                 None => None,
             },
+            Some(FocusTarget::Id(id)) => self
+                .component_mut(id)
+                .and_then(|component| component.handle_input(data)),
             None => None,
         };
         // Keyboard input is latency-sensitive. pi avoids the throttled timer
@@ -3481,5 +3566,49 @@ mod tests {
     fn debug_key_is_recognised() {
         assert!(Tui::is_debug_key("\x1b[68;6u"));
         assert!(!Tui::is_debug_key("d"));
+    }
+
+    // ------------------------------------- focus by identity (fullscreen)
+
+    /// `FocusTarget::Id`: a component nested inside a root child — the
+    /// fullscreen dock's editor — receives keys when focused by identity.
+    /// Upstream focuses the same component object across renderer switches;
+    /// the port names it by identity instead.
+    #[test]
+    fn focus_by_identity_reaches_a_nested_component() {
+        let (mut tui, _capture) = tui(&["one"], (10, 5));
+        let keys = Box::new(Keys(Vec::new()));
+        let keys_id = component_id(keys.as_ref());
+        let mut container = Container::new();
+        container.add_child(keys);
+        tui.add_child(Box::new(container));
+        tui.start().unwrap();
+        tui.set_focus(Some(FocusTarget::Id(keys_id)));
+        assert_eq!(tui.focused_id_value(), keys_id);
+        assert!(
+            tui.handle_input("x"),
+            "the key reached the nested component"
+        );
+    }
+
+    /// [`Tui::set_focus_by_id`]: the shallow scans miss a nested component;
+    /// the deep walk focuses it by identity.
+    #[test]
+    fn set_focus_by_id_finds_a_nested_component() {
+        let (mut tui, _capture) = tui(&["one"], (10, 5));
+        let keys = Box::new(Keys(Vec::new()));
+        let keys_id = component_id(keys.as_ref());
+        let mut container = Container::new();
+        container.add_child(keys);
+        tui.add_child(Box::new(container));
+        tui.start().unwrap();
+        assert!(
+            tui.set_focus_by_id(keys_id),
+            "the nested component is mounted"
+        );
+        assert_eq!(tui.focused_id_value(), keys_id);
+        // Delivery follows: the identity target resolves through the same
+        // walk.
+        assert!(tui.handle_input("y"));
     }
 }
