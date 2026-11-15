@@ -14,7 +14,7 @@ use pi_ai::types::ImageContent;
 use pi_coding_agent::cli::args::{Args, DiagnosticKind, Mode, parse_args, print_help};
 use pi_coding_agent::cli::file_processor::process_file_arguments;
 use pi_coding_agent::cli::project_trust::{
-    ProjectTrustStore, ResolveProjectTrustedOptions, resolve_project_trusted,
+    DefaultProjectTrust, ProjectTrustStore, ResolveProjectTrustedOptions, resolve_project_trusted,
 };
 use pi_coding_agent::config;
 use pi_coding_agent::config::settings::{SettingsManager, SettingsManagerCreateOptions};
@@ -109,6 +109,32 @@ fn list_models(search: Option<&str>) {
     }
 }
 
+/// Upstream creates a settings manager before trust is resolved
+/// (`main.js:583`) so the global `defaultProjectTrust` can inform
+/// `resolveProjectTrusted` (`main.js:669`). `getDefaultProjectTrust`
+/// (`settings-manager.js:789-792`) accepts only "always"/"never"; anything
+/// else falls back to the "ask" default (`None` here).
+fn startup_default_project_trust(
+    cwd: &std::path::Path,
+    agent_dir: &std::path::Path,
+) -> Option<DefaultProjectTrust> {
+    let settings = SettingsManager::create(
+        cwd,
+        agent_dir,
+        SettingsManagerCreateOptions {
+            project_trusted: None,
+        },
+    );
+    match settings
+        .get("defaultProjectTrust")
+        .and_then(|value| value.as_str())
+    {
+        Some("always") => Some(DefaultProjectTrust::Always),
+        Some("never") => Some(DefaultProjectTrust::Never),
+        _ => None,
+    }
+}
+
 /// Assemble the runtime shared by print/JSON/RPC modes. Mirrors the startup
 /// path of upstream `cli.ts` for non-interactive runs: settings, model,
 /// credentials, session, tools, system prompt.
@@ -119,15 +145,16 @@ fn build_runtime(
 ) -> Result<PrintRuntime, String> {
     let agent_dir = config::get_agent_dir();
     // `resolveProjectTrusted` (`project-trust.ts:47-97`): the `--approve`
-    // override, the trust store, then the `defaultProjectTrust` setting (the
-    // setting itself lands with the settings-schema work; "ask" without a UI
-    // resolves to not-trusted, like upstream's non-interactive paths).
+    // override, the trust store, then the `defaultProjectTrust` setting
+    // ("ask" without a UI resolves to not-trusted, like upstream's
+    // non-interactive paths).
     let trust_store = ProjectTrustStore::new(&agent_dir);
+    let default_project_trust = startup_default_project_trust(cwd, &agent_dir);
     let project_trusted = resolve_project_trusted(&ResolveProjectTrustedOptions {
         cwd,
         store: &trust_store,
         trust_override: args.project_trust_override,
-        default_project_trust: None,
+        default_project_trust,
     })?;
     let settings = SettingsManager::create(
         cwd,
@@ -205,12 +232,28 @@ fn build_runtime(
     // System prompt.
     let system_prompt = system_prompt_for(args, cwd_string)?;
 
-    let thinking_level = args
+    // Thinking level: the `--thinking` flag wins; else the per-model
+    // override (`modelThinkingLevels[provider/id]`), then the
+    // `defaultThinkingLevel` setting, else off
+    // (`model-resolver.js:386-421`).
+    let thinking_level = if let Some(level) = args
         .thinking
         .as_deref()
         .map(thinking_level_from_str)
         .transpose()?
-        .unwrap_or_default();
+    {
+        level
+    } else {
+        let key = format!("{}/{}", model.provider, model.id);
+        let level = settings
+            .get("modelThinkingLevels")
+            .and_then(|value| value.get(key.as_str()))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| settings.get_default_thinking_level())
+            .unwrap_or_else(|| "off".to_string());
+        thinking_level_from_str(&level).unwrap_or_default()
+    };
 
     Ok(PrintRuntime {
         model,
@@ -273,11 +316,12 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
     // state and the theme seeding uses the same settings access.
     let agent_dir = config::get_agent_dir();
     let trust_store = ProjectTrustStore::new(&agent_dir);
+    let default_project_trust = startup_default_project_trust(cwd, &agent_dir);
     let project_trusted = resolve_project_trusted(&ResolveProjectTrustedOptions {
         cwd,
         store: &trust_store,
         trust_override: args.project_trust_override,
-        default_project_trust: None,
+        default_project_trust,
     })
     .unwrap_or(false);
     // The theme setting seeds the controller: `--use-theme` wins, else

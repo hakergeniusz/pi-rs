@@ -536,7 +536,7 @@ mod tests {
             submenu.drain(),
             vec![SelectSubmenuEvent::SelectionChanged("light".into())]
         );
-        assert!(submenu.search_input.as_ref().unwrap().value().is_empty());
+        assert_eq!(submenu.search_input.as_ref().unwrap().value(), "");
     }
 
     #[test]

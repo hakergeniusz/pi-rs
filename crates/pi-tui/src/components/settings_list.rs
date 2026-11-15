@@ -97,6 +97,12 @@ pub struct SubmenuClose {
 #[derive(Clone)]
 pub struct SubmenuDone(Arc<Mutex<Option<SubmenuClose>>>);
 
+impl Default for SubmenuDone {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SubmenuDone {
     /// An empty mailbox. Hosts and tests create one to hand to a factory.
     pub fn new() -> Self {

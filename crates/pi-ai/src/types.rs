@@ -689,6 +689,34 @@ pub enum ToolChoice {
     None,
 }
 
+/// The levels `getSupportedThinkingLevels` (`models.js:698-699`) filters down
+/// to.
+const EXTENDED_THINKING_LEVELS: [&str; 7] =
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// `getSupportedThinkingLevels` (`models.js:702-712`): the thinking levels a
+/// model accepts. Non-reasoning models accept only `off`; `xhigh`/`max` ride
+/// the model's `thinkingLevelMap` (present and non-null), and an explicit
+/// `null` mapping marks a level unsupported.
+pub fn get_supported_thinking_levels(model: &Model) -> Vec<&'static str> {
+    if !model.reasoning {
+        return vec!["off"];
+    }
+    EXTENDED_THINKING_LEVELS
+        .into_iter()
+        .filter(|level| {
+            match model
+                .thinking_level_map
+                .as_ref()
+                .and_then(|map| map.get(*level))
+            {
+                Some(value) => !value.is_null(),
+                None => !matches!(*level, "xhigh" | "max"),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,32 +809,4 @@ mod tests {
             duration_ms: None,
         }
     }
-}
-
-/// The levels `getSupportedThinkingLevels` (`models.js:698-699`) filters down
-/// to.
-const EXTENDED_THINKING_LEVELS: [&str; 7] =
-    ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
-/// `getSupportedThinkingLevels` (`models.js:702-712`): the thinking levels a
-/// model accepts. Non-reasoning models accept only `off`; `xhigh`/`max` ride
-/// the model's `thinkingLevelMap` (present and non-null), and an explicit
-/// `null` mapping marks a level unsupported.
-pub fn get_supported_thinking_levels(model: &Model) -> Vec<&'static str> {
-    if !model.reasoning {
-        return vec!["off"];
-    }
-    EXTENDED_THINKING_LEVELS
-        .into_iter()
-        .filter(|level| {
-            match model
-                .thinking_level_map
-                .as_ref()
-                .and_then(|map| map.get(*level))
-            {
-                Some(value) => !value.is_null(),
-                None => !matches!(*level, "xhigh" | "max"),
-            }
-        })
-        .collect()
 }

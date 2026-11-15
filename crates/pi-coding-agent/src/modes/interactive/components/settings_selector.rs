@@ -501,18 +501,19 @@ impl Component for ThemeSubmenu {
             ThemeMenuView::Automatic(list) => {
                 // The heading container (`settings-selector.ts:170-175`).
                 let theme = theme::theme();
-                let mut lines = Vec::new();
-                lines.push(theme.fg(ThemeColor::Accent, &theme::bold("Automatic Theme")));
-                lines.push(String::new());
-                lines.push(theme.fg(
-                    ThemeColor::Muted,
-                    "Choose themes for terminal light and dark appearance.",
-                ));
-                lines.push(theme.fg(
-                    ThemeColor::Muted,
-                    "Light/dark detection requires terminal support.",
-                ));
-                lines.push(String::new());
+                let mut lines = vec![
+                    theme.fg(ThemeColor::Accent, &theme::bold("Automatic Theme")),
+                    String::new(),
+                    theme.fg(
+                        ThemeColor::Muted,
+                        "Choose themes for terminal light and dark appearance.",
+                    ),
+                    theme.fg(
+                        ThemeColor::Muted,
+                        "Light/dark detection requires terminal support.",
+                    ),
+                    String::new(),
+                ];
                 lines.extend(list.render(width));
                 lines
             }
@@ -557,7 +558,6 @@ fn single_mode_theme_items(available: &[String], current: &str) -> Vec<SelectIte
 /// (`settings-selector.ts:469-484`).
 struct ModelThinkingSubmenu {
     stepped: SteppedSubmenu,
-    events: Arc<Mutex<Vec<SteppedSubmenuEvent>>>,
     state: Arc<Mutex<SelectorState>>,
     selector_events: Arc<Mutex<Vec<SettingsSelectorEvent>>>,
     done: SubmenuDone,
@@ -572,136 +572,149 @@ impl ModelThinkingSubmenu {
         default_model_key: Option<String>,
         thinking_level: &str,
     ) -> Vec<SubmenuStep> {
-        let model_state = Arc::clone(state);
-        let level_state = Arc::clone(state);
-        let level_preselect_state = Arc::clone(state);
-        let models = available_models.to_vec();
-        let current = current_model_key;
-        let default = default_model_key;
-        let preselect_current = current.clone();
-        let preselect_default = default.clone();
-        let thinking_level = thinking_level.to_string();
+        let preselect = current_model_key
+            .clone()
+            .or_else(|| default_model_key.clone());
         vec![
-            SubmenuStep {
-                key: "model",
-                title: Box::new(|_| "Per-Model Thinking Level".to_string()),
-                description: Box::new(|_| "Select a model to configure".to_string()),
-                options: Box::new(move |_context| {
-                    let current_model_key = current.clone();
-                    let current_default_model_key = default.clone();
-                    let mut sorted = models.clone();
-                    sorted.sort_by(|a, b| {
-                        let rank = |model: &pi_ai::types::Model| {
-                            let key = model_setting_key(&model.provider, &model.id);
-                            if Some(&key) == current_model_key.as_ref() {
-                                0
-                            } else if Some(&key) == current_default_model_key.as_ref() {
-                                1
-                            } else {
-                                2
-                            }
-                        };
-                        rank(a)
-                            .cmp(&rank(b))
-                            .then_with(|| a.provider.cmp(&b.provider))
-                    });
-                    let state = model_state.lock().expect("selector state");
-                    let mut items: Vec<SelectItem> = sorted
-                        .iter()
-                        .map(|model| {
-                            let key = model_setting_key(&model.provider, &model.id);
-                            let mut item = SelectItem::new(
-                                key.clone(),
-                                model_item_label(&model.provider, &model.id),
-                            );
-                            item.description = state.model_thinking_levels.get(&key).cloned();
-                            item
-                        })
-                        .collect();
-                    if items.is_empty() {
-                        items.push(
-                            SelectItem::new("__none__", "No models available").with_description(
-                                "Log in to a provider or configure an API key first",
-                            ),
-                        );
-                    }
-                    items
-                }),
-                preselect: Some(Box::new(move |_context| {
-                    preselect_current.clone().or(preselect_default.clone())
-                })),
-                searchable: true,
-                layout: Some(SelectListLayout {
-                    min_primary_column_width: Some(12),
-                    max_primary_column_width: Some(46),
-                }),
-            },
-            SubmenuStep {
-                key: "level",
-                title: Box::new(|context: &SubmenuContext| {
-                    let key = context.get("model").cloned().unwrap_or_default();
-                    let (provider, id) = split_model_key(&key);
-                    let display = provider.zip(id).map_or_else(
-                        || key.clone(),
-                        |(provider, id)| model_display_label(&provider, &id),
-                    );
-                    format!("Thinking Level for {display}")
-                }),
-                description: Box::new(|_| {
-                    "Select default thinking level for this model".to_string()
-                }),
-                options: Box::new(move |context: &SubmenuContext| {
-                    let key = context.get("model").cloned().unwrap_or_default();
-                    let (provider, id) = split_model_key(&key);
-                    let Some((provider, id)) = provider.zip(id) else {
-                        return Vec::new();
-                    };
-                    let Some(model) = pi_ai::catalog::catalog()
-                        .models(&provider)
-                        .into_iter()
-                        .find(|model| model.id == id)
-                    else {
-                        return Vec::new();
-                    };
-                    let state = level_state.lock().expect("selector state");
-                    let active_level = state.model_thinking_levels.get(&key);
-                    let mut items: Vec<SelectItem> =
-                        pi_ai::types::get_supported_thinking_levels(model)
-                            .into_iter()
-                            .map(|level| {
-                                let marker = if Some(level) == active_level.map(String::as_str) {
-                                    "✓ "
-                                } else {
-                                    "  "
-                                };
-                                SelectItem::new(level, format!("{marker}{level}"))
-                                    .with_description(thinking_description(level))
-                            })
-                            .collect();
-                    if active_level.is_some() {
-                        items.push(
-                            SelectItem::new(CLEAR_OVERRIDE_VALUE, "  (clear override)")
-                                .with_description(format!(
-                                    "Revert to global default ({})",
-                                    thinking_level
-                                )),
-                        );
-                    }
-                    items
-                }),
-                preselect: Some(Box::new(move |context: &SubmenuContext| {
-                    let key = context.get("model")?;
-                    level_preselect_state
-                        .lock()
-                        .expect("selector state")
-                        .model_thinking_levels
-                        .get(key)
-                        .cloned()
-                })),
-                searchable: false,
-                layout: None,
-            },
+            model_step(
+                state,
+                available_models,
+                current_model_key,
+                default_model_key,
+                preselect,
+            ),
+            level_step(state, thinking_level),
         ]
+    }
+}
+
+/// The model chooser step (`settings-selector.ts:396-430`): available models
+/// sorted current-first, default-second, each showing its override.
+fn model_step(
+    state: &Arc<Mutex<SelectorState>>,
+    available_models: &[pi_ai::types::Model],
+    current_model_key: Option<String>,
+    default_model_key: Option<String>,
+    preselect: Option<String>,
+) -> SubmenuStep {
+    let model_state = Arc::clone(state);
+    let models = available_models.to_vec();
+    SubmenuStep {
+        key: "model",
+        title: Box::new(|_| "Per-Model Thinking Level".to_string()),
+        description: Box::new(|_| "Select a model to configure".to_string()),
+        options: Box::new(move |_context| {
+            let current_model_key = current_model_key.clone();
+            let current_default_model_key = default_model_key.clone();
+            let mut sorted = models.clone();
+            sorted.sort_by(|a, b| {
+                let rank = |model: &pi_ai::types::Model| {
+                    let key = model_setting_key(&model.provider, &model.id);
+                    if Some(&key) == current_model_key.as_ref() {
+                        0
+                    } else if Some(&key) == current_default_model_key.as_ref() {
+                        1
+                    } else {
+                        2
+                    }
+                };
+                rank(a)
+                    .cmp(&rank(b))
+                    .then_with(|| a.provider.cmp(&b.provider))
+            });
+            let state = model_state.lock().expect("selector state");
+            let mut items: Vec<SelectItem> = sorted
+                .iter()
+                .map(|model| {
+                    let key = model_setting_key(&model.provider, &model.id);
+                    let mut item =
+                        SelectItem::new(key.clone(), model_item_label(&model.provider, &model.id));
+                    item.description = state.model_thinking_levels.get(&key).cloned();
+                    item
+                })
+                .collect();
+            if items.is_empty() {
+                items.push(
+                    SelectItem::new("__none__", "No models available")
+                        .with_description("Log in to a provider or configure an API key first"),
+                );
+            }
+            items
+        }),
+        preselect: Some(Box::new(move |_context| preselect.clone())),
+        searchable: true,
+        layout: Some(SelectListLayout {
+            min_primary_column_width: Some(12),
+            max_primary_column_width: Some(46),
+        }),
+    }
+}
+
+/// The level chooser step (`settings-selector.ts:432-467`): the model's
+/// supported levels with the active one marked, plus a clear-override row
+/// when an override exists.
+fn level_step(state: &Arc<Mutex<SelectorState>>, thinking_level: &str) -> SubmenuStep {
+    let level_state = Arc::clone(state);
+    let level_preselect_state = Arc::clone(state);
+    let thinking_level = thinking_level.to_string();
+    SubmenuStep {
+        key: "level",
+        title: Box::new(|context: &SubmenuContext| {
+            let key = context.get("model").cloned().unwrap_or_default();
+            let (provider, id) = split_model_key(&key);
+            let display = provider.zip(id).map_or_else(
+                || key.clone(),
+                |(provider, id)| model_display_label(&provider, &id),
+            );
+            format!("Thinking Level for {display}")
+        }),
+        description: Box::new(|_| "Select default thinking level for this model".to_string()),
+        options: Box::new(move |context: &SubmenuContext| {
+            let key = context.get("model").cloned().unwrap_or_default();
+            let (provider, id) = split_model_key(&key);
+            let Some((provider, id)) = provider.zip(id) else {
+                return Vec::new();
+            };
+            let Some(model) = pi_ai::catalog::catalog()
+                .models(&provider)
+                .into_iter()
+                .find(|model| model.id == id)
+            else {
+                return Vec::new();
+            };
+            let state = level_state.lock().expect("selector state");
+            let active_level = state.model_thinking_levels.get(&key);
+            let mut items: Vec<SelectItem> = pi_ai::types::get_supported_thinking_levels(model)
+                .into_iter()
+                .map(|level| {
+                    let marker = if Some(level) == active_level.map(String::as_str) {
+                        "✓ "
+                    } else {
+                        "  "
+                    };
+                    SelectItem::new(level, format!("{marker}{level}"))
+                        .with_description(thinking_description(level))
+                })
+                .collect();
+            if active_level.is_some() {
+                items.push(
+                    SelectItem::new(CLEAR_OVERRIDE_VALUE, "  (clear override)")
+                        .with_description(format!("Revert to global default ({thinking_level})")),
+                );
+            }
+            items
+        }),
+        preselect: Some(Box::new(move |context: &SubmenuContext| {
+            let key = context.get("model")?;
+            level_preselect_state
+                .lock()
+                .expect("selector state")
+                .model_thinking_levels
+                .get(key)
+                .cloned()
+        })),
+        searchable: false,
+        layout: None,
     }
 }
 
@@ -786,13 +799,87 @@ impl Component for ModelThinkingSubmenu {
 /// The dialog (`SettingsSelectorComponent`, `settings-selector.ts:256-752`).
 pub struct SettingsSelectorComponent {
     settings_list: SettingsList,
-    state: Arc<Mutex<SelectorState>>,
     events: Arc<Mutex<Vec<SettingsSelectorEvent>>>,
+}
+
+/// The dialog rows (`settings-selector.ts:256-394`), in upstream order:
+/// queue modes, thinking visibility, project trust, per-model thinking, and
+/// the theme.
+fn selector_items(
+    config: &SettingsSelectorConfig,
+    default_project_trust_label: &str,
+    model_thinking_factory: SubmenuFactory,
+    theme_factory: SubmenuFactory,
+) -> Vec<SettingItem> {
+    let follow_up_key = theme::key_text(theme::app_keys::MESSAGE_FOLLOW_UP);
+    let cycle_thinking_key = theme::key_text(theme::app_keys::THINKING_CYCLE);
+    vec![
+        SettingItem::new(
+            "steering-mode",
+            "Steering mode",
+            config.steering_mode.clone(),
+        )
+        .with_description(
+            "Enter while streaming queues steering messages. 'one-at-a-time': \
+             deliver one, wait for response. 'all': deliver all at once.",
+        )
+        .with_values(vec!["one-at-a-time".to_string(), "all".to_string()]),
+        SettingItem::new(
+            "follow-up-mode",
+            "Follow-up mode",
+            config.follow_up_mode.clone(),
+        )
+        .with_description(format!(
+            "{follow_up_key} queues follow-up messages until agent stops. \
+             'one-at-a-time': deliver one, wait for response. 'all': deliver \
+             all at once."
+        ))
+        .with_values(vec!["one-at-a-time".to_string(), "all".to_string()]),
+        SettingItem::new(
+            "hide-thinking",
+            "Hide thinking",
+            if config.hide_thinking_block {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .with_description("Hide thinking blocks in assistant responses")
+        .with_values(vec!["true".to_string(), "false".to_string()]),
+        SettingItem::new(
+            "default-project-trust",
+            "Default project trust",
+            default_project_trust_label.to_string(),
+        )
+        .with_description(
+            "Fallback behavior when no extension or saved trust decision \
+             decides project trust",
+        )
+        .with_values(
+            DEFAULT_PROJECT_TRUST_LABELS
+                .iter()
+                .map(|(_, label)| (*label).to_string())
+                .collect(),
+        ),
+        SettingItem::new(
+            "model-thinking",
+            "Default thinking level per model",
+            model_thinking_overrides_summary(&config.model_thinking_levels),
+        )
+        .with_description(format!(
+            "Override the default thinking level for specific models. \
+             {cycle_thinking_key} cycles in-session."
+        ))
+        .with_submenu(model_thinking_factory),
+        SettingItem::new("theme", "Theme", config.current_theme.clone())
+            .with_description("Color theme for the interface")
+            .with_submenu(theme_factory),
+    ]
 }
 
 impl SettingsSelectorComponent {
     pub fn new(
-        config: SettingsSelectorConfig,
+        config: &SettingsSelectorConfig,
         events: Arc<Mutex<Vec<SettingsSelectorEvent>>>,
     ) -> Self {
         let state = Arc::new(Mutex::new(SelectorState {
@@ -801,8 +888,7 @@ impl SettingsSelectorComponent {
         let default_project_trust_label = DEFAULT_PROJECT_TRUST_LABELS
             .iter()
             .find(|(value, _)| *value == config.default_project_trust)
-            .map(|(_, label)| (*label).to_string())
-            .unwrap_or_else(|| "Ask".to_string());
+            .map_or("Ask".to_string(), |(_, label)| (*label).to_string());
         let current_model_key = config
             .current_model
             .as_ref()
@@ -811,8 +897,6 @@ impl SettingsSelectorComponent {
             .default_model
             .as_ref()
             .map(|(provider, id)| model_setting_key(provider, id));
-        let follow_up_key = theme::key_text(theme::app_keys::MESSAGE_FOLLOW_UP);
-        let cycle_thinking_key = theme::key_text(theme::app_keys::THINKING_CYCLE);
 
         let selector_events = Arc::clone(&events);
         let theme_factory: SubmenuFactory = {
@@ -849,81 +933,23 @@ impl SettingsSelectorComponent {
                 );
                 Box::new(ModelThinkingSubmenu {
                     stepped,
-                    events: stepped_events,
-                    state: Arc::clone(&thinking_state),
                     selector_events: Arc::clone(&selector_events),
+                    state: Arc::clone(&thinking_state),
                     done,
                 }) as Box<dyn Component>
             })
         };
 
-        let items = vec![
-            SettingItem::new(
-                "steering-mode",
-                "Steering mode",
-                config.steering_mode.clone(),
-            )
-            .with_description(
-                "Enter while streaming queues steering messages. 'one-at-a-time': \
-                 deliver one, wait for response. 'all': deliver all at once.",
-            )
-            .with_values(vec!["one-at-a-time".to_string(), "all".to_string()]),
-            SettingItem::new(
-                "follow-up-mode",
-                "Follow-up mode",
-                config.follow_up_mode.clone(),
-            )
-            .with_description(format!(
-                "{follow_up_key} queues follow-up messages until agent stops. \
-                 'one-at-a-time': deliver one, wait for response. 'all': deliver \
-                 all at once."
-            ))
-            .with_values(vec!["one-at-a-time".to_string(), "all".to_string()]),
-            SettingItem::new(
-                "hide-thinking",
-                "Hide thinking",
-                if config.hide_thinking_block {
-                    "true"
-                } else {
-                    "false"
-                },
-            )
-            .with_description("Hide thinking blocks in assistant responses")
-            .with_values(vec!["true".to_string(), "false".to_string()]),
-            SettingItem::new(
-                "default-project-trust",
-                "Default project trust",
-                default_project_trust_label,
-            )
-            .with_description(
-                "Fallback behavior when no extension or saved trust decision \
-                 decides project trust",
-            )
-            .with_values(
-                DEFAULT_PROJECT_TRUST_LABELS
-                    .iter()
-                    .map(|(_, label)| (*label).to_string())
-                    .collect(),
-            ),
-            SettingItem::new(
-                "model-thinking",
-                "Default thinking level per model",
-                model_thinking_overrides_summary(&config.model_thinking_levels),
-            )
-            .with_description(format!(
-                "Override the default thinking level for specific models. \
-                 {cycle_thinking_key} cycles in-session."
-            ))
-            .with_submenu(model_thinking_factory),
-            SettingItem::new("theme", "Theme", config.current_theme.clone())
-                .with_description("Color theme for the interface")
-                .with_submenu(theme_factory),
-        ];
+        let items = selector_items(
+            config,
+            &default_project_trust_label,
+            model_thinking_factory,
+            theme_factory,
+        );
         let settings_list =
             SettingsList::new(items, 10, theme::settings_list_theme()).with_search();
         Self {
             settings_list,
-            state,
             events,
         }
     }
@@ -1053,7 +1079,7 @@ mod tests {
 
     #[test]
     fn renders_the_scoped_rows_with_values_and_search() {
-        let selector = SettingsSelectorComponent::new(config(), queue());
+        let selector = SettingsSelectorComponent::new(&config(), queue());
         let lines = plain(&selector, 90);
         let joined = lines.join("\n");
         for label in [
@@ -1079,7 +1105,7 @@ mod tests {
     #[test]
     fn cycling_a_value_publishes_its_event() {
         let events = queue();
-        let mut selector = SettingsSelectorComponent::new(config(), events);
+        let mut selector = SettingsSelectorComponent::new(&config(), events);
         // First row is steering-mode.
         selector.handle_input("\r");
         assert_eq!(
@@ -1093,7 +1119,7 @@ mod tests {
     #[test]
     fn the_theme_submenu_previews_and_persists_through_done() {
         let events = queue();
-        let mut selector = SettingsSelectorComponent::new(config(), events);
+        let mut selector = SettingsSelectorComponent::new(&config(), events);
         // Navigate to the theme row (last) and open its submenu.
         for _ in 0..5 {
             selector.handle_input("\x1b[B");
@@ -1130,7 +1156,7 @@ mod tests {
     #[test]
     fn the_automatic_theme_menu_applies_the_light_dark_setting() {
         let events = queue();
-        let mut selector = SettingsSelectorComponent::new(config(), events);
+        let mut selector = SettingsSelectorComponent::new(&config(), events);
         for _ in 0..5 {
             selector.handle_input("\x1b[B");
         }
@@ -1170,7 +1196,7 @@ mod tests {
             .expect("catalog model")
             .clone();
         config.available_models = vec![model.clone()];
-        let mut selector = SettingsSelectorComponent::new(config, events);
+        let mut selector = SettingsSelectorComponent::new(&config, events);
         // Row 4 (0-based): model-thinking.
         for _ in 0..4 {
             selector.handle_input("\x1b[B");
@@ -1233,7 +1259,7 @@ mod tests {
     #[test]
     fn default_project_trust_maps_labels_back_to_values() {
         let events = queue();
-        let mut selector = SettingsSelectorComponent::new(config(), events);
+        let mut selector = SettingsSelectorComponent::new(&config(), events);
         for _ in 0..3 {
             selector.handle_input("\x1b[B");
         }

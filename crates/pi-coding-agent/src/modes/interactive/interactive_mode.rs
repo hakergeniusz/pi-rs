@@ -10,6 +10,7 @@
 //! only the fullscreen TUI enables tracking and delivers reports), the
 //! selector dialogs beyond `/model`, and the extension host.
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,7 +20,9 @@ use pi_agent::agent_message::AgentMessage;
 use pi_agent::events::{AgentEvent, AgentEventSink};
 use pi_agent::queues::Queues;
 use pi_agent::transcript::tool_declaration;
-use pi_agent::types::{AbortSignal, AgentContext, ThinkingLevel, ToolExecutionMode, ToolExecutor};
+use pi_agent::types::{
+    AbortSignal, AgentContext, QueueMode, ThinkingLevel, ToolExecutionMode, ToolExecutor,
+};
 use pi_tui::component::{Component, ComponentMutation};
 use pi_tui::components::editor::{Editor, EditorOptions};
 use pi_tui::components::text::Text;
@@ -32,6 +35,7 @@ use pi_tui::tui::FocusTarget;
 use pi_tui::tui::{TerminalColors, Tui, TuiStopOptions};
 
 use crate::cli::project_trust::ProjectTrustStore;
+use crate::config::settings::{SettingsManager, SettingsManagerCreateOptions};
 use crate::modes::print_mode::PrintRuntime;
 use crate::session::store::{NewSessionOptions, SessionManager};
 use crate::tools::index::BuiltinToolExecutor;
@@ -41,6 +45,9 @@ use super::components::assistant_message::AssistantMessageComponent;
 use super::components::footer::{FooterComponent, FooterData, UsageTotals};
 use super::components::header::{BuiltInHeader, pi_logo_lines};
 use super::components::model_selector::{ModelSelectorComponent, ModelSelectorEvent};
+use super::components::settings_selector::{
+    SettingsSelectorComponent, SettingsSelectorConfig, SettingsSelectorEvent,
+};
 use super::components::status_indicator::{IdleStatus, StatusIndicator};
 use super::components::tool_execution::{ToolExecutionComponent, ToolResultView};
 use super::components::trust_selector::{TrustSelectorComponent, TrustSelectorEvent};
@@ -280,6 +287,40 @@ const PENDING_INDEX: usize = 2;
 const EDITOR_INDEX: usize = 4;
 const FOOTER_INDEX: usize = 5;
 
+/// The `steeringMode`/`followUpMode` settings → queue mode. Only "all"
+/// switches off the one-at-a-time default (`QueueMode`).
+fn queue_mode_from_setting(value: Option<&str>) -> QueueMode {
+    if value == Some("all") {
+        QueueMode::All
+    } else {
+        QueueMode::OneAtATime
+    }
+}
+
+/// The queue mode → settings value.
+fn queue_mode_as_setting(mode: QueueMode) -> &'static str {
+    match mode {
+        QueueMode::All => "all",
+        QueueMode::OneAtATime => "one-at-a-time",
+    }
+}
+
+/// The `modelThinkingLevels` map: `provider/id` → level.
+fn model_thinking_levels(settings: &SettingsManager) -> BTreeMap<String, String> {
+    settings
+        .get("modelThinkingLevels")
+        .and_then(|value| value.as_object())
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|level| (key.clone(), level.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The interactive mode (`InteractiveMode`, reduced to the chat core).
 // The booleans mirror upstream TS state flags; the port keeps them one-to-one.
 #[allow(clippy::struct_excessive_bools)]
@@ -320,6 +361,8 @@ pub struct InteractiveMode {
     model_selector_events: Option<Arc<Mutex<Vec<ModelSelectorEvent>>>>,
     /// Events from the mounted `/trust` selector, same queue pattern.
     trust_selector_events: Option<Arc<Mutex<Vec<TrustSelectorEvent>>>>,
+    /// Events from the mounted `/settings` dialog, same queue pattern.
+    settings_selector_events: Option<Arc<Mutex<Vec<SettingsSelectorEvent>>>>,
     /// The editor, parked while the selector occupies its tree slot.
     suspended_editor: Option<Box<dyn Component>>,
     /// Where provider credentials live (`auth.json`).
@@ -328,6 +371,9 @@ pub struct InteractiveMode {
     agent_dir: std::path::PathBuf,
     /// Whether this project is trusted in the current session.
     project_trusted: bool,
+    /// The settings manager the dialog reads and writes
+    /// (`this.settingsManager`, `interactive-mode.ts`).
+    settings: SettingsManager,
     /// The agent loop's steering/follow-up queues, shared with the worker
     /// thread and persistent across runs (upstream: `agent.queues`).
     queues: Arc<Mutex<Queues>>,
@@ -418,6 +464,8 @@ impl InteractiveMode {
             &theme_late_reports,
             &theme_scheme_reports,
         );
+        let (agent_dir, settings, hide_thinking_block, queues) =
+            Self::startup_settings(options, runtime);
 
         InteractiveMode {
             tui,
@@ -445,21 +493,20 @@ impl InteractiveMode {
             last_sigint_time: None,
             last_spinner_tick: Instant::now(),
             tool_output_expanded: false,
-            hide_thinking_block: false,
+            hide_thinking_block,
             exiting: false,
             model_selector_events: None,
             trust_selector_events: None,
+            settings_selector_events: None,
             suspended_editor: None,
             auth_path: options
                 .auth_path
                 .clone()
                 .unwrap_or_else(crate::config::get_auth_path),
-            agent_dir: options
-                .agent_dir
-                .clone()
-                .unwrap_or_else(crate::config::get_agent_dir),
+            agent_dir,
             project_trusted: options.project_trusted,
-            queues: Arc::new(Mutex::new(Queues::new())),
+            settings,
+            queues,
             queued_deliveries: Vec::new(),
             compaction_run: None,
             compaction_queued: Vec::new(),
@@ -508,6 +555,51 @@ impl InteractiveMode {
         query_start
     }
 
+    /// Seeds the session flags from settings (`interactive-mode.ts`'s
+    /// constructor reads them through the settings manager): hide-thinking,
+    /// and the steering/follow-up queue modes.
+    fn startup_settings(
+        options: &InteractiveOptions,
+        runtime: &PrintRuntime,
+    ) -> (
+        std::path::PathBuf,
+        SettingsManager,
+        bool,
+        Arc<Mutex<Queues>>,
+    ) {
+        let agent_dir = options
+            .agent_dir
+            .clone()
+            .unwrap_or_else(crate::config::get_agent_dir);
+        let session_cwd = runtime.session.get_cwd().to_path_buf();
+        let settings = SettingsManager::create(
+            &session_cwd,
+            &agent_dir,
+            SettingsManagerCreateOptions {
+                project_trusted: Some(options.project_trusted),
+            },
+        );
+        let hide_thinking_block = settings
+            .get("hideThinkingBlock")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let steering = settings
+            .get("steeringMode")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let follow_up = settings
+            .get("followUpMode")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let queues = Arc::new(Mutex::new(Queues::new()));
+        {
+            let mut pending = queues.lock().expect("queues");
+            pending.set_steering_mode(queue_mode_from_setting(steering.as_deref()));
+            pending.set_follow_up_mode(queue_mode_from_setting(follow_up.as_deref()));
+        }
+        (agent_dir, settings, hide_thinking_block, queues)
+    }
+
     /// The `/`-commands offered by autocomplete (`createBaseAutocompleteProvider`,
     /// `interactive-mode.ts:743-853`). Only the commands this port implements
     /// are listed — advertising upstream's unimplemented builtins would make
@@ -554,6 +646,7 @@ impl InteractiveMode {
                 })),
             autocomplete::SlashCommand::new("compact", "Manually compact the session context"),
             autocomplete::SlashCommand::new("trust", "Show the project trust options"),
+            autocomplete::SlashCommand::new("settings", "Open settings menu"),
             autocomplete::SlashCommand::new("thinking", "Set thinking level")
                 .with_argument_hint("<level>")
                 .with_argument_completions(Arc::new(|prefix: &str| {
@@ -989,6 +1082,11 @@ impl InteractiveMode {
         // `/trust` (`interactive-mode.ts:2736-2739`).
         if text == "/trust" {
             self.open_trust_selector();
+            return;
+        }
+        // `/settings` (`interactive-mode.ts:2653-2655`).
+        if text == "/settings" {
+            self.open_settings_selector();
             return;
         }
         // `/compact [instructions]` (`interactive-mode.ts:3434-3439`).
@@ -1495,6 +1593,190 @@ impl InteractiveMode {
         self.trust_selector_events = None;
         self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
         self.tui.request_render();
+    }
+
+    /// Mount the `/settings` dialog in the editor's tree slot
+    /// (`showSettingsSelector`, `interactive-mode.ts:4178-4416`).
+    fn open_settings_selector(&mut self) {
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (provider, model_id) = (
+            self.settings.get_default_provider(),
+            self.settings.get_default_model(),
+        );
+        let default_model = provider.zip(model_id);
+        let selector = SettingsSelectorComponent::new(
+            &SettingsSelectorConfig {
+                steering_mode: queue_mode_as_setting(
+                    self.queues.lock().expect("queues").steering_mode(),
+                )
+                .to_string(),
+                follow_up_mode: queue_mode_as_setting(
+                    self.queues.lock().expect("queues").follow_up_mode(),
+                )
+                .to_string(),
+                hide_thinking_block: self.hide_thinking_block,
+                thinking_level: self
+                    .settings
+                    .get_default_thinking_level()
+                    .unwrap_or_else(|| "off".to_string()),
+                model_thinking_levels: model_thinking_levels(&self.settings),
+                available_models: self.available_models(),
+                current_model: Some((self.model.provider.clone(), self.model.id.clone())),
+                default_model,
+                current_theme: self
+                    .theme_setting
+                    .clone()
+                    .unwrap_or_else(|| pi_tui::theme::SYSTEM_THEME_NAME.to_string()),
+                terminal_theme: theme::terminal_theme().to_string(),
+                default_project_trust: self
+                    .settings
+                    .get("defaultProjectTrust")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("ask")
+                    .to_string(),
+            },
+            Arc::clone(&events),
+        );
+        let editor = self.tui.replace_child(EDITOR_INDEX, Box::new(selector));
+        self.suspended_editor = Some(editor);
+        self.settings_selector_events = Some(events);
+        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
+        self.tui.request_render();
+    }
+
+    /// Put the editor back after the settings dialog closes.
+    fn close_settings_selector(&mut self) {
+        if self.suspended_editor.is_none() {
+            return;
+        }
+        let editor = self.suspended_editor.take().expect("suspended editor");
+        let _ = self.tui.replace_child(EDITOR_INDEX, editor);
+        self.settings_selector_events = None;
+        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
+        self.tui.request_render();
+    }
+
+    /// The `/settings` dialog's event handlers
+    /// (`showSettingsSelector`'s callbacks, `interactive-mode.ts:4227-4412`).
+    fn handle_settings_event(&mut self, event: SettingsSelectorEvent) {
+        match event {
+            SettingsSelectorEvent::ThemeChange(setting) => {
+                // `onThemeChange` (`interactive-mode.ts:4301-4304`):
+                // persist, then re-apply through the controller.
+                self.settings
+                    .set("theme", serde_json::Value::String(setting.clone()));
+                self.theme_setting = Some(setting);
+                let _ = self.theme_apply_from_settings(true);
+            }
+            SettingsSelectorEvent::ThemePreview(setting) => {
+                // `onThemePreview` → `preview`
+                // (`theme-controller.ts:111-119`): switch the loaded theme
+                // without recording the setting.
+                let name = theme::resolve_theme_setting(Some(&setting))
+                    .unwrap_or_else(|| self.theme_active_name.clone());
+                let _ = theme::set_theme(&name);
+                self.tui.invalidate();
+                self.tui.request_render();
+            }
+            SettingsSelectorEvent::SteeringModeChange(mode) => {
+                // `onSteeringModeChange` → `session.setSteeringMode`
+                // (`agent-session.ts:2286-2289`): the live queues and
+                // settings.json.
+                self.queues
+                    .lock()
+                    .expect("queues")
+                    .set_steering_mode(queue_mode_from_setting(Some(&mode)));
+                self.settings
+                    .set("steeringMode", serde_json::Value::String(mode));
+            }
+            SettingsSelectorEvent::FollowUpModeChange(mode) => {
+                self.queues
+                    .lock()
+                    .expect("queues")
+                    .set_follow_up_mode(queue_mode_from_setting(Some(&mode)));
+                self.settings
+                    .set("followUpMode", serde_json::Value::String(mode));
+            }
+            SettingsSelectorEvent::HideThinkingBlockChange(hidden) => {
+                // `onHideThinkingBlockChange`
+                // (`interactive-mode.ts:4306-4310`).
+                self.hide_thinking_block = hidden;
+                self.settings
+                    .set("hideThinkingBlock", serde_json::Value::Bool(hidden));
+                self.update_thinking_block_visibility();
+                self.tui.request_render();
+            }
+            SettingsSelectorEvent::ModelThinkingLevelChange {
+                provider,
+                model_id,
+                level,
+            } => {
+                self.apply_model_thinking_level(&provider, &model_id, Some(&level));
+            }
+            SettingsSelectorEvent::ModelThinkingLevelRemove { provider, model_id } => {
+                self.apply_model_thinking_level(&provider, &model_id, None);
+            }
+            SettingsSelectorEvent::DefaultProjectTrustChange(value) => {
+                self.settings
+                    .set("defaultProjectTrust", serde_json::Value::String(value));
+            }
+            SettingsSelectorEvent::Cancel => {
+                self.close_settings_selector();
+            }
+        }
+    }
+
+    /// `onModelThinkingLevelChange`/`onModelThinkingLevelRemove`
+    /// (`interactive-mode.ts:4280-4300`): persist the override map; when it
+    /// concerns the current model, re-apply the thinking level live.
+    fn apply_model_thinking_level(&mut self, provider: &str, model_id: &str, level: Option<&str>) {
+        let key = format!("{provider}/{model_id}");
+        let mut levels = model_thinking_levels(&self.settings);
+        match level {
+            Some(level) => {
+                levels.insert(key, level.to_string());
+            }
+            None => {
+                levels.remove(&key);
+            }
+        }
+        self.settings.set(
+            "modelThinkingLevels",
+            serde_json::Value::Object(
+                levels
+                    .into_iter()
+                    .map(|(key, value)| (key, serde_json::Value::String(value)))
+                    .collect(),
+            ),
+        );
+        if self.model.provider == provider && self.model.id == model_id {
+            let default_level = self
+                .settings
+                .get_default_thinking_level()
+                .unwrap_or_else(|| "off".to_string());
+            let level = level.unwrap_or(default_level.as_str());
+            if let Ok(level) = crate::modes::print_mode::thinking_level_from_str(level) {
+                self.thinking_level = level;
+                let _ = self.session.append_thinking_level_change(level.as_str());
+                self.refresh_footer();
+            }
+        }
+    }
+
+    /// `updateThinkingBlockVisibility`
+    /// (`interactive-mode.ts:3887-3891`): flip the flag on every rendered
+    /// assistant row.
+    fn update_thinking_block_visibility(&mut self) {
+        let hide = self.hide_thinking_block;
+        let chat_len = self.chat_len();
+        for index in 0..chat_len {
+            if let Some(message) = self.downcast_chat::<AssistantMessageComponent>(index) {
+                message.set_hide_thinking_block(hide);
+            }
+        }
     }
 
     /// `/thinking [level]` (`handleThinkingCommand`).
@@ -2049,6 +2331,24 @@ impl InteractiveMode {
         }
     }
 
+    /// The `/settings` dialog's drain (`showSettingsSelector`'s callbacks).
+    fn pump_settings_selector(&mut self) {
+        if self.settings_selector_events.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .settings_selector_events
+                .as_ref()
+                .expect("settings selector")
+                .lock()
+                .expect("settings selector events"),
+        );
+        for event in events {
+            self.handle_settings_event(event);
+        }
+    }
+
     /// One loop iteration without terminal input: editor events, agent
     /// events, spinner frames. `run` calls this between input polls; the
     /// scripted tests drive it directly with a capture terminal.
@@ -2070,6 +2370,7 @@ impl InteractiveMode {
         // to (`showSelector`'s onSelect/onCancel callbacks).
         self.pump_model_selector();
         self.pump_trust_selector();
+        self.pump_settings_selector();
 
         // Agent events, without blocking the input loop: collect first,
         // then handle, so the run borrow ends before the handlers run.
