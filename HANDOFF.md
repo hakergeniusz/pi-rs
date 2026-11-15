@@ -874,7 +874,7 @@ pump cadence stands in for upstream's `setInterval`).
   feature-gate `pi-ext-js` behind `ext-js` on `pi-coding-agent` and
   replace the seam (`crates/pi-coding-agent/src/extensions/mod.rs`).
 
-## E2: UI over protocol + host wiring (in progress, on `feat/e2-ext-wiring`, 2026-11-15)
+## E2: UI over protocol + host wiring (in progress, on `feat/e2-host-wiring`, 2026-11-15)
 
 - **Slice 1 — engine UI surface** (`2355e01`): `ctx.ui`
   select/confirm/input/editor/custom queue a request through the
@@ -950,14 +950,71 @@ pump cadence stands in for upstream's `setInterval`).
   servers (language-agnostic), and RPC mode (external processes). The
   host-side registries keep a native-registration path open if a real
   use case appears.
-- **Next**: slice 3 — feature-gate `pi-ext-js` behind `ext-js` on
-  `pi-coding-agent` and replace
-  `crates/pi-coding-agent/src/extensions/mod.rs` (discovery/load from
-  `-e` paths + settings, tool composition from `ToolInfo`, command
-  dispatch, flag claiming, provider-registry application); slice 4 —
-  RPC dialog subprotocol in `modes/rpc.rs`, `session_before_*` gates in
-  the agent loop, virtual-model routing, provider OAuth/streamSimple
-  decision.
+- **Slice 3 — host wiring** (`1a17635`, branch `feat/e2-host-wiring`):
+  the dead seam (`Extension` trait/registry, zero consumers) is replaced
+  by the real host. `pi-ext-js` is an optional dep of `pi-coding-agent`
+  behind the `ext-js` feature (default on; `--no-default-features`
+  builds the engine-free shape). `main.rs build_runtime` now runs the
+  upstream startup sequence (`main.ts:780-941`):
+  - Discovery with `--no-extensions` semantics — CLI `-e` paths still
+    load (`discover_cli_paths`, `resource-loader.ts:609-610`); missing
+    local `-e` paths error once (`Failed to load extension "…":
+    Extension path does not exist: …`) and are excluded from loading
+    (`resource-loader.ts:620-627`; `isLocalPath` prefixes ported).
+  - The pre-trust bootstrap pass runs only when trust actually needs
+    resolving (no `--approve` override + trust-requiring resources,
+    `main.ts:804-808`) and loads non-project origins only; the
+    `project_trust` hook sits in the trust ladder before the store
+    (`project-trust.ts:55-71`) and `remember` persists. The runner's
+    settings view flips to the trusted dump after the decision
+    (`setProjectTrusted` + `reload`).
+  - The final pass loads trusted-allowed paths minus already-loaded
+    modules and never retries bootstrap failures
+    (`loadFinalExtensionSet`, `resource-loader.ts:791-833`), then
+    `bind()`; bind-flush provider errors surface as warnings.
+  - Flag claiming (`applyExtensionFlagValues`,
+    `agent-session-services.ts:82-129`): registered booleans set `true`
+    regardless of the captured value; strings require a value
+    (`Extension flag "--x" requires a value`); unclaimed collapse into
+    one `Unknown option(s): --a, --b` error.
+  - Diagnostics: warnings print to stderr, error-level entries abort
+    startup with the joined `Error: …` lines and the
+    `"pi -ne"` hint (`main.ts:982-990`).
+  - Tools: `select_tools(args, builtin, extension)` — `--no-tools`
+    drops everything (`noTools: "all"`), `--no-builtin-tools` keeps
+    extension tools (`noTools: "builtin"`), all-names `--tools`
+    allowlists both, the modifier form keeps extension tools
+    (`allowedToolNames` undefined, `sdk.ts:287-291`), `--exclude-tools`
+    always removes. `PrintRuntime.executor` is `Arc<dyn ToolExecutor>`;
+    the composite validates extension calls against their schema and
+    dispatches through `ExtensionRunner::execute_tool` behind a mutex.
+- **E2 slice-3 deviations/interpretations**:
+  - rquickjs runs with the `parallel` feature (Send `Runtime`/`Context`)
+    so the runner can live in `Arc<Mutex<_>>` next to the agent loop;
+    the per-runtime lock is uncontended on the single-threaded host.
+    Error listeners and host-action closures carry `Send`.
+  - `--tools` unknown names still error (the P4 behavior; upstream
+    silently ignores unknown allowlist names), and the message's tool
+    list now includes extension tools.
+  - `+exttool` does not activate a default-inactive extension tool and
+    `-exttool` cannot remove one (upstream's modifiers apply to the
+    builtin base only; `-` removal parity, `+` activation skipped) —
+    the full active-loadout machinery is E3.
+  - Flag diagnostics iterate name-sorted (`BTreeMap`), not CLI capture
+    order (upstream `Map`) — same content, different order.
+  - The runner's `active_tools` (`pi.getActiveTools`) reflects bind()'s
+    default set, not the CLI-filtered declared set.
+  - Post-bind tool registrations do not refresh the runner's dispatch
+    snapshots (`/reload`/E3 concern).
+  - `session_start` is not emitted yet — it lands with the slice-4 loop
+    wiring; commands dispatch with the consuming hosts.
+  - Interactive mode prints startup warnings to stderr (upstream shows
+    them in the TUI).
+- **Next**: slice 4 — RPC dialog subprotocol in `modes/rpc.rs` (the
+  `UiSink` bridged to stdin/stdout), `session_before_*` gates in the
+  agent loop, `user_bash` at the bash tool, `emit_context` at LLM-request
+  assembly, `session_start` emission, virtual-model routing,
+  provider OAuth/streamSimple decision.
 
 ## Gotchas / decisions
 - **Round-hunting can exercise a stale binary (E2, 2026-11-15)**: a hunt

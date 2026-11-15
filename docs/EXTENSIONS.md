@@ -419,14 +419,34 @@ appears.
 
 **E1/E2 status (2026-11-15):** the real runner now exists —
 `crates/pi-ext-js/src/runner.rs` ports every §2 dispatch family, and E2
-slices 1–2 added the UI bridge, `user_bash`, context transforms, and the
-provider registry (§8). The seam
-(`crates/pi-coding-agent/src/extensions/mod.rs`) is still the *only*
-extension surface the `pi` binary knows; replacing it with the E1/E2
-runner (feature `ext-js`) is E2 slice 3, so the gauntlets below remain as
-written until that wiring.
+slices 1–3 added the UI bridge, `user_bash`, context transforms, the
+provider registry, and the host wiring (§8). The old seam is gone:
+`crates/pi-coding-agent/src/extensions/mod.rs` now holds the real host
+wiring (discovery, pre-trust pass, trust hook, final load, bind, flag
+claiming, tool composition, the composite executor), feature-gated
+behind `ext-js`. The gauntlets below describe what the seam *used* to
+model, kept for the record:
 
-The seam (`crates/pi-coding-agent/src/extensions/mod.rs`) models the easy 20%:
+1. **Event model** — one `handle_event(&AgentEvent) -> EventOutcome` vs ~35
+   typed events, each with its own chaining/result semantics (§2). `AgentEvent`
+   is the agent-loop output stream, not the extension event set; the port needs
+   its own `ExtensionEvent` enum with typed payloads and result types.
+2. **Tool registration** — `ExtensionTool` lacks: `signal`/abort, `onUpdate`
+   progress callback, nested `executeTool`, `tools` listing, `details`-typed
+   results, `terminate`, `usage` rollup, exposure/annotations/namespace,
+   `defaultActive`, `prepareArguments`, `executionMode`, first-wins by name.
+3. **Commands** — no command context (`waitForIdle`, `newSession/fork/
+   switchSession/navigateTree/reload`, `withSession` staleness semantics), no
+   `name:occurrence` disambiguation.
+4. **Missing registration surfaces** — shortcuts/keybindings, message/entry/
+   tool renderers, markdown transformers, MCP server registry, provider and
+   virtual-model registration, flags-with-values, `pi.events` bus, settings
+   access, skills/prompt/theme discovery.
+5. **Lifecycle** — no runner-level staleness invalidation, no error listener
+   plumbing, no UI-context no-op/mode gating (`hasUI`, `ctx.mode`).
+6. **What survives** — the `Arc<dyn Fn>` executor signature, the registry
+   fan-out shape, and the flag-claiming flow are keepers; the rest of the seam
+   is scaffolding to build the real thing on, not a constraint.
 a static `Extension` trait (`tools()/commands()/flags()/handle_event()`), an
 aggregating registry, and unknown-flag claiming. Gaps against §2/§3:
 
@@ -499,11 +519,24 @@ fidelity rule applies per phase (deviations recorded as they appear).
   registry with upstream's two-level load-time deferral (per-extension
   pending changes discarded on failed load → runtime queues flushed at
   bind with per-registration error reports; post-bind registrations
-  apply immediately and throw into the caller). Remaining: slice 3
-  (feature gate `ext-js` on `pi-coding-agent`, replace the seam,
-  loader/discovery wiring) and slice 4 (RPC dialog subprotocol in
-  `modes/rpc.rs`, `session_before_*` agent-loop gates, virtual-model
-  routing, provider OAuth/streamSimple). Exit: RPC-mode extension
+  apply immediately and throw into the caller). Slice 3 landed
+  (`1a17635`) — the host wiring: `pi-ext-js` is an optional dep of
+  `pi-coding-agent` behind `ext-js` (default on), the seam is replaced
+  by the real host in `crates/pi-coding-agent/src/extensions/mod.rs`
+  (`--no-extensions` still loads CLI `-e` paths, the pre-trust bootstrap
+  pass + `project_trust` hook in the trust ladder, the final pass
+  reusing bootstrap modules, missing local `-e` paths erroring without a
+  load, bind + provider-bind-error warnings, flag claiming with the
+  exact `Unknown option(s)` diagnostics, warnings-print/errors-abort
+  with the `pi -ne` hint), and the tool composition: `select_tools`
+  with upstream's `noTools: "all"|"builtin"` semantics and a composite
+  executor that dispatches extension tools through
+  `ExtensionRunner::execute_tool` (runner shared as `Arc<Mutex<_>>` —
+  rquickjs `parallel` + Send closures/listeners). Remaining: slice 4
+  (RPC dialog subprotocol in `modes/rpc.rs`, `session_before_*`
+  agent-loop gates, `user_bash` at the bash tool, `emit_context` at
+  request assembly, `session_start` emission, virtual-model routing,
+  provider OAuth/streamSimple). Exit: RPC-mode extension
   dialogs match upstream's rpc-extension-ui contract; codemode E1 port
   decided (needs worker-subprocess JS execution).
 - **E3 — TUI bridging**: shortcuts, message/entry/tool renderers, markdown
