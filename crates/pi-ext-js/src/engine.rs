@@ -117,6 +117,15 @@ pub struct HostCore {
     pub thinking_level: Option<String>,
     /// `ctx.ui.notify` calls, in order (the headless UI log).
     pub ui_log: Vec<String>,
+    /// Whether a real UI sink is bound (`ctx.hasUI`; `false` until
+    /// `set_ui_context`).
+    pub has_ui: bool,
+    /// UI requests queued by dialog/fire-and-forget `ctx.ui` calls, in
+    /// order; each entry is `{id, method, ...params}`. The runner drains
+    /// and hands them to its sink.
+    pub ui_requests: Vec<Json>,
+    /// Monotonic id source for UI requests.
+    pub ui_counter: u64,
     /// Tool `onUpdate` callbacks, in order.
     pub tool_updates: Vec<(String, Json)>,
     /// The host actions.
@@ -342,6 +351,27 @@ impl JsHost {
         });
         op!("mode", core, || -> String {
             core.lock().expect("host core mutex poisoned").mode.clone()
+        });
+        op!("hasUi", core, || -> String {
+            if core.lock().expect("host core mutex poisoned").has_ui {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        });
+        // A `ctx.ui` call crossing the boundary: the request JSON is
+        // `{method, ...params}`; dialogs get the id back so their promise
+        // can be resolved later via `__piUiResolve`.
+        op!("uiRequest", core, |request: String| -> String {
+            let mut core = core.lock().expect("host core mutex poisoned");
+            core.ui_counter += 1;
+            let id = format!("ui-{}", core.ui_counter);
+            let mut value: Json = serde_json::from_str(&request).unwrap_or(Json::Null);
+            if let Some(object) = value.as_object_mut() {
+                object.shift_insert(0, "id".to_string(), Json::String(id.clone()));
+            }
+            core.ui_requests.push(value);
+            id
         });
         op!("getModel", core, || -> String {
             let core = core.lock().expect("host core mutex poisoned");
@@ -662,6 +692,33 @@ impl JsHost {
     /// Ends a dispatch session, releasing its live objects.
     pub fn session_end(&self, id: u32) -> Result<(), JsHostError> {
         self.call_unit("__piSessionEnd", id as usize)
+    }
+
+    /// Binds (or unbinds) the UI surface: `ctx.mode` and `ctx.hasUI` read
+    /// these lazily through the ops, so no JS push is needed.
+    pub fn set_ui_mode(&self, mode: &str, has_ui: bool) {
+        let mut core = self.core.lock().expect("host core mutex poisoned");
+        core.mode = mode.to_string();
+        core.has_ui = has_ui;
+    }
+
+    /// Takes the UI requests queued since the last drain
+    /// (`{id, method, ...params}`, in call order).
+    pub fn drain_ui_requests(&self) -> Vec<Json> {
+        let mut core = self.core.lock().expect("host core mutex poisoned");
+        std::mem::take(&mut core.ui_requests)
+    }
+
+    /// Settles one pending dialog promise (`__piUiResolve`): the payload
+    /// is a JSON-encoded `RpcExtensionUIResponse` shape
+    /// (`{value}`, `{confirmed}`, `{cancelled:true}`, or `{}` for the
+    /// sink-side default). The caller drives jobs afterwards.
+    pub fn resolve_ui(&self, id: &str, payload_json: &str) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let resolve: Function = ctx.globals().get("__piUiResolve")?;
+            let _: Value = resolve.call((id, payload_json))?;
+            Ok(())
+        })
     }
 
     /// Evaluates one JS source string (tests and capability probes):

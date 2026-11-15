@@ -86,6 +86,27 @@ pub fn session_before_fork(entry_id: &str, position: &str) -> Json {
     json!({ "type": "session_before_fork", "entryId": entry_id, "position": position })
 }
 
+/// `{type:"ui_prompt_start", reason:"ui_prompt", kind, title?}`
+/// (`types.ts:1063-1069`) — fired when the runner starts waiting on a
+/// blocking extension UI prompt.
+pub fn ui_prompt_start(kind: &str, title: Option<&str>) -> Json {
+    ui_prompt_event("ui_prompt_start", kind, title)
+}
+
+/// `{type:"ui_prompt_end", reason:"ui_prompt", kind, title?}`
+/// (`types.ts:1070-1076`).
+pub fn ui_prompt_end(kind: &str, title: Option<&str>) -> Json {
+    ui_prompt_event("ui_prompt_end", kind, title)
+}
+
+fn ui_prompt_event(event_type: &str, kind: &str, title: Option<&str>) -> Json {
+    let mut event = json!({ "type": event_type, "reason": "ui_prompt", "kind": kind });
+    if let Some(title) = title {
+        event["title"] = json!(title);
+    }
+    event
+}
+
 /// `{type:"project_trust", cwd}` (`types.ts`, `ProjectTrustEvent`).
 pub fn project_trust(cwd: &str) -> Json {
     json!({ "type": "project_trust", "cwd": cwd })

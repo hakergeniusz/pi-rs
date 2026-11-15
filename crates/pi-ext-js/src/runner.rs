@@ -135,11 +135,36 @@ pub struct ToolExecutionError {
 type ErrorListeners = Vec<Box<dyn Fn(&ExtensionError)>>;
 
 /// The runner: dispatch semantics over the loaded extensions.
+/// The host side of the UI-over-protocol surface (E2): every `ctx.ui`
+/// request that crosses the engine boundary reaches [`UiSink::request`],
+/// and dialog requests additionally block on
+/// [`UiSink::wait_response`] — the sink owns the transport (RPC lines in
+/// E2), the timeout default resolution, and the response shapes
+/// (`{value}`, `{confirmed}`, `{cancelled:true}`, `{}`).
+pub trait UiSink: Send + Sync {
+    /// Delivers one request (`{id, method, ...params}`). Fire-and-forget
+    /// methods never get a response; dialog methods must eventually
+    /// produce one through [`UiSink::wait_response`].
+    fn request(&self, request: &Json);
+
+    /// Waits for the response to the dialog request with this id. The
+    /// sink resolves its own timeout default (the request payload carries
+    /// the `timeout` field upstream includes in the wire request).
+    fn wait_response(&self, id: &str, method: &str) -> Json;
+}
+
 pub struct ExtensionRunner {
     host: JsHost,
     core: std::sync::Arc<Mutex<HostCore>>,
     extensions: Vec<ExtensionSnapshot>,
     error_listeners: ErrorListeners,
+    /// The bound UI surface; `None` keeps the headless no-op matrix.
+    ui_sink: Option<std::sync::Arc<dyn UiSink>>,
+    /// `withUIPrompt` depth (runner.ts:589-613): only the outermost
+    /// dialog emits `ui_prompt_start`/`ui_prompt_end`.
+    ui_prompt_depth: u32,
+    /// The outermost prompt's kind/title, replayed on its end event.
+    active_ui_prompt: Option<(String, Option<String>)>,
 }
 
 impl ExtensionRunner {
@@ -155,6 +180,9 @@ impl ExtensionRunner {
             core: core.1,
             extensions: Vec::new(),
             error_listeners: Vec::new(),
+            ui_sink: None,
+            ui_prompt_depth: 0,
+            active_ui_prompt: None,
         })
     }
 
@@ -392,7 +420,7 @@ impl ExtensionRunner {
         let id = self.host.session_begin("{}", ContextKind::Command, None)?;
         self.host
             .session_call_command(id, index, &command.name, args)?;
-        self.host.drive_jobs()?;
+        self.settle_session(id)?;
         let outcome = parse_session_outcome(&self.host.session_last(id)?)?;
         self.host.session_end(id)?;
         Self::outcome_result(outcome)?;
@@ -437,7 +465,7 @@ impl ExtensionRunner {
                 message: err.to_string(),
             })?;
         let call = self.host.session_call_tool(id, index, name, tool_call_id);
-        let driven = call.and_then(|()| self.host.drive_jobs());
+        let driven = call.and_then(|()| self.settle_session(id));
         let outcome = match driven.and_then(|()| self.host.session_last(id)) {
             Ok(raw) => parse_session_outcome(&raw),
             Err(err) => {
@@ -520,6 +548,129 @@ impl ExtensionRunner {
         }
     }
 
+    /// Binds the UI surface (`setUIContext`, `runner.ts:570-575`):
+    /// `ctx.mode`/`ctx.hasUI` flip, and every `ctx.ui` request crosses to
+    /// the sink. Without this call the runner stays headless.
+    pub fn set_ui_context(&mut self, sink: std::sync::Arc<dyn UiSink>, mode: &str) {
+        self.host.set_ui_mode(mode, true);
+        self.ui_sink = Some(sink);
+    }
+
+    /// Unbinds the UI surface (`setUIContext(undefined)`): back to the
+    /// headless matrix and `mode: "print"`.
+    pub fn clear_ui_context(&mut self) {
+        self.host.set_ui_mode("print", false);
+        self.ui_sink = None;
+    }
+
+    /// Drives jobs, then services UI requests until the session settles
+    /// or nothing is pending. Replaces the bare job drain inside every
+    /// dispatch loop: a handler awaiting a dialog promise only finishes
+    /// once the sink's response resolves it. Draining precedes the
+    /// settled check so fire-and-forget requests queued during the last
+    /// job batch still cross now (upstream's void `ctx.ui` calls are
+    /// synchronous).
+    fn settle_session(&mut self, id: u32) -> Result<(), JsHostError> {
+        self.host.drive_jobs()?;
+        loop {
+            let requests = self.host.drain_ui_requests();
+            if !requests.is_empty() {
+                for request in &requests {
+                    self.deliver_ui_request(request)?;
+                    self.host.drive_jobs()?;
+                }
+                continue;
+            }
+            if self.session_settled(id)? {
+                return Ok(());
+            }
+            // A promise only jobs can settle; leave the slot pending
+            // (the caller reads `{done:false}`).
+            return Ok(());
+        }
+    }
+
+    /// Whether the session's result slot has settled.
+    fn session_settled(&self, id: u32) -> Result<bool, JsHostError> {
+        let raw = self.host.session_last(id)?;
+        let value: Json =
+            serde_json::from_str(&raw).map_err(|err| JsHostError::Job(err.to_string()))?;
+        Ok(value.get("done").and_then(Json::as_bool).unwrap_or(true))
+    }
+
+    /// Delivers one UI request. Dialog methods (`select`, `confirm`,
+    /// `input`, `editor`) emit the `ui_prompt_*` pair around the blocking
+    /// wait (`wrapUIPromptContext`, `runner.ts:577-613`); `custom` emits
+    /// the pair with no sink delivery (RPC mode answers it immediately);
+    /// everything else is fire-and-forget.
+    fn deliver_ui_request(&mut self, request: &Json) -> Result<(), JsHostError> {
+        let method = request
+            .get("method")
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let id = request
+            .get("id")
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match method.as_str() {
+            "select" | "confirm" | "input" | "editor" => {
+                let title = request
+                    .get("title")
+                    .and_then(Json::as_str)
+                    .map(ToOwned::to_owned);
+                self.begin_ui_prompt(&method, title.as_deref())?;
+                if let Some(sink) = self.ui_sink.clone() {
+                    sink.request(request);
+                    let response = sink.wait_response(&id, &method);
+                    let payload = serde_json::to_string(&response).unwrap_or_default();
+                    self.host.resolve_ui(&id, &payload)?;
+                }
+                self.end_ui_prompt()?;
+            }
+            "custom" => {
+                self.begin_ui_prompt("custom", None)?;
+                self.host.resolve_ui(&id, "")?;
+                self.end_ui_prompt()?;
+            }
+            _ => {
+                if let Some(sink) = &self.ui_sink {
+                    sink.request(request);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Depth-gated `ui_prompt_start`: only the outermost prompt emits,
+    /// with its kind and title.
+    fn begin_ui_prompt(&mut self, kind: &str, title: Option<&str>) -> Result<(), JsHostError> {
+        self.ui_prompt_depth += 1;
+        if self.ui_prompt_depth == 1 {
+            self.active_ui_prompt = Some((kind.to_string(), title.map(ToOwned::to_owned)));
+            self.emit(&events::ui_prompt_start(kind, title))?;
+        }
+        Ok(())
+    }
+
+    /// Depth-gated `ui_prompt_end`, replaying the outermost prompt's
+    /// kind/title; emitted before the resolved handler's continuation
+    /// runs (upstream queues the end emit ahead of it).
+    fn end_ui_prompt(&mut self) -> Result<(), JsHostError> {
+        if self.ui_prompt_depth > 0 {
+            self.ui_prompt_depth -= 1;
+        }
+        if self.ui_prompt_depth == 0 {
+            let (kind, title) = self
+                .active_ui_prompt
+                .take()
+                .unwrap_or_else(|| ("custom".to_string(), None));
+            self.emit(&events::ui_prompt_end(&kind, title.as_deref()))?;
+        }
+        Ok(())
+    }
+
     /// Begins a session, runs `dispatch` per handler, ends the session.
     /// Returns the per-handler outcomes in dispatch order.
     fn run_session(
@@ -540,7 +691,7 @@ impl ExtensionRunner {
                 break;
             }
             let call = self.host.session_call(id, *index, event_name, *handler);
-            if let Err(err) = call.and_then(|()| self.host.drive_jobs()) {
+            if let Err(err) = call.and_then(|()| self.settle_session(id)) {
                 fatal = Some(err);
                 break;
             }
@@ -621,7 +772,7 @@ impl ExtensionRunner {
             if let Err(err) = self
                 .host
                 .session_call(id, index, "tool_call", handler)
-                .and_then(|()| self.host.drive_jobs())
+                .and_then(|()| self.settle_session(id))
             {
                 let _ = self.host.session_end(id);
                 fatal = Some(err);
@@ -672,7 +823,7 @@ impl ExtensionRunner {
                 .host
                 .session_begin(&payload, ContextKind::Event, None)?;
             self.host.session_call(id, index, "tool_result", handler)?;
-            self.host.drive_jobs()?;
+            self.settle_session(id)?;
             let outcome = parse_session_outcome(&self.host.session_last(id)?);
             self.host.session_end(id)?;
             let outcome = outcome?;
@@ -736,7 +887,7 @@ impl ExtensionRunner {
                 .host
                 .session_begin(&payload, ContextKind::Event, None)?;
             self.host.session_call(id, index, "input", handler)?;
-            self.host.drive_jobs()?;
+            self.settle_session(id)?;
             let outcome = parse_session_outcome(&self.host.session_last(id)?);
             self.host.session_end(id)?;
             let outcome = outcome?;
@@ -819,7 +970,7 @@ impl ExtensionRunner {
                 .session_begin(&payload, ContextKind::Event, None)?;
             self.host
                 .session_call(id, index, "before_agent_start", handler)?;
-            self.host.drive_jobs()?;
+            self.settle_session(id)?;
             let outcome = parse_session_outcome(&self.host.session_last(id)?);
             self.host.session_end(id)?;
             let outcome = outcome?;
@@ -859,7 +1010,7 @@ impl ExtensionRunner {
                 .host
                 .session_begin(&payload, ContextKind::Event, None)?;
             self.host.session_call(id, index, "message_end", handler)?;
-            self.host.drive_jobs()?;
+            self.settle_session(id)?;
             let outcome = parse_session_outcome(&self.host.session_last(id)?);
             self.host.session_end(id)?;
             let outcome = outcome?;
@@ -922,7 +1073,7 @@ impl ExtensionRunner {
                 .host
                 .session_begin(&payload, ContextKind::Event, None)?;
             self.host.session_call(id, index, &event_type, handler)?;
-            self.host.drive_jobs()?;
+            self.settle_session(id)?;
             let outcome = parse_session_outcome(&self.host.session_last(id)?);
             self.host.session_end(id)?;
             if let Ok(outcome) = &outcome {
@@ -992,7 +1143,7 @@ impl ExtensionRunner {
                 .session_begin(&payload, ContextKind::ProjectTrust, None)?;
             self.host
                 .session_call(id, index, "project_trust", handler)?;
-            self.host.drive_jobs()?;
+            self.settle_session(id)?;
             let outcome = parse_session_outcome(&self.host.session_last(id)?);
             self.host.session_end(id)?;
             let outcome = outcome?;
@@ -1113,6 +1264,323 @@ export default function (pi) {
         let sink = errors.clone();
         runner.on_error(Box::new(move |error| sink.borrow_mut().push(error.clone())));
         errors
+    }
+
+    // ---- E2 UI surface ----
+
+    /// Scripted UI sink: records every request, answers dialogs by
+    /// method (or `{}` — the sink-side timeout default resolution).
+    struct FakeSink {
+        requests: Mutex<Vec<Json>>,
+        responses: Mutex<std::collections::HashMap<String, Json>>,
+    }
+
+    impl FakeSink {
+        fn scripted(responses: &[(&str, Json)]) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                requests: Mutex::new(Vec::new()),
+                responses: Mutex::new(
+                    responses
+                        .iter()
+                        .map(|(method, response)| (method.to_string(), response.clone()))
+                        .collect(),
+                ),
+            })
+        }
+
+        fn requests(&self) -> Vec<Json> {
+            self.requests.lock().expect("requests").clone()
+        }
+    }
+
+    impl UiSink for FakeSink {
+        fn request(&self, request: &Json) {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(request.clone());
+        }
+
+        fn wait_response(&self, _id: &str, method: &str) -> Json {
+            self.responses
+                .lock()
+                .expect("responses")
+                .get(method)
+                .cloned()
+                .unwrap_or_else(|| json!({}))
+        }
+    }
+
+    fn entries_of(runner: &ExtensionRunner) -> Vec<Json> {
+        runner
+            .core()
+            .lock()
+            .expect("core")
+            .entries
+            .iter()
+            .map(|(custom_type, data)| json!({ "type": custom_type, "data": data }))
+            .collect()
+    }
+
+    const EXT_UI_DIALOG: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    const choice = await ctx.ui.select("Pick", ["a", "b"]);
+    pi.appendEntry("choice", choice);
+  });
+  pi.on("ui_prompt_start", (event) => pi.appendEntry("prompt-start", event.kind));
+  pi.on("ui_prompt_end", (event) => pi.appendEntry("prompt-end", event.kind));
+}
+"#;
+
+    #[test]
+    fn ui_dialog_round_trip_and_prompt_events() {
+        let mut runner = runner_with(&[EXT_UI_DIALOG]);
+        let sink = FakeSink::scripted(&[("select", json!({ "value": "a" }))]);
+        runner.set_ui_context(sink.clone(), "rpc");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "select");
+        assert_eq!(requests[0]["title"], "Pick");
+        assert_eq!(requests[0]["options"], json!(["a", "b"]));
+        assert!(requests[0]["id"].is_string());
+        assert_eq!(
+            entries_of(&runner),
+            vec![
+                json!({ "type": "prompt-start", "data": "select" }),
+                json!({ "type": "prompt-end", "data": "select" }),
+                json!({ "type": "choice", "data": "a" }),
+            ]
+        );
+    }
+
+    const EXT_UI_FIRE: &str = r#"
+export default function (pi) {
+  pi.on("session_start", (event, ctx) => {
+    ctx.ui.notify("hello", "warning");
+    ctx.ui.setStatus("k", "v");
+    ctx.ui.setWidget("w", ["l1", "l2"], { placement: "belowEditor" });
+    ctx.ui.setWidget("w2", ["x"]);
+    ctx.ui.setWidget("w3", () => "component");
+    ctx.ui.setTitle("t");
+    ctx.ui.setEditorText("e");
+  });
+}
+"#;
+
+    #[test]
+    fn ui_fire_and_forget_requests() {
+        let mut runner = runner_with(&[EXT_UI_FIRE]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "rpc");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 6); // the component-factory widget is ignored
+        assert_eq!(
+            requests[0],
+            json!({ "id": requests[0]["id"], "method": "notify", "message": "hello", "notifyType": "warning" })
+        );
+        assert_eq!(
+            requests[1],
+            json!({ "id": requests[1]["id"], "method": "setStatus", "statusKey": "k", "statusText": "v" })
+        );
+        assert_eq!(
+            requests[2],
+            json!({ "id": requests[2]["id"], "method": "setWidget", "widgetKey": "w", "widgetLines": ["l1", "l2"], "widgetPlacement": "belowEditor" })
+        );
+        assert_eq!(
+            requests[3],
+            json!({ "id": requests[3]["id"], "method": "setWidget", "widgetKey": "w2", "widgetLines": ["x"] })
+        );
+        assert_eq!(
+            requests[4],
+            json!({ "id": requests[4]["id"], "method": "setTitle", "title": "t" })
+        );
+        assert_eq!(
+            requests[5],
+            json!({ "id": requests[5]["id"], "method": "set_editor_text", "text": "e" })
+        );
+    }
+
+    const EXT_UI_ANSWERS: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    pi.appendEntry("s", String(await ctx.ui.select("T", ["x"], { timeout: 1000 })));
+    pi.appendEntry("c", String(await ctx.ui.confirm("T2", "m")));
+    pi.appendEntry("i", String(await ctx.ui.input("T3", "ph")));
+  });
+}
+"#;
+
+    #[test]
+    fn ui_dialog_timeout_default_is_the_method_default() {
+        let mut runner = runner_with(&[EXT_UI_ANSWERS]);
+        // `{}` is what the sink resolves on a timeout: select/input fall
+        // to undefined, confirm to false.
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "rpc");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        assert_eq!(
+            entries_of(&runner),
+            vec![
+                json!({ "type": "s", "data": "undefined" }),
+                json!({ "type": "c", "data": "false" }),
+                json!({ "type": "i", "data": "undefined" }),
+            ]
+        );
+        let requests = sink.requests();
+        assert_eq!(requests[0]["timeout"], 1000);
+        assert_eq!(requests[2]["placeholder"], "ph");
+    }
+
+    #[test]
+    fn ui_dialog_cancel_and_value_responses() {
+        let mut runner = runner_with(&[EXT_UI_ANSWERS]);
+        let sink = FakeSink::scripted(&[
+            ("select", json!({ "cancelled": true })),
+            ("confirm", json!({ "confirmed": true })),
+            ("input", json!({ "value": "typed" })),
+        ]);
+        runner.set_ui_context(sink.clone(), "rpc");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        assert_eq!(
+            entries_of(&runner),
+            vec![
+                json!({ "type": "s", "data": "undefined" }),
+                json!({ "type": "c", "data": "true" }),
+                json!({ "type": "i", "data": "typed" }),
+            ]
+        );
+    }
+
+    const EXT_UI_NESTED: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    const choice = await ctx.ui.select("Outer", ["a"]);
+    pi.appendEntry("choice", choice);
+  });
+  pi.on("ui_prompt_start", async (event, ctx) => {
+    pi.appendEntry("prompt-start", event.kind);
+    if (event.kind === "select") {
+      const ok = await ctx.ui.confirm("Inner", "sure?");
+      pi.appendEntry("inner", ok === true);
+    }
+  });
+  pi.on("ui_prompt_end", (event) => pi.appendEntry("prompt-end", event.kind));
+}
+"#;
+
+    #[test]
+    fn ui_prompt_pair_nests_to_the_outermost_dialog() {
+        let mut runner = runner_with(&[EXT_UI_NESTED]);
+        let sink = FakeSink::scripted(&[
+            ("select", json!({ "value": "a" })),
+            ("confirm", json!({ "confirmed": true })),
+        ]);
+        runner.set_ui_context(sink.clone(), "rpc");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        // The nested confirm (inside the start listener) emits no pair:
+        // only the outermost select does.
+        assert_eq!(
+            entries_of(&runner),
+            vec![
+                json!({ "type": "prompt-start", "data": "select" }),
+                json!({ "type": "inner", "data": true }),
+                json!({ "type": "prompt-end", "data": "select" }),
+                json!({ "type": "choice", "data": "a" }),
+            ]
+        );
+    }
+
+    const EXT_UI_LIMITS: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    pi.appendEntry("editorText", JSON.stringify(ctx.ui.getEditorText()));
+    pi.appendEntry("custom", String(await ctx.ui.custom(() => {})));
+    pi.appendEntry("theme", JSON.stringify(ctx.ui.setTheme("dark")));
+    pi.appendEntry("themes", JSON.stringify(ctx.ui.getAllThemes()));
+    pi.appendEntry("expanded", JSON.stringify(ctx.ui.getToolsExpanded()));
+    pi.appendEntry("hasUI", String(ctx.hasUI));
+    pi.appendEntry("mode", ctx.mode);
+  });
+}
+"#;
+
+    #[test]
+    fn ui_live_limitations_match_the_rpc_doc() {
+        let mut runner = runner_with(&[EXT_UI_LIMITS]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "rpc");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        assert_eq!(
+            entries_of(&runner),
+            vec![
+                json!({ "type": "editorText", "data": "\"\"" }),
+                json!({ "type": "custom", "data": "undefined" }),
+                json!({ "type": "theme", "data": "{\"success\":false,\"error\":\"Theme switching not supported in RPC mode\"}" }),
+                json!({ "type": "themes", "data": "[]" }),
+                json!({ "type": "expanded", "data": "false" }),
+                json!({ "type": "hasUI", "data": "true" }),
+                json!({ "type": "mode", "data": "rpc" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn ui_headless_matrix_unchanged_without_a_sink() {
+        let mut runner = runner_with(&[EXT_UI_LIMITS]);
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        assert_eq!(
+            entries_of(&runner),
+            vec![
+                json!({ "type": "editorText", "data": "\"\"" }),
+                json!({ "type": "custom", "data": "undefined" }),
+                json!({ "type": "theme", "data": "{\"success\":false,\"error\":\"UI not available\"}" }),
+                json!({ "type": "themes", "data": "[]" }),
+                json!({ "type": "expanded", "data": "false" }),
+                json!({ "type": "hasUI", "data": "false" }),
+                json!({ "type": "mode", "data": "print" }),
+            ]
+        );
+        // Notify still reaches the headless log.
+        assert_eq!(runner.core().lock().expect("core").ui_log.len(), 0);
+    }
+
+    const EXT_TRUST_UI: &str = r#"
+export default function (pi) {
+  pi.on("project_trust", async (event, ctx) => {
+    const ok = await ctx.ui.confirm("Trust", event.cwd);
+    return { trusted: ok ? "yes" : "no" };
+  });
+}
+"#;
+
+    #[test]
+    fn trust_context_ui_prompts_in_live_mode() {
+        let mut runner = runner_with(&[EXT_TRUST_UI]);
+        let sink = FakeSink::scripted(&[("confirm", json!({ "confirmed": true }))]);
+        runner.set_ui_context(sink.clone(), "rpc");
+        let (result, errors) = runner.emit_project_trust("/tmp").expect("trust");
+        assert!(errors.is_empty());
+        assert_eq!(result.expect("result").trusted, "yes");
+        assert_eq!(sink.requests()[0]["method"], "confirm");
+        assert_eq!(sink.requests()[0]["title"], "Trust");
+        assert_eq!(sink.requests()[0]["message"], "/tmp");
     }
 
     #[test]

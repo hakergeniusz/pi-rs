@@ -384,12 +384,58 @@ globalThis.__piCreateApi = function (extIdx) {
   };
 };
 
-// The headless UI matrix (noOpUIContext, runner.ts:331-362; §4.6 row 1 of
-// docs/EXTENSIONS.md): notify reaches the host hook, dialogs resolve to
-// their "no UI" answers, and every setter is a no-op.
+// The UI context. Headless (no bound UI — runner.ts:331-362
+// `noOpUIContext`, §4.6 row 1 of docs/EXTENSIONS.md): notify reaches the
+// host hook, dialogs resolve to their "no UI" answers, setters are
+// no-ops. With a bound UI (E2, mode "rpc" — the surface of
+// `modes/rpc/rpc-mode.ts` `createExtensionUIContext`): dialog methods
+// queue a request through the `uiRequest` op and return a promise that
+// the host settles via `__piUiResolve`; fire-and-forget methods queue a
+// request with no pending promise; terminal-only methods keep their RPC
+// limitations (docs/rpc-extension-ui.md). The mode is read at call time,
+// so binding a UI affects contexts created earlier.
+globalThis.__piUiPending = new Map();
+globalThis.__piUiResolve = function (id, payloadJson) {
+  const entry = globalThis.__piUiPending.get(id);
+  if (entry === undefined) return;
+  globalThis.__piUiPending.delete(id);
+  let payload;
+  try {
+    payload = payloadJson === "" ? undefined : JSON.parse(payloadJson);
+  } catch {
+    payload = undefined;
+  }
+  entry(payload);
+};
+
 globalThis.__piCreateUiCtx = function () {
   const assertActive = () => globalThis.__piAssertRuntimeActive();
-  return {
+  const hasUi = () => globalThis.__piOps.hasUi() === "true";
+  // The response parse mirrors upstream's per-method `parseResponse`
+  // (rpc-mode.ts:118-129): `{cancelled:true}` falls to the method
+  // default, `{value}`/`{confirmed}` carry the answer, `{}` (the
+  // sink-side timeout default) falls through too.
+  const parseValue = (payload) => {
+    if (payload && payload.cancelled) return undefined;
+    if (payload && "value" in payload) return payload.value;
+    return undefined;
+  };
+  const parseConfirm = (payload) => {
+    if (payload && payload.cancelled) return false;
+    if (payload && "confirmed" in payload) return payload.confirmed;
+    return false;
+  };
+  // One queued request: `{method, ...fields}` — dialog methods wait on
+  // the returned id, fire-and-forget calls never do.
+  const queue = (method, fields, wait) => {
+    const id = globalThis.__piOps.uiRequest(JSON.stringify(Object.assign({ method }, fields)));
+    if (!wait) return undefined;
+    return new Promise((resolve) => {
+      globalThis.__piUiPending.set(id, resolve);
+    });
+  };
+
+  const headless = {
     select: () => {
       assertActive();
       return Promise.resolve(undefined);
@@ -478,6 +524,161 @@ globalThis.__piCreateUiCtx = function () {
       assertActive();
     },
   };
+
+  const live = {
+    select: (title, options, opts) => {
+      assertActive();
+      const fields = { title, options };
+      if (opts && opts.timeout !== undefined) fields.timeout = opts.timeout;
+      return queue("select", fields, true).then(parseValue);
+    },
+    confirm: (title, message, opts) => {
+      assertActive();
+      const fields = { title, message };
+      if (opts && opts.timeout !== undefined) fields.timeout = opts.timeout;
+      return queue("confirm", fields, true).then(parseConfirm);
+    },
+    input: (title, placeholder, opts) => {
+      assertActive();
+      const fields = { title };
+      if (placeholder !== undefined) fields.placeholder = placeholder;
+      if (opts && opts.timeout !== undefined) fields.timeout = opts.timeout;
+      return queue("input", fields, true).then(parseValue);
+    },
+    editor: (title, prefill) => {
+      assertActive();
+      const fields = { title };
+      if (prefill !== undefined) fields.prefill = prefill;
+      return queue("editor", fields, true).then(parseValue);
+    },
+    custom: () => {
+      // RPC mode answers custom immediately; the request still crosses
+      // so the runner emits its ui_prompt pair in upstream's order.
+      assertActive();
+      return queue("custom", {}, true);
+    },
+    notify: (message, notifyType) => {
+      assertActive();
+      const fields = { message };
+      if (notifyType !== undefined) fields.notifyType = notifyType;
+      queue("notify", fields, false);
+    },
+    onTerminalInput: () => {
+      assertActive();
+      return () => {};
+    },
+    setStatus: (statusKey, statusText) => {
+      assertActive();
+      const fields = { statusKey };
+      if (statusText !== undefined) fields.statusText = statusText;
+      queue("setStatus", fields, false);
+    },
+    setWorkingMessage: () => {
+      assertActive();
+    },
+    setWorkingVisible: () => {
+      assertActive();
+    },
+    setWorkingIndicator: () => {
+      assertActive();
+    },
+    setHiddenThinkingLabel: () => {
+      assertActive();
+    },
+    setWidget: (widgetKey, widgetLines, options) => {
+      assertActive();
+      // Component factories are not supported in RPC mode.
+      if (widgetLines === undefined || Array.isArray(widgetLines)) {
+        const fields = { widgetKey, widgetLines };
+        if (options && options.placement !== undefined) fields.widgetPlacement = options.placement;
+        queue("setWidget", fields, false);
+      }
+    },
+    setFooter: () => {
+      assertActive();
+    },
+    setHeader: () => {
+      assertActive();
+    },
+    setTitle: (title) => {
+      assertActive();
+      queue("setTitle", { title }, false);
+    },
+    pasteToEditor: (text) => {
+      assertActive();
+      live.setEditorText(text);
+    },
+    setEditorText: (text) => {
+      assertActive();
+      queue("set_editor_text", { text }, false);
+    },
+    getEditorText: () => {
+      assertActive();
+      return "";
+    },
+    addAutocompleteProvider: () => {
+      assertActive();
+    },
+    setEditorComponent: () => {
+      assertActive();
+    },
+    getEditorComponent: () => {
+      assertActive();
+      return undefined;
+    },
+    setTheme: () => {
+      assertActive();
+      return { success: false, error: "Theme switching not supported in RPC mode" };
+    },
+    getAllThemes: () => {
+      assertActive();
+      return [];
+    },
+    getTheme: () => {
+      assertActive();
+      return undefined;
+    },
+    getToolsExpanded: () => {
+      assertActive();
+      return false;
+    },
+    setToolsExpanded: () => {
+      assertActive();
+    },
+  };
+
+  // One stable surface; the branch happens per call so a later
+  // `set_ui_context` affects contexts created before it.
+  const pick = () => (hasUi() ? live : headless);
+  return {
+    select: (title, options, opts) => pick().select(title, options, opts),
+    confirm: (title, message, opts) => pick().confirm(title, message, opts),
+    input: (title, placeholder, opts) => pick().input(title, placeholder, opts),
+    editor: (title, prefill) => pick().editor(title, prefill),
+    custom: (factory, options) => pick().custom(factory, options),
+    notify: (message, notifyType) => pick().notify(message, notifyType),
+    onTerminalInput: (handler) => pick().onTerminalInput(handler),
+    setStatus: (key, text) => pick().setStatus(key, text),
+    setWorkingMessage: (message) => pick().setWorkingMessage(message),
+    setWorkingVisible: (visible) => pick().setWorkingVisible(visible),
+    setWorkingIndicator: (options) => pick().setWorkingIndicator(options),
+    setHiddenThinkingLabel: (label) => pick().setHiddenThinkingLabel(label),
+    setWidget: (key, content, options) => pick().setWidget(key, content, options),
+    setFooter: (factory) => pick().setFooter(factory),
+    setHeader: (factory) => pick().setHeader(factory),
+    setTitle: (title) => pick().setTitle(title),
+    pasteToEditor: (text) => pick().pasteToEditor(text),
+    setEditorText: (text) => pick().setEditorText(text),
+    getEditorText: () => pick().getEditorText(),
+    addAutocompleteProvider: (...args) => pick().addAutocompleteProvider(...args),
+    setEditorComponent: (...args) => pick().setEditorComponent(...args),
+    getEditorComponent: () => pick().getEditorComponent(),
+    setTheme: (theme) => pick().setTheme(theme),
+    getAllThemes: () => pick().getAllThemes(),
+    getTheme: (name) => pick().getTheme(name),
+    getToolsExpanded: () => pick().getToolsExpanded(),
+    setToolsExpanded: (expanded) => pick().setToolsExpanded(expanded),
+  };
 };
 
 // The base ExtensionContext (runner.ts:891-969). Values resolve at call
@@ -495,7 +696,7 @@ globalThis.__piCreateCtx = function () {
     },
     get hasUI() {
       assertActive();
-      return false;
+      return globalThis.__piOps.hasUi() === "true";
     },
     get cwd() {
       assertActive();
@@ -596,6 +797,11 @@ globalThis.__piCreateCommandCtx = function () {
 // notify-capable ui — nothing else.
 globalThis.__piCreateTrustCtx = function () {
   const assertActive = () => globalThis.__piAssertRuntimeActive();
+  // `ProjectTrustContext.ui` is `Pick<ExtensionUIContext, "select" |
+  // "confirm" | "input" | "notify">` (types.ts:733-738): the same
+  // dispatch surface as the base context, restricted to those four, so
+  // trust handlers can prompt in UI mode.
+  const full = globalThis.__piCreateUiCtx();
   return {
     get cwd() {
       assertActive();
@@ -607,25 +813,13 @@ globalThis.__piCreateTrustCtx = function () {
     },
     get hasUI() {
       assertActive();
-      return false;
+      return globalThis.__piOps.hasUi() === "true";
     },
     ui: {
-      select: () => {
-        assertActive();
-        return Promise.resolve(undefined);
-      },
-      confirm: () => {
-        assertActive();
-        return Promise.resolve(false);
-      },
-      input: () => {
-        assertActive();
-        return Promise.resolve(undefined);
-      },
-      notify: (message) => {
-        assertActive();
-        globalThis.__piOps.notify(typeof message === "string" ? message : JSON.stringify(message));
-      },
+      select: (title, options, opts) => full.select(title, options, opts),
+      confirm: (title, message, opts) => full.confirm(title, message, opts),
+      input: (title, placeholder, opts) => full.input(title, placeholder, opts),
+      notify: (message, notifyType) => full.notify(message, notifyType),
     },
   };
 };
