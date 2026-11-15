@@ -1,6 +1,6 @@
 [package]
 name = "pi-ext-js"
-description = "Embedded JavaScript extensions host (E0 spike; port target: the @earendil-works/pi-coding-agent extensions runtime)"
+description = "Embedded JavaScript extensions host (E1 headless core; port target: the @earendil-works/pi-coding-agent extensions runtime)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,8 +9,21 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-rquickjs = { workspace = true }
+rquickjs = { workspace = true, features = ["loader"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+oxc_allocator = "0.158"
+oxc_codegen = "0.158"
+oxc_parser = "0.158"
+oxc_semantic = "0.158"
+oxc_span = "0.158"
+oxc_transformer = "0.158"
+
+[target.'cfg(unix)'.dependencies]
+# Signal-based exec termination (SIGTERM, then SIGKILL after the grace);
+# std only offers SIGKILL via `Child::kill`.
+nix = { version = "0.30", features = ["signal"] }
 
 [lints]
 workspace = true
