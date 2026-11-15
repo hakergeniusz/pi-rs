@@ -512,6 +512,42 @@ pub struct BranchSummarySettings {
     pub skip_prompt: bool,
 }
 
+/// What the terminal shows when a fullscreen session ends
+/// (`fullscreenExitOutput`, `settings-defaults.js:62`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FullscreenExitOutput {
+    /// Repaint the transcript into the terminal's own scrollback, so leaving
+    /// fullscreen reads like a normal program's output.
+    #[default]
+    Transcript,
+    /// Leave the screen as the alt screen had it and print only the session
+    /// resume hint.
+    ResumeHint,
+}
+
+/// The fullscreen scrollbar mode (`fullscreenScrollbar`,
+/// `settings-defaults.js:63`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FullscreenScrollbar {
+    /// Show while scrolling, fade otherwise (`scroll-view.ts` default).
+    #[default]
+    Auto,
+    /// Always visible.
+    Always,
+    /// Never visible.
+    Hidden,
+}
+
+impl From<FullscreenScrollbar> for pi_tui::components::scroll_view::Scrollbar {
+    fn from(scrollbar: FullscreenScrollbar) -> Self {
+        match scrollbar {
+            FullscreenScrollbar::Auto => Self::Auto,
+            FullscreenScrollbar::Always => Self::Always,
+            FullscreenScrollbar::Hidden => Self::Hidden,
+        }
+    }
+}
+
 /// The settings store. `SettingsManager` (`settings-manager.ts:378-1533`).
 pub struct SettingsManager {
     storage: Arc<dyn SettingsStorage>,
@@ -1244,6 +1280,118 @@ impl SettingsManager {
         };
         self.set_global("defaultTools", value);
     }
+
+    // -- TUI mode and fullscreen ---------------------------------------------
+
+    /// `getTuiMode` (`settings-manager.js:998-1000`): anything but
+    /// `"regular"` resolves to the default, fullscreen — the interface layout
+    /// boots on the alt screen unless the user or a flag opts out.
+    pub fn get_tui_mode(&self) -> crate::cli::args::TuiMode {
+        match self.settings.get("tuiMode").and_then(Value::as_str) {
+            Some("regular") => crate::cli::args::TuiMode::Regular,
+            _ => crate::cli::args::TuiMode::Fullscreen,
+        }
+    }
+
+    /// `setTuiMode` setter shape (`settings-manager.js:1002-1004`).
+    pub fn set_tui_mode(&mut self, mode: crate::cli::args::TuiMode) {
+        let value = match mode {
+            crate::cli::args::TuiMode::Regular => "regular",
+            crate::cli::args::TuiMode::Fullscreen => "fullscreen",
+        };
+        self.set_global("tuiMode", Value::String(value.to_string()));
+    }
+
+    /// `getFullscreenExitOutput` (`settings-manager.js:1006-1014`): what the
+    /// terminal shows when a fullscreen session ends. Anything but
+    /// `"resume-hint"` resolves to the default, the transcript repaint.
+    pub fn get_fullscreen_exit_output(&self) -> FullscreenExitOutput {
+        match self
+            .settings
+            .get("fullscreenExitOutput")
+            .and_then(Value::as_str)
+        {
+            Some("resume-hint") => FullscreenExitOutput::ResumeHint,
+            _ => FullscreenExitOutput::Transcript,
+        }
+    }
+
+    /// `setFullscreenExitOutput` setter shape (`settings-manager.js:1010-1012`).
+    pub fn set_fullscreen_exit_output(&mut self, output: FullscreenExitOutput) {
+        let value = match output {
+            FullscreenExitOutput::Transcript => "transcript",
+            FullscreenExitOutput::ResumeHint => "resume-hint",
+        };
+        self.set_global("fullscreenExitOutput", Value::String(value.to_string()));
+    }
+
+    /// `getFullscreenScrollbar` (`settings-manager.js:1016-1023`): anything
+    /// but `"always"` or `"hidden"` resolves to `"auto"`.
+    pub fn get_fullscreen_scrollbar(&self) -> FullscreenScrollbar {
+        match self
+            .settings
+            .get("fullscreenScrollbar")
+            .and_then(Value::as_str)
+        {
+            Some("always") => FullscreenScrollbar::Always,
+            Some("hidden") => FullscreenScrollbar::Hidden,
+            _ => FullscreenScrollbar::Auto,
+        }
+    }
+
+    /// `setFullscreenScrollbar` setter shape (`settings-manager.js:1018-1022`).
+    pub fn set_fullscreen_scrollbar(&mut self, scrollbar: FullscreenScrollbar) {
+        let value = match scrollbar {
+            FullscreenScrollbar::Auto => "auto",
+            FullscreenScrollbar::Always => "always",
+            FullscreenScrollbar::Hidden => "hidden",
+        };
+        self.set_global("fullscreenScrollbar", Value::String(value.to_string()));
+    }
+
+    /// `getFullscreenCopyOnSelect` (`settings-manager.js:1025-1031`).
+    pub fn get_fullscreen_copy_on_select(&self) -> bool {
+        self.settings
+            .get("fullscreenCopyOnSelect")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
+
+    /// `setFullscreenCopyOnSelect` setter shape (`settings-manager.js:1029`).
+    pub fn set_fullscreen_copy_on_select(&mut self, enabled: bool) {
+        self.set_global("fullscreenCopyOnSelect", Value::Bool(enabled));
+    }
+
+    /// `getFullscreenWheelScrollLines` (`settings-manager.js:1033-1041`): a
+    /// finite number clamps to the 1–100 whole lines upstream accepts,
+    /// anything else (including `"auto"`) is the accelerated default.
+    pub fn get_fullscreen_wheel_scroll_lines(&self) -> pi_tui::wheel_scroll::WheelScrollLines {
+        match self
+            .settings
+            .get("fullscreenWheelScrollLines")
+            .and_then(Value::as_f64)
+        {
+            Some(lines) if lines.is_finite() => {
+                pi_tui::wheel_scroll::WheelScrollLines::Fixed(lines.clamp(1.0, 100.0).floor())
+            }
+            _ => pi_tui::wheel_scroll::WheelScrollLines::Auto,
+        }
+    }
+
+    /// `setFullscreenWheelScrollLines` setter shape
+    /// (`settings-manager.js:1043-1049`).
+    pub fn set_fullscreen_wheel_scroll_lines(
+        &mut self,
+        lines: pi_tui::wheel_scroll::WheelScrollLines,
+    ) {
+        let value = match lines {
+            pi_tui::wheel_scroll::WheelScrollLines::Auto => Value::String("auto".to_string()),
+            pi_tui::wheel_scroll::WheelScrollLines::Fixed(count) => {
+                Value::from(count.clamp(1.0, 100.0).floor())
+            }
+        };
+        self.set_global("fullscreenWheelScrollLines", value);
+    }
 }
 
 #[cfg(test)]
@@ -1505,5 +1653,120 @@ mod tests {
         manager.set_default_tools(Some(vec!["edit".to_string()]));
         manager.flush();
         assert_eq!(manager.get_default_tools(), Some(vec!["edit".to_string()]));
+    }
+
+    // -- TUI mode and fullscreen ---------------------------------------------
+
+    fn manager_with_global(value: &Value) -> SettingsManager {
+        let storage = Arc::new(InMemorySettingsStorage::default());
+        let _ = storage.with_lock(SettingsScope::Global, &mut |_| {
+            Ok(Some(serde_json::to_string_pretty(value).unwrap()))
+        });
+        SettingsManager::from_storage(storage, SettingsManagerCreateOptions::default())
+    }
+
+    /// `getTuiMode` (`settings-manager.js:998-1000`): only `"regular"` opts
+    /// out of the fullscreen default.
+    #[test]
+    fn tui_mode_defaults_to_fullscreen_and_accepts_regular() {
+        let manager = manager_with_global(&json!({}));
+        assert_eq!(
+            manager.get_tui_mode(),
+            crate::cli::args::TuiMode::Fullscreen
+        );
+        let manager = manager_with_global(&json!({"tuiMode": "regular"}));
+        assert_eq!(manager.get_tui_mode(), crate::cli::args::TuiMode::Regular);
+        // A malformed value resolves to the default, not an error.
+        let manager = manager_with_global(&json!({"tuiMode": "neither"}));
+        assert_eq!(
+            manager.get_tui_mode(),
+            crate::cli::args::TuiMode::Fullscreen
+        );
+    }
+
+    /// `getFullscreenExitOutput` / `getFullscreenScrollbar`
+    /// (`settings-manager.js:1006-1023`): unknown values fall back to the
+    /// defaults.
+    #[test]
+    fn fullscreen_exit_output_and_scrollbar_validate_like_upstream() {
+        let manager = manager_with_global(&json!({}));
+        assert_eq!(
+            manager.get_fullscreen_exit_output(),
+            FullscreenExitOutput::Transcript
+        );
+        assert_eq!(
+            manager.get_fullscreen_scrollbar(),
+            FullscreenScrollbar::Auto
+        );
+        let manager = manager_with_global(&json!({
+            "fullscreenExitOutput": "resume-hint",
+            "fullscreenScrollbar": "hidden"
+        }));
+        assert_eq!(
+            manager.get_fullscreen_exit_output(),
+            FullscreenExitOutput::ResumeHint
+        );
+        assert_eq!(
+            manager.get_fullscreen_scrollbar(),
+            FullscreenScrollbar::Hidden
+        );
+        assert_eq!(
+            pi_tui::components::scroll_view::Scrollbar::from(FullscreenScrollbar::Always),
+            pi_tui::components::scroll_view::Scrollbar::Always
+        );
+    }
+
+    /// `getFullscreenCopyOnSelect` / `getFullscreenWheelScrollLines`
+    /// (`settings-manager.js:1025-1041`): copy defaults on, wheel lines clamp
+    /// to whole lines in 1-100 and `"auto"` wins otherwise.
+    #[test]
+    fn fullscreen_copy_on_select_and_wheel_lines_resolve_like_upstream() {
+        let manager = manager_with_global(&json!({}));
+        assert!(manager.get_fullscreen_copy_on_select());
+        assert_eq!(
+            manager.get_fullscreen_wheel_scroll_lines(),
+            pi_tui::wheel_scroll::WheelScrollLines::Auto
+        );
+        let manager = manager_with_global(&json!({
+            "fullscreenCopyOnSelect": false,
+            "fullscreenWheelScrollLines": 250.7
+        }));
+        assert!(!manager.get_fullscreen_copy_on_select());
+        assert_eq!(
+            manager.get_fullscreen_wheel_scroll_lines(),
+            pi_tui::wheel_scroll::WheelScrollLines::Fixed(100.0)
+        );
+        // A non-number is "auto", not an error.
+        let manager = manager_with_global(&json!({"fullscreenWheelScrollLines": "auto"}));
+        assert_eq!(
+            manager.get_fullscreen_wheel_scroll_lines(),
+            pi_tui::wheel_scroll::WheelScrollLines::Auto
+        );
+    }
+
+    /// The fullscreen setters round-trip through the global layer.
+    #[test]
+    fn fullscreen_setters_persist_their_values() {
+        let mut manager = manager_with_global(&json!({}));
+        manager.set_tui_mode(crate::cli::args::TuiMode::Regular);
+        manager.set_fullscreen_exit_output(FullscreenExitOutput::ResumeHint);
+        manager.set_fullscreen_scrollbar(FullscreenScrollbar::Always);
+        manager.set_fullscreen_copy_on_select(false);
+        manager
+            .set_fullscreen_wheel_scroll_lines(pi_tui::wheel_scroll::WheelScrollLines::Fixed(5.0));
+        assert_eq!(manager.get_tui_mode(), crate::cli::args::TuiMode::Regular);
+        assert_eq!(
+            manager.get_fullscreen_exit_output(),
+            FullscreenExitOutput::ResumeHint
+        );
+        assert_eq!(
+            manager.get_fullscreen_scrollbar(),
+            FullscreenScrollbar::Always
+        );
+        assert!(!manager.get_fullscreen_copy_on_select());
+        assert_eq!(
+            manager.get_fullscreen_wheel_scroll_lines(),
+            pi_tui::wheel_scroll::WheelScrollLines::Fixed(5.0)
+        );
     }
 }
