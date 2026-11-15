@@ -239,15 +239,22 @@ impl ArminComponent {
             }
             Effect::Scanline => {
                 let mut grid = empty_grid();
-                for row in 0..frame.min(DISPLAY_HEIGHT) {
-                    grid[row].copy_from_slice(&self.final_grid[row]);
+                let revealed = frame.min(DISPLAY_HEIGHT);
+                for (grid_row, final_row) in
+                    grid.iter_mut().zip(self.final_grid.iter()).take(revealed)
+                {
+                    grid_row.copy_from_slice(final_row);
                 }
                 grid
             }
             Effect::Rain => self.rain_grid(frame),
             Effect::Fade => {
                 let mut grid = empty_grid();
-                for &(row, x) in self.positions.iter().take(frame * self.effect.reveal_step()) {
+                for &(row, x) in self
+                    .positions
+                    .iter()
+                    .take(frame * self.effect.reveal_step())
+                {
                     grid[row][x] = self.final_grid[row][x];
                 }
                 grid
@@ -255,7 +262,11 @@ impl ArminComponent {
             Effect::Dissolve => {
                 // Start from noise; the shuffled reveal resolves into the image.
                 let mut grid = self.noise.clone();
-                for &(row, x) in self.positions.iter().take(frame * self.effect.reveal_step()) {
+                for &(row, x) in self
+                    .positions
+                    .iter()
+                    .take(frame * self.effect.reveal_step())
+                {
                     grid[row][x] = self.final_grid[row][x];
                 }
                 grid
@@ -264,9 +275,12 @@ impl ArminComponent {
                 let mut grid = empty_grid();
                 let mid_row = DISPLAY_HEIGHT / 2;
                 let top = mid_row.saturating_sub(frame);
-                let bottom = mid_row + frame;
-                for row in top..=bottom.min(DISPLAY_HEIGHT - 1) {
-                    grid[row].copy_from_slice(&self.final_grid[row]);
+                let bottom = (mid_row + frame).min(DISPLAY_HEIGHT - 1);
+                for (row, grid_row) in grid.iter_mut().enumerate().skip(top) {
+                    if row > bottom {
+                        break;
+                    }
+                    grid_row.copy_from_slice(&self.final_grid[row]);
                 }
                 grid
             }
@@ -315,22 +329,23 @@ impl ArminComponent {
                     }
                 }
                 // Draw settled pixels, bottom-up.
-                for row in (DISPLAY_HEIGHT - settled[x].min(DISPLAY_HEIGHT))..DISPLAY_HEIGHT {
-                    grid[row][x] = self.final_grid[row][x];
+                let settled_top = DISPLAY_HEIGHT - settled[x].min(DISPLAY_HEIGHT);
+                for (row, grid_row) in grid.iter_mut().enumerate().skip(settled_top) {
+                    grid_row[x] = self.final_grid[row][x];
                 }
                 // Clear the drop's previous cell above the settled region so
                 // only the current falling position shows, like upstream's
                 // per-tick grid rebuild.
                 if (0..DISPLAY_HEIGHT as isize).contains(&previous_y) {
                     let row = previous_y as usize;
-                    if row < DISPLAY_HEIGHT - settled[x].min(DISPLAY_HEIGHT) {
+                    if row < settled_top {
                         grid[row][x] = ' ';
                     }
                 }
                 // Draw the falling drop.
                 if settled[x] < DISPLAY_HEIGHT
                     && (0..DISPLAY_HEIGHT as isize).contains(&y[x])
-                    && (y[x] as usize) < DISPLAY_HEIGHT - settled[x]
+                    && (y[x] as usize) < settled_top
                 {
                     grid[y[x] as usize][x] = '▓';
                 }
@@ -375,11 +390,10 @@ impl ArminComponent {
 /// A nanosecond timestamp as the per-instance randomness seed.
 fn fresh_seed() -> u64 {
     use std::time::SystemTime;
-    SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(0x5eed)
-        | 1
+        .map_or(0x5eed, |duration| duration.as_nanos() as u64);
+    nanos | 1
 }
 
 impl Default for ArminComponent {

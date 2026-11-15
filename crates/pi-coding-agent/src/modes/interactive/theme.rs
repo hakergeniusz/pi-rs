@@ -79,8 +79,8 @@ fn custom_themes_dir() -> PathBuf {
 }
 
 /// The terminal colors reported so far (empty until the controller records a
-/// reply).
-fn terminal_colors() -> TerminalColors {
+/// reply). The 3D easter egg reads these for its fade colors.
+pub(crate) fn terminal_colors() -> TerminalColors {
     TERMINAL_COLORS
         .read()
         .expect("terminal colors lock")

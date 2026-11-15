@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -50,7 +51,9 @@ use crate::tools::index::BuiltinToolExecutor;
 
 use super::autocomplete;
 use super::chat_viewport::{self, ChatViewport, HostSlot};
+use super::components::armin::ArminComponent;
 use super::components::assistant_message::AssistantMessageComponent;
+use super::components::easter_egg_3d::{EasterEgg3d, EasterEggHandle, play_easter_egg_3d};
 use super::components::footer::{FooterComponent, FooterData, UsageTotals};
 use super::components::header::{BuiltInHeader, pi_logo_lines};
 use super::components::model_selector::{ModelSelectorComponent, ModelSelectorEvent};
@@ -387,6 +390,14 @@ pub struct InteractiveMode {
     /// The mounted chat viewport while fullscreen
     /// (`this.fullscreenLayoutRoot` / `this.transcriptScrollView`).
     viewport: Option<ChatViewport>,
+    /// The playing 3D easter egg overlay, if any (`playEasterEgg3d`). The
+    /// host owns it because the port has no timers: `pump` refreshes the
+    /// terminal rows and hides the overlay once the exit completes.
+    easter_egg: Option<EasterEggHandle>,
+    /// Header-logo clicks queued by the header's callback, which cannot
+    /// borrow the mode during dispatch (`header.onLogoClick`,
+    /// `interactive-mode.ts:792`).
+    easter_egg_requests: Arc<Mutex<Vec<(i64, i64)>>>,
     /// Where provider credentials live (`auth.json`).
     auth_path: std::path::PathBuf,
     /// The agent dir the trust selector reads and writes (`trust.json`).
@@ -430,6 +441,7 @@ pub struct InteractiveMode {
 }
 
 impl InteractiveMode {
+    #[allow(clippy::too_many_lines)] // the TS constructor's mount + settings flow; split when extending
     fn new(
         runtime: &mut PrintRuntime,
         options: &InteractiveOptions,
@@ -467,12 +479,16 @@ impl InteractiveMode {
             .editor
             .set_autocomplete_provider(Some(Arc::new(provider)));
 
+        // The header's logo-click queue (`header.onLogoClick`): the callback
+        // cannot borrow the mode, so it parks the logo's position here.
+        let easter_egg_requests: Arc<Mutex<Vec<(i64, i64)>>> = Arc::new(Mutex::new(Vec::new()));
         let (mut tui, editor_id) = Self::mount_flat_tree(
             terminal,
             &options.version,
             &runtime.model.id,
             editor_host,
             FooterComponent::new(Self::footer_data(runtime)),
+            &easter_egg_requests,
         );
 
         let theme_query_start = Self::arm_theme_queries(
@@ -523,6 +539,8 @@ impl InteractiveMode {
             tui_mode,
             editor_id,
             viewport: None,
+            easter_egg: None,
+            easter_egg_requests,
             auth_path: options
                 .auth_path
                 .clone()
@@ -556,10 +574,21 @@ impl InteractiveMode {
         model_id: &str,
         editor_host: ChatEditor,
         footer: FooterComponent,
+        easter_egg_requests: &Arc<Mutex<Vec<(i64, i64)>>>,
     ) -> (Tui, ComponentId) {
         let mut tui = Tui::new(terminal);
         tui.set_clear_on_shrink(true);
-        tui.add_child(Box::new(Self::build_header(version, model_id)));
+        let mut header = Self::build_header(version, model_id);
+        // `header.onLogoClick = …` (`interactive-mode.ts:792`): the 3D pi
+        // logo lifts off the logo's screen position. The callback cannot
+        // borrow the mode, so it queues the position for `pump`.
+        let requests = Arc::clone(easter_egg_requests);
+        header.set_on_logo_click(Some(Box::new(move |column, row| {
+            if let Ok(mut pending) = requests.lock() {
+                pending.push((column, row));
+            }
+        })));
+        tui.add_child(Box::new(header));
         tui.add_child(Box::new(pi_tui::component::Container::new()));
         tui.add_child(Box::new(pi_tui::component::Container::new()));
         tui.add_child(Box::new(IdleStatus));
@@ -1317,6 +1346,38 @@ impl InteractiveMode {
     }
 
     // --------------------------------------------------------------
+    // Easter eggs (`handleArminSaysHi`, `interactive-mode.ts:5993`)
+    // --------------------------------------------------------------
+
+    /// `playEasterEgg3d`'s lazy wrapper (`easter-egg-3d.lazy.js`): only
+    /// fullscreen can show it, because it dissolves the rendered screen, and
+    /// the screen is captured first. Returns false when it cannot play so the
+    /// caller can fall back, and true — absorbed, as upstream — when an
+    /// overlay is already showing.
+    fn play_easter_egg(&mut self, egg: EasterEgg3d) -> bool {
+        if !self.tui.alt_screen_active() {
+            return false;
+        }
+        if self.tui.has_overlay() {
+            return true;
+        }
+        let screen = self.tui.last_lines().to_vec();
+        self.easter_egg = Some(play_easter_egg_3d(&mut self.tui, screen, egg));
+        true
+    }
+
+    /// The 3D Armin when it can play, otherwise the inline effect appended
+    /// to the chat.
+    fn handle_armin_says_hi(&mut self) {
+        if self.play_easter_egg(EasterEgg3d::Armin) {
+            return;
+        }
+        self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        self.add_to_chat(Box::new(ArminComponent::new()));
+        self.tui.request_render();
+    }
+
+    // --------------------------------------------------------------
     // Submission (`setupEditorSubmitHandler`, `interactive-mode.ts:3324`)
     // --------------------------------------------------------------
 
@@ -1331,6 +1392,12 @@ impl InteractiveMode {
         }
         if text == "/exit" || text == "/quit" {
             self.exiting = true;
+            return;
+        }
+        // `/arminsayshi` (`interactive-mode.ts:2773-2777`): the hidden
+        // easter egg command — 3D when it can play, inline otherwise.
+        if text == "/arminsayshi" {
+            self.handle_armin_says_hi();
             return;
         }
         if let Some(rest) = text.strip_prefix("/model") {
@@ -3001,6 +3068,7 @@ impl InteractiveMode {
     /// One loop iteration without terminal input: editor events, agent
     /// events, spinner frames. `run` calls this between input polls; the
     /// scripted tests drive it directly with a capture terminal.
+    #[allow(clippy::too_many_lines)] // mirrors the TS event loop shape; split when extending
     fn pump(&mut self) {
         // Editor events: take them out before acting on them, so the
         // mutex guard does not pin `self`.
@@ -3021,6 +3089,35 @@ impl InteractiveMode {
         self.pump_trust_selector();
         self.pump_settings_selector();
         self.pump_session_selector();
+
+        // The 3D easter egg (`playEasterEgg3d`): the header's logo clicks
+        // replay from the queue, the animation's rows track the terminal, and
+        // the completed exit hides the overlay (upstream's interval `finish`).
+        let pending_clicks = match self.easter_egg_requests.lock() {
+            Ok(mut requests) => std::mem::take(&mut *requests),
+            Err(_) => Vec::new(),
+        };
+        for (column, row) in pending_clicks {
+            self.play_easter_egg(EasterEgg3d::PiLogo {
+                column: usize::try_from(column).unwrap_or(0),
+                row: usize::try_from(row).unwrap_or(0),
+            });
+        }
+        if let Some(handle) = &self.easter_egg
+            && let Ok(size) = self.tui.terminal().size()
+        {
+            handle.rows.store(size.rows, Ordering::SeqCst);
+        }
+        if self
+            .easter_egg
+            .as_ref()
+            .is_some_and(|handle| handle.done.load(Ordering::SeqCst))
+        {
+            if let Some(handle) = self.easter_egg.take() {
+                self.tui.hide_overlay(handle.overlay);
+                self.tui.request_render();
+            }
+        }
 
         // Agent events, without blocking the input loop: collect first,
         // then handle, so the run borrow ends before the handlers run.
@@ -3261,7 +3358,7 @@ fn now_millis() -> i64 {
 
 /// `keyDisplayText` (`keybinding-hints.js:27-29`) reduced to one key: the
 /// action's first key, capitalized ("end" → "End").
-fn key_display_text(action: &str) -> String {
+pub(crate) fn key_display_text(action: &str) -> String {
     let Some(key) = pi_tui::keybindings::keys_for(action).first() else {
         return String::new();
     };
@@ -4452,6 +4549,75 @@ mod tests {
             plain.contains("clear/exit"),
             "the flat tree renders again: {plain}"
         );
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `/arminsayshi` in the flat tree: the 3D egg cannot play (no alt
+    /// screen), so the inline effect lands in the chat
+    /// (`handleArminSaysHi`'s fallback, `interactive-mode.ts:5993-5998`).
+    #[test]
+    fn arminsayshi_falls_back_to_the_inline_component_in_regular_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+        assert!(mode.switch_tui_mode(TuiMode::Regular));
+
+        mode.submit("/arminsayshi");
+        mode.tui.render_now(false);
+        assert!(mode.easter_egg.is_none(), "no overlay in the flat tree");
+        assert!(!mode.tui.has_overlay());
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("ARMIN SAYS HI"), "{plain}");
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `/arminsayshi` fullscreen: the 3D Armin plays as an overlay, and the
+    /// pump retires it once the exit completes (upstream's `finish` clears
+    /// the interval and hides the overlay).
+    #[test]
+    fn arminsayshi_plays_the_3d_egg_fullscreen_and_pump_retires_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+        mode.enter_fullscreen().expect("enter fullscreen");
+
+        mode.submit("/arminsayshi");
+        mode.tui.render_now(false);
+        assert!(mode.tui.has_overlay(), "the 3D egg is playing");
+        mode.easter_egg
+            .as_ref()
+            .expect("the host owns the handle")
+            .done
+            .store(true, Ordering::SeqCst);
+        mode.pump();
+        assert!(mode.easter_egg.is_none(), "the egg was retired");
+        assert!(!mode.tui.has_overlay(), "the overlay was hidden");
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// A header-logo click: the callback queues the logo's position and the
+    /// pump replays it as the 3D pi logo — only fullscreen, where the egg
+    /// can play (`header.onLogoClick`, `playPiLogo3d`); the flat tree
+    /// swallows the click with no fallback.
+    #[test]
+    fn header_logo_click_plays_the_pi_logo_egg_in_fullscreen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.easter_egg_requests.lock().expect("queue").push((0, 0));
+        mode.pump();
+        assert!(mode.easter_egg.is_none(), "no egg in the flat tree");
+
+        mode.enter_fullscreen().expect("enter fullscreen");
+        mode.easter_egg_requests.lock().expect("queue").push((0, 0));
+        mode.pump();
+        mode.tui.render_now(false);
+        assert!(mode.easter_egg.is_some(), "the logo lifts off");
+        assert!(mode.tui.has_overlay());
 
         mode.shutdown().expect("shutdown");
     }
