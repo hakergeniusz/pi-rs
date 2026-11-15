@@ -360,6 +360,14 @@ pub mod app_keys {
     pub const THINKING_TOGGLE: &str = "app.thinking.toggle";
     pub const MESSAGE_FOLLOW_UP: &str = "app.message.followUp";
     pub const MESSAGE_DEQUEUE: &str = "app.message.dequeue";
+    /// Dialog-only actions (`keybindings.ts:86-104`), bound inside their
+    /// selectors.
+    pub const SESSION_TOGGLE_NAMED_FILTER: &str = "app.session.toggleNamedFilter";
+    pub const SESSION_TOGGLE_PATH: &str = "app.session.togglePath";
+    pub const SESSION_TOGGLE_SORT: &str = "app.session.toggleSort";
+    pub const SESSION_RENAME: &str = "app.session.rename";
+    pub const SESSION_DELETE: &str = "app.session.delete";
+    pub const SESSION_DELETE_NONINVASIVE: &str = "app.session.deleteNoninvasive";
 
     /// pi's default keys, in `APP_KEYBINDINGS` order.
     pub const DEFAULTS: &[(&str, &[&str])] = &[
@@ -374,6 +382,12 @@ pub mod app_keys {
         (THINKING_TOGGLE, &["ctrl+t"]),
         (MESSAGE_FOLLOW_UP, &["alt+enter"]),
         (MESSAGE_DEQUEUE, &["alt+up"]),
+        (SESSION_TOGGLE_NAMED_FILTER, &["ctrl+n"]),
+        (SESSION_TOGGLE_PATH, &["ctrl+p"]),
+        (SESSION_TOGGLE_SORT, &["ctrl+s"]),
+        (SESSION_RENAME, &["ctrl+r"]),
+        (SESSION_DELETE, &["ctrl+d"]),
+        (SESSION_DELETE_NONINVASIVE, &["ctrl+backspace"]),
     ];
 
     /// The keys bound to `action` (`keybindings.ts:60-70` getKeys).

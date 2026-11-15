@@ -9,6 +9,7 @@ pub mod compaction_summary;
 pub mod footer;
 pub mod header;
 pub mod model_selector;
+pub mod session_selector;
 pub mod session_selector_search;
 pub mod settings_selector;
 pub mod settings_submenu;
