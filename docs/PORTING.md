@@ -7,13 +7,12 @@ porting, and consolidates conventions that were previously scattered through
 
 ## Ground truth
 
-- **Canonical TS source:** `/tmp/ai-agent/pi` — read-only clone of
+- **Canonical TS source:** `/tmp/pi` — read-only clone of
   `earendil-works/pi`; `packages/coding-agent` is at 1.5.2. `/tmp` is
-  ephemeral; re-clone the public repo if it is gone.
-- **Durable compiled upstream (allowed reads):**
-  `~/.pi/agent/install/releases/1.5.2/node_modules/@earendil-works/*/dist/`
-  — JS, `.d.ts`, and sourcemaps per package.
-- Nothing else under `~/.pi` may be read (privacy — see `AGENTS.md`).
+  ephemeral; re-clone the public repo if it is gone:
+  `gh repo clone earendil-works/pi /tmp/pi`.
+- Nothing under a live pi data root (the XDG `pi` directories or a
+  legacy `~/.pi`) may be read (privacy — see `AGENTS.md`).
 
 ## Crate ↔ package map
 

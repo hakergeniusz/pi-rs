@@ -407,14 +407,23 @@ and UI bridge calls. Component-bearing calls (`renderCall`, widgets as
 factories, `custom()`) are TUI-phase (§8) and cross as opaque component
 handles whose `render/handleInput/invalidate` are engine round-trips.
 
+**Extension language (decided 2026-11-15):** extensions are JS/TS-only
+for authors — upstream has no native-plugin semantics to mirror, and a
+second extension ABI would be pure divergence. Native-level extension
+points are: in-tree Rust modules (compiled into the host), MCP servers
+(language-agnostic), and RPC mode (external processes). The host-side
+registries keep a native-registration path open if a real use case
+appears.
+
 ## 7. Gap analysis vs the current Rust seam
 
-**E1 status (2026-11-15):** the real runner now exists —
-`crates/pi-ext-js/src/runner.rs` ports every §2 dispatch family, and the
-items below describe what that port covers. The seam
+**E1/E2 status (2026-11-15):** the real runner now exists —
+`crates/pi-ext-js/src/runner.rs` ports every §2 dispatch family, and E2
+slices 1–2 added the UI bridge, `user_bash`, context transforms, and the
+provider registry (§8). The seam
 (`crates/pi-coding-agent/src/extensions/mod.rs`) is still the *only*
-extension surface the `pi` binary knows; replacing it with the E1 runner
-(feature `ext-js`) is the first E2 item, so the gauntlets below remain as
+extension surface the `pi` binary knows; replacing it with the E1/E2
+runner (feature `ext-js`) is E2 slice 3, so the gauntlets below remain as
 written until that wiring.
 
 The seam (`crates/pi-coding-agent/src/extensions/mod.rs`) models the easy 20%:
@@ -476,12 +485,27 @@ fidelity rule applies per phase (deviations recorded as they appear).
   node built-ins / node_modules, unbound nested `executeTool`, no
   `ctx.signal`, simplified `setActiveTools`, live-registry dispatch
   snapshots, reduced `ToolInfo`, ESM-only) are itemized in HANDOFF.md.
-- **E2 — UI over protocol + host wiring**: dialogs/notify/setStatus/setWidget/setTitle via
-  the no-op matrix headless and the RPC subprotocol in RPC mode (§4.6);
-  `ui_prompt_start/end`; providers/virtual models incl. OAuth-config;
-  `session_before_*` gates; `user_bash` interception. Exit: RPC-mode
-  extension dialogs match upstream's rpc-extension-ui contract; codemode E1
-  port decided (needs worker-subprocess JS execution).
+- **E2 — UI over protocol + host wiring** (in progress, on
+  `feat/e2-ext-wiring`): slice 1 landed (`2355e01`) — the engine UI
+  surface: `ctx.ui` dialog methods queue requests and continue via the
+  host-settled `__piUiResolve` promise, fire-and-forget methods queue,
+  `ui_prompt_start/end` emit in upstream's order, and a `UiSink`
+  receives requests and scripts responses (§4.6 mode/hasUI semantics).
+  Slice 2 landed (`0cfa34b`) — `emit_user_bash` (first-valid-wins
+  `{operations}`/`{result}`, invalid result reported + rethrown with the
+  exact upstream message; `operations.exec` streams `onData` through the
+  `bashData` op behind a bounded poll), `emit_context` two-phase
+  dispatch with `restoreSystemMessages`, and the provider/virtual-model
+  registry with upstream's two-level load-time deferral (per-extension
+  pending changes discarded on failed load → runtime queues flushed at
+  bind with per-registration error reports; post-bind registrations
+  apply immediately and throw into the caller). Remaining: slice 3
+  (feature gate `ext-js` on `pi-coding-agent`, replace the seam,
+  loader/discovery wiring) and slice 4 (RPC dialog subprotocol in
+  `modes/rpc.rs`, `session_before_*` agent-loop gates, virtual-model
+  routing, provider OAuth/streamSimple). Exit: RPC-mode extension
+  dialogs match upstream's rpc-extension-ui contract; codemode E1 port
+  decided (needs worker-subprocess JS execution).
 - **E3 — TUI bridging**: shortcuts, message/entry/tool renderers, markdown
   transformers, widgets-as-components, `ctx.ui.custom` with overlay handles,
   editor component, autocomplete, themes; component handles crossing as

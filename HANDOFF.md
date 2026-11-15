@@ -2,7 +2,7 @@
 
 > Written 2026-11-11, updated same day after gate attempts. Repo: `/home/hakergeniusz/Projects/pi-rs` on `acer`.
 > **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). **`main` = P0–P5-part-1 + codex adapter + interactive TUI (parts 1+2a+2b fullscreen) + XDG paths; E2E PROVEN LIVE** — `pi -p` smoke test PASSED 2026-11-14 (PONG / read-tool round-trip ALBATROSS / JSON event mode) with the openai-codex stored OAuth credential and default model `openai-codex/gpt-6-luna`; required (1) a new `openai-codex-responses` adapter in pi-ai (`8efb00b`) and (2) the agent loop driven on a process-wide tokio runtime (`4c4d62c`, was futures::executor::block_on → "no reactor running"). — landing fast-forwarded `39b22ad..37782d1` on 2026-11-14; first landing CI failed only because ubuntu-latest ships **neither rg nor fd** (12 grep tests: `which("rg")` failed) → fixed in ci.yml (`8c6d178`, installs `ripgrep` + `fd-find`); CI run `43578686739` on `8c6d178` = **ok**. Interactive TUI landed `27769a9..500302b` + part 2a `8ae806d` on 2026-11-14 (see P6 sections). `wip/p4-pre-gate` == `main`; local checkout is ON `wip/p4-pre-gate`.
-> ALL development happens on `acer` (per user). Reference checkout: `/tmp/ai-agent/pi` on `acer` — **WIPED (tmpfs); re-clone before P5 work: `gh repo clone earendil-works/pi /tmp/ai-agent/pi`** (was @ `b22e525b3`).
+> ALL development happens on `acer` (per user). Reference checkout: **`/tmp/pi`** on `acer` (re-cloned 2026-11-15 @ 1.5.2; tmpfs — re-clone if gone: `gh repo clone earendil-works/pi /tmp/pi`).
 
 ## Goal
 Rewrite Pi (earendil-works/pi — TypeScript coding-agent harness monorepo, ~236K LOC) in Rust, following `PLAN.md` in the repo root. Phases P0→P7, each ends with a committed, gated milestone.
@@ -874,7 +874,102 @@ pump cadence stands in for upstream's `setInterval`).
   feature-gate `pi-ext-js` behind `ext-js` on `pi-coding-agent` and
   replace the seam (`crates/pi-coding-agent/src/extensions/mod.rs`).
 
+## E2: UI over protocol + host wiring (in progress, on `feat/e2-ext-wiring`, 2026-11-15)
+
+- **Slice 1 — engine UI surface** (`2355e01`): `ctx.ui`
+  select/confirm/input/editor/custom queue a request through the
+  `uiRequest` op and continue from a host-settled `__piUiResolve`
+  promise (timeout answers resolve per the rpc-extension-ui contract);
+  fire-and-forget methods queue only; `ui_prompt_start`/`ui_prompt_end`
+  emit in upstream's order; the runner drains requests into a `UiSink`
+  and threads responses (scripted `FakeSink` tests). The mode is read at
+  call time, so binding a UI affects contexts created earlier.
+- **Slice 2 — user_bash, context, providers** (`0cfa34b`):
+  - `emit_user_bash` (runner.ts:1276-1307): handlers run in order; the
+    first valid `{operations}`/`{result}` wins; `undefined` falls
+    through to local execution; an invalid result is reported AND
+    rethrown with the exact upstream message ("Invalid user_bash
+    handler result: return undefined for local execution or exactly one
+    valid { operations } or { result } object").
+  - `call_bash_exec` bridge (core/tools/bash.ts:74-93): the stashed
+    operations `exec` runs with a normalized options object; `onData`
+    streams through the `bashData` op; `signal` stays `undefined` (no
+    abort crossing — deviation). The result lands in a one-slot poll;
+    the poll is bounded at 100k job drains and fails with a JSON
+    engine-state dump instead of spinning.
+  - `emit_context` (runner.ts:1312-1370): `context` handlers see the
+    conversation minus system roles on a fresh per-handler event;
+    in-place edits and `{messages}` returns both apply; a changed
+    conversation reattaches the replayed system message
+    (`restoreSystemMessages`). `context_with_system` handlers see the
+    full transcript; a leading-system loss is reported but honored.
+  - Provider/virtual-model registry (`model-runtime.ts:924-1030` +
+    `loader.ts:468-524`) with the **two-level load-time deferral**:
+    while an extension is loading, provider changes queue on the
+    extension record (a failed load discards them, loader.ts:269-277);
+    after commit they queue on the runtime; `bind()` drains the queues
+    through the registry in order and records per-registration
+    validation failures as `ProviderBindError {extension_path, event:
+    "register_provider"|"register_virtual_model", error}` (read via
+    `ExtensionRunner::provider_registration_errors()`); post-bind
+    registrations apply immediately and throw into the caller. The
+    API-level "Provider config is required when registering by name"
+    check still throws at load (loader.ts:471).
+  - Every rquickjs error surface maps through `js_error` (exception
+    message extraction), so callers see the JS message instead of
+    rquickjs's opaque engine error text.
+- **E2 deviations so far**: `user_bash` `signal` stays `undefined`
+  across the bridge; native-provider/virtual-model definitions cross as
+  JSON (route functions dropped — routing protocol lands with the
+  model-runtime wiring); the physical-model conflict check runs
+  host-side when the registry is consumed; bind-flush validation
+  failures are *recorded* (`provider_bind_errors`) rather than emitted
+  through the runner error callback — that plumbing lands with slice
+  3/4 host wiring.
+- **The flaky-hang saga, resolved** (process lessons in Gotchas): the
+  21-minute spin in `user_bash_operations_bridge…` was the bridge never
+  writing its result slot (`__piBashText`), so the poll could never
+  succeed. The same gate then surfaced two more deterministic bugs:
+  slot errors must be JSON *strings* (`__piSessionLast` `JSON.parse`s
+  them; the validation branch stored an object →
+  `JSON.parse("[object Object]")` → the reported message came out as
+  `unexpected token: 'object'`), and the provider-error test called
+  `pi.appendEntry` at module top level — action methods throw until
+  bind (loader.ts:179 `appendEntry: notInitialized`); it now appends
+  from a `session_start` handler. What made these look flaky: the hunt
+  rounds ran the test binary directly via `find` without a rebuild. The
+  bounded poll stays as defense-in-depth. The provider deferral above
+  was then ported faithfully — the first cut validated eagerly at load,
+  which upstream does not.
+- **Tests**: pi-ext-js 75 passed + 1 ignored (5 stability rounds at
+  `--test-threads=4`); full-workspace gate + CI before merge.
+- **Extension language (decided 2026-11-15)**: JS/TS-only for extension
+  authors — upstream has no native-plugin semantics to mirror, and a
+  second extension ABI would be pure divergence. Native-level extension
+  points are: in-tree Rust modules (compiled into the host), MCP
+  servers (language-agnostic), and RPC mode (external processes). The
+  host-side registries keep a native-registration path open if a real
+  use case appears.
+- **Next**: slice 3 — feature-gate `pi-ext-js` behind `ext-js` on
+  `pi-coding-agent` and replace
+  `crates/pi-coding-agent/src/extensions/mod.rs` (discovery/load from
+  `-e` paths + settings, tool composition from `ToolInfo`, command
+  dispatch, flag claiming, provider-registry application); slice 4 —
+  RPC dialog subprotocol in `modes/rpc.rs`, `session_before_*` gates in
+  the agent loop, virtual-model routing, provider OAuth/streamSimple
+  decision.
+
 ## Gotchas / decisions
+- **Round-hunting can exercise a stale binary (E2, 2026-11-15)**: a hunt
+  script that `find`s the test binary and runs it directly skips the
+  rebuild — three deterministic bugs looked flaky across 40+ "green"
+  rounds and one 21-minute spin. Always `cargo test` (which rebuilds)
+  when asserting source-level stability; treat `find`+run loops as
+  binary-level evidence only.
+- **`pkill -9 -f <pattern>` kills its own shell** when the pattern
+  matches the shell's own cmdline (it does for `pi_ext_js` — the pattern
+  is in the shell's argv) — a hunt script died exit 137 on its own
+  cleanup line.
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
   slot shifted every later index — the `*_INDEX` consts are the single source of
   truth; never hardcode numbers in tests or handlers.

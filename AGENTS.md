@@ -22,20 +22,16 @@ real TypeScript pi install.
 ### Ground truth and the privacy rule
 
 - **TypeScript source (canonical, cited by line in module docs):**
-  `/tmp/ai-agent/pi` on the operator's machine — a read-only clone of
+  `/tmp/pi` on the operator's machine — a read-only clone of
   `earendil-works/pi`; `packages/coding-agent` is at 1.5.2. `/tmp` is
-  ephemeral; re-clone the public repo if it is gone, or use the durable
-  compiled copies:
-- **Compiled upstream (durable, allowed reads):**
-  `~/.pi/agent/install/releases/1.5.2/node_modules/@earendil-works/*/dist/`
-  (`pi-coding-agent`, `pi-agent-core`, `pi-ai`, `pi-tui`, `pi-schema`,
-  `pi-mcp`, `pi-codemode`, `pi-telemetry`) — JS + `.d.ts` + sourcemaps.
-- **Privacy rule (hard):** read *only* the `node_modules` trees and docs
-  under `~/.pi/agent/install/`. Never open, `cat`, or Read anything else
-  under `~/.pi` — `auth.json`, real sessions, the user's real settings —
-  those hold live credentials and chat history. The built `pi` binary reading
-  its own config is fine; the agent reading those files is not. All test
-  fixtures are synthetic.
+  ephemeral; re-clone the public repo if it is gone:
+  `gh repo clone earendil-works/pi /tmp/pi`.
+- **Privacy rule (hard):** never open, `cat`, or Read anything under a
+  live pi data root — the XDG `pi` directories (`~/.config/pi`,
+  `~/.local/state/pi`, …) or a legacy `~/.pi` — because `auth.json`,
+  real sessions, and real settings hold live credentials and chat
+  history. The built `pi` binary reading its own config is fine; the
+  agent reading those files is not. All test fixtures are synthetic.
 
 ### Where knowledge lives
 
