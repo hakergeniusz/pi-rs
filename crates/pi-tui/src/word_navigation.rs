@@ -311,7 +311,7 @@ fn breaks_at(chars: &[char], classes: &[WordClass], index: usize) -> bool {
         return false; // WB3d
     }
     if left == WordClass::RegionalIndicator && right == WordClass::RegionalIndicator {
-        return regional_indicator_run_length(classes, before) % 2 == 0; // WB15, WB16
+        return regional_indicator_run_length(classes, before).is_multiple_of(2); // WB15, WB16
     }
     if left == WordClass::ALetter && right == WordClass::ALetter {
         return false; // WB5

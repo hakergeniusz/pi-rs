@@ -1,0 +1,16 @@
+[package]
+name = "pi-ext-js"
+description = "Embedded JavaScript extensions host (E0 spike; port target: the @earendil-works/pi-coding-agent extensions runtime)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rquickjs = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

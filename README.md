@@ -61,7 +61,7 @@ Deferred (not in the core scope): `chord`, `pi-durable`, `apps/p2`.
 
 ## Build
 
-Requires Rust 1.85 (MSRV).
+Requires Rust 1.87 (MSRV).
 
 ```sh
 cargo build

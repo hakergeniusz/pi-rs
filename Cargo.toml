@@ -8,6 +8,7 @@ members = [
 	"crates/pi-mcp",
 	"crates/pi-codemode",
 	"crates/pi-coding-agent",
+	"crates/pi-ext-js",
 ]
 
 [workspace.package]
@@ -16,7 +17,7 @@ edition = "2024"
 license = "MIT"
 authors = ["pi-rs contributors"]
 repository = "https://github.com/hakergeniusz/pi-rs"
-rust-version = "1.85"
+rust-version = "1.87"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -53,6 +54,9 @@ pi-agent = { path = "crates/pi-agent", version = "0.1.0-alpha.1" }
 pi-tui = { path = "crates/pi-tui", version = "0.1.0-alpha.1" }
 pi-mcp = { path = "crates/pi-mcp", version = "0.1.0-alpha.1" }
 pi-codemode = { path = "crates/pi-codemode", version = "0.1.0-alpha.1" }
+
+# extensions host (E0 spike)
+rquickjs = "0.14"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

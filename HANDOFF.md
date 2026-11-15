@@ -724,6 +724,53 @@ pump cadence stands in for upstream's `setInterval`).
   memory caps (prebuilt v8), MSRV vs 1.85, tokio alignment, binary growth +
   RSS, hello-world op round-trip.
 
+## E0 spike: JS host on rquickjs (landed on `feat/e0-js-host-spike`, 2026-11-15)
+- **Engine decision flipped before the spike ran: `deno_core` → `rquickjs`
+  0.14 (QuickJS-NG).**
+  - Cloudflare acquired Deno (2026-10-09): the Deno runtime is deprecated —
+    monthly bug/security releases until ~2027-10, then EOL. The maintenance
+    guarantee the recon relied on for `deno_core` is gone.
+  - Bun (the operator's suggested alternative) was assessed and rejected for
+    embedding: no embeddable library API exists (oven-sh/bun#12017 still
+    open; the Anthropic Rust rewrite — acquired 2025-12, Zig→Rust merged
+    2026-05 — ships none; the only embedding crates are weeks-old community
+    projects). Embedding Bun today would reopen the subprocess-host model
+    rejected in docs/EXTENSIONS.md §6.2. Watch item: an official Bun
+    embedding API would be revisited before E2.
+  - `rquickjs` 0.14 was the recon's recorded fallback and is now primary:
+    embedded library, MIT, active, QuickJS-NG backend. docs/EXTENSIONS.md §6
+    carries the updated decision.
+- **Spike crate `crates/pi-ext-js`** (E0 scope, deliberately no API):
+  ESM module load → default-export `(pi)` factory → `pi.on` /
+  `pi.registerCommand` into JS-side registries → Rust-backed `getConfig` op
+  → `emit` fan-out in registration order with stringified results back in
+  Rust; a module without a default export fails as a typed
+  `JsHostError::MissingDefaultExport`. Three tests, all green. The real
+  `ExtensionAPI` (loader, TS transpile, async handlers, runner) is E1.
+- **Measurements** (container 4 cores / 4 GB, `-j2`, `nice 19`,
+  `/build-target`):
+  - cold release build (quickjs-ng + rquickjs + crate + example): **29 s**;
+  - runtime peak RSS of the spike example: **~4.0 MiB** release (4.5 MiB dev);
+  - release example binary, stripped + thin-LTO: **1.7 MiB**;
+    `libquickjs.a`: **2.3 MiB** — versus deno_core's projected +30–60 MiB.
+  The OOM-risk gate that motivated the go/no-go is retired.
+- **MSRV bumped 1.85 → 1.87**: rquickjs 0.14 declares
+  `rust-version = "1.87"`; the workspace floor moved (CI runs
+  `dtolnay/rust-toolchain@stable`, unaffected; 1.87 shipped 2025-05). The
+  bump also surfaced `manual_is_multiple_of` in `pi-tui/word_navigation.rs`
+  (WB15/WB16 even-run check now `.is_multiple_of(2)`; `is_multiple_of`
+  stabilized exactly in 1.87).
+- **rquickjs 0.14 API notes banked for E1**: `Runtime::set_memory_limit`
+  takes `usize`; `Array::len()` returns `usize`; `Array::get<V>(idx)` is
+  single-generic; modules go `Module::declare(..)?.eval()` →
+  `(Module, Promise)`; drain jobs with `Runtime::execute_pending_job()` →
+  `Result<bool>` (its `JobException` is not publicly nameable — flatten to
+  a string); `JSON.stringify` quote-wraps strings, so the glue keeps an
+  identity helper for string values.
+- **Next: E1 headless core** — Rust `ExtensionRunner` port with §2 dispatch
+  semantics, loader (§5), de-facto core API subset (§5.3); exit = the
+  bundled `tool-search` extension runs identically to upstream.
+
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
   slot shifted every later index — the `*_INDEX` consts are the single source of
@@ -746,7 +793,7 @@ pump cadence stands in for upstream's `setInterval`).
   port needed); BuiltInHeader/Footer needed `as_any_mut` opt-ins (downcasts
   silently no-oped). Lesson: run the full suite, not just the new crate's subset.
 - Ported code once arrived with a systematic corruption: `map_or((default,` (extra `(` after `map_or(`) — fixed crate-wide by rewriting to `map_or(`. (Store.rs E0308 in old `test-log.txt` was another artifact of that batch, already fixed.)
-- Workspace lints: clippy `all+pedantic`, CI `-D warnings`, `cargo fmt --check`, MSRV 1.85 (`rust-version = "1.85"`). Newer-API fixes must respect MSRV (e.g. `f64::midpoint` 1.87 → scoped `#[allow]`).
+- Workspace lints: clippy `all+pedantic`, CI `-D warnings`, `cargo fmt --check`, MSRV 1.87 (`rust-version = "1.87"`, bumped from 1.85 at the E0 spike for `rquickjs` 0.14). Newer-API fixes must respect MSRV (the `f64::midpoint` scoped `#[allow]` from the 1.85 era can be lifted now).
 - `ToolDefinition.name` is `&'static str`; `Mode`/`PrintModeOptions` have no `Default`.
 - pi-ai `StreamOptions.reasoning` has only 5 levels; `xhigh`/`max` clamp to `High` in `ProviderStreamFn` until P5.
 - Catalog reality check for tests: `models.json` has `claude-sonnet-4-5/4-6/5/5-5` but NOT plain `claude-sonnet-4`; bare `claude-sonnet-4-6` is ambiguous (anthropic + cloudflare-ai-gateway + opencode).

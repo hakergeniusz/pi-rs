@@ -309,9 +309,12 @@ setStatus`, `modelRegistry.getProviderAuth/refresh`, `cwd`, `signal`,
 
 ## 6. Runtime decision
 
-**Decision: embedded JS engine — `deno_core` (V8) — behind a feature-gated
-host crate, phased per §8. This ratifies PLAN.md §2's recommendation with the
-recon evidence; `rquickjs` + swc is the recorded fallback.**
+**Decision: embedded JS engine — `rquickjs` 0.14 (QuickJS-NG) — behind a
+feature-gated host crate, phased per §8. Originally `deno_core` (V8) with
+`rquickjs` as the fallback; flipped at the E0 spike (2026-11-15) when
+Cloudflare's acquisition deprecated the Deno runtime and Bun proved
+non-embeddable (§6.2). The spike validated the engine in-container
+(measurements in HANDOFF.md).**
 
 ### 6.1 Why an embedded engine at all
 
@@ -335,32 +338,40 @@ recon evidence; `rquickjs` + swc is the recorded fallback.**
   already specifies a JSON protocol for everything that is not a live
   component (§4.6).
 
-### 6.2 Why `deno_core` over the alternatives
+### 6.2 Why `rquickjs` over the alternatives
 
 | Option | Verdict | Reason |
 |---|---|---|
-| **`deno_core` (V8)** | **chosen** | tokio-native (our loop is tokio), serde_json/V8 value interop, mature op framework for the virtual-module surface, TS transpile path exists (swc, the same crate deno uses), prebuilt V8 static libs via the `v8` crate. Runs real extensions at upstream parity. |
-| `rquickjs`/`boa` + swc | fallback | ~2–5 MB instead of +30–60 MB and no V8 build risk — but slower, weaker ES2023+ coverage, no debugging story, and still needs the identical virtual-module + node-compat work. Fallback only if the spike (§8.0) fails on the memory-capped build machine. |
+| **`rquickjs` 0.14 (QuickJS-NG) + TS transpiler** | **chosen** | Embeddable as a library (the gate Bun fails), MIT, active (0.14.0, 2026-09), QuickJS-NG backend. Light where it matters for this port: E0 measured a 29 s cold release build at `-j2` on the memory-capped machine, ~4 MiB runtime RSS, and 1.7 MiB of binary weight (`libquickjs.a` 2.3 MiB) versus V8's projected 30–60 MiB. Slower than V8 and needs hand-written glue (bootstrap globals, job draining, value marshalling), but the extension API crosses the boundary as JSON/strings (§6.1), so the glue is written once, not per event. |
+| `deno_core` (V8) | fallback (was chosen at recon) | tokio-native, mature op framework, prebuilt V8 static libs — but Cloudflare acquired Deno (2026-10-09) and deprecated the runtime (monthly fixes until ~2027-10, then EOL), removing the maintenance guarantee the recon relied on. Remains the escape hatch if QuickJS hits a fidelity wall (debugger story, ES2023+ gaps). |
+| Bun (embedded) | rejected | No embeddable library API exists: oven-sh/bun#12017 is open, the Anthropic Rust rewrite (merged 2026-05) ships none, and the only embedding crates (`bun_runtime` 0.6.0) are weeks-old community projects. Embedding Bun today would mean the subprocess model rejected below. Watch item: an official Bun embedding API would be revisited before E2. |
 | Rust-native trait (seam as-is) | rejected | incompatible with the TS ecosystem and with 1:1 fidelity; survives only as the seam the JS host plugs into (§7). |
 | Subprocess host (node/deno child) | rejected | ships a JS runtime anyway, adds a second IPC protocol over a deeply bidirectional API (sync-ish UI calls, streaming, component bridging), and buys isolation upstream explicitly does not have (extensions run with full user permissions; trust is decided before load). |
 
 ### 6.3 Known costs and mitigations
 
-- **Binary size / build**: V8 adds ~30–60 MB to the release binary and a
-  heavy first build (prebuilt static libs keep it to download + link).
-  Mitigation: feature-gate (`ext-js`) so the lean build and CI stay fast;
-  gate order unchanged.
+- **Binary size / build**: measured at E0 — `libquickjs.a` is 2.3 MiB, the
+  stripped spike example binary 1.7 MiB, cold release build 29 s at `-j2`
+  under the 4 GiB container cap. Mitigation kept: `pi-ext-js` stays a
+  workspace member, and `pi-coding-agent` gets the dependency behind the
+  `ext-js` feature at E1 wiring so the lean build remains possible.
 - **node built-ins**: extensions may import `node:fs`, `node:path`, …
-  (upstream docs line 184). `deno_core` alone ships none. Mitigation: start
-  with the subset the bundled extensions and the top examples use
-  (`node:fs`, `node:path`, `node:os`, `node:child_process` subset,
-  `node:url`), grow on demand; record gaps as deviations.
-- **MSRV/toolchain**: deno_core's MSRV must be validated against ours (1.85)
-  in the spike; if it forces a toolchain bump, that is a separate decision.
-- **tokio alignment**: deno_core pins tokio features; align versions in the
-  workspace rather than vendoring a fork.
+  (upstream docs line 184). No embedded engine ships them (`rquickjs`
+  included). Mitigation: start with the subset the bundled extensions and
+  the top examples use (`node:fs`, `node:path`, `node:os`,
+  `node:child_process` subset, `node:url`), grow on demand; record gaps as
+  deviations.
+- **MSRV/toolchain**: resolved at the spike — `rquickjs` 0.14 declares
+  `rust-version = "1.87"`, so the workspace floor moved 1.85 → 1.87 (CI runs
+  `@stable`; recorded in HANDOFF.md).
+- **No built-in event loop**: `QuickJS` is single-threaded with a job queue;
+  the host drains `Runtime::execute_pending_job()` after every engine entry
+  (the E0 spike pattern). Upstream factories may return promises and
+  handlers may be async — E1 decides between `rquickjs`'s futures support
+  and an explicit job-queue shim.
 - **jiti parity**: jiti does Babel TS/ESM/CJS interop + `tsconfigPaths` +
-  node_modules resolution. Our loader needs swc (transpile) + a module
+  node_modules resolution. Our loader needs a TS-stripping transpiler
+  (`swc` or the lighter-to-build `oxc`; picked in E1) + a module
   resolver covering the virtual-module table (§4.7), relative/absolute specifiers,
   and extension `node_modules`. ESM-only first (upstream extensions are ESM;
   CJS interop deferred and recorded if it bites).
@@ -380,8 +391,8 @@ New crate `crates/pi-ext-js` (working name), feature `ext-js` on
 │        ▲                                                       │
 │        │ impl Extension (one per loaded module)                │
 │  pi-ext-js: JsExtension                                        │
-│   - deno_core JsRuntime + tokio                                │
-│   - module loader: swc TS transpile + virtual-module table     │
+│   - rquickjs Runtime (QuickJS-NG), single-threaded per host    │
+│   - module loader (E1): swc/oxc TS strip + virtual-module table│
 │   - ops: pi.* API (registration, exec, settings, events bus)   │
 │   - host callbacks: events in → JSON results out; UI via       │
 │     mode-gated bridge (no-op json/print, RPC subprotocol, TUI) │
@@ -428,10 +439,14 @@ aggregating registry, and unknown-flag claiming. Gaps against §2/§3:
 Each phase is one or more topic branches with the full container gate; the
 fidelity rule applies per phase (deviations recorded as they appear).
 
-- **E0 — spike (no API)**: `deno_core` builds in the container within memory
-  caps; hello-world ESM module + op round-trip + tokio interop; measure
-  binary growth and RSS; MSRV check. Gate: go/no-go for deno_core vs
-  rquickjs fallback. *Deliverable: spike notes in HANDOFF.md.*
+- **E0 — spike (no API): DONE** (2026-11-15, `feat/e0-js-host-spike`). The
+  engine flipped to `rquickjs` 0.14 before the spike ran (Deno deprecation +
+  Bun non-embeddable, §6.2); the spike proved the full round trip
+  in-container — ESM default-export factory → `pi.on`/`registerCommand` →
+  Rust-backed `getConfig` op → emit fan-out in registration order — with 3
+  tests green, a 29 s cold release build at `-j2`, ~4 MiB runtime RSS, a
+  1.7 MiB stripped example binary, and MSRV moved 1.85 → 1.87.
+  *Notes: HANDOFF.md.*
 - **E1 — headless core** (everything except UI/components/node-polyfills):
   Rust `ExtensionRunner` port with §2 dispatch semantics; loader (§5: paths,
   trust gating, manifest, errors-as-values); `pi` subset = the de-facto core
@@ -458,5 +473,5 @@ fidelity rule applies per phase (deviations recorded as they appear).
   semantics. Exit: golden extension fixtures generated by the real TS pi
   (shared with the P4 fixture work) pass.
 
-Backlog order after this recon: **E0 spike** → E1. The 69-item doc remainder
-and P5 rpc-envelope reconciliation stay queued behind E0.
+Backlog order: **E1 headless core** next (E0 done 2026-11-15). The 69-item
+doc remainder and P5 rpc-envelope reconciliation stay queued behind E1.
