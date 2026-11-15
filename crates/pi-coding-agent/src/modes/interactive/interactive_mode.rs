@@ -5,10 +5,11 @@
 //! messages, tool execution rows, the working status embedded in the editor's
 //! top border, the footer, the `/`-commands this phase wires, the `!` bash
 //! mode, the editor autocomplete (slash commands, `@` files, paths), context
-//! compaction, and the OSC theme controller. Deferred to later P6 parts:
-//! fullscreen mode (the mouse handlers on the shared components are ported;
-//! only the fullscreen TUI enables tracking and delivers reports), the
-//! selector dialogs beyond `/model`, and the extension host.
+//! compaction, and the OSC theme controller. Fullscreen mode is ported as the
+//! alt-screen renderer choice plus the chat viewport ([`chat_viewport`])
+//! mounted over the same component tree (`switchTuiMode`,
+//! `interactive-mode.ts:641-700`); the selector dialogs are editor-slot
+//! swaps, and the extension host is deferred.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -23,24 +24,31 @@ use pi_agent::transcript::tool_declaration;
 use pi_agent::types::{
     AbortSignal, AgentContext, QueueMode, ThinkingLevel, ToolExecutionMode, ToolExecutor,
 };
+use pi_tui::color::{TextAttributes, style_text_with_ansi};
 use pi_tui::component::{Component, ComponentMutation};
 use pi_tui::components::editor::{Editor, EditorOptions};
+use pi_tui::components::stack::VStack;
 use pi_tui::components::text::Text;
-use pi_tui::mouse::{MouseEvent, MouseEventResult};
+use pi_tui::mouse::{ComponentId, MouseEvent, MouseEventResult, component_id};
 use pi_tui::stdin_buffer::{StdinBuffer, StdinBufferOptions, StdinEvent};
 use pi_tui::terminal::CrosstermTerminal;
 use pi_tui::terminal_colors::TerminalColorScheme;
 use pi_tui::theme::ThemeAppearance;
 use pi_tui::tui::FocusTarget;
 use pi_tui::tui::{TerminalColors, Tui, TuiStopOptions};
+use pi_tui::tui_alt_screen::AltScreenOptions;
 
+use crate::cli::args::TuiMode;
 use crate::cli::project_trust::ProjectTrustStore;
-use crate::config::settings::{SettingsManager, SettingsManagerCreateOptions};
+use crate::config::settings::{
+    FullscreenExitOutput, SettingsManager, SettingsManagerCreateOptions,
+};
 use crate::modes::print_mode::PrintRuntime;
 use crate::session::store::{NewSessionOptions, SessionManager};
 use crate::tools::index::BuiltinToolExecutor;
 
 use super::autocomplete;
+use super::chat_viewport::{self, ChatViewport, HostSlot};
 use super::components::assistant_message::AssistantMessageComponent;
 use super::components::footer::{FooterComponent, FooterData, UsageTotals};
 use super::components::header::{BuiltInHeader, pi_logo_lines};
@@ -60,6 +68,9 @@ pub struct InteractiveOptions {
     pub version: String,
     /// A `--theme` override; the settings getter lands with the settings work.
     pub theme_name: Option<String>,
+    /// A `--tui-mode` override; unset resolves through the settings
+    /// (`getTuiMode`, which defaults to fullscreen).
+    pub tui_mode: Option<TuiMode>,
     /// The `auth.json` path for the model-availability check. `None` uses the
     /// real agent dir; tests inject a temp path to stay hermetic.
     pub auth_path: Option<std::path::PathBuf>,
@@ -76,6 +87,7 @@ impl Default for InteractiveOptions {
         InteractiveOptions {
             version: env!("CARGO_PKG_VERSION").to_string(),
             theme_name: None,
+            tui_mode: None,
             auth_path: None,
             agent_dir: None,
             project_trusted: false,
@@ -280,13 +292,10 @@ struct PendingTool {
     chat_index: usize,
 }
 
-/// Tree child indices. The pending-messages container sits between the chat
-/// and the status row (`interactive-mode.ts` `pendingMessagesContainer`).
-const HEADER_INDEX: usize = 0;
-const CHAT_INDEX: usize = 1;
-const PENDING_INDEX: usize = 2;
-const EDITOR_INDEX: usize = 4;
-const FOOTER_INDEX: usize = 5;
+// The flat tree mounts the six hosts in [`HostSlot`] order; the chat
+// viewport moves them into its document and dock without changing their
+// identities (`switchTuiMode` keeps one component tree,
+// `interactive-mode.ts:641-700`).
 
 /// The `steeringMode`/`followUpMode` settings → queue mode. Only "all"
 /// switches off the one-at-a-time default (`QueueMode`).
@@ -367,6 +376,16 @@ pub struct InteractiveMode {
     session_selector_events: Option<Arc<Mutex<Vec<SessionSelectorEvent>>>>,
     /// The editor, parked while the selector occupies its tree slot.
     suspended_editor: Option<Box<dyn Component>>,
+    /// The resolved renderer mode (`options.tuiMode`): which screen the
+    /// frames paint onto (`createInteractiveTui`, `tui-renderer.js:8`).
+    tui_mode: TuiMode,
+    /// The editor host's component id. Focus follows it across the mode
+    /// switch, exactly as `switchTuiMode` carries the focused component
+    /// between renderers (`interactive-mode.ts:646, 677`).
+    editor_id: ComponentId,
+    /// The mounted chat viewport while fullscreen
+    /// (`this.fullscreenLayoutRoot` / `this.transcriptScrollView`).
+    viewport: Option<ChatViewport>,
     /// Where provider credentials live (`auth.json`).
     auth_path: std::path::PathBuf,
     /// The agent dir the trust selector reads and writes (`trust.json`).
@@ -447,18 +466,13 @@ impl InteractiveMode {
             .editor
             .set_autocomplete_provider(Some(Arc::new(provider)));
 
-        let mut tui = Tui::new(terminal);
-        tui.set_clear_on_shrink(true);
-        tui.add_child(Box::new(Self::build_header(
+        let (mut tui, editor_id) = Self::mount_flat_tree(
+            terminal,
             &options.version,
             &runtime.model.id,
-        )));
-        tui.add_child(Box::new(pi_tui::component::Container::new()));
-        tui.add_child(Box::new(pi_tui::component::Container::new()));
-        tui.add_child(Box::new(IdleStatus));
-        tui.add_child(Box::new(editor_host));
-        tui.add_child(Box::new(FooterComponent::new(Self::footer_data(runtime))));
-        tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
+            editor_host,
+            FooterComponent::new(Self::footer_data(runtime)),
+        );
 
         let theme_query_start = Self::arm_theme_queries(
             &mut tui,
@@ -468,6 +482,9 @@ impl InteractiveMode {
         );
         let (agent_dir, settings, hide_thinking_block, queues) =
             Self::startup_settings(options, runtime);
+        // The renderer choice: the `--tui-mode` flag wins, otherwise the
+        // settings (`getTuiMode`, default fullscreen).
+        let tui_mode = options.tui_mode.unwrap_or_else(|| settings.get_tui_mode());
 
         InteractiveMode {
             tui,
@@ -502,6 +519,9 @@ impl InteractiveMode {
             settings_selector_events: None,
             session_selector_events: None,
             suspended_editor: None,
+            tui_mode,
+            editor_id,
+            viewport: None,
             auth_path: options
                 .auth_path
                 .clone()
@@ -524,6 +544,32 @@ impl InteractiveMode {
             theme_scheme_reports,
             theme_query_start,
         }
+    }
+
+    /// The regular renderer's flat mount: the six hosts in [`HostSlot`] order
+    /// (`interactive-mode.ts` init's `mountInteractiveTui` flat path), focus
+    /// on the editor.
+    fn mount_flat_tree(
+        terminal: Box<dyn pi_tui::terminal::Terminal>,
+        version: &str,
+        model_id: &str,
+        editor_host: ChatEditor,
+        footer: FooterComponent,
+    ) -> (Tui, ComponentId) {
+        let mut tui = Tui::new(terminal);
+        tui.set_clear_on_shrink(true);
+        tui.add_child(Box::new(Self::build_header(version, model_id)));
+        tui.add_child(Box::new(pi_tui::component::Container::new()));
+        tui.add_child(Box::new(pi_tui::component::Container::new()));
+        tui.add_child(Box::new(IdleStatus));
+        // Ids are heap addresses, so the editor's identity is taken once the
+        // host is boxed — focus names it across the mode switches.
+        let editor_box = Box::new(editor_host);
+        let editor_id = component_id(editor_box.as_ref());
+        tui.add_child(editor_box);
+        tui.add_child(Box::new(footer));
+        tui.set_focus(Some(FocusTarget::Id(editor_id)));
+        (tui, editor_id)
     }
 
     /// Arms the theme controller's terminal plumbing: the mode-2031 scheme
@@ -763,16 +809,34 @@ impl InteractiveMode {
     // --------------------------------------------------------------
 
     fn chat_mut(&mut self) -> &mut pi_tui::component::Container {
-        self.downcast_tree::<pi_tui::component::Container>(CHAT_INDEX)
+        self.downcast_tree::<pi_tui::component::Container>(HostSlot::Chat)
             .expect("chat container")
     }
 
-    fn downcast_tree<T: 'static>(&mut self, index: usize) -> Option<&mut T> {
-        self.tui.child_mut(index)?.as_any_mut()?.downcast_mut::<T>()
+    /// A slot's host, wherever the viewport has it: a flat root child in the
+    /// regular renderer, nested inside the chat viewport's document or dock
+    /// in fullscreen. `switchTuiMode` keeps one component tree, so the
+    /// helpers reach the hosts by recorded identity in either arrangement.
+    fn downcast_tree<T: 'static>(&mut self, slot: HostSlot) -> Option<&mut T> {
+        let id = self
+            .viewport
+            .as_ref()
+            .map(|viewport| viewport.slot_id(slot));
+        if let Some(id) = id {
+            return self
+                .tui
+                .component_by_id_deep_mut(id)?
+                .as_any_mut()?
+                .downcast_mut::<T>();
+        }
+        self.tui
+            .child_mut(slot.index())?
+            .as_any_mut()?
+            .downcast_mut::<T>()
     }
 
     fn downcast_chat<T: 'static>(&mut self, index: usize) -> Option<&mut T> {
-        self.downcast_tree::<pi_tui::component::Container>(CHAT_INDEX)
+        self.downcast_tree::<pi_tui::component::Container>(HostSlot::Chat)
             .and_then(|chat| chat.get_mut(index))
             .and_then(|child| child.as_any_mut())
             .and_then(|any| any.downcast_mut::<T>())
@@ -789,7 +853,7 @@ impl InteractiveMode {
     }
 
     fn editor_mut(&mut self) -> &mut ChatEditor {
-        self.downcast_tree::<ChatEditor>(EDITOR_INDEX)
+        self.downcast_tree::<ChatEditor>(HostSlot::Editor)
             .expect("editor host")
     }
 
@@ -1240,7 +1304,7 @@ impl InteractiveMode {
         let thinking_level = self.thinking_level.as_str().to_string();
         let model_id = self.model.id.clone();
         let model_supports_reasoning = self.model.reasoning;
-        let Some(footer) = self.downcast_tree::<FooterComponent>(FOOTER_INDEX) else {
+        let Some(footer) = self.downcast_tree::<FooterComponent>(HostSlot::Footer) else {
             return;
         };
         footer.data.totals = totals;
@@ -1619,7 +1683,7 @@ impl InteractiveMode {
             ));
         }
         let pending = self
-            .downcast_tree::<pi_tui::component::Container>(PENDING_INDEX)
+            .downcast_tree::<pi_tui::component::Container>(HostSlot::Pending)
             .expect("pending container");
         pending.clear();
         for row in rows {
@@ -1739,11 +1803,8 @@ impl InteractiveMode {
             initial_search,
             Arc::clone(&events),
         );
-        let editor = self.tui.replace_child(EDITOR_INDEX, Box::new(selector));
-        self.suspended_editor = Some(editor);
         self.model_selector_events = Some(events);
-        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
-        self.tui.request_render();
+        self.suspend_editor_with(Box::new(selector));
     }
 
     /// Put the editor back (`showSelector`'s `done`).
@@ -1751,11 +1812,8 @@ impl InteractiveMode {
         if self.suspended_editor.is_none() {
             return;
         }
-        let editor = self.suspended_editor.take().expect("suspended editor");
-        let _ = self.tui.replace_child(EDITOR_INDEX, editor);
         self.model_selector_events = None;
-        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
-        self.tui.request_render();
+        self.restore_editor();
     }
 
     /// Mount the `/trust` selector in the editor's tree slot
@@ -1774,11 +1832,8 @@ impl InteractiveMode {
             self.project_trusted,
             Arc::clone(&events),
         );
-        let editor = self.tui.replace_child(EDITOR_INDEX, Box::new(selector));
-        self.suspended_editor = Some(editor);
         self.trust_selector_events = Some(events);
-        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
-        self.tui.request_render();
+        self.suspend_editor_with(Box::new(selector));
     }
 
     /// Put the editor back after a trust decision or a cancel.
@@ -1786,11 +1841,8 @@ impl InteractiveMode {
         if self.suspended_editor.is_none() {
             return;
         }
-        let editor = self.suspended_editor.take().expect("suspended editor");
-        let _ = self.tui.replace_child(EDITOR_INDEX, editor);
         self.trust_selector_events = None;
-        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
-        self.tui.request_render();
+        self.restore_editor();
     }
 
     /// Mount the `/settings` dialog in the editor's tree slot
@@ -1838,11 +1890,8 @@ impl InteractiveMode {
             },
             Arc::clone(&events),
         );
-        let editor = self.tui.replace_child(EDITOR_INDEX, Box::new(selector));
-        self.suspended_editor = Some(editor);
         self.settings_selector_events = Some(events);
-        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
-        self.tui.request_render();
+        self.suspend_editor_with(Box::new(selector));
     }
 
     /// Put the editor back after the settings dialog closes.
@@ -1850,11 +1899,8 @@ impl InteractiveMode {
         if self.suspended_editor.is_none() {
             return;
         }
-        let editor = self.suspended_editor.take().expect("suspended editor");
-        let _ = self.tui.replace_child(EDITOR_INDEX, editor);
         self.settings_selector_events = None;
-        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
-        self.tui.request_render();
+        self.restore_editor();
     }
 
     /// The `/settings` dialog's event handlers
@@ -2362,6 +2408,15 @@ impl InteractiveMode {
             })
             .is_ok();
         let stdin_rx = spawned.then_some(rx);
+        // `init` mounts the fullscreen viewport on the alt-screen renderer
+        // before the first frame (`interactive-mode.ts:713-731`); the port's
+        // single `Tui` enters it here instead.
+        if self.tui_mode == TuiMode::Fullscreen
+            && let Err(error) = self.enter_fullscreen()
+        {
+            let _ = self.shutdown();
+            return Err(error);
+        }
         // A resumed session replays its transcript (`renderInitialMessages`).
         self.render_initial_messages();
         loop {
@@ -2563,11 +2618,8 @@ impl InteractiveMode {
             self.session.session_file(),
             Arc::clone(&events),
         );
-        let editor = self.tui.replace_child(EDITOR_INDEX, Box::new(selector));
-        self.suspended_editor = Some(editor);
         self.session_selector_events = Some(events);
-        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
-        self.tui.request_render();
+        self.suspend_editor_with(Box::new(selector));
     }
 
     /// Put the editor back after the resume dialog closes.
@@ -2575,11 +2627,222 @@ impl InteractiveMode {
         if self.suspended_editor.is_none() {
             return;
         }
-        let editor = self.suspended_editor.take().expect("suspended editor");
-        let _ = self.tui.replace_child(EDITOR_INDEX, editor);
         self.session_selector_events = None;
-        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
+        self.restore_editor();
+    }
+
+    // --------------------------------------------------------------
+    // TUI mode (`switchTuiMode`, `interactive-mode.ts:641-700`)
+    // --------------------------------------------------------------
+
+    /// The alt-screen options `createInteractiveTui` builds for fullscreen
+    /// (`tui-renderer.js:9-29`): the theme-styled search matches, the themed
+    /// jump-to-end label, and the fullscreen settings. `open_url` /
+    /// `on_right_click_paste` stay unset — the port has no browser opener,
+    /// and right-click paste is a Windows-terminal feature upstream.
+    fn fullscreen_options(&self) -> AltScreenOptions {
+        let theme = theme::theme();
+        let search_match_style = {
+            let theme = std::sync::Arc::clone(&theme);
+            std::sync::Arc::new(move |text: &str| {
+                let base = theme.bg(
+                    pi_tui::theme::ThemeBg::SearchMatchBg,
+                    &theme.fg(pi_tui::theme::ThemeColor::SearchMatchText, text),
+                );
+                style_text_with_ansi(
+                    &base,
+                    None,
+                    None,
+                    TextAttributes {
+                        underline: true,
+                        ..TextAttributes::default()
+                    },
+                )
+            })
+        };
+        let search_current_match_style = {
+            let theme = std::sync::Arc::clone(&theme);
+            std::sync::Arc::new(move |text: &str| {
+                let base = theme.bg(
+                    pi_tui::theme::ThemeBg::SearchMatchBg,
+                    &theme.fg(pi_tui::theme::ThemeColor::SearchMatchText, text),
+                );
+                style_text_with_ansi(
+                    &base,
+                    None,
+                    None,
+                    TextAttributes {
+                        bold: true,
+                        inverse: true,
+                        ..TextAttributes::default()
+                    },
+                )
+            })
+        };
+        let search_navigation_button_style: pi_tui::alt_screen_search::SearchButtonStyle = {
+            std::sync::Arc::new(|text: &str, hovered: bool| {
+                if !hovered {
+                    return text.to_string();
+                }
+                style_text_with_ansi(
+                    text,
+                    None,
+                    None,
+                    TextAttributes {
+                        underline: true,
+                        ..TextAttributes::default()
+                    },
+                )
+            })
+        };
+        let shortcut = key_display_text(pi_tui::keybindings::action::ALT_SCREEN_BOTTOM);
+        let scroll_to_end_indicator = {
+            let theme = std::sync::Arc::clone(&theme);
+            Box::new(move || {
+                let label = if shortcut.is_empty() {
+                    " ↓ Jump to latest message ".to_string()
+                } else {
+                    format!(" ↓ Jump to latest message · {shortcut} ")
+                };
+                theme.bg(
+                    pi_tui::theme::ThemeBg::SelectedBg,
+                    &theme.fg(pi_tui::theme::ThemeColor::Text, &label),
+                )
+            }) as Box<dyn Fn() -> String + Send>
+        };
+        AltScreenOptions {
+            mouse: true,
+            wheel_scroll_lines: Some(self.settings.get_fullscreen_wheel_scroll_lines()),
+            scroll_to_end_indicator: Some(scroll_to_end_indicator),
+            open_url: None,
+            on_right_click_paste: None,
+            copy_on_select: self.settings.get_fullscreen_copy_on_select(),
+            search_match_style,
+            search_current_match_style,
+            search_navigation_button_style,
+        }
+    }
+
+    /// Mount the fullscreen viewport: the flat hosts move into the chat
+    /// viewport on the alt screen (`switchTuiMode("fullscreen")`'s
+    /// `mountInteractiveTui` + `setLayoutRoot`, `interactive-mode.ts:672-680`).
+    fn enter_fullscreen(&mut self) -> Result<(), String> {
+        let hosts = self.tui.take_root_children();
+        let scrollbar = self.settings.get_fullscreen_scrollbar().into();
+        let options = self.fullscreen_options();
+        if let Err(error) = self.tui.enter_alt_screen(options) {
+            // The terminal refused the alt screen; put the flat tree back.
+            for host in hosts {
+                self.tui.add_child(host);
+            }
+            return Err(format!("failed to enter fullscreen: {error}"));
+        }
+        self.viewport = Some(chat_viewport::mount(&mut self.tui, hosts, scrollbar));
+        self.tui.set_focus(Some(FocusTarget::Id(self.editor_id)));
+        Ok(())
+    }
+
+    /// Unmount the fullscreen viewport and restore the flat tree. The
+    /// counterpart of upstream rebuilding the regular renderer and remounting
+    /// the same components (`interactive-mode.ts:653-680`); the alt screen
+    /// leaves with `preserveScreen` and the next regular frame repaints.
+    fn exit_fullscreen(&mut self) {
+        let Some(viewport) = self.viewport.take() else {
+            return;
+        };
+        let hosts = chat_viewport::disassemble(&viewport, &mut self.tui);
+        let leftover = self.tui.exit_alt_screen(TuiStopOptions {
+            preserve_screen: true,
+        });
+        debug_assert!(
+            leftover.is_empty(),
+            "the viewport owns every root child while fullscreen"
+        );
+        for host in hosts {
+            self.tui.add_child(host);
+        }
+        self.tui.set_focus(Some(FocusTarget::Id(self.editor_id)));
+    }
+
+    /// Swap the renderer under the component tree
+    /// (`switchTuiMode`, `interactive-mode.ts:641-700`). Returns false while
+    /// a selector occupies the editor slot — upstream refuses the switch
+    /// while overlay entries are open (`:645`) — and true when the mode
+    /// already matched (`:643`).
+    fn switch_tui_mode(&mut self, mode: TuiMode) -> bool {
+        if mode == self.tui_mode {
+            return true;
+        }
+        if self.suspended_editor.is_some() {
+            return false;
+        }
+        match mode {
+            TuiMode::Fullscreen => {
+                if self.enter_fullscreen().is_err() {
+                    return false;
+                }
+            }
+            TuiMode::Regular => self.exit_fullscreen(),
+        }
+        self.tui_mode = mode;
+        self.tui.render_now(true);
+        true
+    }
+
+    /// Swap `component` into the editor's slot — the flat root index in the
+    /// regular renderer, the dock slot inside the viewport in fullscreen —
+    /// and return the previous occupant (`showSelector`'s editor-container
+    /// swap, `interactive-mode.ts:5085-5090`).
+    fn replace_editor_slot(&mut self, component: Box<dyn Component>) -> Option<Box<dyn Component>> {
+        let dock_id = self.viewport.as_ref().map(ChatViewport::dock_id);
+        if let Some(dock_id) = dock_id {
+            return self
+                .tui
+                .component_by_id_deep_mut(dock_id)?
+                .as_any_mut()?
+                .downcast_mut::<VStack>()?
+                .stack()
+                .replace_child(HostSlot::Editor.dock_index(), component)
+                .into();
+        }
+        Some(self.tui.replace_child(HostSlot::Editor.index(), component))
+    }
+
+    /// `showSelector`'s mount (`interactive-mode.ts:5085-5093`): swap
+    /// `component` into the editor's slot, park the editor, and focus the
+    /// new occupant by identity.
+    fn suspend_editor_with(&mut self, component: Box<dyn Component>) {
+        let focused = component_id(component.as_ref());
+        let editor = self
+            .replace_editor_slot(component)
+            .expect("the editor slot holds a component");
+        self.suspended_editor = Some(editor);
+        self.tui.set_focus(Some(FocusTarget::Id(focused)));
         self.tui.request_render();
+    }
+
+    /// `showSelector`'s `done` (`interactive-mode.ts:5096-5103`): put the
+    /// editor back and focus it.
+    fn restore_editor(&mut self) {
+        if let Some(editor) = self.suspended_editor.take() {
+            drop(self.replace_editor_slot(editor));
+        }
+        self.tui.set_focus(Some(FocusTarget::Id(self.editor_id)));
+        self.tui.request_render();
+    }
+
+    /// `stopInteractiveTui`'s overlay drain (`interactive-mode.ts:634-636`):
+    /// put the editor back and drop the selector queues, so the transcript
+    /// exit leaves a plain transcript behind.
+    fn drain_overlays_for_exit(&mut self) {
+        if let Some(editor) = self.suspended_editor.take() {
+            drop(self.replace_editor_slot(editor));
+        }
+        self.model_selector_events = None;
+        self.trust_selector_events = None;
+        self.settings_selector_events = None;
+        self.session_selector_events = None;
+        self.tui.set_focus(Some(FocusTarget::Id(self.editor_id)));
     }
 
     /// `handleResumeSession` (`interactive-mode.ts:4928-4974`): swap the
@@ -2804,7 +3067,7 @@ impl InteractiveMode {
                         component.set_expanded(expanded);
                     }
                 }
-                if let Some(header) = self.downcast_tree::<BuiltInHeader>(HEADER_INDEX) {
+                if let Some(header) = self.downcast_tree::<BuiltInHeader>(HostSlot::Header) {
                     header.set_expanded(expanded);
                 }
                 self.tui.request_render();
@@ -2813,13 +3076,26 @@ impl InteractiveMode {
     }
 
     /// `shutdown` (`interactive-mode.ts:4475`): restore the terminal, print
-    /// the resume command (`formatResumeCommand`).
+    /// the resume command (`formatResumeCommand`). The fullscreen exits run
+    /// through `stopInteractiveTui` (`interactive-mode.ts:632-639`): the
+    /// transcript output drains the overlays, switches to the regular
+    /// renderer, and lets the stop repaint the transcript into the
+    /// scrollback; the resume-hint output leaves the alt screen in place and
+    /// hands the terminal back untouched.
     fn shutdown(&mut self) -> Result<(), String> {
         let session_id = self.session.get_session_id().to_string();
         let uses_default_dir = self.session.uses_default_session_dir();
         let session_dir = self.session.get_session_dir().to_string_lossy().to_string();
+        if self.tui.alt_screen_active()
+            && self.settings.get_fullscreen_exit_output() == FullscreenExitOutput::Transcript
+        {
+            self.drain_overlays_for_exit();
+            self.switch_tui_mode(TuiMode::Regular);
+        }
+        // `{ preserveScreen: this.renderer.mode === "fullscreen" }` (`:639`).
+        let preserve_screen = self.tui.alt_screen_active();
         self.tui
-            .stop(TuiStopOptions::default())
+            .stop(TuiStopOptions { preserve_screen })
             .map_err(|error| format!("terminal restore failed: {error}"))?;
         let mut command = format!("pi --session {session_id}");
         if !uses_default_dir {
@@ -2885,6 +3161,19 @@ fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as i64)
+}
+
+/// `keyDisplayText` (`keybinding-hints.js:27-29`) reduced to one key: the
+/// action's first key, capitalized ("end" → "End").
+fn key_display_text(action: &str) -> String {
+    let Some(key) = pi_tui::keybindings::keys_for(action).first() else {
+        return String::new();
+    };
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// The cached git branch for the footer.
@@ -3730,7 +4019,7 @@ mod tests {
         mode.tui.render_now(false);
         assert!(mode.suspended_editor.is_some(), "selector not mounted");
         let selector = mode
-            .downcast_tree::<ModelSelectorComponent>(EDITOR_INDEX)
+            .downcast_tree::<ModelSelectorComponent>(HostSlot::Editor)
             .expect("selector in the editor slot");
         let rendered = pi_tui::ansi::strip_terminal_sequences(&selector.render(100).join("\n"));
         assert!(
@@ -3758,7 +4047,7 @@ mod tests {
         let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
         assert!(frame.contains("Model: test-model"), "{frame}");
         let editor = mode
-            .downcast_tree::<ChatEditor>(EDITOR_INDEX)
+            .downcast_tree::<ChatEditor>(HostSlot::Editor)
             .expect("editor back");
         assert!(editor.has_input_handler(), "focus-able editor restored");
 
@@ -3804,7 +4093,7 @@ mod tests {
         mode.tui.render_now(false);
         assert!(mode.suspended_editor.is_some(), "selector not mounted");
         let selector = mode
-            .downcast_tree::<TrustSelectorComponent>(EDITOR_INDEX)
+            .downcast_tree::<TrustSelectorComponent>(HostSlot::Editor)
             .expect("selector in the editor slot");
         let rendered = strip_terminal_sequences(&selector.render(100).join("\n"));
         assert!(rendered.contains("Project trust"), "{rendered}");
@@ -3904,7 +4193,7 @@ mod tests {
         // capture stream keeps every frame, so assert on the live state).
         assert!(mode.queued_deliveries.is_empty());
         let pending = mode
-            .downcast_tree::<pi_tui::component::Container>(PENDING_INDEX)
+            .downcast_tree::<pi_tui::component::Container>(HostSlot::Pending)
             .expect("pending container");
         assert_eq!(pending.len(), 0);
     }
@@ -3976,5 +4265,69 @@ mod tests {
             .push(EditorEventOut::Action(AppAction::Exit));
         mode.pump();
         assert!(mode.exiting, "ctrl+d did not set the exit flag");
+    }
+
+    /// The fullscreen switch over the capture terminal: the viewport mounts
+    /// on the alt screen with focus by identity, a mounted selector blocks
+    /// the switch (`switchTuiMode`'s overlay guard, `interactive-mode.ts:645`),
+    /// and the way back restores the flat tree.
+    #[test]
+    fn fullscreen_switch_enters_and_leaves_the_alt_screen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+        assert_eq!(
+            mode.tui_mode,
+            TuiMode::Fullscreen,
+            "fullscreen is the settings default"
+        );
+        // run() enters the resolved mode's alt screen; the test drives the
+        // switch mechanics directly.
+        assert!(
+            mode.switch_tui_mode(TuiMode::Fullscreen),
+            "an already-matched mode is a no-op success"
+        );
+        assert!(!mode.tui.alt_screen_active());
+        mode.enter_fullscreen().expect("enter fullscreen");
+        assert!(mode.tui.alt_screen_active());
+        {
+            let viewport = mode.viewport.as_ref().expect("viewport");
+            assert_eq!(
+                mode.tui.alt_screen_root(),
+                Some(viewport.root_id()),
+                "the viewport is the layout root"
+            );
+        }
+        let entered = capture.output();
+        assert!(
+            entered.contains(pi_tui::tui_alt_screen::ENTER_ALT_SCREEN),
+            "the alt screen was entered: {entered:?}"
+        );
+
+        // A selector occupies the editor dock slot and blocks the switch.
+        mode.open_model_selector(None);
+        assert!(
+            !mode.switch_tui_mode(TuiMode::Regular),
+            "the switch is refused while a selector is open"
+        );
+        assert!(mode.tui.alt_screen_active());
+        mode.close_model_selector();
+
+        assert!(mode.switch_tui_mode(TuiMode::Regular));
+        assert!(!mode.tui.alt_screen_active());
+        assert!(mode.viewport.is_none(), "the viewport is unmounted");
+        let left = capture.output();
+        assert!(
+            left.contains(pi_tui::tui_alt_screen::EXIT_ALT_SCREEN),
+            "the alt screen was left: {left:?}"
+        );
+        mode.tui.render_now(true);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(
+            plain.contains("clear/exit"),
+            "the flat tree renders again: {plain}"
+        );
+
+        mode.shutdown().expect("shutdown");
     }
 }

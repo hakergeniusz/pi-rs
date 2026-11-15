@@ -343,6 +343,7 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
     let options = pi_coding_agent::modes::interactive::interactive_mode::InteractiveOptions {
         version: env!("CARGO_PKG_VERSION").to_string(),
         theme_name,
+        tui_mode: args.tui_mode,
         auth_path: None,
         agent_dir: None,
         project_trusted,

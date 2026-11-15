@@ -45,6 +45,13 @@ impl HostSlot {
     pub fn index(self) -> usize {
         self as usize
     }
+
+    /// The slot's index inside the dock stack: pending 0, status 1, editor 2,
+    /// footer 3 (`chat-viewport.js:13-22`). Only the four dock slots mount
+    /// there; the header and chat live in the scrolled document instead.
+    pub fn dock_index(self) -> usize {
+        self.index() - 2
+    }
 }
 
 /// A mounted fullscreen chat viewport, with the component identities the
