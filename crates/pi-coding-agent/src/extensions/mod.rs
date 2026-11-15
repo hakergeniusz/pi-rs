@@ -13,10 +13,21 @@
 //! (`main.ts:861-869`); error-level diagnostics abort startup with the
 //! load-failure hint (`main.ts:986-990`).
 //!
-//! Deliberately slice-3 scoped (§8 of `docs/EXTENSIONS.md`): commands
-//! dispatch with the consuming hosts, session/agent event hooks and the
-//! `session_start` emission land in slice 4, and the full active-loadout
-//! machinery (`prepareLoadout`, pending tools) is E3.
+//! Slice 4 adds the runtime events over that spine: the `session_start`
+//! emission at the end of bind (`bindExtensions`, `agent-session.ts:3445`),
+//! the `user_bash` interception for interactive `!` commands
+//! (`handleBashCommand`, `interactive-mode.ts:7172-7189` — the operations
+//! path composes through the ported `executeBashWithOperations`,
+//! `bash-executor.ts`), the `transformContext` hook into the agent loop
+//! (`sdk.ts:430-434`), the `session_before_switch`/`session_before_compact`
+//! gates at the reachable switch points (`agent-session-runtime.ts:133-166`,
+//! `agent-session.ts:2964-2982`), and the UI-context binding the RPC mode
+//! drives (`modes/rpc.rs`).
+//!
+//! Deliberately slice-4 scoped (§8 of `docs/EXTENSIONS.md`): the full
+//! active-loadout machinery (`prepareLoadout`, pending tools), the
+//! `session_before_fork`/`session_before_tree` gates (no fork/tree in the
+//! runtime yet), and extension-provided compaction results stay open.
 //!
 //! The `ext-js` feature gates the engine. Without it the host keeps
 //! upstream's shape with zero extensions: nothing loads, trust resolves
@@ -34,14 +45,15 @@ use std::sync::Mutex;
 
 use pi_agent::types::ToolExecutor;
 #[cfg(feature = "ext-js")]
-use pi_agent::types::{AgentToolCall, AgentToolResult, ToolSpec};
+use pi_agent::types::{AgentToolCall, AgentToolResult, BoxFuture, ToolSpec};
 #[cfg(feature = "ext-js")]
 use serde_json::{Value, json};
 
 use crate::cli::args::{Args, Diagnostic, DiagnosticKind};
+#[cfg(feature = "ext-js")]
+use crate::cli::project_trust::has_trust_requiring_project_resources;
 use crate::cli::project_trust::{
-    DefaultProjectTrust, ProjectTrustStore, ResolveProjectTrustedOptions,
-    has_trust_requiring_project_resources, resolve_project_trusted,
+    DefaultProjectTrust, ProjectTrustStore, ResolveProjectTrustedOptions, resolve_project_trusted,
 };
 use crate::config::settings::SettingsManager;
 #[cfg(feature = "ext-js")]
@@ -51,6 +63,8 @@ use crate::tools::index::{ToolDefinition, ToolRegistry};
 use crate::tools::renderers::ToolRenderers;
 #[cfg(feature = "ext-js")]
 use crate::tools::schema::validate_tool_arguments;
+#[cfg(feature = "ext-js")]
+use crate::tools::truncate::{DEFAULT_MAX_BYTES, TruncationOptions, truncate_tail};
 
 /// `EXTENSION_LOAD_FAILURE_HINT` (`main.ts:77`), printed after the
 /// diagnostics when an extension failed to load (`main.ts:986-990`).
@@ -136,6 +150,302 @@ impl ExtensionHost {
         }
         #[cfg(not(feature = "ext-js"))]
         ToolRegistry::new(selected.to_vec()).executor(cwd)
+    }
+
+    /// The runner handle the modes share: the RPC mode binds the UI sink,
+    /// interactive mode intercepts `!` commands and consults the
+    /// `session_before_*` gates. `None` without the engine or when the
+    /// host is compiled without it.
+    #[cfg(feature = "ext-js")]
+    #[must_use]
+    pub fn runner(&self) -> Option<Arc<Mutex<pi_ext_js::ExtensionRunner>>> {
+        self.runner.clone()
+    }
+
+    /// Binds the UI surface (`setUIContext`, `runner.ts:570-575`): the RPC
+    /// mode passes its `extension_ui_request` bridge; print/json stay
+    /// headless (upstream's non-interactive paths pass no `uiContext`).
+    #[cfg(feature = "ext-js")]
+    pub fn set_ui_context(&self, sink: Arc<dyn pi_ext_js::UiSink>, mode: &str) {
+        if let Some(runner) = &self.runner {
+            runner
+                .lock()
+                .expect("extension runner mutex poisoned")
+                .set_ui_context(sink, mode);
+        }
+    }
+
+    /// Unbinds the UI surface (`setUIContext(undefined)`): back to the
+    /// headless matrix.
+    #[cfg(feature = "ext-js")]
+    pub fn clear_ui_context(&self) {
+        if let Some(runner) = &self.runner {
+            runner
+                .lock()
+                .expect("extension runner mutex poisoned")
+                .clear_ui_context();
+        }
+    }
+
+    /// The `!`-command interception point (`handleBashCommand`,
+    /// `interactive-mode.ts:7172-7189`). `None` means headless (no runner —
+    /// execute locally); `Some(Err(message))` means a handler failed (the
+    /// runner already reported it — do **not** fall back to local
+    /// execution, upstream returns early); `Some(Ok(outcome))` carries the
+    /// decision.
+    #[cfg(feature = "ext-js")]
+    pub fn user_bash(
+        &self,
+        command: &str,
+        exclude_from_context: bool,
+        cwd: &str,
+    ) -> Option<Result<UserBashOutcome, String>> {
+        user_bash(self.runner.as_ref()?, command, exclude_from_context, cwd)
+    }
+
+    /// Emits one gate/teardown event (`session_before_*`,
+    /// `session_shutdown`) and reports whether a handler voted
+    /// `cancel: true` (`emitBeforeSwitch`, `agent-session-runtime.ts:133-166`;
+    /// the `session_before_*` emit family keeps the last handler result and
+    /// short-circuits on `cancel`, `runner.ts:1103-1132`). Headless or
+    /// handler-less hosts never cancel. Handler-level failures surface as
+    /// the runner error report plus `Err`; the caller decides severity.
+    #[cfg(feature = "ext-js")]
+    pub fn emit_gate(&self, event: &Value) -> Result<bool, String> {
+        let Some(runner) = &self.runner else {
+            return Ok(false);
+        };
+        emit_gate(runner, event)
+    }
+}
+
+/// The `user_bash` interception over a shared runner (the host method
+/// delegates here; the interactive orchestrator calls this directly).
+#[cfg(feature = "ext-js")]
+pub fn user_bash(
+    runner: &Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+    command: &str,
+    exclude_from_context: bool,
+    cwd: &str,
+) -> Option<Result<UserBashOutcome, String>> {
+    let mut runner = runner.lock().expect("extension runner mutex poisoned");
+    if !runner.has_handlers("user_bash") {
+        return Some(Ok(UserBashOutcome::Local));
+    }
+    let decision = runner
+        .emit_user_bash(command, exclude_from_context, cwd)
+        .map_err(|err| err.to_string());
+    Some(match decision {
+        Err(message) => Err(message),
+        Ok(None) => Ok(UserBashOutcome::Local),
+        Ok(Some(pi_ext_js::UserBashDecision::Operations)) => {
+            execute_bash_with_operations(&mut runner, command, cwd).map(UserBashOutcome::Executed)
+        }
+        Ok(Some(pi_ext_js::UserBashDecision::Result(result))) => {
+            Ok(UserBashOutcome::Result(result))
+        }
+    })
+}
+
+/// The gate/teardown emit over a shared runner (the host method delegates
+/// here; the interactive orchestrator calls this directly).
+#[cfg(feature = "ext-js")]
+pub fn emit_gate(
+    runner: &Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+    event: &Value,
+) -> Result<bool, String> {
+    let event_name = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut runner = runner.lock().expect("extension runner mutex poisoned");
+    if !runner.has_handlers(&event_name) {
+        return Ok(false);
+    }
+    let result = runner.emit(event).map_err(|err| err.to_string())?;
+    Ok(result
+        .as_ref()
+        .and_then(|result| result.get("cancel"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
+}
+
+/// What a `user_bash` interception decided (`UserBashEventResult`,
+/// `extensions/types.ts:1487-1494`). Not engine-gated: the interactive
+/// host's interception seam references it in both builds and answers
+/// `Local`-shaped fallthrough headlessly.
+#[derive(Debug, Clone)]
+pub enum UserBashOutcome {
+    /// No handler intercepted; the host executes locally.
+    Local,
+    /// The handler supplied `operations`; the host executed them through
+    /// the stashed `exec` and composed the `BashResult`
+    /// (`executeBashWithOperations`, `bash-executor.ts:57-135`).
+    Executed(serde_json::Value),
+    /// The handler executed the command; its `BashResult` verbatim.
+    Result(serde_json::Value),
+}
+
+/// `executeBashWithOperations` (`bash-executor.ts:57-135`) reduced to the
+/// no-streaming shape the engine boundary gives us: the extension's exec
+/// runs once via [`pi_ext_js::ExtensionRunner::call_bash_exec`], its
+/// chunks sanitize per `appendText` (`stripAnsi` → `sanitizeBinaryOutput`
+/// → `\r` removal), a rolling window keeps the tail under twice
+/// `DEFAULT_MAX_BYTES` (upstream measures `text.length`, UTF-16 units —
+/// the port counts chars, identical below the astral plane), the tail
+/// truncation applies, and the temp file spills once the stream crosses
+/// the threshold (upstream `ensureTempFile`). `cancelled` is always false:
+/// the abort signal does not cross the engine boundary (HANDOFF, slice 1).
+#[cfg(feature = "ext-js")]
+fn execute_bash_with_operations(
+    runner: &mut pi_ext_js::ExtensionRunner,
+    command: &str,
+    cwd: &str,
+) -> Result<Value, String> {
+    use crate::tools::render_utils::{sanitize_binary_output, strip_ansi};
+    use std::io::Write as _;
+
+    let (result, chunks) = runner
+        .call_bash_exec(command, cwd, &json!({}))
+        .map_err(|err| err.to_string())?;
+    if let Some(message) = result.get("error").and_then(Value::as_str) {
+        // An exec failure rethrows upstream (`bash-executor.ts:113-119`).
+        return Err(message.to_string());
+    }
+    let exit_code = result.get("exitCode").and_then(Value::as_i64);
+
+    let mut window: Vec<String> = Vec::new();
+    let mut window_chars = 0usize;
+    let mut streamed_chars = 0usize;
+    let mut discarded = false;
+    let mut temp: Option<(std::path::PathBuf, std::fs::File)> = None;
+    for raw in chunks {
+        let text = sanitize_binary_output(&strip_ansi(&raw)).replace('\r', "");
+        if text.is_empty() {
+            continue;
+        }
+        streamed_chars += text.chars().count();
+        if temp.is_none() && streamed_chars > DEFAULT_MAX_BYTES {
+            // ensureTempFile: the buffered window rides along so the file
+            // opens with everything streamed so far.
+            let path = crate::tools::output_accumulator::temp_file_path("pi-bash");
+            let file = std::fs::File::create(&path)
+                .map_err(|err| format!("Failed to create the bash output file: {err}"))?;
+            let mut file = file;
+            for buffered in &window {
+                let _ = file.write_all(buffered.as_bytes());
+            }
+            temp = Some((path, file));
+        }
+        if let Some((_, file)) = temp.as_mut() {
+            let _ = file.write_all(text.as_bytes());
+        }
+        window_chars += text.chars().count();
+        window.push(text);
+        while window_chars > DEFAULT_MAX_BYTES * 2 && window.len() > 1 {
+            let removed = window.remove(0);
+            window_chars -= removed.chars().count();
+            discarded = true;
+        }
+    }
+
+    let full = window.join("");
+    let truncation = truncate_tail(&full, TruncationOptions::default());
+    let mut full_output_path = None;
+    if truncation.truncated {
+        let path = if let Some((path, file)) = &temp {
+            file.sync_all().ok();
+            path.clone()
+        } else {
+            let path = crate::tools::output_accumulator::temp_file_path("pi-bash");
+            std::fs::write(&path, &full)
+                .map_err(|err| format!("Failed to write the bash output file: {err}"))?;
+            path
+        };
+        full_output_path = Some(path);
+    }
+    if let Some((_, file)) = temp {
+        let _ = file.sync_all();
+    }
+
+    // `exitCode: undefined` and the exec's `null` both drop from the
+    // upstream result (`exitCode ?? undefined`).
+    let mut bash_result = serde_json::Map::new();
+    bash_result.insert("output".to_string(), json!(truncation.content));
+    if let Some(code) = exit_code {
+        bash_result.insert("exitCode".to_string(), json!(code));
+    }
+    bash_result.insert("cancelled".to_string(), json!(false));
+    bash_result.insert(
+        "truncated".to_string(),
+        json!(discarded || truncation.truncated),
+    );
+    if let Some(path) = full_output_path {
+        bash_result.insert(
+            "fullOutputPath".to_string(),
+            json!(path.to_string_lossy().into_owned()),
+        );
+    }
+    Ok(Value::Object(bash_result))
+}
+
+/// The `transformContext` hook (`sdk.ts:430-434`): the agent loop's context
+/// crosses to [`pi_ext_js::ExtensionRunner::emit_context`] before
+/// serialization — `context` handlers see the conversation without system
+/// messages, `context_with_system` handlers the full transcript
+/// (`runner.ts:1312-1370`, ported in the runner). Installed only when such
+/// handlers exist; otherwise the identity, like upstream's no-op run.
+#[cfg(feature = "ext-js")]
+pub fn context_transform(
+    runner: Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+) -> Option<Arc<dyn pi_agent::TransformContext>> {
+    {
+        let runner = runner.lock().expect("extension runner mutex poisoned");
+        if !runner.has_handlers("context") && !runner.has_handlers("context_with_system") {
+            return None;
+        }
+    }
+    Some(Arc::new(ExtensionContextTransform { runner }) as Arc<dyn pi_agent::TransformContext>)
+}
+
+/// The [`pi_agent::TransformContext`] implementation: `AgentMessage`s
+/// serialize to the session JSONL v3 shapes the runner already emits in
+/// tool/session events, round-trip through `emit_context`, and come back.
+#[cfg(feature = "ext-js")]
+struct ExtensionContextTransform {
+    runner: Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+}
+
+#[cfg(feature = "ext-js")]
+impl pi_agent::TransformContext for ExtensionContextTransform {
+    fn call(
+        &self,
+        messages: Vec<pi_agent::agent_message::AgentMessage>,
+    ) -> BoxFuture<'_, Vec<pi_agent::agent_message::AgentMessage>> {
+        Box::pin(async move {
+            let values: Vec<Value> = messages
+                .iter()
+                .map(|message| serde_json::to_value(message).unwrap_or(Value::Null))
+                .collect();
+            let transformed = {
+                let mut runner = self.runner.lock().expect("extension runner mutex poisoned");
+                runner
+                    .emit_context(&values)
+                    .map_err(|err| err.to_string())
+                    .unwrap_or_else(|error| {
+                        // Handler errors report inside the runner; a
+                        // context transform failure keeps the input, like
+                        // upstream's per-handler catch (`runner.ts:1347`).
+                        eprintln!("Warning: Extension context error: {error}");
+                        values.clone()
+                    })
+            };
+            transformed
+                .into_iter()
+                .filter_map(|value| serde_json::from_value(value).ok())
+                .collect()
+        })
     }
 }
 
@@ -290,11 +600,15 @@ pub struct Loaded {
 /// Discovery + load + bind + flag claiming
 /// (`createAgentSessionServices` + `resource-loader.reload`). Returns the
 /// diagnostics in report order; the caller prints warnings and aborts on
-/// error-level entries.
+/// error-level entries. `ui` carries the mode's UI surface — the RPC
+/// bridge — applied before bind so `session_start` handlers can already
+/// prompt (`bindExtensions` applies the bindings, then emits,
+/// `agent-session.ts:3429-3449`).
 ///
 /// # Errors
 /// Runtime creation, bind, and trust-store failures propagate; load
 /// failures come back as error diagnostics instead.
+#[allow(clippy::too_many_arguments)] // mirrors upstream's load pipeline; split when extending
 pub fn load(
     args: &Args,
     cwd: &Path,
@@ -303,6 +617,7 @@ pub fn load(
     default_project_trust: Option<DefaultProjectTrust>,
     startup_settings: &SettingsManager,
     mode: &str,
+    #[cfg(feature = "ext-js")] ui: Option<(Arc<dyn pi_ext_js::UiSink>, String)>,
 ) -> Result<(Loaded, Vec<Diagnostic>), String> {
     #[cfg(feature = "ext-js")]
     {
@@ -314,6 +629,7 @@ pub fn load(
             default_project_trust,
             startup_settings,
             mode,
+            ui,
         )
     }
     #[cfg(not(feature = "ext-js"))]
@@ -350,6 +666,7 @@ pub fn load(
 /// The real path with the engine.
 #[cfg(feature = "ext-js")]
 #[allow(clippy::too_many_lines)] // the upstream reload() sequence, kept in one pass
+#[allow(clippy::too_many_arguments)] // mirrors upstream's load pipeline; split when extending
 fn load_with_engine(
     args: &Args,
     cwd: &Path,
@@ -358,6 +675,7 @@ fn load_with_engine(
     default_project_trust: Option<DefaultProjectTrust>,
     startup_settings: &SettingsManager,
     mode: &str,
+    ui: Option<(Arc<dyn pi_ext_js::UiSink>, String)>,
 ) -> Result<(Loaded, Vec<Diagnostic>), String> {
     use pi_ext_js::loader::{discover_cli_paths, discover_extensions, load_paths, split_for_trust};
 
@@ -487,9 +805,20 @@ fn load_with_engine(
         )));
     }
 
-    runner
-        .bind()
-        .map_err(|err| format!("Failed to bind the extension runtime: {err}"))?;
+    // `bindExtensions` (`agent-session.ts:3429-3449`): the mode's UI
+    // bindings apply first, then `session_start` fires — handlers can
+    // prompt during the event. The RPC mode passes its bridge; print/json
+    // stay headless (upstream's non-interactive paths pass no `uiContext`)
+    // and interactive binds its TUI surface with E3.
+    if let Some((sink, ui_mode)) = ui {
+        runner.set_ui_context(sink, &ui_mode);
+    }
+    if let Err(err) = runner.emit(&json!({ "type": "session_start", "reason": "startup" })) {
+        diagnostics.push(warning(format!("Extension error: session_start: {err}")));
+    }
+    // The reason is "startup"; the "reload" path arrives with the
+    // session-reload work. MCP reporting and `resources_discover` are P5.
+
     // Bind-time registration failures report without failing the load
     // (the bindCore `emitError` reports, `runner.ts:470-521`).
     for bind_error in runner.provider_registration_errors() {
@@ -622,5 +951,148 @@ mod tests {
         assert!(!is_local_path("npm:pkg"));
         assert!(!is_local_path("builtin:mcp"));
         assert!(!is_local_path("https://example.com/x.ts"));
+    }
+
+    // ---- runner-backed pieces (E2 slice 4) ----
+
+    /// A runner over one inline extension, bound like the host does.
+    fn host_with(source: &str) -> ExtensionHost {
+        let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
+            cwd: "/tmp".to_string(),
+            mode: "print".to_string(),
+            settings: json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        runner.load_extension("<test>", Some(source)).expect("load");
+        runner.bind().expect("bind");
+        ExtensionHost {
+            runner: Some(Arc::new(Mutex::new(runner))),
+            extension_tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn user_bash_result_replaces_local_execution() {
+        let host = host_with(
+            r#"
+export default function (pi) {
+  pi.on("user_bash", () => ({
+    result: { output: "remote", exitCode: 0, cancelled: false, truncated: false },
+  }));
+}
+"#,
+        );
+        let outcome = host
+            .user_bash("ls", false, "/tmp")
+            .expect("intercepted")
+            .expect("handled");
+        let UserBashOutcome::Result(result) = outcome else {
+            panic!("expected a full result, got {outcome:?}");
+        };
+        assert_eq!(result.get("output").and_then(Value::as_str), Some("remote"));
+    }
+
+    #[test]
+    fn user_bash_operations_execute_through_the_bridge() {
+        let host = host_with(
+            r#"
+export default function (pi) {
+  pi.on("user_bash", () => ({
+    operations: {
+      exec: async (command, cwd, opts) => {
+        opts.onData("raw \u001b[31mred\u001b[0m\n");
+        return { exitCode: 3 };
+      },
+    },
+  }));
+}
+"#,
+        );
+        let outcome = host
+            .user_bash("deploy", false, "/tmp")
+            .expect("intercepted")
+            .expect("handled");
+        let UserBashOutcome::Executed(result) = outcome else {
+            panic!("expected composed operations, got {outcome:?}");
+        };
+        // appendText sanitizes per chunk (`bash-executor.ts:90-92`).
+        assert_eq!(
+            result.get("output").and_then(Value::as_str),
+            Some("raw red\n")
+        );
+        assert_eq!(result.get("exitCode").and_then(Value::as_i64), Some(3));
+        assert_eq!(
+            result.get("truncated").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            result.get("cancelled").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn headless_host_runs_user_bash_locally() {
+        let host = host_with("export default function (pi) {}");
+        let outcome = host
+            .user_bash("ls", false, "/tmp")
+            .expect("runner present")
+            .expect("no handlers");
+        assert!(matches!(outcome, UserBashOutcome::Local));
+    }
+
+    #[test]
+    fn emit_gate_reports_cancel_votes() {
+        let host = host_with(
+            r#"
+export default function (pi) {
+  pi.on("session_before_switch", () => ({ cancel: true }));
+  pi.on("session_before_compact", () => ({}));
+}
+"#,
+        );
+        let cancelled = host
+            .emit_gate(&json!({ "type": "session_before_switch", "reason": "new" }))
+            .expect("gate");
+        assert!(cancelled, "the cancel vote must reach the host");
+        let cancelled = host
+            .emit_gate(&json!({ "type": "session_before_compact" }))
+            .expect("gate");
+        assert!(!cancelled, "no vote is no cancel");
+        let cancelled = host
+            .emit_gate(&json!({ "type": "session_before_fork", "entryId": "e1" }))
+            .expect("gate");
+        assert!(!cancelled, "handler-less events never cancel");
+    }
+
+    #[test]
+    fn context_transform_gates_on_handlers_and_round_trips() {
+        let headless = host_with("export default function (pi) {}");
+        let runner = headless.runner().expect("runner");
+        assert!(context_transform(runner).is_none(), "no context handlers");
+
+        let host = host_with(
+            r#"
+export default function (pi) {
+  pi.on("context", (event) => ({ messages: event.messages.slice().reverse() }));
+}
+"#,
+        );
+        let runner = host.runner().expect("runner");
+        let transform = context_transform(runner).expect("context handlers exist");
+        let first = pi_agent::transcript::user_message("first", 1);
+        let second = pi_agent::transcript::user_message("second", 2);
+        let transformed = crate::runtime::block_on(transform.call(vec![first, second]));
+        assert_eq!(transformed.len(), 2);
+        let pi_agent::agent_message::AgentMessage::User(user) = &transformed[0] else {
+            panic!("expected a user message");
+        };
+        assert!(
+            serde_json::to_string(user)
+                .unwrap_or_default()
+                .contains("second"),
+            "the handler reversed the conversation"
+        );
     }
 }

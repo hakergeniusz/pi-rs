@@ -376,8 +376,10 @@ impl OutputAccumulator {
 }
 
 /// pi's `defaultTempFilePath` (`utils/output-files.ts`): the same
-/// `<tmpdir>/<prefix>-<random>.log` shape.
-fn temp_file_path(prefix: &str) -> PathBuf {
+/// `<tmpdir>/<prefix>-<random>.log` shape. Crate-visible so the extension
+/// `user_bash` operations path spills identically (`bash-executor.ts`
+/// `createOutputFileStream`).
+pub(crate) fn temp_file_path(prefix: &str) -> PathBuf {
     let id = random_hex(8);
     std::env::temp_dir().join(format!("{prefix}-{id}.log"))
 }

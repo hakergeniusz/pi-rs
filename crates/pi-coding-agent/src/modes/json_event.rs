@@ -303,7 +303,7 @@ pub fn run_json_mode(
         finish_turn: None,
         prepare_request: None,
         prepare_next_turn: None,
-        transform_context: None,
+        transform_context: runtime.transform_context(),
         convert_to_llm: Arc::new(DefaultConvertToLlm),
     };
 

@@ -7,11 +7,14 @@
 //!
 //! Port deviations (documented in HANDOFF): the summarization call is a
 //! single attempt (upstream wraps `retryAssistantCall` with the retry
-//! settings), no extension `session_before_compact` hook exists yet, and
+//! settings), the `session_before_compact` gate emits cancel-only —
+//! extension-provided compaction results are not plumbed yet — and
 //! prompt-cache retention is left to the adapter (upstream forces
 //! `cacheRetention: "none"` on the one-off summary).
 
 use std::collections::BTreeSet;
+
+use serde::Serialize;
 
 use pi_agent::types::AssistantMessageEvent;
 use pi_agent::{
@@ -32,8 +35,9 @@ use super::store::{
 // Settings
 // ============================================================================
 
-/// `CompactionSettings` (`compaction.ts:120-124`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `CompactionSettings` (`compaction.ts:120-124`). `Serialize` serves the
+/// `session_before_compact` gate payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CompactionSettings {
     pub enabled: bool,
     pub reserve_tokens: u64,
@@ -52,8 +56,8 @@ pub const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = CompactionSettings {
 // ============================================================================
 
 /// File operations extracted from tool calls; `CompactionDetails` carries the
-/// final lists.
-#[derive(Debug, Default, Clone)]
+/// final lists. `Serialize` serves the `session_before_compact` payload.
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct FileOperations {
     read: BTreeSet<String>,
     written: BTreeSet<String>,
@@ -772,8 +776,9 @@ pub struct CompactionResult {
     pub modified_files: Vec<String>,
 }
 
-/// `CompactionPreparation` (`compaction.ts:759-775`).
-#[derive(Debug, Clone)]
+/// `CompactionPreparation` (`compaction.ts:759-775`). `Serialize` serves
+/// the `session_before_compact` gate payload (`agent-session.ts:2964-2977`).
+#[derive(Debug, Clone, Serialize)]
 pub struct CompactionPreparation {
     pub first_kept_entry_id: String,
     pub messages_to_summarize: Vec<AgentMessage>,

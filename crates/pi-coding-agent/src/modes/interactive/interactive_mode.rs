@@ -351,6 +351,11 @@ pub struct InteractiveMode {
     /// The composite executor (builtins + extension dispatch, E2 slice 3).
     executor: Arc<dyn ToolExecutor>,
     system_prompt: String,
+    /// The extension runner (E2 slice 4): `user_bash` interception,
+    /// `session_before_*` gates, the context transform. The TUI surface
+    /// itself binds with E3, so dialogs resolve headless here.
+    #[cfg(feature = "ext-js")]
+    extension_runner: Option<Arc<std::sync::Mutex<pi_ext_js::ExtensionRunner>>>,
 
     /// Tool rows still awaiting results, keyed by call id.
     pending_tools: std::collections::HashMap<String, PendingTool>,
@@ -523,6 +528,8 @@ impl InteractiveMode {
             stream_fn: Arc::clone(&runtime.stream_fn),
             executor: Arc::clone(&runtime.executor),
             system_prompt: runtime.system_prompt.clone(),
+            #[cfg(feature = "ext-js")]
+            extension_runner: runtime.extension_runner.clone(),
             pending_tools: std::collections::HashMap::new(),
             streaming_index: None,
             agent_run: None,
@@ -1519,6 +1526,30 @@ impl InteractiveMode {
             return;
         };
 
+        // `session_before_compact` (`agent-session.ts:2964-2982`): the
+        // manual gate carries the preparation, the branch entries (the raw
+        // JSONL records, key order included), and the custom instructions;
+        // a `cancel` vote aborts. Extension-provided compaction results are
+        // not plumbed yet (§8 of docs/EXTENSIONS.md).
+        if self.extension_cancelled(&serde_json::json!({
+            "type": "session_before_compact",
+            "preparation": serde_json::to_value(&preparation)
+                .unwrap_or(serde_json::Value::Null),
+            "branchEntries": serde_json::Value::Array(
+                self.session
+                    .get_branch_records(None)
+                    .iter()
+                    .map(|record| serde_json::Value::Object(record.object().clone()))
+                    .collect(),
+            ),
+            "customInstructions": custom_instructions,
+            "reason": "manual",
+            "willRetry": false,
+        })) {
+            self.show_error("Compaction cancelled");
+            return;
+        }
+
         let model = self.model.clone();
         let api_key = self.api_key.clone();
         let access_token = self.access_token.clone();
@@ -2351,6 +2382,17 @@ impl InteractiveMode {
             self.show_error("Cannot start a new session while the agent is responding.");
             return;
         }
+        // `emitBeforeSwitch("new")` (`agent-session-runtime.ts:133-146`):
+        // a `cancel` vote aborts the switch. Teardown emits
+        // `session_shutdown` with reason "new" (`teardownCurrent`,
+        // `agent-session-runtime.ts:167-175`) before the replacement.
+        if self.extension_cancelled(&serde_json::json!({
+            "type": "session_before_switch",
+            "reason": "new",
+        })) {
+            return;
+        }
+        self.emit_extension_shutdown("new", None);
         let cwd = self.session.get_cwd().to_path_buf();
         match SessionManager::create(&cwd, None, &NewSessionOptions::default()) {
             Ok(session) => {
@@ -2369,6 +2411,29 @@ impl InteractiveMode {
     /// row, persist as a bash-execution message. Upstream streams the output
     /// live through a PTY; the streaming pass lands with P7.
     fn run_bash(&mut self, command: &str, excluded: bool) {
+        // Extensions intercept first (`handleBashCommand`,
+        // `interactive-mode.ts:7172-7189`): a handler failure skips local
+        // execution entirely (the runner already reported it); a decision
+        // replaces the local run.
+        if let Some(outcome) =
+            self.extension_user_bash(command, excluded, &self.session.get_cwd().to_string_lossy())
+        {
+            match outcome {
+                Err(message) => {
+                    self.show_error(&format!("user_bash: {message}"));
+                    return;
+                }
+                // No handler intercepted: the normal local run below.
+                Ok(crate::extensions::UserBashOutcome::Local) => {}
+                Ok(
+                    crate::extensions::UserBashOutcome::Executed(result)
+                    | crate::extensions::UserBashOutcome::Result(result),
+                ) => {
+                    self.record_bash_result(command, excluded, &result, Instant::now());
+                    return;
+                }
+            }
+        }
         let started = Instant::now();
         let output = std::process::Command::new("bash")
             .arg("-c")
@@ -2389,6 +2454,24 @@ impl InteractiveMode {
             }
             Err(error) => (error.to_string(), None),
         };
+        self.record_bash_output(command, excluded, text, exit_code, false, None, started);
+    }
+
+    /// The shared `!` tail — render the shell row and persist the
+    /// bash-execution entry (`recordBashResult`): the output rides the
+    /// entry, so `bashExecutionToText` shows it to the model exactly like
+    /// upstream.
+    #[allow(clippy::too_many_arguments)] // mirrors upstream's recordBashResult fields; split when extending
+    fn record_bash_output(
+        &mut self,
+        command: &str,
+        excluded: bool,
+        text: String,
+        exit_code: Option<i64>,
+        truncated: bool,
+        full_output_path: Option<String>,
+        started: Instant,
+    ) {
         let component = ToolExecutionComponent::new(
             "bash",
             &format!("bash-{}", self.chat_len()),
@@ -2402,7 +2485,7 @@ impl InteractiveMode {
             component.mark_execution_started();
             component.update_result(
                 ToolResultView {
-                    text,
+                    text: text.clone(),
                     is_error: exit_code.is_none_or(|code| code != 0),
                     duration_ms: Some(started.elapsed().as_millis() as u64),
                 },
@@ -2412,16 +2495,136 @@ impl InteractiveMode {
         let _ = self.session.append_message(AgentMessage::BashExecution(
             pi_agent::agent_message::BashExecutionMessage {
                 command: command.to_string(),
-                output: String::new(),
+                output: text,
                 exit_code,
                 cancelled: false,
-                truncated: false,
-                full_output_path: None,
+                truncated,
+                full_output_path,
                 exclude_from_context: Some(excluded),
                 timestamp: now_millis(),
             },
         ));
         self.tui.request_render();
+    }
+
+    /// The extension-decided path: the outcome is an upstream
+    /// `BashResult` (`{output, exitCode, cancelled, truncated,
+    /// fullOutputPath?}`) either verbatim or composed from the handler's
+    /// operations.
+    fn record_bash_result(
+        &mut self,
+        command: &str,
+        excluded: bool,
+        result: &serde_json::Value,
+        started: Instant,
+    ) {
+        let text = result
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let exit_code = result.get("exitCode").and_then(serde_json::Value::as_i64);
+        let truncated = result
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let full_output_path = result
+            .get("fullOutputPath")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        self.record_bash_output(
+            command,
+            excluded,
+            text,
+            exit_code,
+            truncated,
+            full_output_path,
+            started,
+        );
+    }
+
+    /// The `user_bash` interception (`handleBashCommand`): `None` when
+    /// headless — no runner, execute locally.
+    fn extension_user_bash(
+        &self,
+        command: &str,
+        exclude_from_context: bool,
+        cwd: &str,
+    ) -> Option<Result<crate::extensions::UserBashOutcome, String>> {
+        #[cfg(feature = "ext-js")]
+        {
+            let runner = self.extension_runner.as_ref()?;
+            crate::extensions::user_bash(runner, command, exclude_from_context, cwd)
+        }
+        #[cfg(not(feature = "ext-js"))]
+        {
+            let _ = (command, exclude_from_context, cwd);
+            None
+        }
+    }
+
+    /// One `session_before_*` gate vote: `true` cancels the surrounding
+    /// operation (`emitBeforeSwitch`/`session_before_compact`).
+    fn extension_cancelled(&self, event: &serde_json::Value) -> bool {
+        #[cfg(feature = "ext-js")]
+        {
+            let Some(runner) = &self.extension_runner else {
+                return false;
+            };
+            match crate::extensions::emit_gate(runner, event) {
+                Ok(cancelled) => cancelled,
+                Err(error) => {
+                    // Gate failures do not block the operation; the
+                    // runner reported the handler error.
+                    eprintln!("Warning: Extension gate error: {error}");
+                    false
+                }
+            }
+        }
+        #[cfg(not(feature = "ext-js"))]
+        {
+            let _ = event;
+            false
+        }
+    }
+
+    /// `teardownCurrent`'s `session_shutdown` emission before a session
+    /// replacement (`agent-session-runtime.ts:167-175`).
+    fn emit_extension_shutdown(&self, reason: &str, target_session_file: Option<&str>) {
+        #[cfg(feature = "ext-js")]
+        {
+            let Some(runner) = &self.extension_runner else {
+                return;
+            };
+            let mut event = serde_json::json!({
+                "type": "session_shutdown",
+                "reason": reason,
+            });
+            if let Some(target) = target_session_file {
+                event["targetSessionFile"] = serde_json::json!(target);
+            }
+            if let Err(error) = crate::extensions::emit_gate(runner, &event) {
+                eprintln!("Warning: Extension error: session_shutdown: {error}");
+            }
+        }
+        #[cfg(not(feature = "ext-js"))]
+        {
+            let _ = (reason, target_session_file);
+        }
+    }
+
+    /// The `transformContext` hook (`sdk.ts:430-434`) for the agent-loop
+    /// config; `None` without the engine or without context handlers.
+    fn transform_context(&self) -> Option<Arc<dyn pi_agent::TransformContext>> {
+        #[cfg(feature = "ext-js")]
+        {
+            let runner = self.extension_runner.as_ref()?;
+            crate::extensions::context_transform(Arc::clone(runner))
+        }
+        #[cfg(not(feature = "ext-js"))]
+        {
+            None
+        }
     }
 
     // --------------------------------------------------------------
@@ -2479,7 +2682,7 @@ impl InteractiveMode {
             finish_turn: None,
             prepare_request: None,
             prepare_next_turn: None,
-            transform_context: None,
+            transform_context: self.transform_context(),
             convert_to_llm: Arc::new(DefaultConvertToLlm),
         };
 
@@ -3017,6 +3220,19 @@ impl InteractiveMode {
         if self.agent_run.is_some() {
             self.abort_active_run();
         }
+        // `emitBeforeSwitch("resume", targetSessionFile)`
+        // (`agent-session-runtime.ts:148-166`), then `teardownCurrent`
+        // emits `session_shutdown` with the destination
+        // (`agent-session-runtime.ts:167-175`) before the replacement.
+        let target = session_path.to_string_lossy().into_owned();
+        if self.extension_cancelled(&serde_json::json!({
+            "type": "session_before_switch",
+            "reason": "resume",
+            "targetSessionFile": target,
+        })) {
+            return;
+        }
+        self.emit_extension_shutdown("resume", Some(&target));
         let session_dir = Some(self.session.get_session_dir().to_path_buf());
         match SessionManager::open(session_path, session_dir.as_deref(), None) {
             Ok(session) => {
@@ -3347,6 +3563,10 @@ pub fn run_interactive_mode(
 ) -> Result<i32, String> {
     let mut mode = InteractiveMode::new(runtime, options, Box::new(CrosstermTerminal::default()));
     mode.run()?;
+    // Quit teardown (`runtimeHost.dispose`, `agent-session-runtime.ts:
+    // 415-421`): `session_shutdown` with reason "quit" fires before the
+    // process exits.
+    mode.emit_extension_shutdown("quit", None);
     Ok(0)
 }
 
@@ -3577,6 +3797,8 @@ mod tests {
             session: SessionManager::in_memory(dir, &NewSessionOptions::default(), Vec::new())
                 .expect("session"),
             project_trusted: false,
+            #[cfg(feature = "ext-js")]
+            extension_runner: None,
         }
     }
 

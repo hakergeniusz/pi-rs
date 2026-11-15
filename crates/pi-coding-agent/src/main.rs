@@ -3,7 +3,7 @@
 //! Binary `pi`. Phase P4 wires print mode (`pi -p`); P5 adds JSON and RPC
 //! modes; interactive mode (P6) still exits with a phase note.
 
-use std::io::{BufReader, stdout};
+use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -129,11 +129,36 @@ fn startup_default_project_trust(settings: &SettingsManager) -> Option<DefaultPr
 /// extensions host (discovery, pre-trust pass, trust decision, final load,
 /// bind, flag claiming), model, credentials, session, tools, system prompt.
 #[allow(clippy::too_many_lines)] // mirrors the main.ts createRuntime assembly; split when extending
+/// The mode's UI surface for the extension host (`bindExtensions`'s
+/// `uiContext`). The RPC host passes its dialog bridge; without the
+/// engine nothing binds and the unit default carries no surface.
+#[cfg(feature = "ext-js")]
+type ModeUi = Option<Arc<dyn pi_ext_js::UiSink>>;
+#[cfg(not(feature = "ext-js"))]
+type ModeUi = ();
+
+/// Every non-RPC mode: headless extension host, like upstream's
+/// non-interactive paths that pass no `uiContext`.
 fn build_runtime(
     args: &Args,
     cwd: &std::path::Path,
     cwd_string: &str,
     mode: &str,
+) -> Result<PrintRuntime, String> {
+    build_runtime_with_ui(args, cwd, cwd_string, mode, ModeUi::default())
+}
+
+/// The runtime assembly with an optional UI surface. `ui` binds before
+/// load's bind step so `session_start` handlers can already prompt
+/// (`bindExtensions` applies the bindings, then emits,
+/// `agent-session.ts:3429-3449`).
+#[allow(clippy::too_many_lines)] // mirrors the TS service assembly (main.ts); split when extending
+fn build_runtime_with_ui(
+    args: &Args,
+    cwd: &std::path::Path,
+    cwd_string: &str,
+    mode: &str,
+    ui: ModeUi,
 ) -> Result<PrintRuntime, String> {
     let agent_dir = config::get_agent_dir();
     let trust_store = ProjectTrustStore::new(&agent_dir);
@@ -146,9 +171,23 @@ fn build_runtime(
     );
     let default_project_trust = startup_default_project_trust(&startup_settings);
 
+    #[cfg(not(feature = "ext-js"))]
+    let _ = ui;
     // Extensions (E2 slice 3). Diagnostics report in order: warnings to
     // stderr, error-level entries abort with the load-failure hint
     // (`main.ts:982-990`).
+    #[cfg(feature = "ext-js")]
+    let (extensions, diagnostics) = extensions::load(
+        args,
+        cwd,
+        &agent_dir,
+        &trust_store,
+        default_project_trust,
+        &startup_settings,
+        mode,
+        ui.map(|sink| (sink, mode.to_string())),
+    )?;
+    #[cfg(not(feature = "ext-js"))]
     let (extensions, diagnostics) = extensions::load(
         args,
         cwd,
@@ -301,6 +340,8 @@ fn build_runtime(
         system_prompt,
         session,
         project_trusted,
+        #[cfg(feature = "ext-js")]
+        extension_runner: extensions.host.runner(),
     })
 }
 
@@ -400,8 +441,18 @@ fn run_rpc(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, 
         // `main.ts:708-711`.
         return Err("Error: @file arguments are not supported in RPC mode".to_string());
     }
+    // The bridge owns stdin/stdout for the run: the reader thread routes
+    // `extension_ui_response` lines to pending dialogs while the loop is
+    // inside a command (upstream routes both through the same stdin
+    // handler, `rpc-mode.ts:759-824`).
+    let bridge = pi_coding_agent::modes::rpc::create_bridge(
+        Box::new(BufReader::new(std::io::stdin())),
+        Box::new(pi_coding_agent::modes::rpc::RpcStdout::new()),
+    );
+    #[cfg(feature = "ext-js")]
+    let mut runtime =
+        build_runtime_with_ui(args, cwd, cwd_string, "rpc", Some(Arc::clone(&bridge.sink)))?;
+    #[cfg(not(feature = "ext-js"))]
     let mut runtime = build_runtime(args, cwd, cwd_string, "rpc")?;
-    let mut stdin = BufReader::new(std::io::stdin());
-    let out = stdout();
-    run_rpc_mode(&mut runtime, &mut stdin, &mut out.lock())
+    run_rpc_mode(&mut runtime, &bridge)
 }

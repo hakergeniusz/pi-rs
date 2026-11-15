@@ -57,6 +57,32 @@ pub struct PrintRuntime {
     /// The resolved trust decision, shared with the interactive host
     /// (extensions may decide through the `project_trust` hook).
     pub project_trusted: bool,
+    /// The extension runner the mode-level surfaces share (E2 slice 4):
+    /// the RPC dialog bridge, the `user_bash` interception, the session
+    /// gates, and the context transform. `None` without the engine.
+    #[cfg(feature = "ext-js")]
+    pub extension_runner: Option<Arc<std::sync::Mutex<pi_ext_js::ExtensionRunner>>>,
+}
+
+impl PrintRuntime {
+    /// The `transformContext` hook (`sdk.ts:430-434`) when extension
+    /// `context`/`context_with_system` handlers exist; `None` otherwise
+    /// (the loop then runs upstream's no-transform identity). Present in
+    /// both builds — headless `None` without the engine — so the four
+    /// `AgentLoopConfig` sites need no cfg.
+    #[cfg(feature = "ext-js")]
+    #[must_use]
+    pub fn transform_context(&self) -> Option<Arc<dyn pi_agent::TransformContext>> {
+        let runner = self.extension_runner.as_ref()?;
+        crate::extensions::context_transform(Arc::clone(runner))
+    }
+
+    /// Headless twin: no engine, no transform.
+    #[cfg(not(feature = "ext-js"))]
+    #[must_use]
+    pub fn transform_context(&self) -> Option<Arc<dyn pi_agent::TransformContext>> {
+        None
+    }
 }
 
 /// `runPrintMode` (`print-mode.ts:33-181`), minus signals/backpressure (P7)
@@ -154,7 +180,7 @@ pub fn run_print_mode(
         finish_turn: None,
         prepare_request: None,
         prepare_next_turn: None,
-        transform_context: None,
+        transform_context: runtime.transform_context(),
         convert_to_llm: Arc::new(DefaultConvertToLlm),
     };
 

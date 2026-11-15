@@ -1943,6 +1943,33 @@ impl SessionManager {
         Ok(path)
     }
 
+    /// The branch's raw JSONL records, leaf-first reversed to append order —
+    /// the extension `session_before_compact` gate's `branchEntries` carries
+    /// them verbatim (key order included), like upstream's `pathEntries`.
+    pub fn get_branch_records(&self, from_id: Option<&str>) -> Vec<Record> {
+        let start = from_id
+            .or(self.leaf_id.as_deref())
+            .filter(|id| !id.is_empty());
+        let Some(position) = start.and_then(|id| self.by_id.get(id).copied()) else {
+            return Vec::new();
+        };
+        let mut path = Vec::new();
+        let mut position = position;
+        loop {
+            let record = &self.entries[position];
+            path.push(record.clone());
+            match record
+                .parent_id()
+                .and_then(|parent| self.by_id.get(parent).copied())
+            {
+                Some(next) => position = next,
+                None => break,
+            }
+        }
+        path.reverse();
+        path
+    }
+
     /// `buildContextEntries` (`:1503-1505`).
     pub fn build_context_entries(&self) -> Vec<SessionEntry> {
         match self.leaf_id.as_deref() {
