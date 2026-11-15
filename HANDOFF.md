@@ -639,6 +639,28 @@ pump cadence stands in for upstream's `setInterval`).
   click drain). Gate green: fmt, clippy --workspace --all-targets -D
   warnings, workspace tests.
 
+## Agent docs (landed on `docs/agent-docs`, 2026-11-15)
+- **`AGENTS.md`** (repo root): the operating manual for AI agents — fidelity
+  directive, ground-truth locations, the `~/.pi` privacy rule, docs-where-you-go
+  rule, build/test suite, git workflow, code conventions, and the current
+  backlog. Machine-specific constraints (podman container `pi-rs-build`, OOM
+  caps, `-j 2`, no stress probes) are quarantined under a
+  "workstation-specific" heading so agents without that container can still
+  use the file; only the plain cargo suite is universal.
+- **`docs/PORTING.md`**: the porting craft — ground-truth locations, the
+  crate↔package map (including the `pi-coding-agent` module map against
+  upstream `cli/core/extensions/modes/utils`), the six-step porting workflow,
+  the TS→Rust pattern dictionary (timers→pump, callback queues, aliasing→ids,
+  `Math.imul`→`wrapping_mul`, `===`→float_cmp allow, emitter→set_on_*, Map
+  order→ordered containers, let-chains), testing conventions (CaptureTerminal,
+  PTY smokes, synthetic fixtures, `#[ignore]` providers), condensed durable
+  gotchas, and the deviations ledger.
+- Every `.rs` file was verified to carry a `//!` module doc already — the
+  per-code doc rule has held since P0; these two files add the repo-level
+  layer. `/tmp/ai-agent/pi` re-clone CONFIRMED present at `827383a`
+  (`packages/coding-agent` 1.5.2) — the "WIPED (tmpfs)" warning in the header
+  above is stale.
+
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
   slot shifted every later index — the `*_INDEX` consts are the single source of
