@@ -61,7 +61,9 @@ impl SettingItem {
 
     #[must_use]
     pub fn with_values(mut self, values: Vec<String>) -> Self {
-        self.current_value = values.first().cloned().unwrap_or_default();
+        // The caller's `current_value` stands even when it is not the first
+        // option — pi builds items with the live value and the value list
+        // separately (`settings-list.ts:9-25`).
         self.values = Some(values);
         self
     }
@@ -174,9 +176,11 @@ pub enum SettingsListAction {
 /// The settings list. `settings-list.ts:36-...`.
 pub struct SettingsList {
     items: Vec<SettingItem>,
-    /// The search-filtered view of `items`; identical to it while the search
-    /// box is off or empty. `settings-list.ts:10`.
-    filtered_items: Vec<SettingItem>,
+    /// The search-filtered view: indices into `items`, in relevance order.
+    /// Upstream's `filteredItems` holds the same object references as
+    /// `items`, so its value updates are visible through both; the port
+    /// tracks indices for the same effect. `settings-list.ts:10`.
+    filtered: Vec<usize>,
     selected_index: usize,
     max_visible: usize,
     theme: SettingsListTheme,
@@ -206,7 +210,7 @@ impl SettingsList {
     /// `settings-list.ts:21-32` (without `options.enableSearch`).
     pub fn new(items: Vec<SettingItem>, max_visible: usize, theme: SettingsListTheme) -> Self {
         Self {
-            filtered_items: items.clone(),
+            filtered: (0..items.len()).collect(),
             search_enabled: false,
             search_input: None,
             items,
@@ -260,7 +264,7 @@ impl SettingsList {
     }
 
     pub fn selected_item(&self) -> Option<&SettingItem> {
-        self.items.get(self.selected_index)
+        self.display_items().get(self.selected_index).copied()
     }
 
     pub fn selected_index(&self) -> usize {
@@ -269,11 +273,14 @@ impl SettingsList {
 
     /// The items the list currently shows: the search view when enabled.
     /// `settings-list.ts:198-200`.
-    fn display_items(&self) -> &[SettingItem] {
+    fn display_items(&self) -> Vec<&SettingItem> {
         if self.search_enabled {
-            &self.filtered_items
+            self.filtered
+                .iter()
+                .filter_map(|index| self.items.get(*index))
+                .collect()
         } else {
-            &self.items
+            self.items.iter().collect()
         }
     }
 
@@ -289,8 +296,9 @@ impl SettingsList {
 
     /// `settings-list.ts:205-231`: open the submenu, or cycle the values.
     fn activate_item(&mut self) -> SettingsListAction {
+        let display = self.display_items();
         let (id, current_value, submenu) = {
-            let Some(item) = self.display_items().get(self.selected_index) else {
+            let Some(item) = display.get(self.selected_index) else {
                 return SettingsListAction::None;
             };
             (
@@ -380,7 +388,11 @@ impl SettingsList {
 
     /// `settings-list.ts:248-251`.
     fn apply_filter(&mut self, query: &str) {
-        self.filtered_items = fuzzy_filter(&self.items, query, |item| item.label.clone());
+        let pairs: Vec<(usize, &SettingItem)> = self.items.iter().enumerate().collect();
+        self.filtered = fuzzy_filter(&pairs, query, |(_, item)| item.label.clone())
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect();
         self.selected_index = 0;
     }
 
