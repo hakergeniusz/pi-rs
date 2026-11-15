@@ -15,12 +15,12 @@
 //! ESM natively), matching upstream where extensions are ESM (§6.3 of
 //! `docs/EXTENSIONS.md` records CJS interop as deferred).
 
-use std::path::Path;
 use oxc_allocator::Allocator;
 use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 use oxc_transformer::{TransformOptions, Transformer};
+use std::path::Path;
 
 /// Errors from the transpile pipeline.
 #[derive(Debug, thiserror::Error)]
@@ -55,7 +55,9 @@ pub fn transpile(path: &Path, source: &str) -> Result<String, TranspileError> {
     // The transformer needs the symbol/scope tables; the semantic builder
     // builds them (its syntax-error check stays off — the parser's
     // diagnostics above already rejected malformed sources).
-    let semantic = oxc_semantic::SemanticBuilder::new().with_enum_eval(true).build(&program);
+    let semantic = oxc_semantic::SemanticBuilder::new()
+        .with_enum_eval(true)
+        .build(&program);
     let scoping = semantic.semantic.into_scoping();
     let transformer = Transformer::new(&allocator, path, &TransformOptions::default());
     let transformer_return = transformer.build_with_scoping(scoping, &mut program);

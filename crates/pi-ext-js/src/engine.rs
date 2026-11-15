@@ -185,8 +185,12 @@ impl JsHost {
     }
 
     #[allow(clippy::too_many_lines)] // one op per upstream runtime method; split when extending
-    fn install_ops(ctx: &rquickjs::Ctx<'_>, core: &Arc<Mutex<HostCore>>) -> Result<(), JsHostError> {
-        ctx.globals().set("__piOps", rquickjs::Object::new(ctx.clone())?)?;
+    fn install_ops(
+        ctx: &rquickjs::Ctx<'_>,
+        core: &Arc<Mutex<HostCore>>,
+    ) -> Result<(), JsHostError> {
+        ctx.globals()
+            .set("__piOps", rquickjs::Object::new(ctx.clone())?)?;
         let ops: rquickjs::Object = ctx.globals().get("__piOps")?;
         macro_rules! op {
             ($name:literal, $capture:ident, || -> $ret:ty $body:block) => {{
@@ -206,7 +210,9 @@ impl JsHost {
             String::new()
         });
         op!("refreshTools", _core, || -> String { String::new() });
-        op!("flagDefault", core, |name: String, json: String| -> String {
+        op!("flagDefault", core, |name: String,
+                                  json: String|
+         -> String {
             let mut core = core.lock().expect("host core mutex poisoned");
             if let Ok(value) = serde_json::from_str(&json) {
                 core.flag_values.entry(name).or_insert(value);
@@ -242,12 +248,19 @@ impl JsHost {
             let core = core.lock().expect("host core mutex poisoned");
             serde_json::to_string(&core.settings).unwrap_or_else(|_| "{}".to_string())
         });
-        op!("appendEntry", core, |custom_type: String, json: String| -> String {
+        op!("appendEntry", core, |custom_type: String,
+                                  json: String|
+         -> String {
             let mut core = core.lock().expect("host core mutex poisoned");
-            core.entries.push((custom_type, serde_json::from_str(&json).unwrap_or(Json::Null)));
+            core.entries.push((
+                custom_type,
+                serde_json::from_str(&json).unwrap_or(Json::Null),
+            ));
             String::new()
         });
-        op!("sendMessage", core, |message: String, options: String| -> String {
+        op!("sendMessage", core, |message: String,
+                                  options: String|
+         -> String {
             let mut core = core.lock().expect("host core mutex poisoned");
             core.outbox.push((
                 "sendMessage".to_string(),
@@ -256,7 +269,9 @@ impl JsHost {
             ));
             String::new()
         });
-        op!("sendUserMessage", core, |message: String, options: String| -> String {
+        op!("sendUserMessage", core, |message: String,
+                                      options: String|
+         -> String {
             let mut core = core.lock().expect("host core mutex poisoned");
             core.outbox.push((
                 "sendUserMessage".to_string(),
@@ -265,29 +280,46 @@ impl JsHost {
             ));
             String::new()
         });
-        op!("exec", core, |command: String, args: String, options: String| -> String {
+        op!("exec", core, |command: String,
+                           args: String,
+                           options: String|
+         -> String {
             let core = core.lock().expect("host core mutex poisoned");
             let cwd = core.cwd.clone();
             drop(core);
             let args: Vec<String> = serde_json::from_str(&args).unwrap_or_default();
             let options: Json = serde_json::from_str(&options).unwrap_or(Json::Null);
-            serde_json::to_string(&exec::exec(&command, &args, &cwd, &options))
-                .unwrap_or_else(|_| r#"{"execError":"exec result serialization failed"}"#.to_string())
+            serde_json::to_string(&exec::exec(&command, &args, &cwd, &options)).unwrap_or_else(
+                |_| r#"{"execError":"exec result serialization failed"}"#.to_string(),
+            )
         });
-        op!("validateMcpServer", _core, |name: String, json: String| -> String {
+        op!("validateMcpServer", _core, |name: String,
+                                         json: String|
+         -> String {
             let config: Json = serde_json::from_str(&json).unwrap_or(Json::Null);
             crate::mcp_registry::validate_mcp_server_config(&name, &config)
                 .err()
                 .unwrap_or_default()
         });
-        op!("mcpRegister", core, |name: String, ext_path: String, json: String| -> String {
+        op!("mcpRegister", core, |name: String,
+                                  ext_path: String,
+                                  json: String|
+         -> String {
             let mut core = core.lock().expect("host core mutex poisoned");
             let config: Json = serde_json::from_str(&json).unwrap_or(Json::Null);
-            core.mcp.register(&name, &ext_path, config).err().unwrap_or_default()
+            core.mcp
+                .register(&name, &ext_path, config)
+                .err()
+                .unwrap_or_default()
         });
-        op!("mcpUnregister", core, |name: String, ext_path: String| -> String {
+        op!("mcpUnregister", core, |name: String,
+                                    ext_path: String|
+         -> String {
             let mut core = core.lock().expect("host core mutex poisoned");
-            core.mcp.unregister(&name, &ext_path).err().unwrap_or_default()
+            core.mcp
+                .unregister(&name, &ext_path)
+                .err()
+                .unwrap_or_default()
         });
         op!("getMcpServers", core, || -> String {
             let core = core.lock().expect("host core mutex poisoned");
@@ -353,14 +385,17 @@ impl JsHost {
                 .map(|usage| serde_json::to_string(&usage).unwrap_or_default())
                 .unwrap_or_default()
         });
-        op!("compact", _core, |_options: String| -> String { String::new() });
+        op!("compact", _core, |_options: String| -> String {
+            String::new()
+        });
         op!("getSystemPrompt", core, || -> String {
             let core = core.lock().expect("host core mutex poisoned");
             (core.actions.get_system_prompt)()
         });
         op!("getSystemPromptOptions", core, || -> String {
             let core = core.lock().expect("host core mutex poisoned");
-            serde_json::to_string(&(core.actions.get_system_prompt_options)()).unwrap_or_else(|_| "{}".to_string())
+            serde_json::to_string(&(core.actions.get_system_prompt_options)())
+                .unwrap_or_else(|_| "{}".to_string())
         });
         op!("notify", core, |text: String| -> String {
             core.lock()
@@ -369,15 +404,24 @@ impl JsHost {
                 .push(text);
             String::new()
         });
-        op!("toolUpdate", core, |tool_call_id: String, json: String| -> String {
+        op!("toolUpdate", core, |tool_call_id: String,
+                                 json: String|
+         -> String {
             let mut core = core.lock().expect("host core mutex poisoned");
-            core.tool_updates.push((tool_call_id, serde_json::from_str(&json).unwrap_or(Json::Null)));
+            core.tool_updates.push((
+                tool_call_id,
+                serde_json::from_str(&json).unwrap_or(Json::Null),
+            ));
             String::new()
         });
         // Nested tool execution is the one surface the unbound runner
         // reports as unavailable; the exact result shape is
         // runner.ts:988-999. E2 binds a real executor with the agent loop.
-        op!("nestedExecuteTool", _core, |tool_call_id: String, name: String, _args: String, _options: String| -> String {
+        op!("nestedExecuteTool", _core, |tool_call_id: String,
+                                         name: String,
+                                         _args: String,
+                                         _options: String|
+         -> String {
             serde_json::json!({
                 "toolCall": {
                     "type": "toolCall",
@@ -413,7 +457,9 @@ impl JsHost {
                 .clone()
                 .unwrap_or_default()
         });
-        op!("setLabel", core, |entry_id: String, label: String| -> String {
+        op!("setLabel", core, |entry_id: String,
+                               label: String|
+         -> String {
             core.lock()
                 .expect("host core mutex poisoned")
                 .labels
@@ -453,34 +499,41 @@ impl JsHost {
         path: &str,
         source: Option<&str>,
     ) -> Result<(), JsHostError> {
-        let factory_result = self.ctx.with(|ctx| -> Result<Result<(), JsHostError>, JsHostError> {
-            let source = if let Some(inline) = source {
-                inline.to_string()
-            } else {
-                let bytes = std::fs::read(path)
-                    .map_err(|err| JsHostError::Job(format!("failed to read {path}: {err}")))?;
-                crate::transpile::transpile(Path::new(path), &String::from_utf8_lossy(&bytes))
-                    .map_err(|err| JsHostError::Job(err.to_string()))?
-            };
-            let (module, _promise) = match rquickjs::Module::declare(ctx.clone(), path, source) {
-                Ok(declared) => match declared.eval() {
-                    Ok(evaluated) => evaluated,
-                    Err(err) => return Ok(Err(Self::js_error(&ctx, err))),
-                },
-                Err(err) => return Ok(Err(Self::js_error(&ctx, err))),
-            };
-            let namespace = module.namespace()?;
-            let factory: Option<Function> = namespace.get("default")?;
-            let Some(factory) = factory else {
-                return Ok(Err(JsHostError::MissingFactory(path.to_string())));
-            };
-            let create_api: Function = ctx.globals().get("__piCreateApi")?;
-            let pi: Value = create_api.call((index,))?;
-            if let Err(err) = factory.call::<(Value,), Value>((pi,)) {
-                return Ok(Err(Self::js_error(&ctx, err)));
-            }
-            Ok(Ok(()))
-        })?;
+        let factory_result =
+            self.ctx
+                .with(|ctx| -> Result<Result<(), JsHostError>, JsHostError> {
+                    let source = if let Some(inline) = source {
+                        inline.to_string()
+                    } else {
+                        let bytes = std::fs::read(path).map_err(|err| {
+                            JsHostError::Job(format!("failed to read {path}: {err}"))
+                        })?;
+                        crate::transpile::transpile(
+                            Path::new(path),
+                            &String::from_utf8_lossy(&bytes),
+                        )
+                        .map_err(|err| JsHostError::Job(err.to_string()))?
+                    };
+                    let (module, _promise) =
+                        match rquickjs::Module::declare(ctx.clone(), path, source) {
+                            Ok(declared) => match declared.eval() {
+                                Ok(evaluated) => evaluated,
+                                Err(err) => return Ok(Err(Self::js_error(&ctx, err))),
+                            },
+                            Err(err) => return Ok(Err(Self::js_error(&ctx, err))),
+                        };
+                    let namespace = module.namespace()?;
+                    let factory: Option<Function> = namespace.get("default")?;
+                    let Some(factory) = factory else {
+                        return Ok(Err(JsHostError::MissingFactory(path.to_string())));
+                    };
+                    let create_api: Function = ctx.globals().get("__piCreateApi")?;
+                    let pi: Value = create_api.call((index,))?;
+                    if let Err(err) = factory.call::<(Value,), Value>((pi,)) {
+                        return Ok(Err(Self::js_error(&ctx, err)));
+                    }
+                    Ok(Ok(()))
+                })?;
         factory_result?;
         self.drive_jobs()?;
         Ok(())
@@ -497,12 +550,17 @@ impl JsHost {
     /// Marks the runtime bound: action methods work from now on (the
     /// runner calls this once after loading, mirroring `bindCore`).
     pub fn bind_runtime(&self) -> Result<(), JsHostError> {
-        self.ctx
-            .with(|ctx| -> Result<(), JsHostError> { Ok(ctx.globals().get::<_, Function>("__piBindRuntime")?.call::<(), ()>(())?) })
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            Ok(ctx
+                .globals()
+                .get::<_, Function>("__piBindRuntime")?
+                .call::<(), ()>(())?)
+        })
     }
 
     /// Applies the staleness protocol (`__piInvalidate`).
-    pub fn invalidate(&self, message: Option<&str>) -> Result<(), JsHostError> {        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+    pub fn invalidate(&self, message: Option<&str>) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let invalidate: Function = ctx.globals().get("__piInvalidate")?;
             let _: Value = invalidate.call((message,))?;
             Ok(())
@@ -535,7 +593,13 @@ impl JsHost {
 
     /// Calls one event handler inside a session (`__piSessionCall`); the
     /// result lands in the session slot after the job queue drains.
-    pub fn session_call(&self, id: u32, index: usize, event: &str, handler: usize) -> Result<(), JsHostError> {
+    pub fn session_call(
+        &self,
+        id: u32,
+        index: usize,
+        event: &str,
+        handler: usize,
+    ) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let call: Function = ctx.globals().get("__piSessionCall")?;
             let _: Value = call.call((id, index, event, handler))?;
@@ -544,7 +608,13 @@ impl JsHost {
     }
 
     /// Calls one command handler inside a session.
-    pub fn session_call_command(&self, id: u32, index: usize, name: &str, args: &str) -> Result<(), JsHostError> {
+    pub fn session_call_command(
+        &self,
+        id: u32,
+        index: usize,
+        name: &str,
+        args: &str,
+    ) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let call: Function = ctx.globals().get("__piSessionCallCommand")?;
             let _: Value = call.call((id, index, name, args))?;
@@ -554,7 +624,13 @@ impl JsHost {
 
     /// Calls one tool's `execute` inside a session
     /// (`__piSessionCallTool`); the session event holds the tool args.
-    pub fn session_call_tool(&self, id: u32, index: usize, name: &str, tool_call_id: &str) -> Result<(), JsHostError> {
+    pub fn session_call_tool(
+        &self,
+        id: u32,
+        index: usize,
+        name: &str,
+        tool_call_id: &str,
+    ) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let call: Function = ctx.globals().get("__piSessionCallTool")?;
             let _: Value = call.call((id, index, name, tool_call_id))?;
@@ -599,7 +675,11 @@ impl JsHost {
             }
             let json = ctx.json_stringify(value)?;
             Ok(json
-                .map(|json| json.to_string().map_err(JsHostError::from).unwrap_or_default())
+                .map(|json| {
+                    json.to_string()
+                        .map_err(JsHostError::from)
+                        .unwrap_or_default()
+                })
                 .unwrap_or_default())
         })
     }
@@ -626,6 +706,7 @@ pub type TranspileCache = BTreeMap<PathBuf, String>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn host() -> JsHost {
         let core = HostCore {
@@ -661,14 +742,17 @@ mod tests {
     fn loads_module_with_relative_import_and_virtual_module() {
         let dir = std::env::temp_dir().join(format!("pi-ext-js-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(dir.join("helper.ts"), "export const tag: string = \"h\";\n").expect("write");
+        std::fs::write(dir.join("helper.ts"), "export const tag: string = \"h\";\n")
+            .expect("write");
         std::fs::write(
             dir.join("main.ts"),
             "import { tag } from \"./helper.ts\";\nimport { Type } from \"typebox\";\nexport default function (pi: unknown): void {\n  (globalThis as Record<string, unknown>).__loaded = tag + Type.String({ description: \"d\" }).type;\n}\n",
         )
         .expect("write");
         let host = host();
-        let index = host.begin_extension(&dir.join("main.ts").to_string_lossy()).expect("begin");
+        let index = host
+            .begin_extension(&dir.join("main.ts").to_string_lossy())
+            .expect("begin");
         host.load_extension_module(index, &dir.join("main.ts").to_string_lossy(), None)
             .expect("load");
         host.commit_extension(index).expect("commit");
@@ -687,7 +771,9 @@ mod tests {
         )
         .expect("write");
         let host = host();
-        let index = host.begin_extension(&dir.join("main.ts").to_string_lossy()).expect("begin");
+        let index = host
+            .begin_extension(&dir.join("main.ts").to_string_lossy())
+            .expect("begin");
         let err = host
             .load_extension_module(index, &dir.join("main.ts").to_string_lossy(), None)
             .expect_err("node import must fail");
@@ -749,11 +835,17 @@ export default function (pi) {
         .expect("load");
         host.commit_extension(index).expect("commit");
         let id = host
-            .session_begin(r#"{"type":"tool_call","input":{"first":"original"}}"#, ContextKind::Event, None)
+            .session_begin(
+                r#"{"type":"tool_call","input":{"first":"original"}}"#,
+                ContextKind::Event,
+                None,
+            )
             .expect("begin");
-        host.session_call(id, index, "tool_call", 0).expect("call 1");
+        host.session_call(id, index, "tool_call", 0)
+            .expect("call 1");
         host.drive_jobs().expect("drive");
-        host.session_call(id, index, "tool_call", 1).expect("call 2");
+        host.session_call(id, index, "tool_call", 1)
+            .expect("call 2");
         host.drive_jobs().expect("drive");
         // The second handler saw the first handler's in-place writes.
         assert_eq!(
@@ -787,7 +879,9 @@ export default function (pi) {
         host.commit_extension(index).expect("commit");
         host.invalidate(None).expect("invalidate");
         for (event, expected) in [("e", "ctx-stale:This extension ctx is"), ("pi", "pi-stale")] {
-            let id = host.session_begin("{}", ContextKind::Event, None).expect("begin");
+            let id = host
+                .session_begin("{}", ContextKind::Event, None)
+                .expect("begin");
             host.session_call(id, index, event, 0).expect("call");
             host.drive_jobs().expect("drive");
             let last = host.session_last(id).expect("last");
@@ -857,7 +951,9 @@ export default function (pi) {
         );
         host.bind_runtime().expect("bind");
 
-        let id = host.session_begin("{}", ContextKind::Event, None).expect("begin");
+        let id = host
+            .session_begin("{}", ContextKind::Event, None)
+            .expect("begin");
         host.session_call(id, index, "probe", 0).expect("call");
         host.drive_jobs().expect("drive");
         let probe: serde_json::Value =
@@ -866,9 +962,18 @@ export default function (pi) {
         let probe = probe["value"].clone();
         // The flag default and the settings map the ops serve from.
         assert_eq!(probe["flag"], serde_json::json!(true));
-        assert_eq!(probe["settings"], serde_json::json!({"model": "glm-5.3-flash"}));
+        assert_eq!(
+            probe["settings"],
+            serde_json::json!({"model": "glm-5.3-flash"})
+        );
         assert_eq!(probe["active"], serde_json::json!(["synthetic_tool"]));
-        assert!(probe["mcp"].as_array().expect("servers").iter().any(|server| server["name"] == "synth"));
+        assert!(
+            probe["mcp"]
+                .as_array()
+                .expect("servers")
+                .iter()
+                .any(|server| server["name"] == "synth")
+        );
         let tool = &probe["tools"].as_array().expect("tools")[0];
         assert_eq!(tool["name"], "synthetic_tool");
         assert_eq!(tool["exposure"], "deferred");
@@ -876,8 +981,11 @@ export default function (pi) {
         // byte-identical to real TypeBox output: type, required
         // (non-optional only), properties — options last, kind markers
         // non-enumerable.
-        let snapshots: serde_json::Value = serde_json::from_str(&host.inspect().expect("inspect")).expect("snapshots");
-        let schema = &snapshots.as_array().expect("list")[index]["tools"].as_array().expect("tools")[0]["parameters"];
+        let snapshots: serde_json::Value =
+            serde_json::from_str(&host.inspect().expect("inspect")).expect("snapshots");
+        let schema = &snapshots.as_array().expect("list")[index]["tools"]
+            .as_array()
+            .expect("tools")[0]["parameters"];
         assert_eq!(
             schema,
             &serde_json::json!({
@@ -893,7 +1001,8 @@ export default function (pi) {
         let id = host
             .session_begin(r#"{"query":"x"}"#, ContextKind::Tool, Some("t1"))
             .expect("begin");
-        host.session_call_tool(id, index, "synthetic_tool", "t1").expect("call");
+        host.session_call_tool(id, index, "synthetic_tool", "t1")
+            .expect("call");
         host.drive_jobs().expect("drive");
         assert_eq!(
             host.session_last(id).expect("last"),
@@ -925,5 +1034,355 @@ export default function (pi) {
             "{err}"
         );
         host.discard_extension(index).expect("discard");
+    }
+
+    // ------------------------------------------------------------------
+    // E1 exit gate, part 1: the vendored upstream tool-search module
+    // (tests/fixtures/tool-search) through the full pipeline — transpile,
+    // relative imports, virtual modules (`typebox`,
+    // `@earendil-works/pi-codemode/declarations`), the `Intl.Segmenter`
+    // shim. The cases port `packages/coding-agent/test/tool-search.test.ts`;
+    // ICU-dependent segmentation cases are E4 deviations (see the ignored
+    // test below).
+    // ------------------------------------------------------------------
+
+    fn fixture_path(relative: &str) -> String {
+        format!("{}/tests/fixtures/{relative}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Imports the vendored tool.ts through the loader chain and installs
+    /// the test helpers the ported cases use.
+    fn load_vendored_tool_module(host: &JsHost) {
+        let path = fixture_path("tool-search/tool.ts");
+        host.ctx
+            .with(|ctx| {
+                ctx.eval::<(), _>(format!(
+                    "(async () => {{ globalThis.__ts = await import({}); }})()",
+                    serde_json::to_string(&path).expect("path json")
+                ))
+            })
+            .expect("import eval");
+        host.drive_jobs().expect("drive");
+        host.ctx
+            .with(|ctx| {
+                ctx.eval::<(), _>(
+                    r"
+globalThis.__mkdoc = (name, description, parameters, namespace) =>
+  __ts.createToolSearchDocument({ name, description, parameters }, namespace);
+globalThis.__rank = (query, documents, limit) =>
+  new __ts.Bm25Ranker().rank(query, documents, limit).map((match) => match.name);
+globalThis.__doctext = (name, description, parameters) =>
+  __ts.createToolSearchDocument({ name, description, parameters }).text;
+",
+                )
+            })
+            .expect("helpers eval");
+    }
+
+    fn eval_json(host: &JsHost, source: &str) -> serde_json::Value {
+        serde_json::from_str(&host.eval_for_tests(source).expect("eval")).expect("json")
+    }
+
+    #[test]
+    fn vendored_tokenizer_matches_upstream_ascii_and_shim_capable_unicode() {
+        let host = host();
+        load_vendored_tool_module(&host);
+        // "splits camelCase and snake_case, drops stop words, and folds plurals"
+        assert_eq!(
+            eval_json(
+                &host,
+                r#"JSON.stringify(__ts.tokenize("listIssues for the GitHub_repo"))"#
+            ),
+            json!(["list", "issue", "git", "hub", "repo"])
+        );
+        assert_eq!(
+            eval_json(
+                &host,
+                r#"JSON.stringify(__ts.tokenize("searches queries HTTPServer"))"#
+            ),
+            json!(["search", "query", "http", "server"])
+        );
+        assert_eq!(
+            eval_json(
+                &host,
+                r#"JSON.stringify(__ts.tokenize("repo.issues/search:queries"))"#
+            ),
+            json!(["repo", "issue", "search", "query"])
+        );
+        // Unicode words the property-run shim segments identically to ICU.
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__ts.tokenize("Éléments cafés"))"#),
+            json!(["éléments", "cafés"])
+        );
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__ts.tokenize("문서 검색"))"#),
+            json!(["문서", "검색"])
+        );
+        assert_eq!(
+            eval_json(
+                &host,
+                r#"JSON.stringify(__ts.tokenize("Поиск документов"))"#
+            ),
+            json!(["поиск", "документов"])
+        );
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__ts.tokenize("CAFÉ cafe\u0301"))"#),
+            json!(["café", "café"])
+        );
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__ts.tokenize(" \t，。!? 😀 "))"#),
+            json!([])
+        );
+    }
+
+    #[test]
+    #[ignore = "ICU word segmentation: QuickJS-NG ships no Intl, the shim segments unspaced scripts as one run (E4 replaces the shim with a real Intl subset)"]
+    fn vendored_tokenizer_unspaced_scripts_need_icu() {
+        let host = host();
+        load_vendored_tool_module(&host);
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__ts.tokenize("搜索仓库问题"))"#),
+            json!(["搜索", "仓库", "问题"])
+        );
+    }
+
+    #[test]
+    fn vendored_ranker_ranks_by_term_relevance_and_respects_the_limit() {
+        let host = host();
+        load_vendored_tool_module(&host);
+        // The upstream test corpus (`tool-search.test.ts:59-67`).
+        host.eval_for_tests(
+            r#"
+globalThis.__docs = [
+  __mkdoc("mcp__github__list_issues", "List issues in a repository.", { type: "object", properties: { state: { type: "string", description: "open or closed" } } }),
+  __mkdoc("mcp__github__create_pull_request", "Open a pull request.", { type: "object", properties: {} }),
+  __mkdoc("mcp__linear__search_issues", "Search Linear issues by text.", { type: "object", properties: {} }),
+  __mkdoc("mcp__docs__search", "Search the documentation.", { type: "object", properties: {} }),
+];
+"#,
+        )
+        .expect("corpus");
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__rank("issue", __docs, 8))"#),
+            json!(["mcp__linear__search_issues", "mcp__github__list_issues"])
+        );
+        assert_eq!(
+            eval_json(
+                &host,
+                r#"JSON.stringify(__rank("pull requests", __docs, 8)[0])"#
+            ),
+            json!("mcp__github__create_pull_request")
+        );
+        assert_eq!(
+            eval_json(&host, r#"__rank("search", __docs, 1).length"#),
+            json!(1)
+        );
+        // Property names and descriptions are searchable.
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__rank("closed", __docs, 8))"#),
+            json!(["mcp__github__list_issues"])
+        );
+        // Unknown, stop-word, and known-v1-limit queries find nothing.
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__rank("kubernetes", __docs, 8))"#),
+            json!([])
+        );
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__rank("the", __docs, 8))"#),
+            json!([])
+        );
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__rank("tickets", __docs, 8))"#),
+            json!([])
+        );
+    }
+
+    #[test]
+    fn vendored_ranker_name_queries_rank_first() {
+        let host = host();
+        load_vendored_tool_module(&host);
+        host.eval_for_tests(
+            r#"
+globalThis.__named = [
+  __mkdoc("mcp__app__queue_read", "Read a queued message of this thread."),
+  __mkdoc("mcp__dev-app__thread_read", "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans. Continue with afterPosition until hasMore is false."),
+];
+"#,
+        )
+        .expect("corpus");
+        for query in [
+            "thread_read",
+            "dev_app__thread_read",
+            "mcp__dev-app__thread_read",
+            "Thread_Read",
+            "thread read",
+        ] {
+            let source = format!("JSON.stringify(__rank({query:?}, __named, 1))");
+            assert_eq!(
+                eval_json(&host, &source),
+                json!(["mcp__dev-app__thread_read"]),
+                "query: {query}"
+            );
+        }
+        // Partial names still rank by BM25.
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__rank("read", __named, 1))"#),
+            json!(["mcp__app__queue_read"])
+        );
+    }
+
+    #[test]
+    fn vendored_ranker_name_match_beats_description_mentions() {
+        let host = host();
+        load_vendored_tool_module(&host);
+        host.eval_for_tests(
+            r#"
+globalThis.__ci = [
+  __mkdoc("mcp__ci__status", "Deploy status: last deploy, deploy log, deploy errors."),
+  __mkdoc("mcp__ci__deploy_release", "Start a release of the current branch to an environment, run the migrations, switch traffic over, and wait until the new version is live and healthy."),
+];
+"#,
+        )
+        .expect("corpus");
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__rank("deploy", __ci, 1))"#),
+            json!(["mcp__ci__deploy_release"])
+        );
+    }
+
+    #[test]
+    fn vendored_ranker_whole_name_bonus_and_coverage() {
+        let host = host();
+        load_vendored_tool_module(&host);
+        host.eval_for_tests(
+            r#"
+const peekaboo = { name: "mcp__peekaboo", instructions: "Peekaboo controls macOS apps by app name." };
+globalThis.__peek = [
+  __mkdoc("mcp__peekaboo__see", "Capture the app window of the peekaboo app and describe the app.", {}, peekaboo),
+  __mkdoc("mcp__peekaboo__menu", "Click a menu item of an app.", {}, peekaboo),
+  __mkdoc("mcp__peekaboo__app", "Launch, quit, relaunch, focus, hide, or switch applications. Targets an application by name, bundle identifier, or process ID, and can wait until it is ready.", {}, peekaboo),
+  __mkdoc("mcp__app__queue_read", "Read a queued message of this thread."),
+  __mkdoc("mcp__dev-app__thread_read", "Read durable state and a paginated timeline from any thread. The default view returns user messages, assistant messages and plans."),
+];
+"#,
+        )
+        .expect("corpus");
+        assert_eq!(
+            eval_json(
+                &host,
+                r#"JSON.stringify(__rank("peekaboo app", __peek, 1))"#
+            ),
+            json!(["mcp__peekaboo__app"])
+        );
+        assert_eq!(
+            eval_json(
+                &host,
+                r#"JSON.stringify(__rank("open the peekaboo app tool", __peek, 1))"#
+            ),
+            json!(["mcp__peekaboo__app"])
+        );
+        assert_eq!(
+            eval_json(
+                &host,
+                r#"JSON.stringify(__rank("read thread_read state", __peek, 1))"#
+            ),
+            json!(["mcp__dev-app__thread_read"])
+        );
+        // Without the whole name, mentions in descriptions decide.
+        assert_eq!(
+            eval_json(
+                &host,
+                r#"JSON.stringify(__rank("describe window", __peek, 1))"#
+            ),
+            json!(["mcp__peekaboo__see"])
+        );
+    }
+
+    #[test]
+    fn vendored_ranker_more_covered_terms_win() {
+        let host = host();
+        load_vendored_tool_module(&host);
+        host.eval_for_tests(
+            r#"
+globalThis.__four = [
+  __mkdoc("mcp__peekaboo__app", "Launch, quit, focus, or switch applications by name or bundle identifier."),
+  __mkdoc("mcp__peekaboo__see", "Capture the app window and describe the UI elements of the app."),
+  __mkdoc("mcp__peekaboo__window", "Move, resize, or close a window of an app."),
+  __mkdoc("mcp__peekaboo__image", "Take a screenshot of the screen, an app, or a window."),
+];
+"#,
+        )
+        .expect("corpus");
+        // `window` and `app` are whole names, but each covers one term.
+        assert_eq!(
+            eval_json(
+                &host,
+                r#"JSON.stringify(__rank("screenshot window", __four, 1))"#
+            ),
+            json!(["mcp__peekaboo__image"])
+        );
+        assert_eq!(
+            eval_json(
+                &host,
+                r#"JSON.stringify(__rank("describe app", __four, 1))"#
+            ),
+            json!(["mcp__peekaboo__see"])
+        );
+        // An exact name still ranks first.
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__rank("window", __four, 1))"#),
+            json!(["mcp__peekaboo__window"])
+        );
+    }
+
+    #[test]
+    fn vendored_ranker_includes_the_namespace_in_the_search_text() {
+        let host = host();
+        load_vendored_tool_module(&host);
+        host.eval_for_tests(
+            r#"
+globalThis.__nsdoc = [__mkdoc("mcp__x__run", "Run it.", {}, { name: "mcp__x", description: "Kubernetes cluster tools" })];
+"#,
+        )
+        .expect("corpus");
+        assert_eq!(
+            eval_json(&host, r#"JSON.stringify(__rank("kubernetes", __nsdoc, 8))"#),
+            json!(["mcp__x__run"])
+        );
+    }
+
+    #[test]
+    fn vendored_schema_text_reads_local_references() {
+        let host = host();
+        load_vendored_tool_module(&host);
+        // The #11803 cases, verbatim expectations.
+        assert_eq!(
+            eval_json(
+                &host,
+                r##"JSON.stringify(__doctext("mcp__ledger__inspect", "Inspect records", { type: "object", properties: { options: { $ref: "#/$defs/options" } }, $defs: { options: { type: "object", properties: { mode: { type: "string", description: "reconciliation" } } } } }))"##
+            ),
+            json!("Inspect records options mode reconciliation")
+        );
+        assert_eq!(
+            eval_json(
+                &host,
+                r##"JSON.stringify(__doctext("mcp__ledger__inspect", "Inspect records", { type: "object", properties: { range: { $ref: "#/$defs/date~1range" } }, $defs: { "date/range": { description: "fiscal period" } } }))"##
+            ),
+            json!("Inspect records range fiscal period")
+        );
+        assert_eq!(
+            eval_json(
+                &host,
+                r##"JSON.stringify(__doctext("mcp__ledger__inspect", "Inspect records", { type: "object", properties: { root: { $ref: "#/$defs/node" }, other: { $ref: "#/$defs/node" }, self: { $ref: "#" } }, $defs: { node: { description: "tree node", properties: { children: { type: "array", items: { $ref: "#/$defs/node" } } } } } }))"##
+            ),
+            json!("Inspect records root tree node children other self")
+        );
+        assert_eq!(
+            eval_json(
+                &host,
+                r##"JSON.stringify(__doctext("mcp__ledger__inspect", "Inspect records", { type: "object", properties: { remote: { $ref: "https://example.com/schema.json#/$defs/x" }, missing: { $ref: "#/$defs/missing" }, malformed: { $ref: "#/$defs/%E0%A4%A" } }, $defs: { unused: { description: "reconciliation" } } }))"##
+            ),
+            json!("Inspect records remote missing malformed")
+        );
     }
 }

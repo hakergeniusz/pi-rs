@@ -41,7 +41,9 @@ pub fn is_unavailable_host_module(specifier: &str) -> bool {
 /// (`core/pi-manifest.ts:13-42`: strips the BOM, requires a `pi` object,
 /// keeps only arrays of strings).
 pub fn read_pi_manifest(package_json: &str) -> Option<Vec<String>> {
-    let without_bom = package_json.strip_prefix('\u{feff}').unwrap_or(package_json);
+    let without_bom = package_json
+        .strip_prefix('\u{feff}')
+        .unwrap_or(package_json);
     let value: serde_json::Value = serde_json::from_str(without_bom).ok()?;
     let pi = value.get("pi")?.as_object()?;
     let extensions = pi.get("extensions")?.as_array()?;
@@ -145,7 +147,9 @@ fn throw_js_error(ctx: &Ctx<'_>, message: &str) -> rquickjs::Error {
 /// The resolution error for specifiers E1 does not support.
 fn throw_unavailable_module(ctx: &Ctx<'_>, name: &str) -> rquickjs::Error {
     let message = if name.starts_with("node:") {
-        format!("Module \"{name}\" is not available in the E1 headless extensions core; node built-in modules land in E4")
+        format!(
+            "Module \"{name}\" is not available in the E1 headless extensions core; node built-in modules land in E4"
+        )
     } else {
         format!(
             "Module \"{name}\" could not be resolved by the extensions host (E1 supports relative paths and the bundled virtual modules; node_modules resolution lands in E4)"
@@ -228,10 +232,11 @@ impl rquickjs::loader::Loader for ExtensionLoader {
             return Module::declare(ctx.clone(), name, source);
         }
         let bytes = std::fs::read(name).map_err(|_| rquickjs::Error::Unknown)?;
-        let source = match crate::transpile::transpile(Path::new(name), &String::from_utf8_lossy(&bytes)) {
-            Ok(source) => source,
-            Err(err) => return Err(throw_js_error(ctx, &err.to_string())),
-        };
+        let source =
+            match crate::transpile::transpile(Path::new(name), &String::from_utf8_lossy(&bytes)) {
+                Ok(source) => source,
+                Err(err) => return Err(throw_js_error(ctx, &err.to_string())),
+            };
         self.transpiled.push((name.to_string(), source.clone()));
         Module::declare(ctx.clone(), name, source)
     }

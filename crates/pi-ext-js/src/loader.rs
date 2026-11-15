@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::LoadError;
-use crate::resolver::{resolve_directory_entries, DirectoryEntry};
+use crate::resolver::{DirectoryEntry, resolve_directory_entries};
 use crate::runner::ExtensionRunner;
 
 /// Where a discovered extension path came from.
@@ -45,7 +45,10 @@ pub fn discover_extensions_in_dir(dir: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
     let mut discovered = Vec::new();
-    let mut paths: Vec<PathBuf> = entries.filter_map(Result::ok).map(|entry| entry.path()).collect();
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
     paths.sort();
     for path in paths {
         let is_dir = path.is_dir();
@@ -81,7 +84,11 @@ fn is_extension_file(path: &Path) -> bool {
 ///
 /// Duplicates (by resolved path) are dropped, keeping the first
 /// occurrence.
-pub fn discover_extensions(configured_paths: &[String], cwd: &Path, agent_dir: &Path) -> Vec<DiscoveredPath> {
+pub fn discover_extensions(
+    configured_paths: &[String],
+    cwd: &Path,
+    agent_dir: &Path,
+) -> Vec<DiscoveredPath> {
     let mut all: Vec<DiscoveredPath> = Vec::new();
     let push = |path: PathBuf, origin: ExtensionOrigin, all: &mut Vec<DiscoveredPath>| {
         if !all.iter().any(|existing| existing.path == path) {
@@ -131,7 +138,10 @@ pub fn discover_extensions(configured_paths: &[String], cwd: &Path, agent_dir: &
 /// `resource-loader.ts:533-541`): the bootstrap pass loads only
 /// non-project origins, so only global/CLI extensions can decide
 /// `project_trust`; the full pass adds the project origins when trusted.
-pub fn split_for_trust(discovered: &[DiscoveredPath], project_trusted: bool) -> (Vec<PathBuf>, Vec<PathBuf>) {
+pub fn split_for_trust(
+    discovered: &[DiscoveredPath],
+    project_trusted: bool,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let bootstrap: Vec<PathBuf> = discovered
         .iter()
         .filter(|entry| entry.origin != ExtensionOrigin::Project)
@@ -181,7 +191,13 @@ pub fn discover_and_load(
     agent_dir: &Path,
 ) -> LoadExtensionsResult {
     let discovered = discover_extensions(configured_paths, cwd, agent_dir);
-    load_paths(runner, &discovered.iter().map(|entry| entry.path.clone()).collect::<Vec<_>>())
+    load_paths(
+        runner,
+        &discovered
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[cfg(test)]
@@ -189,7 +205,8 @@ mod tests {
     use super::*;
 
     fn temp_tree(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pi-ext-js-loader-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pi-ext-js-loader-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
@@ -219,7 +236,12 @@ mod tests {
         let found = discover_extensions_in_dir(&dir);
         let names: Vec<String> = found
             .iter()
-            .map(|path| path.strip_prefix(&dir).expect("prefix").to_string_lossy().into_owned())
+            .map(|path| {
+                path.strip_prefix(&dir)
+                    .expect("prefix")
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         assert_eq!(
             names,
@@ -249,7 +271,9 @@ mod tests {
         );
         assert_eq!(
             resolve_directory_entries(&dir.join("manifested")),
-            Some(DirectoryEntry::Manifest(vec![dir.join("manifested").join("alt.ts")]))
+            Some(DirectoryEntry::Manifest(vec![
+                dir.join("manifested").join("alt.ts")
+            ]))
         );
     }
 
@@ -272,7 +296,10 @@ mod tests {
         let root = temp_tree("order");
         let cwd = root.join("project");
         let agent = root.join("agent");
-        write(&cwd.join(".pi").join("extensions").join("project_ext.ts"), FACTORY);
+        write(
+            &cwd.join(".pi").join("extensions").join("project_ext.ts"),
+            FACTORY,
+        );
         write(&agent.join("extensions").join("user_ext.ts"), FACTORY);
         let explicit = root.join("extra.ts");
         write(&explicit, FACTORY);
@@ -285,14 +312,31 @@ mod tests {
         assert_eq!(
             origins,
             vec![
-                (cwd.join(".pi/extensions/project_ext.ts").to_string_lossy().into_owned(), ExtensionOrigin::Project),
-                (agent.join("extensions/user_ext.ts").to_string_lossy().into_owned(), ExtensionOrigin::User),
-                (explicit.to_string_lossy().into_owned(), ExtensionOrigin::Explicit),
+                (
+                    cwd.join(".pi/extensions/project_ext.ts")
+                        .to_string_lossy()
+                        .into_owned(),
+                    ExtensionOrigin::Project
+                ),
+                (
+                    agent
+                        .join("extensions/user_ext.ts")
+                        .to_string_lossy()
+                        .into_owned(),
+                    ExtensionOrigin::User
+                ),
+                (
+                    explicit.to_string_lossy().into_owned(),
+                    ExtensionOrigin::Explicit
+                ),
             ]
         );
 
         // The same path configured explicitly does not load twice.
-        let project_path = cwd.join(".pi/extensions/project_ext.ts").to_string_lossy().into_owned();
+        let project_path = cwd
+            .join(".pi/extensions/project_ext.ts")
+            .to_string_lossy()
+            .into_owned();
         let found = discover_extensions(&[project_path], &cwd, &agent);
         assert_eq!(found.len(), 2);
     }
@@ -313,7 +357,10 @@ mod tests {
         assert_eq!(bootstrap, vec![PathBuf::from("/u/user.ts")]);
         assert_eq!(full, vec![PathBuf::from("/u/user.ts")]);
         let (_, full) = split_for_trust(&discovered, true);
-        assert_eq!(full, vec![PathBuf::from("/p/proj.ts"), PathBuf::from("/u/user.ts")]);
+        assert_eq!(
+            full,
+            vec![PathBuf::from("/p/proj.ts"), PathBuf::from("/u/user.ts")]
+        );
     }
 
     #[test]
@@ -323,14 +370,22 @@ mod tests {
         let bad = dir.join("bad.ts");
         let missing = dir.join("missing.ts");
         write(&good, FACTORY);
-        write(&bad, "export default function (pi) { pi.registerTool({ name: \"x\", description: \"\", parameters: null }); }\n");
+        write(
+            &bad,
+            "export default function (pi) { pi.registerTool({ name: \"x\", description: \"\", parameters: null }); }\n",
+        );
 
-        let mut runner = crate::runner::ExtensionRunner::new(crate::engine::HostCore::default()).expect("runner");
+        let mut runner = crate::runner::ExtensionRunner::new(crate::engine::HostCore::default())
+            .expect("runner");
         let result = load_paths(&mut runner, &[bad, good.clone(), missing]);
         assert_eq!(result.extensions, vec![good.to_string_lossy().into_owned()]);
         assert_eq!(result.errors.len(), 2);
         assert!(result.errors[0].error.contains("Failed to load extension:"));
-        assert!(result.errors[0].error.contains("must define an object parameter schema"));
+        assert!(
+            result.errors[0]
+                .error
+                .contains("must define an object parameter schema")
+        );
         assert!(result.errors[1].path.ends_with("missing.ts"));
         // The good extension still works.
         assert!(runner.has_handlers("e"));

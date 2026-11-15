@@ -37,18 +37,27 @@ pub struct McpRegistry {
 impl McpRegistry {
     /// Registers one server, enforcing the loader's ownership and namespace
     /// rules. The error strings are the ones `pi.registerMcpServer` throws.
-    pub fn register(&mut self, name: &str, extension_path: &str, config: Value) -> Result<(), String> {
+    pub fn register(
+        &mut self,
+        name: &str,
+        extension_path: &str,
+        config: Value,
+    ) -> Result<(), String> {
         if let Some(existing) = self.servers.iter().find(|server| server.name == name) {
             if existing.extension_path != extension_path {
-                return Err(format!("MCP server \"{name}\" is already registered by extension \"{}\"", existing.extension_path));
+                return Err(format!(
+                    "MCP server \"{name}\" is already registered by extension \"{}\"",
+                    existing.extension_path
+                ));
             }
         }
-        if let Some(clash) = self
-            .servers
-            .iter()
-            .find(|server| server.name != name && mcp_namespace(&server.name) == mcp_namespace(name))
-        {
-            return Err(format!("MCP server \"{name}\" conflicts with registered server \"{}\"", clash.name));
+        if let Some(clash) = self.servers.iter().find(|server| {
+            server.name != name && mcp_namespace(&server.name) == mcp_namespace(name)
+        }) {
+            return Err(format!(
+                "MCP server \"{name}\" conflicts with registered server \"{}\"",
+                clash.name
+            ));
         }
         self.servers.retain(|server| server.name != name);
         self.servers.push(RegisteredMcpServer {
@@ -88,7 +97,9 @@ pub fn validate_mcp_server_config(name: &str, raw: &Value) -> Result<(), String>
     if !server_name_is_valid(name) {
         // Upstream returns this one unwrapped: the name is unknown, so the
         // `server "{name}":` prefix would repeat it.
-        return Err(format!("invalid server name \"{name}\" (use letters, digits, \"_\" and \"-\")"));
+        return Err(format!(
+            "invalid server name \"{name}\" (use letters, digits, \"_\" and \"-\")"
+        ));
     }
     let Some(entry) = raw.as_object() else {
         return Err(format!("server \"{name}\" must be an object"));
@@ -99,17 +110,27 @@ pub fn validate_mcp_server_config(name: &str, raw: &Value) -> Result<(), String>
     let url = entry.get("url").and_then(Value::as_str);
     let command = entry.get("command").and_then(Value::as_str);
     if entry.get("type").and_then(Value::as_str) == Some("sse") {
-        return invalid("legacy SSE transport is not supported; use the streamable HTTP URL".to_string());
+        return invalid(
+            "legacy SSE transport is not supported; use the streamable HTTP URL".to_string(),
+        );
     }
     if let Some(url) = url {
-        if matches!(entry.get("type").and_then(Value::as_str), None | Some("http" | "streamable-http")) {
+        if matches!(
+            entry.get("type").and_then(Value::as_str),
+            None | Some("http" | "streamable-http")
+        ) {
             return match validate_http_fields(entry, url) {
                 Ok(()) => Ok(()),
                 Err(error) => invalid(error),
             };
         }
     }
-    if command.is_some() && matches!(entry.get("type").and_then(Value::as_str), None | Some("stdio")) {
+    if command.is_some()
+        && matches!(
+            entry.get("type").and_then(Value::as_str),
+            None | Some("stdio")
+        )
+    {
         return match validate_stdio_fields(entry) {
             Ok(()) => Ok(()),
             Err(error) => invalid(error),
@@ -156,7 +177,10 @@ fn validate_http_fields(entry: &serde_json::Map<String, Value>, url: &str) -> Re
 
 /// `URL.canParse(url) && /^https?:$/.test(new URL(url).protocol)`.
 fn is_http_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) else {
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
         return false;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
@@ -165,7 +189,9 @@ fn is_http_url(url: &str) -> bool {
 
 fn validate_stdio_fields(entry: &serde_json::Map<String, Value>) -> Result<(), String> {
     if let Some(args) = entry.get("args") {
-        let ok = args.as_array().is_some_and(|args| args.iter().all(Value::is_string));
+        let ok = args
+            .as_array()
+            .is_some_and(|args| args.iter().all(Value::is_string));
         if !ok {
             return Err("args must be an array of strings".to_string());
         }
@@ -230,18 +256,25 @@ mod tests {
 
     #[test]
     fn validates_stdio_and_http() {
-        assert!(validate_mcp_server_config("fs", &json!({"command": "npx", "args": ["-y", "x"]})).is_ok());
-        assert!(validate_mcp_server_config("web", &json!({"url": "https://example.com/mcp"})).is_ok());
+        assert!(
+            validate_mcp_server_config("fs", &json!({"command": "npx", "args": ["-y", "x"]}))
+                .is_ok()
+        );
+        assert!(
+            validate_mcp_server_config("web", &json!({"url": "https://example.com/mcp"})).is_ok()
+        );
         assert_eq!(
             validate_mcp_server_config("bad name", &json!({"command": "x"})).unwrap_err(),
             "invalid server name \"bad name\" (use letters, digits, \"_\" and \"-\")"
         );
         assert_eq!(
-            validate_mcp_server_config("x", &json!({"type": "sse", "url": "http://x"})).unwrap_err(),
+            validate_mcp_server_config("x", &json!({"type": "sse", "url": "http://x"}))
+                .unwrap_err(),
             "server \"x\": legacy SSE transport is not supported; use the streamable HTTP URL"
         );
         assert_eq!(
-            validate_mcp_server_config("x", &json!({"command": "x", "args": ["ok", 2]})).unwrap_err(),
+            validate_mcp_server_config("x", &json!({"command": "x", "args": ["ok", 2]}))
+                .unwrap_err(),
             "server \"x\": args must be an array of strings"
         );
         assert_eq!(
@@ -275,7 +308,9 @@ mod tests {
             registry.unregister("app", "b.ts").unwrap_err(),
             "MCP server \"app\" is registered by extension \"a.ts\""
         );
-        registry.unregister("app", "a.ts").expect("owner unregisters");
+        registry
+            .unregister("app", "a.ts")
+            .expect("owner unregisters");
         assert!(registry.list().iter().all(|server| server.name != "app"));
     }
 }

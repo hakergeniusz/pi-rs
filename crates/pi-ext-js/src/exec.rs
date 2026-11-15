@@ -54,7 +54,12 @@ pub struct ExecResult {
 
 /// One `pi.exec` call, returning the JSON the op hands back to JS
 /// (`{stdout, stderr, code, killed, truncated}` or `{execError}`).
-pub fn exec(command: &str, args: &[String], cwd: &str, options: &serde_json::Value) -> serde_json::Value {
+pub fn exec(
+    command: &str,
+    args: &[String],
+    cwd: &str,
+    options: &serde_json::Value,
+) -> serde_json::Value {
     let max_buffer = match options.get("maxBuffer") {
         None | Some(serde_json::Value::Null) => DEFAULT_MAX_BUFFER,
         Some(value) => {
@@ -148,7 +153,9 @@ pub fn exec(command: &str, args: &[String], cwd: &str, options: &serde_json::Val
 
     // A signal-killed command has no exit code; use the shell convention
     // (exec.ts:151-153). A truncated result must never read as success.
-    let mut code = status.code().unwrap_or_else(|| status.signal().map_or(1, |signal| 128 + signal));
+    let mut code = status
+        .code()
+        .unwrap_or_else(|| status.signal().map_or(1, |signal| 128 + signal));
     if truncated && code == 0 {
         code = 1;
     }
@@ -178,7 +185,7 @@ struct CapState {
 /// the check and the signal; that race is harmless (upstream guards with
 /// `proc.killed` for the same reason), and ESRCH is ignored.
 fn send_signal(pid: u32, signal: i32) {
-    use nix::sys::signal::{kill, Signal};
+    use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
     let Ok(signal) = Signal::try_from(signal) else {
         return;
@@ -239,7 +246,15 @@ mod tests {
     use super::*;
 
     fn run(command: &str, args: &[&str], options: &serde_json::Value) -> serde_json::Value {
-        exec(command, &args.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(), "/tmp", options)
+        exec(
+            command,
+            &args
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>(),
+            "/tmp",
+            options,
+        )
     }
 
     #[test]
@@ -255,7 +270,12 @@ mod tests {
     fn spawn_failure_is_a_failed_execution() {
         let result = run("/nonexistent-command-e1", &[], &serde_json::json!({}));
         assert_eq!(result["code"], 1);
-        assert!(result["stderr"].as_str().expect("stderr").contains("No such file"));
+        assert!(
+            result["stderr"]
+                .as_str()
+                .expect("stderr")
+                .contains("No such file")
+        );
     }
 
     #[test]
@@ -273,8 +293,17 @@ mod tests {
 
     #[test]
     fn invalid_max_buffer_is_a_range_error() {
-        let result = run("/bin/echo", &["x"], &serde_json::json!({ "maxBuffer": (1 << 29) - 23 }));
-        assert!(result["execError"].as_str().expect("error").contains("maxBuffer must be an integer"));
+        let result = run(
+            "/bin/echo",
+            &["x"],
+            &serde_json::json!({ "maxBuffer": (1 << 29) - 23 }),
+        );
+        assert!(
+            result["execError"]
+                .as_str()
+                .expect("error")
+                .contains("maxBuffer must be an integer")
+        );
     }
 
     #[test]

@@ -40,5 +40,5 @@ pub mod transpile;
 
 pub use engine::{ContextKind, HostActions, HostCore, JsHost};
 pub use error::{ExtensionError, JsHostError, LoadError};
-pub use loader::{discover_extensions, discover_and_load, ExtensionOrigin, LoadExtensionsResult};
+pub use loader::{ExtensionOrigin, LoadExtensionsResult, discover_and_load, discover_extensions};
 pub use runner::{ExtensionRunner, ResolvedCommand, ToolInfo};

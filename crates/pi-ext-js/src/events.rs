@@ -7,7 +7,7 @@
 //! exist so the runner reads typed fields instead of string keys.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 
 /// `{type:"session_start", reason, previousSessionFile?}`.
 pub fn session_start(reason: &str) -> Json {
@@ -123,7 +123,10 @@ impl BeforeAgentStartTrigger {
                 }
                 event
             }
-            Self::Custom { message_type, message } => {
+            Self::Custom {
+                message_type,
+                message,
+            } => {
                 json!({ "messageType": message_type, "message": message })
             }
         }
