@@ -1006,15 +1006,88 @@ pump cadence stands in for upstream's `setInterval`).
     default set, not the CLI-filtered declared set.
   - Post-bind tool registrations do not refresh the runner's dispatch
     snapshots (`/reload`/E3 concern).
-  - `session_start` is not emitted yet — it lands with the slice-4 loop
-    wiring; commands dispatch with the consuming hosts.
+  - `session_start` was not emitted by slice 3 — it lands with the
+    slice-4 loop wiring (below); commands dispatch with the consuming
+    hosts.
   - Interactive mode prints startup warnings to stderr (upstream shows
     them in the TUI).
-- **Next**: slice 4 — RPC dialog subprotocol in `modes/rpc.rs` (the
-  `UiSink` bridged to stdin/stdout), `session_before_*` gates in the
-  agent loop, `user_bash` at the bash tool, `emit_context` at LLM-request
-  assembly, `session_start` emission, virtual-model routing,
-  provider OAuth/streamSimple decision.
+- **Slice 4 — runtime events** (on `feat/e2-runtime-events`,
+  2026-11-15): the runner is now live at every runtime seam.
+  `extensions::load` takes the mode's UI surface and binds it **before**
+  emitting `session_start` (mirroring upstream `bindExtensions` applying
+  bindings then firing the event, `agent-session.ts:3429-3449`), so
+  `session_start` handlers can already prompt; flags/tools collection
+  happens after the emit, so event-time registrations count.
+  Interactive and print/json stay UI-headless (no sink bound); only RPC
+  mode bridges one.
+
+- **user_bash** (`extensions::user_bash`; upstream dispatch
+  `runner.ts:1279-1300`, executor `bash-executor.ts:48`): interactive
+  `!` bash consults `user_bash` handlers first. `Operations` →
+  `call_bash_exec` + `execute_bash_with_operations` (per-chunk
+  stripAnsi→sanitizeBinaryOutput→`\r` removal, rolling 2×
+  `DEFAULT_MAX_BYTES` window counted in chars ≈ JS `.length`,
+  `truncate_tail`, temp-file spill above the threshold); `Result` → the
+  extension's payload verbatim; handler failure → `show_error` with
+  **no local fallback** (upstream returns early); no handlers → local
+  execution. Fidelity fix: interactive transcripts now record the real
+  output in `!` entries — they stored `output: ""` before, while
+  upstream's `recordBashResult` keeps it and `bashExecutionToText`
+  renders it (`agent_loop.rs` bash tool context).
+- **Session gates** (`extensions::emit_gate`, cancel =
+  `result.cancel == true`, last handler wins): `session_before_switch`
+  `{reason:"new"/"resume", targetSessionFile?}` at `/new` and `/resume`
+  with `session_shutdown` emitted after a non-cancelled gate;
+  `session_before_compact` `{preparation, branchEntries, customInstructions,
+  reason:"manual", willRetry:false}` at `/compact` (cancel-only);
+  `session_shutdown` `{reason:"quit"}` at interactive-mode end.
+  `branchEntries` are the raw JSONL records (new `Store::get_branch_records`)
+  so extension-visible key order matches the file.
+- **Context transform** (`extensions::context_transform`): an
+  `Arc<dyn TransformContext>` is installed at all four `AgentLoopConfig`
+  sites (print/json/rpc/interactive) when any `context` or
+  `context_with_system` handler exists; `emit_context` errors warn to
+  stderr and keep the input.
+- **RPC dialog subprotocol** (`modes/rpc.rs`): a stdin reader thread
+  routes `extension_ui_response` frames to per-request one-slot channels
+  (registered at request time so a fast response cannot race; late
+  responses after timeout are dropped) and everything else to the command
+  channel the synchronous loop consumes — dialogs block inside command
+  handling without deadlocking the transport. Every writer (command
+  loop, agent-event sink, dialog sink) takes the shared stream lock per
+  line — never across a call that can write again, or an extension
+  dialog opened mid-command would deadlock against the command's own
+  write guard. Dialog methods write
+  `{"type":"extension_ui_request", id, method, …}` and wait — response
+  channels register for the dialog methods only, and the sink is
+  transport-level (the whole `extension_ui_response` frame crosses; the
+  vendored glue's per-method `parseResponse` extracts the payload, so
+  `select`/`input` read `.value`, `confirm` reads `.confirmed` with
+  `false` never undefined);
+  `timeout` → `recv_timeout` → `Value::Null` (the JS glue parses
+  null/empty payload to the method default, matching upstream's `input`
+  contract); `custom` resolves immediately; fire-and-forget methods
+  (notify/setStatus/setWidget/setTitle/set_editor_text) register nothing
+  and only write. EOF
+  on stdin closes the command channel → shutdown (upstream
+  `onInputEnd`).
+- **Slice-4 deviations/interpretations** (user_bash etc. above are the
+  landed behavior):
+  - Virtual-model routing (`ModelRouteRequest` user/continuation/retry/
+    direct, `pi.virtual-model-state` entries) and provider
+    OAuth/streamSimple handling are **deferred to slice 5**; the slice-2
+    provider seam stands in.
+  - Fork/tree session gates are unreachable in the runtime (no fork/tree
+    yet) and were not ported; extension-provided compaction results are
+    not plumbed (`/compact` gates are cancel-only).
+  - `session_before_compact` omits upstream's `signal` field (not part
+    of our `CompactionPreparation`).
+  - Headless sink fallback (no UI bound, e.g. interactive): dialog
+    methods resolve with an empty payload → the method default; `custom`
+    resolves immediately; fire-and-forget requests are silently dropped.
+    Same semantics as the runner's pre-slice-4 behavior, now explicit.
+- **Next**: slice 5 — virtual-model routing, provider OAuth/streamSimple,
+  E3 TUI bridging; golden fixtures per the backlog order.
 
 ## Gotchas / decisions
 - **Round-hunting can exercise a stale binary (E2, 2026-11-15)**: a hunt

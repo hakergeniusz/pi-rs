@@ -532,11 +532,24 @@ fidelity rule applies per phase (deviations recorded as they appear).
   with upstream's `noTools: "all"|"builtin"` semantics and a composite
   executor that dispatches extension tools through
   `ExtensionRunner::execute_tool` (runner shared as `Arc<Mutex<_>>` —
-  rquickjs `parallel` + Send closures/listeners). Remaining: slice 4
-  (RPC dialog subprotocol in `modes/rpc.rs`, `session_before_*`
-  agent-loop gates, `user_bash` at the bash tool, `emit_context` at
-  request assembly, `session_start` emission, virtual-model routing,
-  provider OAuth/streamSimple). Exit: RPC-mode extension
+  rquickjs `parallel` + Send closures/listeners). Slice 4 landed (on
+  `feat/e2-runtime-events`) — the runtime seams: `extensions::load`
+  binds the mode's UI surface before emitting `session_start` (RPC mode
+  bridges a sink; interactive/print/json stay headless), interactive
+  `!` bash consults `user_bash` handlers (`Operations` runs through the
+  ported `executeBashWithOperations`; `Result` is verbatim; handler
+  failure shows an error with no local fallback), `session_before_switch`
+  / `session_before_compact` gates + `session_shutdown` at `/new`,
+  `/resume`, `/compact` and quit, `context`/`context_with_system`
+  transforms installed at all four `AgentLoopConfig` sites, and the RPC
+  dialog subprotocol in `modes/rpc.rs` (stdin reader thread routes
+  `extension_ui_response` frames to per-request one-slot channels so
+  dialogs block inside command handling without deadlocking the
+  transport; `timeout` → null payload → method default; EOF → shutdown).
+  Remaining: virtual-model routing (`ModelRouteRequest`,
+  `pi.virtual-model-state`) and provider OAuth/streamSimple (slice 5),
+  fork/tree gates (unreachable until fork/tree exist), extension-provided
+  compaction results. Exit: RPC-mode extension
   dialogs match upstream's rpc-extension-ui contract; codemode E1 port
   decided (needs worker-subprocess JS execution).
 - **E3 — TUI bridging**: shortcuts, message/entry/tool renderers, markdown
