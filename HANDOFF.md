@@ -1086,10 +1086,85 @@ pump cadence stands in for upstream's `setInterval`).
     methods resolve with an empty payload → the method default; `custom`
     resolves immediately; fire-and-forget requests are silently dropped.
     Same semantics as the runner's pre-slice-4 behavior, now explicit.
-- **Next**: slice 5 — virtual-model routing, provider OAuth/streamSimple,
-  E3 TUI bridging; golden fixtures per the backlog order.
+- **Slice 5 — virtual-model routing** (on `feat/e2-slice5-virtual-models`):
+  the full port of `core/virtual-models.ts` plus its routing consumers:
+  `crates/pi-coding-agent/src/virtual_models.rs` (catalog construction
+  `createVirtualModel`, `findLatestResponse`, `getVirtualModelState`,
+  `getBranchSelection`, `withVirtualModels`' list semantics, `resolveModel`
+  → `resolve_virtual_model` with `model-runtime.ts:1040-1071`'s verbatim
+  errors), `clampThinkingLevel` (`models.ts:1315-1334`) in
+  `pi-agent/src/types.rs` (+ `ThinkingLevel::EXTENDED_ORDER`), the
+  `pi.registerVirtualModel`/`unregisterVirtualModel` API + route
+  dispatch in `pi-ext-js`, and `TurnRouting` (prepare hook + routed
+  stream fn + state drain) installed at all four loop sites
+  (print/json/rpc/interactive). Selection plumbing: `resolve_model_with`
+  carries virtual entries (`withVirtualModels`), `available_models`
+  appends them outside the auth filter and hides same-id physicals,
+  `/model` completions and `apply_model` (routed-dispatch stream fn)
+  follow, interactive compaction routes its summary request with reason
+  `direct`, and startup (`main.rs`) skips the credential ladder for a
+  virtual selection (the routed provider's credentials decide).
+  Bridge mechanics (upstream semantics, port mechanisms):
+  - Route functions cannot cross `JSON.stringify`, so the definition's
+    `route` stashes JS-side (`__piVirtualModels`, keyed
+    `provider\0id`) with per-extension ownership records cleaned at
+    `__piDiscardExtension` (identity-checked, so a live extension's
+    re-registration survives its own discard); the host calls
+    `runner.route_model(provider, id, request_json)`, which runs the
+    session protocol with kind `"route"` and settles the router's reply.
+  - The branch store is not shared with the loop thread, so
+    `VirtualRouteHook` keeps an in-memory state overlay seeded from the
+    branch; decided `pi.virtual-model-state` entries queue and the host
+    appends them at turn end (`persist_state`).
+  - The prepare hook cannot fail the request, so a routing failure is
+    stored in a shared `RouteErrorSlot` and `RoutedStreamFn` surfaces it
+    as the request's stream error → the run ends with an error response
+    (upstream: routing failure rejects).
+  - `RoutedStreamFn` dispatches per request through the routed model's
+    own provider adapter, re-resolving credentials through the ladder
+    (the `--api-key` flag stays scoped to the selected provider) and
+    failing unrouted virtual requests with the TS message.
+  Tests: 4 `pi-ext-js` route tests (stash + settle + error paths) and
+  11 `virtual_models` tests (pure helpers + 2 `ext-js`-gated
+  `resolve_virtual_model` integration tests). The getBranchSelection
+  fallback semantics were corrected against upstream while testing:
+  a `model_change` only holds when the model is still registered
+  **and** virtual (`change && model && isVirtualModel(model) ? change :
+  response`); otherwise the last physical response wins.
+- **Slice-5 deviations/interpretations**:
+  - Request reason `retry` is unreachable (no retry subsystem yet); the
+    `failed` input is plumbed but nothing produces it.
+  - Upstream's compaction-threshold re-prepare (routing a model that
+    crosses the threshold re-runs `resolveModel`) is deferred — the
+    threshold check keys on the routed model in a later slice.
+  - `entry_appended` is not emitted for the `pi.virtual-model-state`
+    appends (upstream emits it; the port's SessionManager append path
+    has no event yet).
+  - No abort signal crosses into `route()` calls (the runner's calls are
+    synchronous; upstream passes `request.signal`).
+  - Router state persists at end of turn, not mid-turn (mechanism-only;
+    within a turn the overlay reads exactly as the branch would).
+  - Routed-target and `previous`/`failed` lookups read the static
+    catalog only; extension-registered provider models join in slice 6
+    (dynamic providers/OAuth/streamSimple).
+  - `create_virtual_model` defaults a missing `name` to `""` (TS would
+    carry `undefined` through).
+  - `TurnRouting` installs per turn (model is fixed per config) where
+    upstream installs the wrapper unconditionally per session —
+    observable behavior identical.
+- **Next**: slice 6 — dynamic providers (name/config registrations,
+  OAuth, `streamSimple`), then E3 TUI bridging; golden fixtures per the
+  backlog order.
 
 ## Gotchas / decisions
+- **Session-slot errors are JSON strings (E2 slice 5, 2026-11-15)**:
+  every `error:` passed to `__piSessionSettle` must be the `__piErrorText`
+  shape — `JSON.stringify({message, stack})` — because `__piSessionLast`
+  `JSON.parse`s the slot value back into an object. A raw `{message}`
+  object reaches the parser as the string `"[object Object]"` and dies
+  with QuickJS's `unexpected token: 'object'`, masking the real error
+  (hit by the route glue's unregistered-model branch; the user_bash
+  validator already re-stringified for the same reason).
 - **Round-hunting can exercise a stale binary (E2, 2026-11-15)**: a hunt
   script that `find`s the test binary and runs it directly skips the
   rebuild — three deterministic bugs looked flaky across 40+ "green"

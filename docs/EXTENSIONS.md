@@ -546,12 +546,26 @@ fidelity rule applies per phase (deviations recorded as they appear).
   `extension_ui_response` frames to per-request one-slot channels so
   dialogs block inside command handling without deadlocking the
   transport; `timeout` → null payload → method default; EOF → shutdown).
-  Remaining: virtual-model routing (`ModelRouteRequest`,
-  `pi.virtual-model-state`) and provider OAuth/streamSimple (slice 5),
-  fork/tree gates (unreachable until fork/tree exist), extension-provided
-  compaction results. Exit: RPC-mode extension
-  dialogs match upstream's rpc-extension-ui contract; codemode E1 port
-  decided (needs worker-subprocess JS execution).
+  Slice 5 landed (on `feat/e2-slice5-virtual-models`) — virtual-model
+  routing: `core/virtual-models.ts` ported (`resolveModel` with verbatim
+  errors, `createVirtualModel`, branch-state helpers, `withVirtualModels`
+  list semantics) plus `clampThinkingLevel`; `pi.registerVirtualModel` /
+  `unregisterVirtualModel` stash the definition's `route` function
+  JS-side (it cannot cross `JSON.stringify`) and the host drives it
+  through a `route` session kind (`ExtensionRunner::route_model`);
+  `TurnRouting` (prepare hook + routed per-request stream dispatch +
+  state drain) installs at all four loop sites, and the selection
+  surfaces (`--model` resolution, `available_models`, `/model`
+  completions, `apply_model`, interactive compaction's direct reason)
+  carry virtual entries. Deviations (HANDOFF.md): no `retry` reason, no
+  abort signal into `route()`, state persists end-of-turn, no
+  `entry_appended` emission, routed-target/previous lookups read the
+  static catalog only, threshold re-prepare deferred.
+  Remaining: provider OAuth/streamSimple + extension-provider models in
+  the routing resolvers (slice 6), fork/tree gates (unreachable until
+  fork/tree exist), extension-provided compaction results. Exit: RPC-mode
+  extension dialogs match upstream's rpc-extension-ui contract; codemode
+  E1 port decided (needs worker-subprocess JS execution).
 - **E3 — TUI bridging**: shortcuts, message/entry/tool renderers, markdown
   transformers, widgets-as-components, `ctx.ui.custom` with overlay handles,
   editor component, autocomplete, themes; component handles crossing as

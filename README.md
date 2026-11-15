@@ -12,7 +12,9 @@ selector dialogs and fullscreen mode (`--tui-mode regular` opts out).
 Not at feature parity yet: the extensions headless core has landed
 (`pi-ext-js` — embedded QuickJS host, TypeScript transpile, the extension
 runner with upstream dispatch semantics; upstream's bundled `tool-search`
-extension runs identically) while the UI-over-protocol wiring and the MCP
+extension runs identically) together with the UI-over-protocol wiring
+(dialogs, `user_bash`, context transforms, RPC dialog subprotocol) and
+virtual-model routing, while the TUI renderer bridging (E3) and the MCP
 tool bridge are still landing. See [PLAN.md](PLAN.md) for the
 phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
 
@@ -57,7 +59,7 @@ phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
 | `pi-agent` | `@earendil-works/pi-agent-core` | agent loop with steering/follow-up queues, transcript, events |
 | `pi-tui` | `@earendil-works/pi-tui` | differential renderer, editor, fuzzy/autocomplete, mouse, alt screen, theme |
 | `pi-mcp` | `@earendil-works/pi-mcp` | JSON-RPC types + stdio transport client (HTTP transport + tool bridge pending) |
-| `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, `tool-search` exit gate (headless; UI wiring pending) |
+| `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, UI dialogs over protocol, `user_bash`, context transforms, RPC dialog subprotocol, virtual-model routing (`tool-search` exit gate green; TUI renderer bridging pending) |
 | `pi-codemode` | `@earendil-works/pi-codemode` | stub |
 | `pi-coding-agent` (`pi` binary) | `@earendil-works/pi-coding-agent` | CLI, print/JSON/RPC/interactive modes, session store, tools, auth |
 
