@@ -822,7 +822,11 @@ impl InteractiveMode {
     /// `custom_message`, `branch_summary` (forking is unported), and the
     /// cache-miss/cache-warm usage notices (`showCacheMissNotices` is not
     /// ported). `bashExecution` rows likewise (upstream's `!` persistence).
-    fn render_session_entries(&mut self, entries: &[crate::session::records::SessionEntry], populate_history: bool) {
+    fn render_session_entries(
+        &mut self,
+        entries: &[crate::session::records::SessionEntry],
+        populate_history: bool,
+    ) {
         self.pending_tools.clear();
         let mut rendered_pending: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
@@ -846,7 +850,8 @@ impl InteractiveMode {
                     row.set_expanded(self.tool_output_expanded);
                     self.add_to_chat(Box::new(row));
                     if let Some(usage) = &compaction.usage {
-                        let tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+                        let tokens =
+                            usage.input + usage.output + usage.cache_read + usage.cache_write;
                         let cost = if usage.cost.total >= 0.01 {
                             format!(" (~${:.2})", usage.cost.total)
                         } else {
@@ -915,8 +920,7 @@ impl InteractiveMode {
                 component.update_content(assistant, false);
                 self.add_to_chat(Box::new(component));
                 let aborted = assistant.stop_reason == pi_ai::types::StopReason::Aborted;
-                let failed = aborted
-                    || assistant.stop_reason == pi_ai::types::StopReason::Error;
+                let failed = aborted || assistant.stop_reason == pi_ai::types::StopReason::Error;
                 for block in &assistant.content {
                     let pi_ai::types::AssistantContent::ToolCall(call) = block else {
                         continue;
@@ -3013,8 +3017,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         // A persisted session with a full round trip: user prompt, assistant
         // tool call, tool result, final answer.
-        let mut session =
-            SessionManager::create(dir.path(), None, &NewSessionOptions::default()).expect("session");
+        let mut session = SessionManager::create(dir.path(), None, &NewSessionOptions::default())
+            .expect("session");
         session
             .append_message(AgentMessage::User(UserMessage {
                 content: UserContent::Text("list the files".to_string()),
