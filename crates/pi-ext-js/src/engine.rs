@@ -891,6 +891,7 @@ export default function (pi) {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // exercises the full op surface in one host
     fn ops_serve_settings_flags_tools_and_mcp() {
         let host = host();
         let index = host.begin_extension("<test>").expect("begin");
