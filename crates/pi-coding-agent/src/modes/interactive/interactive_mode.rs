@@ -45,6 +45,7 @@ use super::components::assistant_message::AssistantMessageComponent;
 use super::components::footer::{FooterComponent, FooterData, UsageTotals};
 use super::components::header::{BuiltInHeader, pi_logo_lines};
 use super::components::model_selector::{ModelSelectorComponent, ModelSelectorEvent};
+use super::components::session_selector::{SessionSelectorComponent, SessionSelectorEvent};
 use super::components::settings_selector::{
     SettingsSelectorComponent, SettingsSelectorConfig, SettingsSelectorEvent,
 };
@@ -363,6 +364,7 @@ pub struct InteractiveMode {
     trust_selector_events: Option<Arc<Mutex<Vec<TrustSelectorEvent>>>>,
     /// Events from the mounted `/settings` dialog, same queue pattern.
     settings_selector_events: Option<Arc<Mutex<Vec<SettingsSelectorEvent>>>>,
+    session_selector_events: Option<Arc<Mutex<Vec<SessionSelectorEvent>>>>,
     /// The editor, parked while the selector occupies its tree slot.
     suspended_editor: Option<Box<dyn Component>>,
     /// Where provider credentials live (`auth.json`).
@@ -498,6 +500,7 @@ impl InteractiveMode {
             model_selector_events: None,
             trust_selector_events: None,
             settings_selector_events: None,
+            session_selector_events: None,
             suspended_editor: None,
             auth_path: options
                 .auth_path
@@ -647,6 +650,7 @@ impl InteractiveMode {
             autocomplete::SlashCommand::new("compact", "Manually compact the session context"),
             autocomplete::SlashCommand::new("trust", "Show the project trust options"),
             autocomplete::SlashCommand::new("settings", "Open settings menu"),
+            autocomplete::SlashCommand::new("resume", "Resume another session"),
             autocomplete::SlashCommand::new("thinking", "Set thinking level")
                 .with_argument_hint("<level>")
                 .with_argument_completions(Arc::new(|prefix: &str| {
@@ -1276,6 +1280,11 @@ impl InteractiveMode {
         // `/settings` (`interactive-mode.ts:2653-2655`).
         if text == "/settings" {
             self.open_settings_selector();
+            return;
+        }
+        // `/resume` (`interactive-mode.ts:2783-2786`).
+        if text == "/resume" {
+            self.open_session_selector();
             return;
         }
         // `/compact [instructions]` (`interactive-mode.ts:3434-3439`).
@@ -2540,6 +2549,96 @@ impl InteractiveMode {
         }
     }
 
+    /// Mount the `/resume` dialog in the editor's tree slot
+    /// (`showSessionSelector`, `interactive-mode.ts:4900-4926`).
+    fn open_session_selector(&mut self) {
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let selector = SessionSelectorComponent::new(
+            self.session.get_cwd(),
+            Some(self.session.get_session_dir()),
+            self.session.uses_default_session_dir(),
+            self.session.session_file(),
+            Arc::clone(&events),
+        );
+        let editor = self.tui.replace_child(EDITOR_INDEX, Box::new(selector));
+        self.suspended_editor = Some(editor);
+        self.session_selector_events = Some(events);
+        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
+        self.tui.request_render();
+    }
+
+    /// Put the editor back after the resume dialog closes.
+    fn close_session_selector(&mut self) {
+        if self.suspended_editor.is_none() {
+            return;
+        }
+        let editor = self.suspended_editor.take().expect("suspended editor");
+        let _ = self.tui.replace_child(EDITOR_INDEX, editor);
+        self.session_selector_events = None;
+        self.tui.set_focus(Some(FocusTarget::Root(EDITOR_INDEX)));
+        self.tui.request_render();
+    }
+
+    /// `handleResumeSession` (`interactive-mode.ts:4928-4974`): swap the
+    /// session store and replay the target's transcript. Deviation: upstream
+    /// rebuilds the whole runtime for the target's cwd (extensions, tools,
+    /// trust); the port keeps the startup runtime and only swaps the
+    /// session, so a foreign-cwd session keeps this cwd's tool bindings.
+    fn switch_session(&mut self, session_path: &std::path::Path) {
+        if self.agent_run.is_some() {
+            self.abort_active_run();
+        }
+        let session_dir = Some(self.session.get_session_dir().to_path_buf());
+        match SessionManager::open(session_path, session_dir.as_deref(), None) {
+            Ok(session) => {
+                self.session = session;
+                self.active_prompt = None;
+                self.queued_deliveries.clear();
+                self.pending_tools.clear();
+                self.streaming_index = None;
+                self.compaction_run = None;
+                self.render_initial_messages();
+                self.refresh_footer();
+                self.show_status("Resumed session");
+            }
+            Err(error) => {
+                self.show_status(&format!("Failed to resume session: {error}"));
+            }
+        }
+    }
+
+    /// The `/resume` dialog's events (`showSessionSelector`'s callbacks,
+    /// `interactive-mode.ts:4910-4917`).
+    fn handle_session_event(&mut self, event: SessionSelectorEvent) {
+        match event {
+            SessionSelectorEvent::Selected(path) => {
+                self.close_session_selector();
+                self.switch_session(&path);
+            }
+            SessionSelectorEvent::Cancel => self.close_session_selector(),
+        }
+    }
+
+    fn pump_session_selector(&mut self) {
+        if self.session_selector_events.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .session_selector_events
+                .as_ref()
+                .expect("session selector")
+                .lock()
+                .expect("session selector events"),
+        );
+        for event in events {
+            self.handle_session_event(event);
+        }
+    }
+
     /// One loop iteration without terminal input: editor events, agent
     /// events, spinner frames. `run` calls this between input polls; the
     /// scripted tests drive it directly with a capture terminal.
@@ -2562,6 +2661,7 @@ impl InteractiveMode {
         self.pump_model_selector();
         self.pump_trust_selector();
         self.pump_settings_selector();
+        self.pump_session_selector();
 
         // Agent events, without blocking the input loop: collect first,
         // then handle, so the run borrow ends before the handlers run.
