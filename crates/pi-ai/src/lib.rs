@@ -34,6 +34,7 @@ pub mod types;
 
 pub use constrained_sampling::{ConstrainedSampling, GrammarFormat, GrammarVariants, StrictMode};
 pub use event_stream::AssistantMessageEventStream;
+pub use types::get_supported_thinking_levels;
 pub use types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, ContentBlock, Context, InputContent,
     KnownApi, Message, Model, StopReason, StreamOptions, SystemMessage, ThinkingLevel, Tool,

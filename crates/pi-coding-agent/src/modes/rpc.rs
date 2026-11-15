@@ -570,6 +570,15 @@ fn run_agent_turn(
     let mut queues = Queues::new();
     let mut sink = RpcEventSink { writer: output };
     let signal = AbortSignal::new();
+    // Under a virtual selection every request routes first
+    // (`_installAgentRequestProjection`).
+    #[cfg(feature = "ext-js")]
+    let routing = crate::virtual_models::TurnRouting::install(
+        &runtime.model,
+        runtime.extension_runner.as_ref(),
+        runtime.api_key.clone(),
+        &runtime.session,
+    );
     let config = AgentLoopConfig {
         model: runtime.model.clone(),
         thinking_level: runtime.thinking_level,
@@ -583,12 +592,24 @@ fn run_agent_turn(
             after: None,
         },
         finish_turn: None,
+        #[cfg(feature = "ext-js")]
+        prepare_request: routing.as_ref().map(|routing| {
+            Arc::clone(&routing.hook) as Arc<dyn pi_agent::agent_loop::PrepareRequest>
+        }),
+        #[cfg(not(feature = "ext-js"))]
         prepare_request: None,
         prepare_next_turn: None,
         transform_context: runtime.transform_context(),
         convert_to_llm: Arc::new(DefaultConvertToLlm),
     };
 
+    #[cfg(feature = "ext-js")]
+    let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = match &routing {
+        Some(routing) => routing.stream_fn(),
+        None => Arc::clone(&runtime.stream_fn),
+    };
+    #[cfg(not(feature = "ext-js"))]
+    let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = Arc::clone(&runtime.stream_fn);
     let new_messages = crate::runtime::block_on(pi_agent::run_agent_loop(
         user_prompts,
         context,
@@ -597,8 +618,12 @@ fn run_agent_turn(
         &mut queues,
         &mut sink,
         &signal,
-        runtime.stream_fn.as_ref(),
+        loop_stream_fn.as_ref(),
     ));
+    #[cfg(feature = "ext-js")]
+    if let Some(routing) = &routing {
+        routing.persist_state(&mut runtime.session);
+    }
 
     for message in &new_messages {
         runtime

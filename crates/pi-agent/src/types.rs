@@ -68,6 +68,55 @@ impl ThinkingLevel {
             _ => None,
         }
     }
+
+    /// The levels in pi's `EXTENDED_THINKING_LEVELS` order (`models.ts:1294`),
+    /// lowest first.
+    pub const EXTENDED_ORDER: [ThinkingLevel; 7] = [
+        ThinkingLevel::Off,
+        ThinkingLevel::Minimal,
+        ThinkingLevel::Low,
+        ThinkingLevel::Medium,
+        ThinkingLevel::High,
+        ThinkingLevel::Xhigh,
+        ThinkingLevel::Max,
+    ];
+}
+
+/// `clampThinkingLevel` (`packages/ai/src/models.ts:1315-1334`): snap a
+/// requested level onto a model's supported levels — the level itself when
+/// supported, else the nearest supported level by index distance
+/// (high-before-low on ties from the requested index outward), else the
+/// lowest supported level.
+pub fn clamp_thinking_level(model: &pi_ai::types::Model, level: ThinkingLevel) -> ThinkingLevel {
+    let available = pi_ai::get_supported_thinking_levels(model);
+    let parse = |name: &str| ThinkingLevel::parse(name).unwrap_or(ThinkingLevel::Off);
+    if available
+        .iter()
+        .any(|candidate| *candidate == level.as_str())
+    {
+        return level;
+    }
+    let requested = ThinkingLevel::EXTENDED_ORDER
+        .iter()
+        .position(|candidate| *candidate == level);
+    let Some(requested) = requested else {
+        return available
+            .first()
+            .map_or(ThinkingLevel::Off, |name| parse(name));
+    };
+    for candidate in ThinkingLevel::EXTENDED_ORDER.iter().skip(requested) {
+        if available.contains(&candidate.as_str()) {
+            return *candidate;
+        }
+    }
+    for candidate in ThinkingLevel::EXTENDED_ORDER.iter().take(requested).rev() {
+        if available.contains(&candidate.as_str()) {
+            return *candidate;
+        }
+    }
+    available
+        .first()
+        .map_or(ThinkingLevel::Off, |name| parse(name))
 }
 
 /// pi's `ToolExecutionMode`.

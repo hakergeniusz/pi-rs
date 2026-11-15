@@ -41,6 +41,9 @@ pub enum ContextKind {
     Tool,
     /// The reduced project-trust context (`cwd`, `mode`, `hasUI`, `ui`).
     ProjectTrust,
+    /// The routing context: the base event context for a virtual model's
+    /// `route` call (`runtime.createContext()`, loader.ts:518).
+    Route,
 }
 
 /// The host actions an embedder overrides; everything defaults to the
@@ -773,6 +776,7 @@ impl JsHost {
             ContextKind::Command => "command",
             ContextKind::Tool => "tool",
             ContextKind::ProjectTrust => "trust",
+            ContextKind::Route => "route",
         };
         self.ctx.with(|ctx| -> Result<u32, JsHostError> {
             let begin: Function = ctx.globals().get("__piSessionBegin")?;
@@ -834,6 +838,24 @@ impl JsHost {
             let call: Function = ctx.globals().get("__piSessionCallTool")?;
             let _: Value = call
                 .call((id, index, name, tool_call_id))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
+    /// Calls a virtual model's `route` inside a session
+    /// (`__piSessionCallRoute`); the session event is the routing request
+    /// the host built, the reply lands in the session slot.
+    pub fn session_call_route(
+        &self,
+        id: u32,
+        provider: &str,
+        model_id: &str,
+    ) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx.globals().get("__piSessionCallRoute")?;
+            let _: Value = call
+                .call((id, provider, model_id))
                 .map_err(|err| Self::js_error(&ctx, err))?;
             Ok(())
         })

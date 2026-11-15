@@ -45,3 +45,6 @@ pub mod session;
 pub mod skills;
 /// The built-in tools — read, bash, edit, write, ls, find, grep — plus renderers.
 pub mod tools;
+/// Virtual models: catalog entries routing each request to a physical model
+/// (`core/virtual-models.ts` plus the routing consumers).
+pub mod virtual_models;

@@ -20,7 +20,7 @@ use pi_coding_agent::extensions;
 use pi_coding_agent::modes::json_event::run_json_mode;
 use pi_coding_agent::modes::print_mode::{
     PrintModeOptions, PrintRuntime, ProviderStreamFn, WireCredential, parse_model_pattern,
-    resolve_model, resolve_wire_credential, run_print_mode, select_tools, system_prompt_for,
+    resolve_model_with, resolve_wire_credential, run_print_mode, select_tools, system_prompt_for,
     thinking_level_from_str,
 };
 use pi_coding_agent::modes::rpc::run_rpc_mode;
@@ -237,43 +237,85 @@ fn build_runtime_with_ui(
         },
     );
 
-    // Model: --model pattern, else the settings default.
+    // Model: --model pattern, else the settings default. The surface also
+    // carries extension-registered virtual models (`withVirtualModels`).
+    #[cfg(feature = "ext-js")]
+    let virtual_models = pi_coding_agent::virtual_models::virtual_models_from_defs(
+        &extensions
+            .host
+            .runner()
+            .map(|runner| {
+                runner
+                    .lock()
+                    .expect("extension runner mutex poisoned")
+                    .virtual_models()
+            })
+            .unwrap_or_default(),
+    );
+    #[cfg(not(feature = "ext-js"))]
+    let virtual_models: Vec<pi_ai::types::Model> = Vec::new();
     let pattern = args.model.as_deref().map(parse_model_pattern);
-    let model = resolve_model(
+    let model = resolve_model_with(
         pattern.as_ref(),
         settings.get_default_provider().as_deref(),
         settings.get_default_model().as_deref(),
+        &virtual_models,
     )?;
 
     // Credential ladder: flag > auth.json > provider env vars. OAuth tokens
-    // resolve as bearer credentials, distinct from API keys.
-    let (api_key, access_token) = resolve_wire_credential(
-        &model.provider,
-        args.api_key.as_deref(),
-        &config::get_auth_path(),
-    )
-    .map_or((None, None), |(credential, source)| {
-        if source == "environment" {
-            eprintln!("pi-rs: using {} key from environment", model.provider);
-        }
-        match credential {
-            WireCredential::ApiKey(key) => (Some(key), None),
-            WireCredential::AccessToken(token) => (None, Some(token)),
-        }
-    });
-    if api_key.is_none() && access_token.is_none() {
+    // resolve as bearer credentials, distinct from API keys. A virtual
+    // selection defers the check to routing (the routed provider's
+    // credentials decide).
+    let wire: (Option<String>, Option<String>) =
+        if pi_coding_agent::virtual_models::is_virtual_model(&model) {
+            (None, None)
+        } else {
+            resolve_wire_credential(
+                &model.provider,
+                args.api_key.as_deref(),
+                &config::get_auth_path(),
+            )
+            .map_or((None, None), |(credential, source)| {
+                if source == "environment" {
+                    eprintln!("pi-rs: using {} key from environment", model.provider);
+                }
+                match credential {
+                    WireCredential::ApiKey(key) => (Some(key), None),
+                    WireCredential::AccessToken(token) => (None, Some(token)),
+                }
+            })
+        };
+    let (api_key, access_token) = wire;
+    if api_key.is_none()
+        && access_token.is_none()
+        && !pi_coding_agent::virtual_models::is_virtual_model(&model)
+    {
         return Err(format!(
             "No API key for provider {}. Run `pi auth login --provider {}`, set the provider's environment variable, or pass --api-key.",
             model.provider, model.provider
         ));
     }
 
-    let Some(stream_fn) = providers::stream_fn_for(&model.api) else {
-        return Err(format!(
-            "No provider adapter for api \"{}\" (model {}/{}).",
-            model.api, model.provider, model.id
-        ));
-    };
+    // Under a virtual selection the stream dispatches per routed model
+    // (`withVirtualModels`' `unroutedStream` fails unrouted requests with the
+    // TS message); physical selections bind one adapter.
+    let stream_fn: Arc<dyn pi_agent::types::StreamFn> =
+        if pi_coding_agent::virtual_models::is_virtual_model(&model) {
+            Arc::new(pi_coding_agent::virtual_models::RoutedStreamFn {
+                selected_provider: model.provider.clone(),
+                flag_api_key: args.api_key.clone(),
+                auth_path: config::get_auth_path(),
+                route_error: Arc::new(pi_coding_agent::virtual_models::RouteErrorSlot::default()),
+            })
+        } else {
+            let Some(stream_fn) = providers::stream_fn_for(&model.api) else {
+                return Err(format!(
+                    "No provider adapter for api \"{}\" (model {}/{}).",
+                    model.api, model.provider, model.id
+                ));
+            };
+            Arc::new(ProviderStreamFn(stream_fn))
+        };
 
     // Session: --no-session is ephemeral, --continue resumes the most recent
     // session for this cwd, --session opens by path, --session-id reuses or
@@ -335,7 +377,7 @@ fn build_runtime_with_ui(
         thinking_level,
         api_key,
         access_token,
-        stream_fn: Arc::new(ProviderStreamFn(stream_fn)),
+        stream_fn,
         executor,
         system_prompt,
         session,

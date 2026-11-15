@@ -226,6 +226,7 @@ impl<W: Write> AgentEventSink for JsonEventSink<W> {
 /// [`crate::modes::print_mode::run_print_mode`], JSONL output. Returns the
 /// process exit code with the same contract as text mode: 1 when the last
 /// assistant message errored or was aborted, else 0.
+#[allow(clippy::too_many_lines)] // mirrors print-mode.ts's run loop; split when extending
 pub fn run_json_mode(
     runtime: &mut PrintRuntime,
     options: &PrintModeOptions,
@@ -288,6 +289,15 @@ pub fn run_json_mode(
     let mut queues = Queues::new();
     let mut sink = JsonEventSink::new(io::stdout().lock());
     let signal = AbortSignal::new();
+    // Under a virtual selection every request routes first
+    // (`_installAgentRequestProjection`).
+    #[cfg(feature = "ext-js")]
+    let routing = crate::virtual_models::TurnRouting::install(
+        &runtime.model,
+        runtime.extension_runner.as_ref(),
+        runtime.api_key.clone(),
+        &runtime.session,
+    );
     let config = AgentLoopConfig {
         model: runtime.model.clone(),
         thinking_level: runtime.thinking_level,
@@ -301,12 +311,24 @@ pub fn run_json_mode(
             after: None,
         },
         finish_turn: None,
+        #[cfg(feature = "ext-js")]
+        prepare_request: routing.as_ref().map(|routing| {
+            Arc::clone(&routing.hook) as Arc<dyn pi_agent::agent_loop::PrepareRequest>
+        }),
+        #[cfg(not(feature = "ext-js"))]
         prepare_request: None,
         prepare_next_turn: None,
         transform_context: runtime.transform_context(),
         convert_to_llm: Arc::new(DefaultConvertToLlm),
     };
 
+    #[cfg(feature = "ext-js")]
+    let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = match &routing {
+        Some(routing) => routing.stream_fn(),
+        None => Arc::clone(&runtime.stream_fn),
+    };
+    #[cfg(not(feature = "ext-js"))]
+    let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = Arc::clone(&runtime.stream_fn);
     let new_messages = crate::runtime::block_on(pi_agent::run_agent_loop(
         prompts,
         context,
@@ -315,9 +337,13 @@ pub fn run_json_mode(
         &mut queues,
         &mut sink,
         &signal,
-        runtime.stream_fn.as_ref(),
+        loop_stream_fn.as_ref(),
     ));
     sink.flush();
+    #[cfg(feature = "ext-js")]
+    if let Some(routing) = &routing {
+        routing.persist_state(&mut runtime.session);
+    }
 
     for message in &new_messages {
         runtime

@@ -165,6 +165,16 @@ pub fn run_print_mode(
     let mut queues = Queues::new();
     let mut sink = CollectingSink { events: Vec::new() };
     let signal = AbortSignal::new();
+    // Under a virtual selection every request routes first
+    // (`_installAgentRequestProjection`): the hook replaces the model per
+    // request and the stream dispatches per routed model.
+    #[cfg(feature = "ext-js")]
+    let routing = crate::virtual_models::TurnRouting::install(
+        &runtime.model,
+        runtime.extension_runner.as_ref(),
+        runtime.api_key.clone(),
+        &runtime.session,
+    );
     let config = AgentLoopConfig {
         model: runtime.model.clone(),
         thinking_level: runtime.thinking_level,
@@ -178,12 +188,24 @@ pub fn run_print_mode(
             after: None,
         },
         finish_turn: None,
+        #[cfg(feature = "ext-js")]
+        prepare_request: routing.as_ref().map(|routing| {
+            Arc::clone(&routing.hook) as Arc<dyn pi_agent::agent_loop::PrepareRequest>
+        }),
+        #[cfg(not(feature = "ext-js"))]
         prepare_request: None,
         prepare_next_turn: None,
         transform_context: runtime.transform_context(),
         convert_to_llm: Arc::new(DefaultConvertToLlm),
     };
 
+    #[cfg(feature = "ext-js")]
+    let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = match &routing {
+        Some(routing) => routing.stream_fn(),
+        None => Arc::clone(&runtime.stream_fn),
+    };
+    #[cfg(not(feature = "ext-js"))]
+    let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = Arc::clone(&runtime.stream_fn);
     let new_messages = crate::runtime::block_on(pi_agent::run_agent_loop(
         prompts,
         context,
@@ -192,8 +214,14 @@ pub fn run_print_mode(
         &mut queues,
         &mut sink,
         &signal,
-        runtime.stream_fn.as_ref(),
+        loop_stream_fn.as_ref(),
     ));
+    // Router state decided this turn lands on the branch now (upstream
+    // appends mid-turn; the store is not shared with the loop thread).
+    #[cfg(feature = "ext-js")]
+    if let Some(routing) = &routing {
+        routing.persist_state(&mut runtime.session);
+    }
 
     // Persist the turn (`print-mode.ts` persists via MessageEnd events; the
     // completed-run bytes are identical).
@@ -338,26 +366,57 @@ pub fn resolve_model(
     default_provider: Option<&str>,
     default_model: Option<&str>,
 ) -> Result<Model, String> {
+    resolve_model_with(pattern, default_provider, default_model, &[])
+}
+
+/// [`resolve_model`] over a surface that also carries extension-registered
+/// virtual models (`withVirtualModels`): a virtual model hides a physical
+/// catalog model with the same (provider, id), and bare-id patterns match
+/// virtual models too.
+pub fn resolve_model_with(
+    pattern: Option<&ModelPattern>,
+    default_provider: Option<&str>,
+    default_model: Option<&str>,
+    virtual_models: &[Model],
+) -> Result<Model, String> {
+    let lookup = |provider: &str, id: &str| -> Option<Model> {
+        virtual_models
+            .iter()
+            .find(|model| model.provider == provider && model.id == id)
+            .cloned()
+            .or_else(|| catalog::catalog().get(provider, id).cloned())
+    };
     let Some(pattern) = pattern else {
         // Fall back to the settings default; otherwise ask for a model.
         return match (default_provider, default_model) {
-            (Some(provider), Some(id)) => catalog::catalog()
-                .get(provider, id)
-                .cloned()
+            (Some(provider), Some(id)) => lookup(provider, id)
                 .ok_or_else(|| format!("Default model not found in catalog: {provider}/{id}")),
             _ => Err("No model specified. Use --model <pattern> (e.g. anthropic/claude-sonnet-4) or set defaultProvider/defaultModel in settings".to_string()),
         };
     };
     let found = if let Some(provider) = &pattern.provider {
-        catalog::catalog()
-            .get(provider, &pattern.id)
-            .cloned()
+        lookup(provider, &pattern.id)
             .ok_or_else(|| format!("Model not found: {provider}/{}", pattern.id))?
     } else {
-        let matches = catalog::catalog().find(&pattern.id);
+        let mut matches: Vec<Model> = virtual_models
+            .iter()
+            .filter(|model| model.id == pattern.id)
+            .cloned()
+            .collect();
+        matches.extend(
+            catalog::catalog()
+                .find(&pattern.id)
+                .into_iter()
+                .filter(|model| {
+                    !virtual_models.iter().any(|virtual_model| {
+                        virtual_model.provider == model.provider && virtual_model.id == model.id
+                    })
+                })
+                .cloned(),
+        );
         match matches.len() {
             0 => return Err(format!("Model not found: {}", pattern.id)),
-            1 => matches[0].clone(),
+            1 => matches.remove(0),
             _ => {
                 let candidates: Vec<String> = matches
                     .iter()

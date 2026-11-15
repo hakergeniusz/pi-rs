@@ -1506,6 +1506,35 @@ impl ExtensionRunner {
             .collect()
     }
 
+    /// Calls a virtual model's `route` with the request the host built
+    /// (`ModelRuntime.resolveModel`'s `virtual.route(request)` leg,
+    /// `model-runtime.ts:1059-1065`); the reply is the router's
+    /// `{model, thinkingLevel, state?}`. The request crosses as the session
+    /// event; dialog-like settling applies (promises drain through the job
+    /// queue before the slot is read).
+    pub fn route_model(
+        &mut self,
+        provider: &str,
+        model_id: &str,
+        request: &Json,
+    ) -> Result<Option<Json>, JsHostError> {
+        let payload =
+            serde_json::to_string(request).map_err(|err| JsHostError::Job(err.to_string()))?;
+        let id = self
+            .host
+            .session_begin(&payload, ContextKind::Route, None)?;
+        let call = self.host.session_call_route(id, provider, model_id);
+        let outcome = match call.and_then(|()| self.settle_session(id)) {
+            Ok(()) => parse_session_outcome(&self.host.session_last(id)?),
+            Err(err) => {
+                let _ = self.host.session_end(id);
+                return Err(err);
+            }
+        };
+        let _ = self.host.session_end(id);
+        Self::outcome_result(outcome.map_err(|err| JsHostError::Job(err.to_string()))?)
+    }
+
     /// Provider registrations that failed validation at the bind-time
     /// flush, in flush order (upstream's bindCore `emitError` reports,
     /// `runner.ts:470-521`).
@@ -2184,6 +2213,153 @@ export default function (pi) {
             errors[1].error,
             "Handler removed the leading system message; the request has no prompt or initial tool declarations. Keep it at index 0 or replace a dropped prefix with getCurrentSystemMessage()."
         );
+    }
+
+    /// A virtual model whose router answers from the request: it picks the
+    /// target by the state, mirrors the thinking level, throws on demand,
+    /// and can be async.
+    const EXT_VIRTUAL_ROUTER: &str = r#"
+export default function (pi) {
+  pi.registerVirtualModel({
+    provider: "acme",
+    id: "router",
+    name: "Router",
+    route: (request) => {
+      if (request.reason === "boom") throw new Error("router exploded");
+      if (request.reason === "async") return Promise.resolve({
+        model: { provider: "anthropic", id: "claude-async", api: "anthropic-messages" },
+        thinkingLevel: "low",
+      });
+      return {
+        model: {
+          provider: "anthropic",
+          id: request.state === "pro" ? "claude-pro" : "claude-x",
+          api: "anthropic-messages",
+        },
+        thinkingLevel: request.thinkingLevel,
+        state: request.reason === "user" ? { picked: request.messages.length } : request.state,
+      };
+    },
+  });
+}
+"#;
+
+    /// A factory that registers and then dies: the registration must die
+    /// with the record (the route function is stashed JS-side, so the
+    /// discard has to clean it).
+    const EXT_VIRTUAL_FAIL: &str = r#"
+export default function (pi) {
+  pi.registerVirtualModel({ provider: "acme", id: "ghost", name: "Ghost", route: () => ({}) });
+  throw new Error("factory died");
+}
+"#;
+
+    fn exception_of(error: JsHostError) -> String {
+        match error {
+            JsHostError::JsException(message) => message,
+            other => panic!("expected a JS exception, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_model_invokes_the_stashed_route_function() {
+        let mut runner = runner_with(&[EXT_VIRTUAL_ROUTER]);
+        // The whole request the host built crosses as the session event.
+        let reply = runner
+            .route_model(
+                "acme",
+                "router",
+                &json!({
+                    "reason": "user",
+                    "thinkingLevel": "high",
+                    "messages": [{ "role": "user", "content": "hi" }, { "role": "assistant", "content": "hey" }],
+                }),
+            )
+            .expect("route")
+            .expect("route reply");
+        assert_eq!(
+            reply.get("model"),
+            Some(
+                &json!({ "provider": "anthropic", "id": "claude-x", "api": "anthropic-messages" })
+            )
+        );
+        assert_eq!(reply.get("thinkingLevel"), Some(&json!("high")));
+        // The router's new state rides the reply.
+        assert_eq!(reply.get("state"), Some(&json!({ "picked": 2 })));
+    }
+
+    #[test]
+    fn route_model_round_trips_state_and_async_routers_settle() {
+        let mut runner = runner_with(&[EXT_VIRTUAL_ROUTER]);
+        // Continuation with state: the router echoes it back unchanged.
+        let reply = runner
+            .route_model(
+                "acme",
+                "router",
+                &json!({ "reason": "continuation", "thinkingLevel": "off", "state": "pro" }),
+            )
+            .expect("route")
+            .expect("route reply");
+        assert_eq!(
+            reply.get("model"),
+            Some(
+                &json!({ "provider": "anthropic", "id": "claude-pro", "api": "anthropic-messages" })
+            )
+        );
+        assert_eq!(reply.get("state"), Some(&json!("pro")));
+        // An async router settles through the job queue before the slot is
+        // read.
+        let reply = runner
+            .route_model("acme", "router", &json!({ "reason": "async" }))
+            .expect("route")
+            .expect("route reply");
+        assert_eq!(
+            reply.get("model"),
+            Some(
+                &json!({ "provider": "anthropic", "id": "claude-async", "api": "anthropic-messages" })
+            )
+        );
+    }
+
+    #[test]
+    fn route_model_reports_router_errors_and_unregistered_models() {
+        let mut runner = runner_with(&[EXT_VIRTUAL_ROUTER]);
+        let message = exception_of(
+            runner
+                .route_model("acme", "router", &json!({ "reason": "boom" }))
+                .expect_err("router throws"),
+        );
+        assert_eq!(message, "router exploded");
+        // No stash entry: the glue answers with the TS error message.
+        let message = exception_of(
+            runner
+                .route_model("acme", "missing", &json!({}))
+                .expect_err("not registered"),
+        );
+        assert_eq!(message, "Virtual model acme/missing is not registered.");
+    }
+
+    #[test]
+    fn route_model_of_a_failed_extension_is_not_registered() {
+        let mut runner = ExtensionRunner::new(HostCore {
+            cwd: "/tmp".to_string(),
+            mode: "print".to_string(),
+            settings: json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        assert!(
+            runner
+                .load_extension("<test-0>", Some(EXT_VIRTUAL_FAIL))
+                .is_err()
+        );
+        runner.bind().expect("bind");
+        let message = exception_of(
+            runner
+                .route_model("acme", "ghost", &json!({}))
+                .expect_err("discard cleaned the stash"),
+        );
+        assert_eq!(message, "Virtual model acme/ghost is not registered.");
     }
 
     #[test]

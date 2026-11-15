@@ -63,6 +63,12 @@ globalThis.__piRuntime = {
   pendingNativeProviderRegistrations: [],
   pendingVirtualModelRegistrations: [],
 };
+
+// The `route` functions of registered virtual models, keyed
+// `provider\0id` (model-runtime.ts:97-182 `virtualModels`). Definitions
+// cross to the host as JSON — which drops functions — so the callable stays
+// here and the host invokes it per request through the routing protocol.
+globalThis.__piVirtualModels = new Map();
 globalThis.__piExtensions = [];
 globalThis.__piExtState = [];
 
@@ -108,6 +114,10 @@ globalThis.__piBeginExtension = function (path) {
     flags: {},
     busSubscriptions: [],
     pendingChanges: [],
+    // The virtual-model definitions this extension registered, for cleanup
+    // when the record is discarded (the route functions live in
+    // __piVirtualModels keyed by the definitions' provider/id).
+    virtualModels: [],
   });
   globalThis.__piExtState.push("loading");
   return globalThis.__piExtensions.length - 1;
@@ -194,6 +204,15 @@ globalThis.__piDiscardExtension = function (extIdx) {
   globalThis.__piExtState[extIdx] = "failed";
   const ext = globalThis.__piExtensions[extIdx];
   for (const unsubscribe of ext.busSubscriptions) unsubscribe();
+  // A failed extension's virtual models die with its record (the deferred
+  // registration never applies — loader.ts:269-277). Only the entries this
+  // extension still owns are removed, so a re-registration by a live
+  // extension survives.
+  for (const entry of ext.virtualModels ?? []) {
+    if (globalThis.__piVirtualModels.get(entry.key) === entry.definition) {
+      globalThis.__piVirtualModels.delete(entry.key);
+    }
+  }
   globalThis.__piExtensions[extIdx] = { path: ext.path, events: {}, tools: {}, commands: {}, flags: {}, busSubscriptions: [] };
 };
 
@@ -480,11 +499,24 @@ globalThis.__piCreateApi = function (extIdx) {
 
     registerVirtualModel(model) {
       assertActive();
-      applyProviderChange("virtual", { definitionJson: JSON.stringify(model ?? null) });
+      // `route` is a function and cannot cross as JSON: stash the definition
+      // (the map replaces on re-registration, like model-runtime.ts's
+      // `virtualModels`), record ownership for discard-time cleanup, then
+      // send the serializable shape.
+      const definition = model ?? null;
+      if (definition !== null && typeof definition === "object") {
+        const key = `${definition.provider}\u0000${definition.id}`;
+        globalThis.__piVirtualModels.set(key, definition);
+        ext.virtualModels.push({ key, definition });
+      }
+      applyProviderChange("virtual", { definitionJson: JSON.stringify(definition) });
     },
 
     unregisterVirtualModel(provider, id) {
       assertActive();
+      const key = `${String(provider)}\u0000${String(id)}`;
+      globalThis.__piVirtualModels.delete(key);
+      ext.virtualModels = ext.virtualModels.filter((entry) => entry.key !== key);
       applyProviderChange("unregisterVirtual", { provider: String(provider), id: String(id) });
     },
 
@@ -966,6 +998,7 @@ globalThis.__piSessionBegin = function (eventJson, kind, toolCallId) {
   if (kind === "command") ctx = globalThis.__piCreateCommandCtx();
   else if (kind === "tool") ctx = globalThis.__piCreateToolCtx(toolCallId);
   else if (kind === "trust") ctx = globalThis.__piCreateTrustCtx();
+  else if (kind === "route") ctx = globalThis.__piCreateCtx();
   else ctx = globalThis.__piCreateCtx();
   globalThis.__piSessions.set(id, {
     event: JSON.parse(eventJson),
@@ -1106,6 +1139,33 @@ globalThis.__piSessionCallTool = function (id, extIdx, name, toolCallId) {
   };
   Promise.resolve()
     .then(() => tool.execute(toolCallId, session.event, undefined, onUpdate, session.ctx))
+    .then(
+      (result) => globalThis.__piSessionSettle(session, { value: result }),
+      (error) => globalThis.__piSessionSettle(session, { error: globalThis.__piErrorText(error) }),
+    );
+};
+
+// The virtual-model routing call (`ModelRuntime.resolveModel` →
+// `virtual.route(request, ctx)`, model-runtime.ts:1059-1065): the host
+// built the request (model, reason, previous, failed, state, messages) and
+// the stashed route function answers with `{model, thinkingLevel, state?}`.
+globalThis.__piSessionCallRoute = function (id, provider, modelId) {
+  const session = globalThis.__piSessions.get(id);
+  const definition = globalThis.__piVirtualModels.get(`${provider}\u0000${modelId}`);
+  if (definition === undefined || typeof definition.route !== "function") {
+    // Slot errors are JSON strings (the shape __piErrorText produces);
+    // __piSessionLast parses them back into objects.
+    globalThis.__piSessionSettle(session, {
+      error: JSON.stringify({
+        message: `Virtual model ${provider}/${modelId} is not registered.`,
+        stack: null,
+      }),
+    });
+    return;
+  }
+  session.eventName = "route";
+  Promise.resolve()
+    .then(() => definition.route(session.event, session.ctx))
     .then(
       (result) => globalThis.__piSessionSettle(session, { value: result }),
       (error) => globalThis.__piSessionSettle(session, { error: globalThis.__piErrorText(error) }),

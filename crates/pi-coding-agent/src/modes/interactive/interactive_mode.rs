@@ -260,6 +260,10 @@ struct AgentRun {
     abort: Arc<AbortSignal>,
     events: std::sync::mpsc::Receiver<LoopEvent>,
     handle: Option<std::thread::JoinHandle<()>>,
+    /// The turn's routing wiring under a virtual selection; its pending
+    /// `pi.virtual-model-state` entries persist when the run retires.
+    #[cfg(feature = "ext-js")]
+    routing: Option<Arc<crate::virtual_models::TurnRouting>>,
 }
 
 /// Outcome of a compaction worker thread (`compaction_end` event payload).
@@ -475,8 +479,23 @@ impl InteractiveMode {
         // `setupAutocompleteProvider` (`interactive-mode.ts:855-871`): the
         // base provider is built once from the builtin commands, the session
         // cwd, and the fd binary.
+        #[cfg(feature = "ext-js")]
+        let virtual_catalog_models = runtime
+            .extension_runner
+            .as_ref()
+            .map(|runner| {
+                crate::virtual_models::virtual_models_from_defs(
+                    &runner
+                        .lock()
+                        .expect("extension runner mutex poisoned")
+                        .virtual_models(),
+                )
+            })
+            .unwrap_or_default();
+        #[cfg(not(feature = "ext-js"))]
+        let virtual_catalog_models: Vec<pi_ai::types::Model> = Vec::new();
         let provider = autocomplete::CombinedAutocompleteProvider::new(
-            Self::autocomplete_commands(),
+            Self::autocomplete_commands(&virtual_catalog_models),
             runtime.session.get_cwd().to_path_buf(),
             crate::tools::bash::which("fd"),
         );
@@ -693,21 +712,34 @@ impl InteractiveMode {
     /// whole catalog (upstream: the scoped-models subset or the runtime
     /// snapshot; the scoped-models setting lands later), `/thinking` the
     /// valid levels.
-    fn autocomplete_commands() -> Vec<autocomplete::SlashCommand> {
+    fn autocomplete_commands(
+        virtual_models: &[pi_ai::types::Model],
+    ) -> Vec<autocomplete::SlashCommand> {
+        let virtual_models = virtual_models.to_vec();
         let commands = vec![
             autocomplete::SlashCommand::new("model", "Select model (opens selector UI)")
                 .with_argument_hint("<provider/model>")
-                .with_argument_completions(Arc::new(|prefix: &str| {
+                .with_argument_completions(Arc::new(move |prefix: &str| {
                     let catalog = pi_ai::catalog::catalog();
                     let mut models: Vec<(String, String, String)> = Vec::new(); // (id, provider, name)
                     for provider in catalog.providers() {
                         for model in catalog.models(provider) {
+                            // A virtual registration hides the same-id
+                            // physical entry (`withVirtualModels`).
+                            if virtual_models.iter().any(|virtual_model| {
+                                virtual_model.provider == provider && virtual_model.id == model.id
+                            }) {
+                                continue;
+                            }
                             models.push((
                                 model.id.clone(),
                                 provider.to_string(),
                                 model.name.clone(),
                             ));
                         }
+                    }
+                    for model in &virtual_models {
+                        models.push((model.id.clone(), model.provider.clone(), model.name.clone()));
                     }
                     // `getModelSearchText` (`model-search.ts:7-11`).
                     let filtered =
@@ -1496,6 +1528,7 @@ impl InteractiveMode {
     /// then prepare + summarize on a worker thread. The session append
     /// happens on the UI thread when the outcome lands, like upstream's
     /// `compaction_end` handling.
+    #[allow(clippy::too_many_lines)] // mirrors the TS compaction flow incl. virtual routing; split when extending
     fn handle_compact_command(&mut self, custom_instructions: Option<&str>) {
         if self.compaction_run.is_some() {
             return;
@@ -1551,9 +1584,92 @@ impl InteractiveMode {
         }
 
         let model = self.model.clone();
-        let api_key = self.api_key.clone();
-        let access_token = self.access_token.clone();
-        let thinking_level = self.thinking_level;
+        // Route a virtual selection first: summaries size their input and
+        // output from the model they get (`_getSummarizationRequestAuth`,
+        // agent-session.ts:617-624; reason "direct", no router state).
+        #[cfg(feature = "ext-js")]
+        let (model, api_key, access_token, thinking_level) =
+            if crate::virtual_models::is_virtual_model(&model) {
+                let Some(runner) = &self.extension_runner else {
+                    self.show_error(&format!(
+                        "Virtual model {}/{} is not registered.",
+                        model.provider, model.id
+                    ));
+                    return;
+                };
+                let messages = self
+                    .session
+                    .build_session_projection()
+                    .map(|projection| projection.messages)
+                    .unwrap_or_default();
+                match crate::virtual_models::resolve_virtual_model(
+                    runner,
+                    &crate::virtual_models::RouteRequest {
+                        model: &model,
+                        messages: &messages,
+                        reason: crate::virtual_models::ModelRouteReason::Direct,
+                        thinking_level: self.thinking_level,
+                        state: None,
+                        failed: None,
+                    },
+                    crate::virtual_models::RouteResolvers {
+                        get_model: &|provider, id| {
+                            pi_ai::catalog::catalog().get(provider, id).cloned()
+                        },
+                        has_credentials: &|provider| {
+                            crate::modes::print_mode::resolve_wire_credential(
+                                provider,
+                                None,
+                                &self.auth_path,
+                            )
+                            .is_some()
+                        },
+                    },
+                ) {
+                    Ok(route) => {
+                        // The routed provider's own credential decides the
+                        // summary request (the flag key stays scoped to the
+                        // selected provider).
+                        let credential = crate::modes::print_mode::resolve_wire_credential(
+                            route.model.provider.as_str(),
+                            if route.model.provider == self.model.provider {
+                                self.api_key.as_deref()
+                            } else {
+                                None
+                            },
+                            &self.auth_path,
+                        );
+                        let (api_key, access_token) =
+                            credential.map_or((None, None), |(credential, _)| match credential {
+                                crate::modes::print_mode::WireCredential::ApiKey(key) => {
+                                    (Some(key), None)
+                                }
+                                crate::modes::print_mode::WireCredential::AccessToken(token) => {
+                                    (None, Some(token))
+                                }
+                            });
+                        (route.model, api_key, access_token, route.thinking_level)
+                    }
+                    Err(error) => {
+                        self.show_error(&error);
+                        return;
+                    }
+                }
+            } else {
+                (
+                    model,
+                    self.api_key.clone(),
+                    self.access_token.clone(),
+                    self.thinking_level,
+                )
+            };
+        #[cfg(not(feature = "ext-js"))]
+        let (model, api_key, access_token, thinking_level) = (
+            model,
+            self.api_key.clone(),
+            self.access_token.clone(),
+            self.thinking_level,
+        );
         let stream_fn = Arc::clone(&self.stream_fn);
         let signal = Arc::new(AbortSignal::new());
         let (tx, rx) = std::sync::mpsc::channel::<CompactionOutcome>();
@@ -1799,7 +1915,12 @@ impl InteractiveMode {
             return;
         }
         let parsed = crate::modes::print_mode::parse_model_pattern(pattern);
-        match crate::modes::print_mode::resolve_model(Some(&parsed), None, None) {
+        match crate::modes::print_mode::resolve_model_with(
+            Some(&parsed),
+            None,
+            None,
+            &self.virtual_catalog_models(),
+        ) {
             Ok(model) => match self.apply_model(model) {
                 Ok(()) => self.show_status(&format!("Model: {}", self.model.id)),
                 Err(error) => self.show_error(&error),
@@ -1808,10 +1929,42 @@ impl InteractiveMode {
         }
     }
 
+    /// The extension-registered virtual models as catalog entries
+    /// (`withVirtualModels`' additions to a provider's models).
+    #[cfg(feature = "ext-js")]
+    fn virtual_catalog_models(&self) -> Vec<pi_ai::types::Model> {
+        self.extension_runner
+            .as_ref()
+            .map(|runner| {
+                crate::virtual_models::virtual_models_from_defs(
+                    &runner
+                        .lock()
+                        .expect("extension runner mutex poisoned")
+                        .virtual_models(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    /// Engine-free shape: no extension host, no virtual registrations.
+    #[cfg(not(feature = "ext-js"))]
+    fn virtual_catalog_models(&self) -> Vec<pi_ai::types::Model> {
+        Vec::new()
+    }
+
     /// Swap the active model, including the provider adapter when the api
     /// changes (`handleModelCommand` and `session.cycleModel` share the path).
+    /// A virtual selection swaps in the routed-dispatch stream function: the
+    /// per-request model decides the adapter (`withVirtualModels`' stream).
     fn apply_model(&mut self, model: pi_ai::types::Model) -> Result<(), String> {
-        if model.api != self.model.api {
+        if crate::virtual_models::is_virtual_model(&model) {
+            self.stream_fn = Arc::new(crate::virtual_models::RoutedStreamFn {
+                selected_provider: model.provider.clone(),
+                flag_api_key: self.api_key.clone(),
+                auth_path: self.auth_path.clone(),
+                route_error: Arc::new(crate::virtual_models::RouteErrorSlot::default()),
+            });
+        } else if model.api != self.model.api {
             let Some(stream_fn) = pi_ai::providers::stream_fn_for(&model.api) else {
                 return Err(format!(
                     "No provider adapter for api \"{}\" (model {}/{}).",
@@ -1837,9 +1990,13 @@ impl InteractiveMode {
     /// through provider `checkAuth`; the port reuses the request-time
     /// credential ladder (stored `auth.json` entry or provider env key),
     /// with the `--api-key` flag counting for the initial provider only.
+    /// Virtual models ride their provider unconditionally (upstream's
+    /// `withVirtualModels` appends them outside `filterModels`), and hide a
+    /// same-id physical model.
     fn available_models(&self) -> Vec<pi_ai::types::Model> {
         let auth_path = &self.auth_path;
         let catalog = pi_ai::catalog::catalog();
+        let virtual_models = self.virtual_catalog_models();
         let mut models = Vec::new();
         for provider in catalog.providers() {
             let flag_key = if provider == self.model.provider {
@@ -1857,7 +2014,7 @@ impl InteractiveMode {
                 models.extend(catalog.models(provider).into_iter().cloned());
             }
         }
-        models
+        crate::virtual_models::with_virtual_model_listing(models, &virtual_models)
     }
 
     /// ctrl+p / ctrl+shift+p cycling (`cycleModel`, `interactive-mode.ts:4722-4741`).
@@ -2667,6 +2824,15 @@ impl InteractiveMode {
             messages: context_messages,
             tools: self.executor.tools(),
         };
+        // Under a virtual selection every request routes first and the
+        // stream dispatches per routed model.
+        #[cfg(feature = "ext-js")]
+        let routing = crate::virtual_models::TurnRouting::install(
+            &self.model,
+            self.extension_runner.as_ref(),
+            self.api_key.clone(),
+            &self.session,
+        );
         let config = AgentLoopConfig {
             model: self.model.clone(),
             thinking_level: self.thinking_level,
@@ -2680,6 +2846,11 @@ impl InteractiveMode {
                 after: None,
             },
             finish_turn: None,
+            #[cfg(feature = "ext-js")]
+            prepare_request: routing.as_ref().map(|routing| {
+                Arc::clone(&routing.hook) as Arc<dyn pi_agent::agent_loop::PrepareRequest>
+            }),
+            #[cfg(not(feature = "ext-js"))]
             prepare_request: None,
             prepare_next_turn: None,
             transform_context: self.transform_context(),
@@ -2689,7 +2860,14 @@ impl InteractiveMode {
         let (tx, rx) = std::sync::mpsc::channel::<LoopEvent>();
         let signal = Arc::new(AbortSignal::new());
         let executor = Arc::clone(&self.executor);
-        let stream_fn = Arc::clone(&self.stream_fn);
+        #[cfg(feature = "ext-js")]
+        let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = match &routing {
+            Some(routing) => routing.stream_fn(),
+            None => Arc::clone(&self.stream_fn),
+        };
+        #[cfg(not(feature = "ext-js"))]
+        let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = Arc::clone(&self.stream_fn);
+        let stream_fn = loop_stream_fn;
         let run_signal = Arc::clone(&signal);
         let shared_queues = SharedQueues(Arc::clone(&self.queues));
         let mut shared_queues = shared_queues;
@@ -2711,6 +2889,8 @@ impl InteractiveMode {
             abort: signal,
             events: rx,
             handle: Some(handle),
+            #[cfg(feature = "ext-js")]
+            routing: routing.map(Arc::new),
         });
         self.set_working_status(Some(StatusIndicator::working("Working...")));
         self.tui.request_render();
@@ -3355,10 +3535,17 @@ impl InteractiveMode {
             self.handle_agent_event(event);
         }
         if agent_done {
-            if let Some(run) = self.agent_run.take()
-                && let Some(handle) = run.handle
-            {
-                let _ = handle.join();
+            if let Some(run) = self.agent_run.take() {
+                if let Some(handle) = run.handle {
+                    let _ = handle.join();
+                }
+                // Router state decided this turn lands on the branch now
+                // (upstream appends mid-turn; the store is not shared with
+                // the loop thread).
+                #[cfg(feature = "ext-js")]
+                if let Some(routing) = &run.routing {
+                    routing.persist_state(&mut self.session);
+                }
             }
             self.set_working_status(None);
             self.tui.request_render();
