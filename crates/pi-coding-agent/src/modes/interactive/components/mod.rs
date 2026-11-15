@@ -4,6 +4,7 @@
 //! these into the TUI tree; the orchestrator lives in
 //! [`super::interactive_mode`].
 
+pub mod armin;
 pub mod assistant_message;
 pub mod compaction_summary;
 pub mod footer;
