@@ -9,7 +9,7 @@ end-to-end against a live provider (`pi -p` prompt → answer, tool round-trips,
 JSON event mode), and bare `pi` renders the interactive chat TUI ported from
 upstream, including the `/model`, `/trust`, `/settings`, and `/resume`
 selector dialogs and fullscreen mode (`--tui-mode regular` opts out).
-Not at feature parity yet: extensions, the 3D easter egg, and the MCP tool
+Not at feature parity yet: extensions and the MCP tool
 bridge are still landing. See [PLAN.md](PLAN.md) for the
 phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
 

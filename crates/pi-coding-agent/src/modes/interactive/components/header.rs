@@ -89,9 +89,9 @@ pub struct BuiltInHeader {
     padding_x: usize,
     padding_y: usize,
     /// `header.onLogoClick` (`interactive-mode.ts:792`): the easter egg's
-    /// callback, taking the logo's screen column and row. The port has no
-    /// 3D easter egg yet, so the mode leaves it unset and clicks pass
-    /// through like upstream's unassigned callback.
+    /// callback, taking the logo's screen column and row. The mode queues
+    /// the position for `pump`, which plays the 3D pi logo; unset, clicks
+    /// pass through like upstream's unassigned callback.
     on_logo_click: Option<Box<dyn FnMut(i64, i64) + Send>>,
 }
 

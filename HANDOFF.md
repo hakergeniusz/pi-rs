@@ -17,7 +17,7 @@ Rewrite Pi (earendil-works/pi — TypeScript coding-agent harness monorepo, ~236
 | P3 | `pi-tui` full TUI crate (~40.5K lines, 17 components, themes, keys, alt screen) | ✅ committed `39b22ad` — 740 workspace tests, clippy all+pedantic clean, fmt clean |
 | P4 | `pi-coding-agent`: config, auth, sessions (JSONL v3 byte-compat), built-in tools, system prompt, prompt templates, skills, CLI args, print mode (`pi -p`) | ✅ committed — gate green in-container (1205 tests, 44 targets), landed on `main` 2026-11-14 |
 | P5 | JSON/RPC modes, extensions seam, MCP client, trust, `@file`, OAuth | ⚠️ part 1 landed on `main` (`c8e1818` + reconciliation `a6b9934`); remainder open (rpc envelope, MCP server-manager/tool-bridge, package-manager, codemode, ext host, `defaultProjectTrust` getter) |
-| P6 | Interactive mode | ⚠️ **parts 1+2a+2b landed on `main`** — regular chat TUI 1:1 (theme, components, orchestrator, themed renderers, CaptureTerminal e2e, real-PTY smoke) + autocomplete/model/trust/settings/session selectors + compaction + queues + mouse toggles + OSC theme + **fullscreen mode (alt screen + chat viewport + switch)**; remainder open (extensions host, 3D easter egg, rpc/MCP hardening) |
+| P6 | Interactive mode | ⚠️ **parts 1+2a+2b+2c landed on `main`** — regular chat TUI 1:1 (theme, components, orchestrator, themed renderers, CaptureTerminal e2e, real-PTY smoke) + autocomplete/model/trust/settings/session selectors + compaction + queues + mouse toggles + OSC theme + fullscreen mode (alt screen + chat viewport + switch) + **3D easter egg + `/arminsayshi`**; remainder open (extensions host, rpc/MCP hardening) |
 
 P4 detail (uncommitted, in working tree):
 - `src/session/` (`records.rs` byte-exact Record envelope + V8-exact JSON writer in `session/json.rs`, `store.rs` SessionManager, `migrate.rs` v1→v3, `mod.rs`), `src/auth.rs` (auth.json store, lock protocol, `$VAR`/`!cmd` config-value resolution), `src/config.rs` + `src/config/settings.rs` (SettingsManager).
@@ -91,7 +91,7 @@ Remaining before landing on `main` — **ALL DONE 2026-11-14**:
 2. ~~Real `pi -p` smoke test~~ **DONE 2026-11-14** — first true end-to-end proof PASSED: `pi -p "Reply with exactly: PONG"` → `PONG`; read-tool round-trip → `ALBATROSS`; `--mode json` → correct JSONL wire. (Working binary: build in the container, `podman cp` out, run from a temp dir with `--no-session`.)
 3. Golden session fixtures from the TS pi (byte-compat proof beyond synthetic fixtures).
 4. P5 remainder: reconcile `rpc.rs` against `rpc-entry.ts`; MCP server-manager + tool bridge into the agent registry, package-manager subset (`package-manager-cli.ts`, 41.6K), codemode sandbox (`pi-codemode` stub, blocked on host decision), extension runtime host (decision pending), `defaultProjectTrust` settings getter.
-5. ~~**P6 — Interactive mode**~~ **parts 1+2a DONE 2026-11-14, part 2b (fullscreen) DONE 2026-11-15** (see the P6 sections below); the extension host + easter egg remain.
+5. ~~**P6 — Interactive mode**~~ **parts 1+2a DONE 2026-11-14, part 2b (fullscreen) DONE 2026-11-15, part 2c (3D easter egg) DONE 2026-11-15** (see the P6 sections below); the extension host remains.
 6. **P7 — Hardening** (compaction, cache warmer, crash log, signals/backpressure + stdin piping, release).
 
 ## P6 progress — interactive chat TUI (part 1, landed `500302b` 2026-11-14)
@@ -590,6 +590,54 @@ alt-screen machinery (P3); this slice is the pi-coding-agent integration.
   is the alt screen's internal OSC-52 path (upstream passes a clipboard
   callback); upstream's `restoreProgress` (terminal progress bar on switch)
   has no port counterpart.
+
+## 3D easter egg + /arminsayshi (landed on `feat/easter-egg-3d`, 2026-11-15)
+
+P6 part 2c: `easter-egg-3d.js` (1138 lines) + `armin.js` + the lazy wrapper,
+ported host-driven (the port has no timers — the interactive loop's ~25ms
+pump cadence stands in for upstream's `setInterval`).
+
+- **armin.rs** (`d6368a6`): the inline component — the 31×36 XBM bitmap
+  (LSB-first, 1 = background; art pixels are the 0s, 245 of them) and the
+  seven reveal effects (typewriter, scanline, rain, fade, dissolve, CRT
+  wipe, glitch) keyed by a fresh splitmix64 seed per mount. Pure
+  `grid_at(frame)` per effect; the host derives the frame from elapsed
+  time × fps ("pi owns an interval; this port owns a frame index").
+- **easter_egg_3d.rs** (`7374b40`): the fullscreen 3D animation. SGR
+  `parseScreen` (inverse video: `cellFg = bg ?? background`); `BlockRaster`
+  braille ray-caster — per-dot ray/plane intersection with a depth buffer,
+  face culling including neighbor-cover (exact `==` positions while blocks
+  rest, as upstream's `===`), diffuse/rim/specular lighting, fog, and the
+  light-background halo as a separable tent filter with quantized
+  amounts/levels; timeline — fly-off (0.1/1.3s), puzzle cycles (0.3s × 12
+  shuffle steps + 1s return + hold) with the spin locked to them
+  (SPIN_RAMP/SPIN_SPEED), dust dissolve (WAVE_SPREAD/JITTER), quantized
+  starfield (STARS_START 2.5), and the 1.1s exit that runs the whole
+  timeline backwards; models pi-logo (4×4, 10 blocks, camera 10,
+  widthShare 0.35) and Armin (31×36, camera 80, widthShare 0.45);
+  `Math.imul`-style hash (`u32::wrapping_mul`) keeps every random choice
+  deterministic per cell.
+- **Host wiring** (`7374b40`): `play_easter_egg_3d` mirrors the lazy
+  wrapper's guards (`alt_screen_active()` ≡ `tui instanceof TuiAltScreen`;
+  `has_overlay()` returns **true** — absorbed, no fallback — exactly
+  upstream) and captures `last_lines()`; the animation uses the stored
+  startup terminal colors (`theme::terminal_colors`, made `pub(crate)`)
+  instead of a fresh query; the exit's completion raises `Arc<AtomicBool>`
+  and the pump hides the overlay. The header's `on_logo_click` callback
+  queues the logo position into an `Arc<Mutex<Vec<(i64,i64)>>>` (the
+  callback cannot borrow the mode mid-dispatch) and the pump replays it as
+  the 3D pi logo. `/arminsayshi` plays the 3D Armin fullscreen and falls
+  back to `Spacer(1)` + the inline component in the flat tree; the command
+  is deliberately absent from autocomplete (upstream hides it too).
+- **Deviations**: no timers (host-driven frames + pump-polled completion,
+  documented at the type); terminal rows via `Arc<AtomicU16>` refreshed by
+  the pump instead of a per-frame `process.stdout.rows` read; stored
+  startup colors instead of a live color query. Everything else — layout,
+  math, constants, easing, quantization, guards — is 1:1.
+- **Tests**: 17 new (armin 5, egg 12) + 3 interactive-mode e2e
+  (fallback in the flat tree, fullscreen play + pump retirement, logo
+  click drain). Gate green: fmt, clippy --workspace --all-targets -D
+  warnings, workspace tests.
 
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
