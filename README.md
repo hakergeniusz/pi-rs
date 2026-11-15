@@ -35,7 +35,10 @@ phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
   persisted to settings.json), the OSC
   terminal-color theme controller (grayscale system theme while the query is
   pending, re-theming on the reply, mode-2031 light/dark reports, `/theme`
-  switcher), and session
+  switcher), the `/resume` session selector (current-folder/all scopes,
+  search with `re:` regex and `"phrase"` support, fork-tree threading,
+  rename and trash-delete) with resumed transcripts replayed into the chat,
+  and session
   persistence (shutdown prints the resume command).
 - **Sessions** — JSONL v3 transcript store under the XDG data root
   (`~/.local/share/pi-rs/sessions` by default), byte-compatible on the

@@ -477,6 +477,53 @@ wiring commit + the version cut (`v0.1.0-alpha.1`).
   `defaultThinkingLevel` > off (model-resolver.js:386-421) — previously
   always "off" for non-interactive runs.
 
+## Session selector (landed on `feat/p6b-session-selector`, 2026-11-15)
+
+The `/resume` dialog (`session-selector.ts`, 884 lines) + the prerequisite
+transcript replay, on one branch (4 commits + this doc).
+
+- **Transcript replay first** (`a06ed45`): `renderSessionEntries` +
+  `renderSessionItems` (interactive-mode.ts:3437/:3340) — startup walk of the
+  compaction-aware context entries re-creating the chat rows (user prompts
+  also populate the editor history, assistant tool calls open rows completed
+  by replayed toolResults with durations/error flags, aborted/errored rows
+  carry upstream's texts, compaction entries render summary + billed-tokens
+  notice). `run()` calls it after terminal start, so `pi --continue` /
+  `--session` now show the prior transcript — the empty-resume deviation is
+  CLOSED, and in-place switching had a truthful display to build on.
+  Skipped (documented): custom messages, branch summaries, bashExecution
+  rows, cache-miss notices.
+- **Search** (`058e5d5`): `session_selector_search.rs` ports
+  `session-selector-search.ts` — tiered matching (name=0, id/messages/cwd
+  exact=1, fuzzy name/cwd=2; tiers dominate the fuzzy scores they carry),
+  `re:` case-insensitive regex mode (the `regex` crate was already a
+  dependency), `"phrase"` with whitespace normalization, unbalanced-quote
+  fallback, Recent keeps listing order while other modes sort by score with
+  modified-desc tiebreak.
+- **Selector** (`209ed86`): header (title left; scope/name/sort right; hint
+  lines swap for delete-confirmation/status), one-line rows in a scrolling
+  window with fork-tree prefixes (`parentSessionPath` grouping, latest
+  subtree activity sort), Tab scope toggle with lazy all-load, ctrl+s sort
+  cycle, ctrl+n named filter, ctrl+p path display, ctrl+d/ctrl+backspace
+  delete confirmation (`trash` CLI → unlink fallback; the active session is
+  protected), ctrl+r rename via `SessionManager::append_session_info`.
+  Deviations: loaders synchronous (no progress/abort plumbing), status
+  messages persist until the next state change (no timer), the upstream
+  loader/confirmation callbacks collapse into direct calls.
+- **Wiring** (`e001452`): `/resume` opens the selector on the standard
+  mount; Select swaps the session store (`SessionManager::open`), clears run
+  state, replays the transcript, and shows "Resumed session".
+  **Deviation**: upstream rebuilds the whole runtime for the target's cwd
+  (extensions, tools, trust); the port keeps the startup runtime and only
+  swaps the session, so a foreign-cwd session keeps this cwd's tool
+  bindings.
+- Gate gotchas: pi-tui's `truncate_to_width(text, width, ellipsis, pad)` —
+  upstream's `truncateToWidth` defaults `pad=false`; passing `true` silently
+  pads lines to full width and broke the header layout math (right side
+  measured as width → left side squeezed to nothing). And `Input` has BOTH
+  `Focusable::set_focused` and `Component::set_focused` — call as
+  `Focusable::set_focused(&mut input, …)` to disambiguate.
+
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
   slot shifted every later index — the `*_INDEX` consts are the single source of
