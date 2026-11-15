@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use serde::Deserialize;
-use serde_json::Value as Json;
+use serde_json::{Value as Json, json};
 
 use crate::engine::{ContextKind, HostCore, JsHost};
 use crate::error::{ExtensionError, JsHostError};
@@ -25,6 +25,7 @@ use crate::events::{
     BoundaryDispatchResult, InputResult, ProjectTrustResult, SessionBeforeResult, SessionOutcome,
     ToolCallResult, ToolResultPatch, parse_session_outcome,
 };
+use crate::transcript;
 
 /// One registered tool as the runner sees it (the E1 `ToolInfo`:
 /// name, description, parameters, exposure, namespace — §4.2 of
@@ -151,6 +152,19 @@ pub trait UiSink: Send + Sync {
     /// sink resolves its own timeout default (the request payload carries
     /// the `timeout` field upstream includes in the wire request).
     fn wait_response(&self, id: &str, method: &str) -> Json;
+}
+
+/// What a `user_bash` handler decided (`UserBashEventResult`): custom
+/// `operations` the host invokes through [`ExtensionRunner::call_bash_exec`],
+/// or a full `result` replacing local execution.
+#[derive(Debug, Clone)]
+pub enum UserBashDecision {
+    /// The handler supplied `operations`; the host runs commands through
+    /// the stashed `exec`.
+    Operations,
+    /// The handler executed the command itself; this is the full
+    /// `BashResult`.
+    Result(Json),
 }
 
 pub struct ExtensionRunner {
@@ -1180,6 +1194,325 @@ impl ExtensionRunner {
     pub fn invalidate(&mut self, message: Option<&str>) -> Result<(), JsHostError> {
         self.host.invalidate(message)
     }
+
+    /// `emitUserBash` (`runner.ts:1276-1307`): handlers run in order;
+    /// `undefined` falls through to local execution, the first valid
+    /// `{operations}`/`{result}` wins. An invalid result or a handler
+    /// error is reported and PROPAGATES (upstream rethrows).
+    pub fn emit_user_bash(
+        &mut self,
+        command: &str,
+        exclude_from_context: bool,
+        cwd: &str,
+    ) -> Result<Option<UserBashDecision>, JsHostError> {
+        let event = events::user_bash(command, exclude_from_context, cwd);
+        let handlers = self.handlers_for("user_bash");
+        let payload =
+            serde_json::to_string(&event).map_err(|err| JsHostError::Job(err.to_string()))?;
+        let id = self
+            .host
+            .session_begin(&payload, ContextKind::Event, None)?;
+        let mut decision: Option<UserBashDecision> = None;
+        for (index, handler) in handlers {
+            let outcome = match self
+                .host
+                .session_call(id, index, "user_bash", handler)
+                .and_then(|()| self.settle_session(id))
+                .and_then(|()| {
+                    parse_session_outcome(&self.host.session_last(id)?)
+                        .map_err(|err| JsHostError::Job(err.to_string()))
+                }) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    self.report_error(
+                        index,
+                        "user_bash",
+                        crate::events::HandlerErrorJson {
+                            message: err.to_string(),
+                            stack: None,
+                        },
+                    );
+                    let _ = self.host.session_end(id);
+                    return Err(err);
+                }
+            };
+            if let Some(error) = outcome.error {
+                self.report_error(
+                    index,
+                    "user_bash",
+                    crate::events::HandlerErrorJson {
+                        message: error.message.clone(),
+                        stack: error.stack.clone(),
+                    },
+                );
+                let _ = self.host.session_end(id);
+                return Err(JsHostError::JsException(error.message));
+            }
+            match outcome.value {
+                Some(value) if value.get("operations").and_then(Json::as_bool) == Some(true) => {
+                    decision = Some(UserBashDecision::Operations);
+                    break;
+                }
+                Some(value) if value.get("result").is_some() => {
+                    decision = Some(UserBashDecision::Result(
+                        value.get("result").cloned().unwrap_or(Json::Null),
+                    ));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        self.host.session_end(id)?;
+        Ok(decision)
+    }
+
+    /// Runs the stashed `user_bash` `operations.exec` for one command.
+    /// Returns `{exitCode}` (or `{error}`) plus the streamed output
+    /// chunks; the host's bash executor consumes both.
+    pub fn call_bash_exec(
+        &mut self,
+        command: &str,
+        cwd: &str,
+        options: &Json,
+    ) -> Result<(Json, Vec<String>), JsHostError> {
+        let options_json = serde_json::to_string(options).unwrap_or_else(|_| "{}".to_string());
+        let result = self.host.call_bash_exec(command, cwd, &options_json)?;
+        let output = std::mem::take(
+            &mut self
+                .core
+                .lock()
+                .expect("host core mutex poisoned")
+                .bash_output,
+        );
+        Ok((result, output))
+    }
+
+    /// `emitContext` (`runner.ts:1312-1370`): `context` handlers see the
+    /// conversation without system messages (in-place edits and
+    /// `{messages}` returns both apply; Pi reattaches the replayed system
+    /// message when the conversation changed), then
+    /// `context_with_system` handlers see the full transcript and their
+    /// output is used as returned. Handler errors are reported and
+    /// skipped.
+    // Ported verbatim as one linear upstream method; splitting the two
+    // phases apart would obscure the shared `current` threading.
+    #[allow(clippy::too_many_lines)]
+    pub fn emit_context(&mut self, messages: &[Json]) -> Result<Vec<Json>, JsHostError> {
+        let mut current: Vec<Json> = messages.to_vec();
+        let payload = serde_json::to_string(&json!({
+            "type": "context",
+            "messages": [],
+        }))
+        .map_err(|err| JsHostError::Job(err.to_string()))?;
+        let id = self
+            .host
+            .session_begin(&payload, ContextKind::Event, None)?;
+        for (index, handler) in self.handlers_for("context") {
+            let visible: Vec<Json> = current
+                .iter()
+                .filter(|message| message.get("role").and_then(Json::as_str) != Some("system"))
+                .cloned()
+                .collect();
+            let snapshot = visible.clone();
+            self.host.session_patch(
+                id,
+                "messages",
+                &serde_json::to_string(&visible).unwrap_or_default(),
+            )?;
+            let outcome = self
+                .host
+                .session_call(id, index, "context", handler)
+                .and_then(|()| self.settle_session(id))
+                .and_then(|()| {
+                    parse_session_outcome(&self.host.session_last(id)?)
+                        .map_err(|err| JsHostError::Job(err.to_string()))
+                });
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    self.report_error(
+                        index,
+                        "context",
+                        crate::events::HandlerErrorJson {
+                            message: err.to_string(),
+                            stack: None,
+                        },
+                    );
+                    continue;
+                }
+            };
+            if let Some(error) = outcome.error {
+                self.report_error(
+                    index,
+                    "context",
+                    crate::events::HandlerErrorJson {
+                        message: error.message,
+                        stack: error.stack,
+                    },
+                );
+                continue;
+            }
+            let returned = if let Some(messages) = outcome
+                .value
+                .and_then(|value| value.get("messages").cloned())
+            {
+                Some(messages)
+            } else {
+                let event: Json =
+                    serde_json::from_str(&self.host.session_event(id)?).unwrap_or(Json::Null);
+                let mutated = event.get("messages").cloned().unwrap_or(Json::Null);
+                if mutated == serde_json::to_value(&snapshot).unwrap_or(Json::Null) {
+                    None
+                } else {
+                    Some(mutated)
+                }
+            };
+            let Some(returned) = returned else {
+                continue;
+            };
+            let returned: Vec<Json> = serde_json::from_value(returned).unwrap_or_default();
+            if returned == snapshot {
+                continue;
+            }
+            // restoreSystemMessages (runner.ts:292-301): a changed
+            // conversation gets the replayed system message as one head.
+            let head = transcript::get_current_system_message(&current);
+            current = match head {
+                Some(head) => {
+                    let mut restored = vec![head];
+                    restored.extend(returned);
+                    restored
+                }
+                None => returned,
+            };
+        }
+        for (index, handler) in self.handlers_for("context_with_system") {
+            let had_leading_system = current
+                .first()
+                .and_then(|message| message.get("role").and_then(Json::as_str))
+                == Some("system");
+            self.host.session_patch(
+                id,
+                "messages",
+                &serde_json::to_string(&current).unwrap_or_default(),
+            )?;
+            let outcome = self
+                .host
+                .session_call(id, index, "context_with_system", handler)
+                .and_then(|()| self.settle_session(id))
+                .and_then(|()| {
+                    parse_session_outcome(&self.host.session_last(id)?)
+                        .map_err(|err| JsHostError::Job(err.to_string()))
+                });
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    self.report_error(
+                        index,
+                        "context_with_system",
+                        crate::events::HandlerErrorJson {
+                            message: err.to_string(),
+                            stack: None,
+                        },
+                    );
+                    continue;
+                }
+            };
+            if let Some(error) = outcome.error {
+                self.report_error(
+                    index,
+                    "context_with_system",
+                    crate::events::HandlerErrorJson {
+                        message: error.message,
+                        stack: error.stack,
+                    },
+                );
+                continue;
+            }
+            if let Some(messages) = outcome
+                .value
+                .and_then(|value| value.get("messages").cloned())
+            {
+                current = serde_json::from_value(messages).unwrap_or(current);
+            } else {
+                // In-place edits to the live event.messages array are the
+                // currentMessages array upstream.
+                let event: Json =
+                    serde_json::from_str(&self.host.session_event(id)?).unwrap_or(Json::Null);
+                if let Some(messages) = event.get("messages").cloned() {
+                    current = serde_json::from_value(messages).unwrap_or(current);
+                }
+            }
+            if had_leading_system
+                && current
+                    .first()
+                    .and_then(|message| message.get("role").and_then(Json::as_str))
+                    != Some("system")
+            {
+                self.report_error(
+                    index,
+                    "context_with_system",
+                    crate::events::HandlerErrorJson {
+                        message: "Handler removed the leading system message; the request has no prompt or initial tool declarations. Keep it at index 0 or replace a dropped prefix with getCurrentSystemMessage().".to_string(),
+                        stack: None,
+                    },
+                );
+            }
+        }
+        self.host.session_end(id)?;
+        Ok(current)
+    }
+
+    /// The provider registrations the host applies to its model catalog.
+    #[must_use]
+    pub fn providers(&self) -> Vec<(String, String, Json)> {
+        let core = self.core.lock().expect("host core mutex poisoned");
+        core.providers
+            .providers()
+            .iter()
+            .map(|provider| {
+                (
+                    provider.name.clone(),
+                    provider.extension_path.clone(),
+                    provider.config.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// The native provider registrations.
+    #[must_use]
+    pub fn native_providers(&self) -> Vec<(Json, String)> {
+        let core = self.core.lock().expect("host core mutex poisoned");
+        core.providers
+            .native_providers()
+            .iter()
+            .map(|entry| (entry.provider.clone(), entry.extension_path.clone()))
+            .collect()
+    }
+
+    /// The virtual-model definitions.
+    #[must_use]
+    pub fn virtual_models(&self) -> Vec<(Json, String)> {
+        let core = self.core.lock().expect("host core mutex poisoned");
+        core.providers
+            .virtual_models()
+            .iter()
+            .map(|entry| (entry.definition.clone(), entry.extension_path.clone()))
+            .collect()
+    }
+
+    /// Provider registrations that failed validation at the bind-time
+    /// flush, in flush order (upstream's bindCore `emitError` reports,
+    /// `runner.ts:470-521`).
+    #[must_use]
+    pub fn provider_registration_errors(&self) -> Vec<crate::events::ProviderBindError> {
+        self.core
+            .lock()
+            .expect("host core mutex poisoned")
+            .provider_bind_errors
+            .clone()
+    }
 }
 
 #[cfg(test)]
@@ -1581,6 +1914,339 @@ export default function (pi) {
         assert_eq!(sink.requests()[0]["method"], "confirm");
         assert_eq!(sink.requests()[0]["title"], "Trust");
         assert_eq!(sink.requests()[0]["message"], "/tmp");
+    }
+
+    // ---- E2 slice 2: user_bash, context, providers ----
+
+    const EXT_BASH_OPS: &str = r#"
+export default function (pi) {
+  pi.on("user_bash", () => ({
+    operations: {
+      exec: async (command, cwd, options) => {
+        options.onData(command + "|" + cwd + "|" + String(options.timeout) + "|" + String(options.signal === undefined));
+        if (command === "boom") throw new Error("exec-failed");
+        return { exitCode: 7 };
+      },
+    },
+  }));
+}
+"#;
+
+    const EXT_BASH_PASS: &str = r#"
+export default function (pi) {
+  pi.on("user_bash", () => undefined);
+}
+"#;
+
+    const EXT_BASH_RESULT_ONE: &str = r#"
+export default function (pi) {
+  pi.on("user_bash", () => ({ result: { output: "blocked", exitCode: 3, cancelled: false, truncated: false } }));
+}
+"#;
+
+    const EXT_BASH_RESULT_TWO: &str = r#"
+export default function (pi) {
+  pi.on("user_bash", () => {
+    pi.appendEntry("second-ran", true);
+    return { operations: { exec: async () => ({ exitCode: 0 }) } };
+  });
+}
+"#;
+
+    const EXT_BASH_INVALID: &str = r#"
+export default function (pi) {
+  pi.on("user_bash", (event) => {
+    if (event.command === "empty") return {};
+    if (event.command === "both") return { operations: { exec: async () => ({}) }, result: { output: "", exitCode: 0, cancelled: false, truncated: false } };
+    if (event.command === "nonobject") return 42;
+    return { result: { output: "ok", exitCode: 0, cancelled: false, truncated: false } };
+  });
+}
+"#;
+
+    const EXT_CONTEXT_APPEND: &str = r#"
+export default function (pi) {
+  pi.on("context", (event) => ({ messages: [...event.messages, { role: "user", content: "injected" }] }));
+  pi.on("context_with_system", (event) => ({ messages: [...event.messages, { role: "user", content: "sys-note" }] }));
+}
+"#;
+
+    const EXT_CONTEXT_INPLACE: &str = r#"
+export default function (pi) {
+  pi.on("context", (event) => {
+    event.messages[0].content += "[c]";
+  });
+}
+"#;
+
+    const EXT_CONTEXT_THROW: &str = r#"
+export default function (pi) {
+  pi.on("context", () => { throw new Error("ctx-boom"); });
+}
+"#;
+
+    const EXT_CONTEXT_DROP: &str = r#"
+export default function (pi) {
+  pi.on("context", (event) => ({ messages: [...event.messages, { role: "user", content: "injected" }] }));
+  pi.on("context_with_system", (event) => ({ messages: event.messages.filter((message) => message.role !== "system") }));
+}
+"#;
+
+    const EXT_PROVIDERS: &str = r#"
+export default function (pi) {
+  pi.registerProvider("acme", { baseUrl: "https://acme.test", api: "openai-completions" });
+  pi.registerProvider({ id: "native-co", api: "anthropic-messages" });
+  pi.registerVirtualModel({ provider: "acme", id: "router", name: "Router", route: {} });
+}
+"#;
+
+    const EXT_PROVIDERS_MERGE: &str = r#"
+export default function (pi) {
+  pi.registerProvider("acme", { baseUrl: "https://merged.test" });
+  pi.registerVirtualModel({ provider: "acme", id: "router", name: "Router Two", route: {} });
+}
+"#;
+
+    const EXT_PROVIDERS_UNREG: &str = r#"
+export default function (pi) {
+  pi.unregisterProvider("acme");
+  pi.unregisterVirtualModel("acme", "router");
+}
+"#;
+
+    const EXT_PROVIDER_ERR: &str = r#"
+export default function (pi) {
+  const caught = [];
+  const attempt = (run) => {
+    try { run(); } catch (error) { caught.push(error.message); }
+  };
+  attempt(() => pi.registerProvider("acme"));
+  attempt(() => pi.registerProvider({ id: "  " }));
+  attempt(() => pi.registerVirtualModel({ provider: "acme", id: "" }));
+  // appendEntry is an action method: it throws until the runner binds
+  // (loader.ts:179), so the collected messages are appended post-bind.
+  pi.on("session_start", () => pi.appendEntry("provider-errors", caught));
+}
+"#;
+
+    #[test]
+    fn user_bash_operations_bridge_streams_and_forwards_options() {
+        let mut runner = runner_with(&[EXT_BASH_OPS]);
+        let decision = runner
+            .emit_user_bash("git status", false, "/tmp")
+            .expect("emit");
+        assert!(matches!(decision, Some(UserBashDecision::Operations)));
+        let (result, output) = runner
+            .call_bash_exec("git status", "/tmp", &json!({ "timeout": 1000 }))
+            .expect("exec");
+        assert_eq!(result, json!({ "exitCode": 7 }));
+        assert_eq!(output, vec!["git status|/tmp|1000|true".to_string()]);
+        // An exec that throws degrades to `{error}`; chunks streamed
+        // before the throw still land.
+        let (result, output) = runner
+            .call_bash_exec("boom", "/tmp", &json!({}))
+            .expect("exec");
+        assert_eq!(result, json!({ "error": "exec-failed" }));
+        assert_eq!(output, vec!["boom|/tmp|undefined|true".to_string()]);
+    }
+
+    #[test]
+    fn user_bash_falls_through_to_local_execution() {
+        let mut runner = runner_with(&[EXT_BASH_PASS]);
+        assert!(
+            runner
+                .emit_user_bash("ls", false, "/tmp")
+                .expect("emit")
+                .is_none()
+        );
+        // No handlers at all: the same fall-through.
+        let mut runner = runner_with(&[]);
+        assert!(
+            runner
+                .emit_user_bash("ls", false, "/tmp")
+                .expect("emit")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn user_bash_result_wins_before_later_handlers() {
+        let mut runner = runner_with(&[EXT_BASH_RESULT_ONE, EXT_BASH_RESULT_TWO]);
+        let decision = runner.emit_user_bash("make", false, "/tmp").expect("emit");
+        match decision {
+            Some(UserBashDecision::Result(result)) => assert_eq!(
+                result,
+                json!({ "output": "blocked", "exitCode": 3, "cancelled": false, "truncated": false })
+            ),
+            other => panic!("expected a result decision, got {other:?}"),
+        }
+        // The losing handler never ran.
+        assert!(entries_of(&runner).is_empty());
+    }
+
+    #[test]
+    fn user_bash_invalid_result_propagates_exact_message() {
+        const INVALID: &str = "Invalid user_bash handler result: return undefined for local execution or exactly one valid { operations } or { result } object";
+        let mut runner = runner_with(&[EXT_BASH_INVALID]);
+        let errors = errors_of(&mut runner);
+        for command in ["empty", "both", "nonobject"] {
+            let error = runner
+                .emit_user_bash(command, false, "/tmp")
+                .expect_err("invalid results propagate");
+            assert_eq!(error.to_string(), INVALID);
+        }
+        let errors = errors.borrow();
+        assert_eq!(errors.len(), 3);
+        for error in errors.iter() {
+            assert_eq!(error.extension_path, "<test-0>");
+            assert_eq!(error.event, "user_bash");
+            assert_eq!(error.error, INVALID);
+        }
+        // The valid branch still resolves after the failures.
+        let decision = runner.emit_user_bash("make", false, "/tmp").expect("emit");
+        assert!(matches!(decision, Some(UserBashDecision::Result(_))));
+    }
+
+    #[test]
+    fn context_returns_apply_and_restore_system() {
+        let mut runner = runner_with(&[EXT_CONTEXT_APPEND]);
+        let messages = vec![
+            json!({ "role": "system", "content": "s1", "timestamp": 5 }),
+            json!({ "role": "user", "content": "u1" }),
+        ];
+        let result = runner.emit_context(&messages).expect("emit");
+        // Phase 1 rewrote the conversation, so the replayed system head
+        // comes back on top; phase 2 appends to the full transcript.
+        assert_eq!(
+            result,
+            vec![
+                json!({ "role": "system", "content": "s1", "timestamp": 5 }),
+                json!({ "role": "user", "content": "u1" }),
+                json!({ "role": "user", "content": "injected" }),
+                json!({ "role": "user", "content": "sys-note" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn context_inplace_mutation_applies_and_restores_system() {
+        let mut runner = runner_with(&[EXT_CONTEXT_INPLACE]);
+        let messages = vec![
+            json!({ "role": "system", "content": "s1", "timestamp": 5 }),
+            json!({ "role": "user", "content": "u1" }),
+        ];
+        let result = runner.emit_context(&messages).expect("emit");
+        // In-place edits to the live event.messages apply without a
+        // `{messages}` return, and still get the replayed system head.
+        assert_eq!(
+            result,
+            vec![
+                json!({ "role": "system", "content": "s1", "timestamp": 5 }),
+                json!({ "role": "user", "content": "u1[c]" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn context_handler_errors_are_reported_and_skipped() {
+        let mut runner = runner_with(&[EXT_CONTEXT_THROW, EXT_CONTEXT_DROP]);
+        let errors = errors_of(&mut runner);
+        let messages = vec![
+            json!({ "role": "system", "content": "s1", "timestamp": 5 }),
+            json!({ "role": "user", "content": "u1" }),
+        ];
+        let result = runner.emit_context(&messages).expect("emit");
+        // Phase 1: the throwing handler is skipped and the appending one
+        // still applies. Phase 2: dropping the leading system message is
+        // reported but the handler's output is honored.
+        assert_eq!(
+            result,
+            vec![
+                json!({ "role": "user", "content": "u1" }),
+                json!({ "role": "user", "content": "injected" }),
+            ]
+        );
+        let errors = errors.borrow();
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].extension_path, "<test-0>");
+        assert_eq!(errors[0].event, "context");
+        assert_eq!(errors[0].error, "ctx-boom");
+        assert_eq!(errors[1].extension_path, "<test-1>");
+        assert_eq!(errors[1].event, "context_with_system");
+        assert_eq!(
+            errors[1].error,
+            "Handler removed the leading system message; the request has no prompt or initial tool declarations. Keep it at index 0 or replace a dropped prefix with getCurrentSystemMessage()."
+        );
+    }
+
+    #[test]
+    fn provider_registrations_merge_replace_and_unregister() {
+        let runner = runner_with(&[EXT_PROVIDERS, EXT_PROVIDERS_MERGE]);
+        assert_eq!(
+            runner.providers(),
+            vec![(
+                "acme".to_string(),
+                "<test-0>".to_string(),
+                json!({ "baseUrl": "https://merged.test", "api": "openai-completions" }),
+            )]
+        );
+        assert_eq!(
+            runner.native_providers(),
+            vec![(
+                json!({ "id": "native-co", "api": "anthropic-messages" }),
+                "<test-0>".to_string(),
+            )]
+        );
+        // The same (provider, id) replaces the earlier definition.
+        assert_eq!(
+            runner.virtual_models(),
+            vec![(
+                json!({ "provider": "acme", "id": "router", "name": "Router Two", "route": {} }),
+                "<test-1>".to_string(),
+            )]
+        );
+
+        let runner = runner_with(&[EXT_PROVIDERS, EXT_PROVIDERS_UNREG]);
+        // Unregistering by name removes the config provider; the native
+        // registration survives (its id differs).
+        assert!(runner.providers().is_empty());
+        assert!(runner.virtual_models().is_empty());
+        assert_eq!(
+            runner.native_providers(),
+            vec![(
+                json!({ "id": "native-co", "api": "anthropic-messages" }),
+                "<test-0>".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn provider_registration_errors_surface_exact_messages() {
+        let mut runner = runner_with(&[EXT_PROVIDER_ERR]);
+        runner
+            .emit(&events::session_start("startup"))
+            .expect("emit");
+        // The config check throws at load (loader.ts:471); the id
+        // validations are bind-time and surface as error reports, not
+        // load failures or handler throws (runner.ts:470-521).
+        assert_eq!(
+            entries_of(&runner),
+            vec![json!({
+                "type": "provider-errors",
+                "data": ["Provider config is required when registering by name"],
+            })]
+        );
+        let errors = runner.provider_registration_errors();
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].extension_path, "<test-0>");
+        assert_eq!(errors[0].event, "register_provider");
+        assert_eq!(errors[0].error, "Provider id must not be empty.");
+        assert_eq!(errors[1].extension_path, "<test-0>");
+        assert_eq!(errors[1].event, "register_virtual_model");
+        assert_eq!(
+            errors[1].error,
+            "Virtual model provider and id must not be empty."
+        );
     }
 
     #[test]

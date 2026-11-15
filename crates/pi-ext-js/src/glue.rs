@@ -56,7 +56,13 @@ globalThis.Intl = {
 // "loading" | "active" | "failed" (loader.ts:262-267); `bound` mirrors
 // bindCore: action methods throw the not-initialized error until the
 // runner binds (loader.ts:160-244).
-globalThis.__piRuntime = { staleMessage: undefined, bound: false };
+globalThis.__piRuntime = {
+  staleMessage: undefined,
+  bound: false,
+  pendingProviderRegistrations: [],
+  pendingNativeProviderRegistrations: [],
+  pendingVirtualModelRegistrations: [],
+};
 globalThis.__piExtensions = [];
 globalThis.__piExtState = [];
 
@@ -101,6 +107,7 @@ globalThis.__piBeginExtension = function (path) {
     commands: {},
     flags: {},
     busSubscriptions: [],
+    pendingChanges: [],
   });
   globalThis.__piExtState.push("loading");
   return globalThis.__piExtensions.length - 1;
@@ -108,6 +115,79 @@ globalThis.__piBeginExtension = function (path) {
 
 globalThis.__piCommitExtension = function (extIdx) {
   globalThis.__piExtState[extIdx] = "active";
+  // Run the runtime changes deferred during loading (loader.ts:269-277):
+  // a failed extension's changes die with its record.
+  const pending = globalThis.__piExtensions[extIdx].pendingChanges ?? [];
+  globalThis.__piExtensions[extIdx].pendingChanges = [];
+  for (const change of pending) globalThis.__piRunProviderChange(extIdx, change);
+};
+
+// Provider/virtual-model registration deferral (loader.ts:221-239 plus
+// runner.ts:470-521): while an extension is loading its changes queue on
+// the extension record; after commit they queue on the runtime until
+// bindCore; post-bind they apply immediately and throw into the caller.
+globalThis.__piRunProviderChange = function (extIdx, change) {
+  const extensionPath = globalThis.__piExtensions[extIdx].path;
+  if (!globalThis.__piRuntime.bound) {
+    if (change.kind === "provider") {
+      globalThis.__piRuntime.pendingProviderRegistrations.push({
+        name: change.name,
+        configJson: change.configJson,
+        extensionPath,
+      });
+    } else if (change.kind === "native") {
+      globalThis.__piRuntime.pendingNativeProviderRegistrations.push({
+        providerJson: change.providerJson,
+        extensionPath,
+      });
+    } else if (change.kind === "virtual") {
+      globalThis.__piRuntime.pendingVirtualModelRegistrations.push({
+        definitionJson: change.definitionJson,
+        extensionPath,
+      });
+    } else if (change.kind === "unregisterProvider") {
+      globalThis.__piRuntime.pendingProviderRegistrations =
+        globalThis.__piRuntime.pendingProviderRegistrations.filter(
+          (entry) => entry.name !== change.name,
+        );
+      globalThis.__piRuntime.pendingNativeProviderRegistrations =
+        globalThis.__piRuntime.pendingNativeProviderRegistrations.filter(
+          (entry) => JSON.parse(entry.providerJson).id !== change.name,
+        );
+    } else {
+      globalThis.__piRuntime.pendingVirtualModelRegistrations =
+        globalThis.__piRuntime.pendingVirtualModelRegistrations.filter((entry) => {
+          const definition = JSON.parse(entry.definitionJson);
+          return definition.provider !== change.provider || definition.id !== change.id;
+        });
+    }
+    return;
+  }
+  let error = "";
+  if (change.kind === "provider") {
+    error = globalThis.__piOps.providerRegister(change.name, extensionPath, change.configJson);
+  } else if (change.kind === "native") {
+    error = globalThis.__piOps.providerRegisterNative(change.providerJson, extensionPath);
+  } else if (change.kind === "virtual") {
+    error = globalThis.__piOps.virtualModelRegister(change.definitionJson, extensionPath);
+  } else if (change.kind === "unregisterProvider") {
+    globalThis.__piOps.providerUnregister(change.name);
+  } else {
+    globalThis.__piOps.virtualModelUnregister(change.provider, change.id);
+  }
+  if (error !== "") throw new Error(error);
+};
+
+globalThis.__piDrainPendingProviderQueues = function () {
+  const drained = JSON.stringify({
+    providers: globalThis.__piRuntime.pendingProviderRegistrations,
+    nativeProviders: globalThis.__piRuntime.pendingNativeProviderRegistrations,
+    virtualModels: globalThis.__piRuntime.pendingVirtualModelRegistrations,
+  });
+  globalThis.__piRuntime.pendingProviderRegistrations = [];
+  globalThis.__piRuntime.pendingNativeProviderRegistrations = [];
+  globalThis.__piRuntime.pendingVirtualModelRegistrations = [];
+  return drained;
 };
 
 globalThis.__piDiscardExtension = function (extIdx) {
@@ -186,6 +266,15 @@ globalThis.__piCreateApi = function (extIdx) {
   const assertAction = () => {
     assertActive();
     assertBound();
+  };
+  // Registration changes defer while this extension loads
+  // (loader.ts:269-272) and run immediately afterwards.
+  const applyProviderChange = (kind, payload) => {
+    if (globalThis.__piExtState[extIdx] === "loading") {
+      ext.pendingChanges.push({ kind, ...payload });
+    } else {
+      globalThis.__piRunProviderChange(extIdx, { kind, ...payload });
+    }
   };
   return {
     on(event, handler) {
@@ -367,6 +456,36 @@ globalThis.__piCreateApi = function (extIdx) {
     getMcpServers() {
       assertActive();
       return JSON.parse(globalThis.__piOps.getMcpServers());
+    },
+
+    registerProvider(providerOrName, config) {
+      assertActive();
+      if (typeof providerOrName === "string") {
+        if (!config) {
+          throw new Error("Provider config is required when registering by name");
+        }
+        applyProviderChange("provider", {
+          name: providerOrName,
+          configJson: JSON.stringify(config),
+        });
+        return;
+      }
+      applyProviderChange("native", { providerJson: JSON.stringify(providerOrName ?? null) });
+    },
+
+    unregisterProvider(name) {
+      assertActive();
+      applyProviderChange("unregisterProvider", { name: String(name) });
+    },
+
+    registerVirtualModel(model) {
+      assertActive();
+      applyProviderChange("virtual", { definitionJson: JSON.stringify(model ?? null) });
+    },
+
+    unregisterVirtualModel(provider, id) {
+      assertActive();
+      applyProviderChange("unregisterVirtual", { provider: String(provider), id: String(id) });
     },
 
     events: {
@@ -878,6 +997,51 @@ globalThis.__piSessionPatch = function (id, key, valueJson) {
   session.event[key] = JSON.parse(valueJson);
 };
 
+// The user_bash outcome validation (isUserBashEventResult +
+// emitUserBash's throw, runner.ts:1281-1290): invalid results become the
+// session error (the runner propagates them); `{operations}` results
+// stash the live operations object for `call_bash_exec` and cross as
+// `{operations:true}`.
+globalThis.__piUserBashInvalidMessage =
+  "Invalid user_bash handler result: return undefined for local execution or exactly one valid { operations } or { result } object";
+globalThis.__piValidateUserBash = function (value) {
+  if (value === undefined) return { value: undefined };
+  if (typeof value !== "object" || value === null) {
+    return { error: { message: globalThis.__piUserBashInvalidMessage } };
+  }
+  const hasOperations = value.operations !== undefined;
+  const hasResult = value.result !== undefined;
+  if (hasOperations === hasResult) {
+    return { error: { message: globalThis.__piUserBashInvalidMessage } };
+  }
+  if (hasOperations) {
+    const operations = value.operations;
+    if (
+      typeof operations !== "object" ||
+      operations === null ||
+      typeof operations.exec !== "function"
+    ) {
+      return { error: { message: globalThis.__piUserBashInvalidMessage } };
+    }
+    globalThis.__piBashOperations = operations;
+    return { value: { operations: true } };
+  }
+  const result = value.result;
+  const ok =
+    typeof result === "object" &&
+    result !== null &&
+    typeof result.output === "string" &&
+    "exitCode" in result &&
+    (result.exitCode === undefined || typeof result.exitCode === "number") &&
+    typeof result.cancelled === "boolean" &&
+    typeof result.truncated === "boolean" &&
+    (result.fullOutputPath === undefined || typeof result.fullOutputPath === "string");
+  if (!ok) {
+    return { error: { message: globalThis.__piUserBashInvalidMessage } };
+  }
+  return { value: value };
+};
+
 globalThis.__piSessionSettle = function (session, outcome) {
   session.done = true;
   if (outcome.error !== undefined) {
@@ -885,6 +1049,17 @@ globalThis.__piSessionSettle = function (session, outcome) {
     session.hasValue = false;
     session.value = undefined;
     return;
+  }
+  if (session.eventName === "user_bash") {
+    outcome = globalThis.__piValidateUserBash(outcome.value);
+    if (outcome.error !== undefined) {
+      // Slot errors are JSON strings (the shape __piErrorText produces);
+      // __piSessionLast parses them back into objects.
+      session.error = JSON.stringify({ message: outcome.error.message, stack: null });
+      session.hasValue = false;
+      session.value = undefined;
+      return;
+    }
   }
   session.error = undefined;
   if (outcome.value === undefined) {
@@ -898,6 +1073,7 @@ globalThis.__piSessionSettle = function (session, outcome) {
 
 globalThis.__piSessionCall = function (id, extIdx, event, handlerIdx) {
   const session = globalThis.__piSessions.get(id);
+  session.eventName = event;
   const handlers = globalThis.__piExtensions[extIdx].events[event];
   const handler = handlers === undefined ? undefined : handlers[handlerIdx];
   Promise.resolve()
@@ -910,6 +1086,7 @@ globalThis.__piSessionCall = function (id, extIdx, event, handlerIdx) {
 
 globalThis.__piSessionCallCommand = function (id, extIdx, name, args) {
   const session = globalThis.__piSessions.get(id);
+  session.eventName = `command:${name}`;
   const command = globalThis.__piExtensions[extIdx].commands[name];
   Promise.resolve()
     .then(() => command.handler(args, session.ctx))
@@ -921,6 +1098,7 @@ globalThis.__piSessionCallCommand = function (id, extIdx, name, args) {
 
 globalThis.__piSessionCallTool = function (id, extIdx, name, toolCallId) {
   const session = globalThis.__piSessions.get(id);
+  session.eventName = `tool:${name}`;
   const argsJson = JSON.stringify(session.event);
   const tool = globalThis.__piExtensions[extIdx].tools[name];
   const onUpdate = (update) => {
@@ -933,6 +1111,56 @@ globalThis.__piSessionCallTool = function (id, extIdx, name, toolCallId) {
       (error) => globalThis.__piSessionSettle(session, { error: globalThis.__piErrorText(error) }),
     );
 };
+
+// The `user_bash` operations bridge (`BashOperations.exec`,
+// core/tools/bash.ts:74-93): the host calls the stashed operations with
+// a normalized options object; `onData` streams through the `bashData`
+// op, `signal` stays undefined (no abort across the engine boundary —
+// HANDOFF deviation), and the result lands in a one-slot poll the Rust
+// side reads after draining jobs.
+globalThis.__piBashText = null;
+globalThis.__piCallBashOperations = function (command, cwd, optionsJson) {
+  globalThis.__piBashText = null;
+  const run = async () => {
+    const operations = globalThis.__piBashOperations;
+    if (!operations || typeof operations.exec !== "function") {
+      return JSON.stringify({ error: "No bash operations are registered" });
+    }
+    let options = {};
+    try {
+      options = JSON.parse(optionsJson || "{}") ?? {};
+    } catch {
+      options = {};
+    }
+    const onData = (data) => {
+      globalThis.__piOps.bashData(typeof data === "string" ? data : String(data));
+    };
+    try {
+      const result = await operations.exec(command, cwd, {
+        onData,
+        timeout: options.timeout,
+        env: options.env,
+      });
+      return JSON.stringify({ exitCode: result === undefined || result === null ? null : result.exitCode });
+    } catch (error) {
+      return JSON.stringify({ error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+  // The result text lands in the poll slot; a bridge rejection (host
+  // pathologies) degrades to the {error} shape so the bounded poll
+  // still settles.
+  run().then(
+    (text) => {
+      globalThis.__piBashText = text;
+    },
+    (error) => {
+      globalThis.__piBashText = JSON.stringify({
+        error: error instanceof Error ? error.message : String(error),
+      });
+    },
+  );
+};
+globalThis.__piBashReady = () => globalThis.__piBashText !== null;
 
 // The result slot, JSON-encoded: {done:false} while pending,
 // {done:true,error:{message,stack}} on throw, {done:true} without a

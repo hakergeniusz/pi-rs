@@ -86,6 +86,18 @@ pub fn session_before_fork(entry_id: &str, position: &str) -> Json {
     json!({ "type": "session_before_fork", "entryId": entry_id, "position": position })
 }
 
+/// `{type:"user_bash", command, excludeFromContext, cwd}`
+/// (`types.ts:1172-1182`) — fired when the user executes a bash command
+/// via the `!`/`!!` prefix.
+pub fn user_bash(command: &str, exclude_from_context: bool, cwd: &str) -> Json {
+    json!({
+        "type": "user_bash",
+        "command": command,
+        "excludeFromContext": exclude_from_context,
+        "cwd": cwd,
+    })
+}
+
 /// `{type:"ui_prompt_start", reason:"ui_prompt", kind, title?}`
 /// (`types.ts:1063-1069`) — fired when the runner starts waiting on a
 /// blocking extension UI prompt.
@@ -282,6 +294,21 @@ pub struct HandlerErrorJson {
     pub message: String,
     /// The error stack, when the throw was an `Error`.
     pub stack: Option<String>,
+}
+
+/// A bind-time provider-registration failure (the `emitError` report at
+/// the bindCore flush, `runner.ts:470-521`): the extension loaded, the
+/// registration did not apply.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderBindError {
+    /// The extension that requested the registration.
+    pub extension_path: String,
+    /// `"register_provider"` or `"register_virtual_model"` (upstream's
+    /// emitError event names; native registrations report as
+    /// `"register_provider"`).
+    pub event: String,
+    /// The validation message.
+    pub error: String,
 }
 
 /// Parses one session result slot.

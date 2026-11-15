@@ -27,6 +27,7 @@ use serde_json::Value as Json;
 use crate::error::JsHostError;
 use crate::exec;
 use crate::mcp_registry::McpRegistry;
+use crate::provider_registry::ProviderRegistry;
 use crate::resolver::{ExtensionLoader, ExtensionResolver};
 
 /// The kind of context a dispatch session uses.
@@ -105,6 +106,15 @@ pub struct HostCore {
     pub flag_values: BTreeMap<String, Json>,
     /// The MCP server registry.
     pub mcp: McpRegistry,
+    /// The provider / virtual-model registry (`pi.registerProvider` and
+    /// friends).
+    pub providers: ProviderRegistry,
+    /// Data `operations.exec`'s `onData` callback streamed, in order,
+    /// for the current `call_bash_exec`.
+    pub bash_output: Vec<String>,
+    /// Provider registrations that failed validation at the bind-time
+    /// flush, in flush order (the bindCore `emitError` reports).
+    pub provider_bind_errors: Vec<crate::events::ProviderBindError>,
     /// `pi.appendEntry` calls, in order.
     pub entries: Vec<(String, Json)>,
     /// `pi.sendMessage` calls, in order.
@@ -373,6 +383,65 @@ impl JsHost {
             core.ui_requests.push(value);
             id
         });
+        op!("providerRegister", core, |name: String,
+                                       extension_path: String,
+                                       config: String|
+         -> String {
+            let mut core = core.lock().expect("host core mutex poisoned");
+            let config: Json = serde_json::from_str(&config).unwrap_or(Json::Null);
+            match core.providers.register(&name, &extension_path, &config) {
+                Ok(()) => String::new(),
+                Err(message) => message,
+            }
+        });
+        op!("providerRegisterNative", core, |provider: String,
+                                             extension_path: String|
+         -> String {
+            let mut core = core.lock().expect("host core mutex poisoned");
+            let provider: Json = serde_json::from_str(&provider).unwrap_or(Json::Null);
+            match core.providers.register_native(provider, &extension_path) {
+                Ok(()) => String::new(),
+                Err(message) => message,
+            }
+        });
+        op!("providerUnregister", core, |name: String| -> String {
+            core.lock()
+                .expect("host core mutex poisoned")
+                .providers
+                .unregister(&name);
+            String::new()
+        });
+        op!("virtualModelRegister", core, |definition: String,
+                                           extension_path: String|
+         -> String {
+            let mut core = core.lock().expect("host core mutex poisoned");
+            let definition: Json = serde_json::from_str(&definition).unwrap_or(Json::Null);
+            match core
+                .providers
+                .register_virtual_model(definition, &extension_path)
+            {
+                Ok(()) => String::new(),
+                Err(message) => message,
+            }
+        });
+        op!("virtualModelUnregister", core, |provider: String,
+                                             id: String|
+         -> String {
+            core.lock()
+                .expect("host core mutex poisoned")
+                .providers
+                .unregister_virtual_model(&provider, &id);
+            String::new()
+        });
+        // `operations.exec`'s `onData` callback: streaming data lands in
+        // order for the current `call_bash_exec`.
+        op!("bashData", core, |data: String| -> String {
+            core.lock()
+                .expect("host core mutex poisoned")
+                .bash_output
+                .push(data);
+            String::new()
+        });
         op!("getModel", core, || -> String {
             let core = core.lock().expect("host core mutex poisoned");
             let model = (core.actions.get_model)();
@@ -573,18 +642,108 @@ impl JsHost {
     pub fn inspect(&self) -> Result<String, JsHostError> {
         self.ctx.with(|ctx| -> Result<String, JsHostError> {
             let inspect: Function = ctx.globals().get("__piInspect")?;
-            Ok(inspect.call::<(), String>(())?)
+            inspect
+                .call::<(), String>(())
+                .map_err(|err| Self::js_error(&ctx, err))
         })
     }
 
     /// Marks the runtime bound: action methods work from now on (the
     /// runner calls this once after loading, mirroring `bindCore`).
+    /// Before binding, the provider registrations queued during
+    /// extension loading flush through the registry in order; a
+    /// per-registration validation failure is recorded as a
+    /// [`ProviderBindError`] instead of failing the load
+    /// (`runner.ts:470-521`).
     pub fn bind_runtime(&self) -> Result<(), JsHostError> {
+        let drained: String = self.ctx.with(|ctx| -> Result<String, JsHostError> {
+            let drain: Function = ctx.globals().get("__piDrainPendingProviderQueues")?;
+            drain
+                .call::<(), String>(())
+                .map_err(|err| Self::js_error(&ctx, err))
+        })?;
+        let queues: Json =
+            serde_json::from_str(&drained).map_err(|err| JsHostError::Job(err.to_string()))?;
+        {
+            let mut core = self.core.lock().expect("host core mutex poisoned");
+            if let Some(entries) = queues.get("providers").and_then(Json::as_array) {
+                for entry in entries {
+                    let name = entry.get("name").and_then(Json::as_str).unwrap_or_default();
+                    let extension_path = entry
+                        .get("extensionPath")
+                        .and_then(Json::as_str)
+                        .unwrap_or_default();
+                    let config = serde_json::from_str(
+                        entry
+                            .get("configJson")
+                            .and_then(Json::as_str)
+                            .unwrap_or("null"),
+                    )
+                    .unwrap_or(Json::Null);
+                    if let Err(error) = core.providers.register(name, extension_path, &config) {
+                        core.provider_bind_errors
+                            .push(crate::events::ProviderBindError {
+                                extension_path: extension_path.to_string(),
+                                event: "register_provider".to_string(),
+                                error,
+                            });
+                    }
+                }
+            }
+            if let Some(entries) = queues.get("nativeProviders").and_then(Json::as_array) {
+                for entry in entries {
+                    let extension_path = entry
+                        .get("extensionPath")
+                        .and_then(Json::as_str)
+                        .unwrap_or_default();
+                    let provider = serde_json::from_str(
+                        entry
+                            .get("providerJson")
+                            .and_then(Json::as_str)
+                            .unwrap_or("null"),
+                    )
+                    .unwrap_or(Json::Null);
+                    if let Err(error) = core.providers.register_native(provider, extension_path) {
+                        core.provider_bind_errors
+                            .push(crate::events::ProviderBindError {
+                                extension_path: extension_path.to_string(),
+                                event: "register_provider".to_string(),
+                                error,
+                            });
+                    }
+                }
+            }
+            if let Some(entries) = queues.get("virtualModels").and_then(Json::as_array) {
+                for entry in entries {
+                    let extension_path = entry
+                        .get("extensionPath")
+                        .and_then(Json::as_str)
+                        .unwrap_or_default();
+                    let definition = serde_json::from_str(
+                        entry
+                            .get("definitionJson")
+                            .and_then(Json::as_str)
+                            .unwrap_or("null"),
+                    )
+                    .unwrap_or(Json::Null);
+                    if let Err(error) = core
+                        .providers
+                        .register_virtual_model(definition, extension_path)
+                    {
+                        core.provider_bind_errors
+                            .push(crate::events::ProviderBindError {
+                                extension_path: extension_path.to_string(),
+                                event: "register_virtual_model".to_string(),
+                                error,
+                            });
+                    }
+                }
+            }
+        }
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
-            Ok(ctx
-                .globals()
-                .get::<_, Function>("__piBindRuntime")?
-                .call::<(), ()>(())?)
+            let bind: Function = ctx.globals().get("__piBindRuntime")?;
+            bind.call::<(), ()>(())
+                .map_err(|err| Self::js_error(&ctx, err))
         })
     }
 
@@ -592,7 +751,9 @@ impl JsHost {
     pub fn invalidate(&self, message: Option<&str>) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let invalidate: Function = ctx.globals().get("__piInvalidate")?;
-            let _: Value = invalidate.call((message,))?;
+            let _: Value = invalidate
+                .call((message,))
+                .map_err(|err| Self::js_error(&ctx, err))?;
             Ok(())
         })
     }
@@ -613,11 +774,13 @@ impl JsHost {
         };
         self.ctx.with(|ctx| -> Result<u32, JsHostError> {
             let begin: Function = ctx.globals().get("__piSessionBegin")?;
-            Ok(begin.call::<(String, String, Option<String>), u32>((
-                event_json.to_string(),
-                kind.to_string(),
-                tool_call_id.map(str::to_string),
-            ))?)
+            begin
+                .call::<(String, String, Option<String>), u32>((
+                    event_json.to_string(),
+                    kind.to_string(),
+                    tool_call_id.map(str::to_string),
+                ))
+                .map_err(|err| Self::js_error(&ctx, err))
         })
     }
 
@@ -632,7 +795,9 @@ impl JsHost {
     ) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let call: Function = ctx.globals().get("__piSessionCall")?;
-            let _: Value = call.call((id, index, event, handler))?;
+            let _: Value = call
+                .call((id, index, event, handler))
+                .map_err(|err| Self::js_error(&ctx, err))?;
             Ok(())
         })
     }
@@ -647,7 +812,9 @@ impl JsHost {
     ) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let call: Function = ctx.globals().get("__piSessionCallCommand")?;
-            let _: Value = call.call((id, index, name, args))?;
+            let _: Value = call
+                .call((id, index, name, args))
+                .map_err(|err| Self::js_error(&ctx, err))?;
             Ok(())
         })
     }
@@ -663,7 +830,9 @@ impl JsHost {
     ) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let call: Function = ctx.globals().get("__piSessionCallTool")?;
-            let _: Value = call.call((id, index, name, tool_call_id))?;
+            let _: Value = call
+                .call((id, index, name, tool_call_id))
+                .map_err(|err| Self::js_error(&ctx, err))?;
             Ok(())
         })
     }
@@ -684,7 +853,9 @@ impl JsHost {
     pub fn session_patch(&self, id: u32, key: &str, value_json: &str) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let patch: Function = ctx.globals().get("__piSessionPatch")?;
-            let _: Value = patch.call((id, key, value_json))?;
+            let _: Value = patch
+                .call((id, key, value_json))
+                .map_err(|err| Self::js_error(&ctx, err))?;
             Ok(())
         })
     }
@@ -716,9 +887,71 @@ impl JsHost {
     pub fn resolve_ui(&self, id: &str, payload_json: &str) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let resolve: Function = ctx.globals().get("__piUiResolve")?;
-            let _: Value = resolve.call((id, payload_json))?;
+            let _: Value = resolve
+                .call((id, payload_json))
+                .map_err(|err| Self::js_error(&ctx, err))?;
             Ok(())
         })
+    }
+
+    /// Calls the stashed `user_bash` `operations.exec` (`__piCallBashOperations`)
+    /// and waits for its promise through the job queue. Returns the JSON
+    /// result (`{exitCode}` or `{error}`); streamed `onData` chunks sit
+    /// in `HostCore::bash_output` afterwards.
+    pub fn call_bash_exec(
+        &self,
+        command: &str,
+        cwd: &str,
+        options_json: &str,
+    ) -> Result<Json, JsHostError> {
+        {
+            let mut core = self.core.lock().expect("host core mutex poisoned");
+            core.bash_output.clear();
+        }
+        {
+            self.ctx.with(|ctx| -> Result<(), JsHostError> {
+                let call: Function = ctx.globals().get("__piCallBashOperations")?;
+                let _: Value = call
+                    .call((command, cwd, options_json))
+                    .map_err(|err| Self::js_error(&ctx, err))?;
+                Ok(())
+            })?;
+        }
+        // Bounded poll: the bridge promise settles in one or two job
+        // drains, so a lingering null slot means a handler's `exec` chain
+        // stalled; fail fast with the engine state instead of spinning
+        // (a flaky hang was observed twice under parallel test threads).
+        let mut probes: u32 = 0;
+        loop {
+            self.drive_jobs()?;
+            let ready: bool = self.ctx.with(|ctx| -> Result<bool, JsHostError> {
+                ctx.eval("__piBashReady()")
+                    .map_err(|err| Self::js_error(&ctx, err))
+            })?;
+            if ready {
+                break;
+            }
+            probes += 1;
+            if probes > 100_000 {
+                let state = self.ctx.with(|ctx| -> Result<String, JsHostError> {
+                    ctx.eval(
+                        "JSON.stringify({textNull: globalThis.__piBashText === null, \
+                         operations: typeof globalThis.__piBashOperations, \
+                         exec: globalThis.__piBashOperations \
+                           ? typeof globalThis.__piBashOperations.exec : \"none\"})",
+                    )
+                    .map_err(|err| Self::js_error(&ctx, err))
+                })?;
+                return Err(JsHostError::HandlerDidNotComplete(format!(
+                    "bash operations.exec did not settle after 100k job drains; engine state: {state}"
+                )));
+            }
+        }
+        let text: String = self.ctx.with(|ctx| -> Result<String, JsHostError> {
+            ctx.eval("globalThis.__piBashText")
+                .map_err(|err| Self::js_error(&ctx, err))
+        })?;
+        Ok(serde_json::from_str(&text).unwrap_or(Json::Null))
     }
 
     /// Evaluates one JS source string (tests and capability probes):
@@ -744,15 +977,18 @@ impl JsHost {
     fn call_unit(&self, name: &str, arg: usize) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let function: Function = ctx.globals().get(name)?;
-            let _: () = function.call::<(i32,), ()>((arg as i32,))?;
-            Ok(())
+            function
+                .call::<(i32,), ()>((arg as i32,))
+                .map_err(|err| Self::js_error(&ctx, err))
         })
     }
 
     fn read_string_function(&self, name: &str, arg: u32) -> Result<String, JsHostError> {
         self.ctx.with(|ctx| -> Result<String, JsHostError> {
             let function: Function = ctx.globals().get(name)?;
-            Ok(function.call((arg,))?)
+            function
+                .call((arg,))
+                .map_err(|err| Self::js_error(&ctx, err))
         })
     }
 }

@@ -34,11 +34,14 @@ pub mod exec;
 pub mod glue;
 pub mod loader;
 pub mod mcp_registry;
+pub mod provider_registry;
 pub mod resolver;
 pub mod runner;
+pub mod transcript;
 pub mod transpile;
 
 pub use engine::{ContextKind, HostActions, HostCore, JsHost};
 pub use error::{ExtensionError, JsHostError, LoadError};
 pub use loader::{ExtensionOrigin, LoadExtensionsResult, discover_and_load, discover_extensions};
-pub use runner::{ExtensionRunner, ResolvedCommand, ToolInfo};
+pub use provider_registry::{RegisteredNativeProvider, RegisteredProvider, RegisteredVirtualModel};
+pub use runner::{ExtensionRunner, ResolvedCommand, ToolInfo, UiSink};
