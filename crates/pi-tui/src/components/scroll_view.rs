@@ -450,6 +450,13 @@ impl ScrollView {
         self.state.styles = styles;
     }
 
+    /// Take the document out through a mutable borrow. The chat viewport's
+    /// disassemble reaches the scroll view by identity, so ownership has to
+    /// move through `&mut self`.
+    pub fn take_child(&mut self) -> Box<dyn Component> {
+        std::mem::replace(&mut self.child, Box::new(crate::components::spacer::Spacer::new(0)))
+    }
+
     /// Give the child back. `implicitScrollView`, `tui-alt-screen.ts:268`: the
     /// alt screen's implicit root is a scroll view it owns for the length of
     /// one frame, wrapping the host's own children.

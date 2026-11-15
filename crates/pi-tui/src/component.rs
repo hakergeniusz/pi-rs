@@ -162,6 +162,13 @@ impl Container {
         self.children
     }
 
+    /// Take the child list out through a mutable borrow, in order. The chat
+    /// viewport's disassemble reaches the document container by identity, so
+    /// ownership has to move through `&mut self`.
+    pub fn take_children(&mut self) -> Vec<Box<dyn Component>> {
+        std::mem::take(&mut self.children)
+    }
+
     pub fn add_child(&mut self, component: Box<dyn Component>) {
         self.children.push(component);
     }
