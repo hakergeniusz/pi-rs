@@ -11,8 +11,9 @@
 //! resource check, then the store, then the `defaultProjectTrust` setting,
 //! then — with no UI, i.e. print/json/rpc modes — **not trusted**. Upstream
 //! prompts only through the interactive selector; the port's interactive
-//! prompt arrives with P6. The extension `project_trust` hook lands with the
-//! extension host (P5).
+//! prompt arrives with P6. The extension `project_trust` hook (the
+//! bootstrap pass, `project-trust.ts:55-71`) is the `extension_trust`
+//! option below; the extensions host supplies it after the pre-trust load.
 //!
 //! All store/resource functions take the agent dir as a parameter so tests
 //! never touch the process environment (the crate forbids `unsafe`, which
@@ -296,8 +297,14 @@ pub fn has_trust_requiring_project_resources(cwd: &Path) -> bool {
     }
 }
 
+/// The bootstrap extension hook (upstream passes `extensionsResult` into
+/// `resolveProjectTrusted`, `project-trust.ts:55-71`): fires the
+/// `project_trust` event in the pre-trust-loaded extensions and returns
+/// `Some((trusted, remember))` when one handler decided.
+pub type ExtensionTrustHook<'a> = &'a mut dyn FnMut(&Path) -> Result<Option<(bool, bool)>, String>;
+
 /// `ResolveProjectTrustedOptions` (`project-trust.ts:15-23`), minus the
-/// extension hook (P5) and the interactive UI (P6).
+/// interactive UI (P6).
 pub struct ResolveProjectTrustedOptions<'a> {
     pub cwd: &'a Path,
     pub store: &'a ProjectTrustStore,
@@ -305,19 +312,35 @@ pub struct ResolveProjectTrustedOptions<'a> {
     pub trust_override: Option<bool>,
     /// The `defaultProjectTrust` setting; `None` means "ask".
     pub default_project_trust: Option<DefaultProjectTrust>,
+    /// The bootstrap extension hook; consulted before the trust store
+    /// whenever the ladder reaches it.
+    pub extension_trust: Option<ExtensionTrustHook<'a>>,
 }
 
 /// `resolveProjectTrusted` (`project-trust.ts:47-97`). Returns whether
 /// project-local resources may load.
 ///
 /// # Errors
-/// Store read/write failures.
-pub fn resolve_project_trusted(options: &ResolveProjectTrustedOptions<'_>) -> Result<bool, String> {
+/// Store read/write failures, and the extension hook's own failures (the
+/// host reports them as warnings, `project-trust.ts:61-63`).
+pub fn resolve_project_trusted(
+    options: &mut ResolveProjectTrustedOptions<'_>,
+) -> Result<bool, String> {
     if let Some(trusted) = options.trust_override {
         return Ok(trusted);
     }
     if !has_trust_requiring_project_resources(options.cwd) {
         return Ok(options.store.get(options.cwd)?.unwrap_or(true));
+    }
+    // The extension `project_trust` hook decides before the store
+    // (`project-trust.ts:55-71`); `remember: true` persists the decision.
+    if let Some(hook) = options.extension_trust.as_deref_mut()
+        && let Some((trusted, remember)) = hook(options.cwd)?
+    {
+        if remember {
+            options.store.set(options.cwd, trusted)?;
+        }
+        return Ok(trusted);
     }
     if let Some(decision) = options.store.get(options.cwd)? {
         return Ok(decision);
@@ -433,43 +456,85 @@ mod tests {
         let store = ProjectTrustStore::new(&agent_dir);
         let project = dir.path().join("proj");
         // No resources: trusted even with nothing stored.
-        let trusted = resolve_project_trusted(&ResolveProjectTrustedOptions {
+        let trusted = resolve_project_trusted(&mut ResolveProjectTrustedOptions {
             cwd: &project,
             store: &store,
             trust_override: None,
             default_project_trust: None,
+            extension_trust: None,
         })
         .expect("resolve");
         assert!(trusted);
         // The override wins over everything.
-        let trusted = resolve_project_trusted(&ResolveProjectTrustedOptions {
+        let trusted = resolve_project_trusted(&mut ResolveProjectTrustedOptions {
             cwd: &project,
             store: &store,
             trust_override: Some(false),
             default_project_trust: Some(DefaultProjectTrust::Always),
+            extension_trust: None,
         })
         .expect("resolve");
         assert!(!trusted);
         // With gated resources and no stored decision, "ask" resolves to
         // false outside the interactive mode.
         std::fs::create_dir_all(project.join(".pi").join("extensions")).expect("mkdir");
-        let trusted = resolve_project_trusted(&ResolveProjectTrustedOptions {
+        let trusted = resolve_project_trusted(&mut ResolveProjectTrustedOptions {
             cwd: &project,
             store: &store,
             trust_override: None,
             default_project_trust: None,
+            extension_trust: None,
         })
         .expect("resolve");
         assert!(!trusted);
         // A stored decision wins before the setting.
         store.set(&project, true).expect("write");
-        let trusted = resolve_project_trusted(&ResolveProjectTrustedOptions {
+        let trusted = resolve_project_trusted(&mut ResolveProjectTrustedOptions {
             cwd: &project,
             store: &store,
             trust_override: None,
             default_project_trust: Some(DefaultProjectTrust::Never),
+            extension_trust: None,
         })
         .expect("resolve");
         assert!(trusted);
+    }
+
+    #[test]
+    fn extension_hook_decides_before_the_store_and_remembers() {
+        let dir = tempdir();
+        let agent_dir = dir.path().join("agent");
+        let store = ProjectTrustStore::new(&agent_dir);
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(project.join(".pi").join("extensions")).expect("mkdir");
+
+        // The hook's decision wins over the store and the setting; the
+        // `remember` flag persists it (`project-trust.ts:64-68`).
+        let mut decided = false;
+        let trusted = resolve_project_trusted(&mut ResolveProjectTrustedOptions {
+            cwd: &project,
+            store: &store,
+            trust_override: None,
+            default_project_trust: Some(DefaultProjectTrust::Never),
+            extension_trust: Some(&mut |_| {
+                decided = true;
+                Ok(Some((true, true)))
+            }),
+        })
+        .expect("resolve");
+        assert!(trusted);
+        assert!(decided);
+        assert_eq!(store.get(&project).expect("read"), Some(true));
+
+        // `undecided` (the hook returns None) falls through to the store.
+        let trusted = resolve_project_trusted(&mut ResolveProjectTrustedOptions {
+            cwd: &project,
+            store: &store,
+            trust_override: None,
+            default_project_trust: None,
+            extension_trust: Some(&mut |_| Ok(None)),
+        })
+        .expect("resolve");
+        assert!(trusted, "stored decision applies after an undecided hook");
     }
 }

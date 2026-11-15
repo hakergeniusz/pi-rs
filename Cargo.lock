@@ -1464,6 +1464,7 @@ dependencies = [
  "pi-agent",
  "pi-ai",
  "pi-codemode",
+ "pi-ext-js",
  "pi-mcp",
  "pi-schema",
  "pi-tui",

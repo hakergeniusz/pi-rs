@@ -44,26 +44,28 @@ pub enum ContextKind {
 }
 
 /// The host actions an embedder overrides; everything defaults to the
-/// unbound runner behavior (`runner.ts:373-401`).
+/// unbound runner behavior (`runner.ts:373-401`). The closures carry
+/// `Send` so `HostCore` (and with rquickjs's `parallel` feature the whole
+/// runner) can live behind a mutex shared with the agent loop.
 pub struct HostActions {
     /// `ctx.isIdle()`.
-    pub is_idle: Box<dyn Fn() -> bool>,
+    pub is_idle: Box<dyn Fn() -> bool + Send>,
     /// `ctx.isProjectTrusted()`.
-    pub is_project_trusted: Box<dyn Fn() -> bool>,
+    pub is_project_trusted: Box<dyn Fn() -> bool + Send>,
     /// `ctx.model`.
-    pub get_model: Box<dyn Fn() -> Json>,
+    pub get_model: Box<dyn Fn() -> Json + Send>,
     /// `ctx.getContextUsage()`.
-    pub get_context_usage: Box<dyn Fn() -> Option<Json>>,
+    pub get_context_usage: Box<dyn Fn() -> Option<Json> + Send>,
     /// `ctx.getSystemPrompt()`.
-    pub get_system_prompt: Box<dyn Fn() -> String>,
+    pub get_system_prompt: Box<dyn Fn() -> String + Send>,
     /// `ctx.getSystemPromptOptions()`.
-    pub get_system_prompt_options: Box<dyn Fn() -> Json>,
+    pub get_system_prompt_options: Box<dyn Fn() -> Json + Send>,
     /// `ctx.abort()`.
-    pub abort: Box<dyn Fn()>,
+    pub abort: Box<dyn Fn() + Send>,
     /// `ctx.shutdown()`.
-    pub shutdown: Box<dyn Fn()>,
+    pub shutdown: Box<dyn Fn() + Send>,
     /// `ctx.hasPendingMessages()`.
-    pub has_pending_messages: Box<dyn Fn() -> bool>,
+    pub has_pending_messages: Box<dyn Fn() -> bool + Send>,
 }
 
 impl Default for HostActions {

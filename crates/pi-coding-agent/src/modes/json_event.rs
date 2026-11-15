@@ -20,7 +20,7 @@ use pi_agent::agent_message::AgentMessage;
 use pi_agent::events::{AgentEvent, AgentEventSink};
 use pi_agent::queues::Queues;
 use pi_agent::transcript::tool_declaration;
-use pi_agent::types::{AbortSignal, AgentContext, ToolExecutionMode, ToolExecutor, ToolSpec};
+use pi_agent::types::{AbortSignal, AgentContext, ToolExecutionMode, ToolSpec};
 use pi_ai::types::{JsonObject, StopReason};
 
 use crate::modes::print_mode::{PrintModeOptions, PrintRuntime, now_millis};

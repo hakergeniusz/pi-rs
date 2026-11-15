@@ -132,8 +132,11 @@ pub struct ToolExecutionError {
     pub message: String,
 }
 
-/// The runner's error listeners (`onError`).
-type ErrorListeners = Vec<Box<dyn Fn(&ExtensionError)>>;
+/// The runner's error listeners (`onError`). `Send` so `ExtensionRunner`
+/// stays `Send` (rquickjs `Runtime`/`Context` already are without the
+/// `parallel` feature) and the host can share it as
+/// `Arc<Mutex<ExtensionRunner>>`.
+type ErrorListeners = Vec<Box<dyn Fn(&ExtensionError) + Send>>;
 
 /// The runner: dispatch semantics over the loaded extensions.
 /// The host side of the UI-over-protocol surface (E2): every `ctx.ui`
@@ -206,8 +209,9 @@ impl ExtensionRunner {
     }
 
     /// Registers an error listener (`onError`); every handler error and
-    /// load-time failure reaches it.
-    pub fn on_error(&mut self, listener: Box<dyn Fn(&ExtensionError)>) {
+    /// load-time failure reaches it. Listeners must be `Send` so the runner
+    /// can live behind a mutex shared with the agent loop.
+    pub fn on_error(&mut self, listener: Box<dyn Fn(&ExtensionError) + Send>) {
         self.error_listeners.push(listener);
     }
 
@@ -1592,10 +1596,13 @@ export default function (pi) {
 
     fn errors_of(
         runner: &mut ExtensionRunner,
-    ) -> std::rc::Rc<std::cell::RefCell<Vec<ExtensionError>>> {
-        let errors = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<ExtensionError>>> {
+        // Listeners are `Send`, so the sink is an `Arc<Mutex<_>>`, not `Rc`.
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = errors.clone();
-        runner.on_error(Box::new(move |error| sink.borrow_mut().push(error.clone())));
+        runner.on_error(Box::new(move |error| {
+            sink.lock().expect("sink").push(error.clone());
+        }));
         errors
     }
 
@@ -2095,7 +2102,7 @@ export default function (pi) {
                 .expect_err("invalid results propagate");
             assert_eq!(error.to_string(), INVALID);
         }
-        let errors = errors.borrow();
+        let errors = errors.lock().expect("sink");
         assert_eq!(errors.len(), 3);
         for error in errors.iter() {
             assert_eq!(error.extension_path, "<test-0>");
@@ -2166,7 +2173,7 @@ export default function (pi) {
                 json!({ "role": "user", "content": "injected" }),
             ]
         );
-        let errors = errors.borrow();
+        let errors = errors.lock().expect("sink");
         assert_eq!(errors.len(), 2);
         assert_eq!(errors[0].extension_path, "<test-0>");
         assert_eq!(errors[0].event, "context");
@@ -2262,7 +2269,7 @@ export default function (pi) {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "saw");
         assert_eq!(entries[0].1, json!("startup"));
-        let errors = errors.borrow();
+        let errors = errors.lock().expect("sink");
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].extension_path, "<test-1>");
         assert_eq!(errors[0].event, "session_start");
@@ -2391,7 +2398,7 @@ export default function (pi) {
         let final_message = final_message.expect("modified");
         assert_eq!(final_message["patched"], json!(true));
         assert_eq!(final_message["role"], json!("assistant"));
-        let errors = errors.borrow();
+        let errors = errors.lock().expect("sink");
         assert_eq!(errors.len(), 1);
         assert_eq!(
             errors[0].error,
@@ -2522,5 +2529,15 @@ export default function (pi) {
         // observable through the entries it would have appended (none).
         assert!(outcome.is_none());
         assert!(runner.core().lock().expect("core").entries.is_empty());
+    }
+
+    /// The host shares the runner with the agent loop through
+    /// `Arc<Mutex<_>>` (E2 slice 3): that only works while the runner stays
+    /// `Send` — rquickjs's `parallel` feature makes `Runtime`/`Context`
+    /// `Send`, and the error listeners and host actions carry the bound.
+    #[test]
+    fn runner_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ExtensionRunner>();
     }
 }

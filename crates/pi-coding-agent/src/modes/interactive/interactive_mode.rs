@@ -47,7 +47,6 @@ use crate::config::settings::{
 };
 use crate::modes::print_mode::PrintRuntime;
 use crate::session::store::{NewSessionOptions, SessionManager};
-use crate::tools::index::BuiltinToolExecutor;
 
 use super::autocomplete;
 use super::chat_viewport::{self, ChatViewport, HostSlot};
@@ -349,7 +348,8 @@ pub struct InteractiveMode {
     api_key: Option<String>,
     access_token: Option<String>,
     stream_fn: Arc<dyn pi_agent::types::StreamFn>,
-    executor: Arc<BuiltinToolExecutor>,
+    /// The composite executor (builtins + extension dispatch, E2 slice 3).
+    executor: Arc<dyn ToolExecutor>,
     system_prompt: String,
 
     /// Tool rows still awaiting results, keyed by call id.
@@ -3576,6 +3576,7 @@ mod tests {
             system_prompt: "test".to_string(),
             session: SessionManager::in_memory(dir, &NewSessionOptions::default(), Vec::new())
                 .expect("session"),
+            project_trusted: false,
         }
     }
 

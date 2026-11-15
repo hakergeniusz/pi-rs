@@ -24,7 +24,7 @@ use pi_ai::types::{ImageContent, Model, StopReason};
 use crate::auth::{self, Credential};
 use crate::cli::args::{Args, Mode};
 use crate::session::store::{SessionManager, build_session_context_from};
-use crate::tools::index::{BuiltinToolExecutor, ToolDefinition, ToolRegistry};
+use crate::tools::index::{ToolDefinition, ToolRegistry};
 
 /// `PrintModeOptions` (`print-mode.ts:18-27`).
 #[derive(Debug, Clone)]
@@ -49,9 +49,14 @@ pub struct PrintRuntime {
     /// OAuth bearer token from the ladder (`Authorization: Bearer`).
     pub access_token: Option<String>,
     pub stream_fn: Arc<dyn StreamFn>,
-    pub executor: Arc<BuiltinToolExecutor>,
+    /// The composite executor: builtins + extension tool dispatch (E2
+    /// slice 3). Without extensions it is the plain builtin executor.
+    pub executor: Arc<dyn ToolExecutor>,
     pub system_prompt: String,
     pub session: SessionManager,
+    /// The resolved trust decision, shared with the interactive host
+    /// (extensions may decide through the `project_trust` hook).
+    pub project_trusted: bool,
 }
 
 /// `runPrintMode` (`print-mode.ts:33-181`), minus signals/backpressure (P7)
@@ -506,56 +511,95 @@ pub fn apply_tool_modifiers(base: &[String], entries: &[String]) -> Vec<String> 
     tools
 }
 
-/// Select the built-in tool set from CLI flags: `--no-tools`/
-/// `--no-builtin-tools` empty the registry; `--tools` names (all-names form)
-/// replace the defaults, `+name`/`-name` entries modify them; `--exclude-tools`
-/// always removes. Unknown names error like upstream's executor wiring.
-pub fn select_builtin_tools(
+/// Select the tool set from the CLI flags (`main.ts:587-598` maps
+/// `--no-tools`/`--no-builtin-tools` to `noTools: "all"|"builtin"`;
+/// `sdk.ts:280-294` builds the allowlist): `--no-tools` empties everything;
+/// `--no-builtin-tools` keeps extension tools; `--tools` is either an
+/// all-names allowlist (builtins and extension tools) or `+name`/`-name`
+/// modifiers over the builtin defaults — extension tools stay (modifiers
+/// apply to the builtin base only), and `--exclude-tools` always removes.
+/// Unknown builtin names error like the port's executor wiring; the
+/// message lists every resolvable tool.
+pub fn select_tools(
     args: &Args,
-    available: &[ToolDefinition],
+    builtin: &[ToolDefinition],
+    extension: &[ToolDefinition],
 ) -> Result<Vec<ToolDefinition>, String> {
-    if args.no_tools || args.no_builtin_tools {
+    if args.no_tools {
         return Ok(Vec::new());
     }
-    let default_names: Vec<String> = ToolRegistry::coding()
-        .definitions()
-        .iter()
-        .map(|definition| definition.name.to_string())
-        .collect();
-    let mut selected: Vec<String> = match &args.tools {
-        Some(entries) => {
-            let all_names = entries.iter().all(|entry| !is_tool_modifier_entry(entry));
-            if all_names {
-                entries.clone()
-            } else {
-                apply_tool_modifiers(&default_names, entries)
+    let modifier_form = args
+        .tools
+        .as_ref()
+        .is_some_and(|entries| entries.iter().any(|entry| is_tool_modifier_entry(entry)));
+    let mut selected: Vec<ToolDefinition> = if args.no_builtin_tools {
+        Vec::new()
+    } else {
+        let default_names: Vec<String> = ToolRegistry::coding()
+            .definitions()
+            .iter()
+            .map(|definition| definition.name.to_string())
+            .collect();
+        let mut names: Vec<String> = match &args.tools {
+            Some(entries) => {
+                let all_names = entries.iter().all(|entry| !is_tool_modifier_entry(entry));
+                if all_names {
+                    entries.clone()
+                } else {
+                    apply_tool_modifiers(&default_names, entries)
+                }
+            }
+            None => default_names,
+        };
+        if let Some(excluded) = &args.exclude_tools {
+            names.retain(|tool| !excluded.contains(tool));
+        }
+        let universe: Vec<&str> = builtin
+            .iter()
+            .map(|definition| definition.name)
+            .chain(extension.iter().map(|definition| definition.name))
+            .collect();
+        let extension_names: Vec<&str> =
+            extension.iter().map(|definition| definition.name).collect();
+        let mut definitions = Vec::new();
+        for name in &names {
+            // Extension names in the list resolve through the extension
+            // filter below (the allowlist keeps them, `+name` activates
+            // them); they are not unknown tools.
+            if extension_names.contains(&name.as_str()) {
+                continue;
+            }
+            let Some(definition) = builtin
+                .iter()
+                .find(|definition| definition.name == name.as_str())
+            else {
+                return Err(format!(
+                    "Unknown tool: {name}. Built-in tools: {}",
+                    universe.join(", ")
+                ));
+            };
+            definitions.push(definition.clone());
+        }
+        definitions
+    };
+    // Extension tools: kept unless excluded, or dropped by an all-names
+    // `--tools` allowlist (`sdk.ts:287-291` — the modifier form leaves
+    // `allowedToolNames` undefined, so nothing filters them).
+    for definition in extension {
+        if let Some(excluded) = &args.exclude_tools {
+            if excluded.contains(&definition.name.to_string()) {
+                continue;
             }
         }
-        None => default_names,
-    };
-    if let Some(excluded) = &args.exclude_tools {
-        for name in excluded {
-            selected.retain(|tool| tool != name);
+        if !modifier_form
+            && let Some(allow) = &args.tools
+            && !allow.contains(&definition.name.to_string())
+        {
+            continue;
         }
+        selected.push(definition.clone());
     }
-    let mut definitions = Vec::new();
-    for name in &selected {
-        let Some(definition) = available
-            .iter()
-            .find(|definition| definition.name == name.as_str())
-        else {
-            return Err(format!(
-                "Unknown tool: {name}. Built-in tools: {}",
-                available
-                    .iter()
-                    .map(|definition| definition.name)
-                    .collect::<Vec<&str>>()
-                    .join(", ")
-            ));
-        };
-        definitions.push(definition.clone());
-    }
-    Ok(definitions)
+    Ok(selected)
 }
 
 fn is_tool_modifier_entry(entry: &str) -> bool {
@@ -656,7 +700,7 @@ mod tests {
             no_tools: true,
             ..Args::default()
         };
-        assert!(select_builtin_tools(&args, &available).unwrap().is_empty());
+        assert!(select_tools(&args, &available, &[]).unwrap().is_empty());
 
         // Mixed names and modifiers are rejected at parse time upstream, so
         // the mixed case never reaches here; direct calls follow
@@ -665,7 +709,7 @@ mod tests {
             tools: Some(vec!["read".to_string(), "+write".to_string()]),
             ..Args::default()
         };
-        let selected = select_builtin_tools(&args, &available).unwrap();
+        let selected = select_tools(&args, &available, &[]).unwrap();
         assert_eq!(
             selected
                 .iter()
@@ -678,7 +722,7 @@ mod tests {
             tools: Some(vec!["bogus".to_string()]),
             ..Args::default()
         };
-        let error = match select_builtin_tools(&args, &available) {
+        let error = match select_tools(&args, &available, &[]) {
             Err(error) => error,
             Ok(selected) => panic!(
                 "expected unknown-tool error, got {} definitions",
@@ -691,13 +735,106 @@ mod tests {
             exclude_tools: Some(vec!["edit".to_string(), "write".to_string()]),
             ..Args::default()
         };
-        let selected = select_builtin_tools(&args, &available).unwrap();
+        let selected = select_tools(&args, &available, &[]).unwrap();
         assert_eq!(
             selected
                 .iter()
                 .map(|definition| definition.name)
                 .collect::<Vec<&str>>(),
             vec!["read", "bash"]
+        );
+    }
+
+    /// An extension tool definition with a stable static name.
+    fn extension_definition(name: &'static str) -> ToolDefinition {
+        ToolDefinition {
+            name,
+            label: name,
+            description: format!("{name} from an extension"),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+            output_schema: None,
+            prompt_snippet: None,
+            prompt_guidelines: Vec::new(),
+            constrained_sampling: None,
+            prepare_arguments: None,
+            execution_mode: None,
+            render_shell: None,
+            renderers: crate::tools::renderers::ToolRenderers {
+                render_call: |_args, _context| String::new(),
+                render_result: |_args, _result, _context| String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn extension_tools_follow_the_cli_filters() {
+        let builtin = ToolRegistry::all().definitions().to_vec();
+        let extension = vec![extension_definition("exta"), extension_definition("extb")];
+
+        // Default: extension tools join the builtins.
+        let args = Args::default();
+        let selected = select_tools(&args, &builtin, &extension).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<&str>>(),
+            vec!["read", "bash", "edit", "write", "exta", "extb"]
+        );
+
+        // `--no-builtin-tools` keeps extension tools (`noTools: "builtin"`).
+        let args = Args {
+            no_builtin_tools: true,
+            ..Args::default()
+        };
+        let selected = select_tools(&args, &builtin, &extension).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<&str>>(),
+            vec!["exta", "extb"]
+        );
+
+        // The all-names `--tools` allowlist filters extension tools too.
+        let args = Args {
+            tools: Some(vec!["read".to_string(), "extb".to_string()]),
+            ..Args::default()
+        };
+        let selected = select_tools(&args, &builtin, &extension).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<&str>>(),
+            vec!["read", "extb"]
+        );
+
+        // The modifier form keeps extension tools (`allowedToolNames`
+        // undefined) and `--exclude-tools` still removes them.
+        let args = Args {
+            tools: Some(vec!["+write".to_string(), "-edit".to_string()]),
+            exclude_tools: Some(vec!["exta".to_string()]),
+            ..Args::default()
+        };
+        let selected = select_tools(&args, &builtin, &extension).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<&str>>(),
+            vec!["read", "bash", "write", "extb"]
+        );
+
+        // `--no-tools` drops everything (`noTools: "all"`).
+        let args = Args {
+            no_tools: true,
+            ..Args::default()
+        };
+        assert!(
+            select_tools(&args, &builtin, &extension)
+                .unwrap()
+                .is_empty()
         );
     }
 }

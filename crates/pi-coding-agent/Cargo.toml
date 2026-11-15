@@ -23,6 +23,8 @@ pi-codemode = { workspace = true }
 pi-mcp = { workspace = true }
 pi-schema = { workspace = true }
 pi-tui = { workspace = true }
+# The embedded JS extensions host; build without it via `--no-default-features`.
+pi-ext-js = { workspace = true, optional = true }
 # Interactive mode polls terminal events directly, like the tui-demo host.
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
 clap = { workspace = true }
@@ -42,6 +44,10 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+default = ["ext-js"]
+ext-js = ["dep:pi-ext-js"]
 
 [lints]
 workspace = true

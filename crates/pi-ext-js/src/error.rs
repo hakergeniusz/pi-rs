@@ -46,12 +46,13 @@ pub struct ExtensionError {
     pub stack: Option<String>,
 }
 
-/// One load failure: the path and the message that upstream would print as
-/// a CLI diagnostic (`Failed to load extension: {message}`).
+/// One load failure: the path and the raw failure message. The host
+/// formats the diagnostic (`Failed to load extension "{path}": {error}`,
+/// `main.ts:861-864`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadError {
     /// The path (or synthetic `builtin:<name>` path) that failed.
     pub path: String,
-    /// The failure message, formatted like upstream's.
+    /// The raw failure message.
     pub error: String,
 }

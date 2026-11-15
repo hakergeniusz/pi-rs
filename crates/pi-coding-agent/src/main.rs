@@ -13,16 +13,15 @@ use pi_ai::providers;
 use pi_ai::types::ImageContent;
 use pi_coding_agent::cli::args::{Args, DiagnosticKind, Mode, parse_args, print_help};
 use pi_coding_agent::cli::file_processor::process_file_arguments;
-use pi_coding_agent::cli::project_trust::{
-    DefaultProjectTrust, ProjectTrustStore, ResolveProjectTrustedOptions, resolve_project_trusted,
-};
+use pi_coding_agent::cli::project_trust::{DefaultProjectTrust, ProjectTrustStore};
 use pi_coding_agent::config;
 use pi_coding_agent::config::settings::{SettingsManager, SettingsManagerCreateOptions};
+use pi_coding_agent::extensions;
 use pi_coding_agent::modes::json_event::run_json_mode;
 use pi_coding_agent::modes::print_mode::{
     PrintModeOptions, PrintRuntime, ProviderStreamFn, WireCredential, parse_model_pattern,
-    resolve_model, resolve_wire_credential, run_print_mode, select_builtin_tools,
-    system_prompt_for, thinking_level_from_str,
+    resolve_model, resolve_wire_credential, run_print_mode, select_tools, system_prompt_for,
+    thinking_level_from_str,
 };
 use pi_coding_agent::modes::rpc::run_rpc_mode;
 use pi_coding_agent::session::store::{NewSessionOptions, SessionManager};
@@ -114,17 +113,7 @@ fn list_models(search: Option<&str>) {
 /// `resolveProjectTrusted` (`main.js:669`). `getDefaultProjectTrust`
 /// (`settings-manager.js:789-792`) accepts only "always"/"never"; anything
 /// else falls back to the "ask" default (`None` here).
-fn startup_default_project_trust(
-    cwd: &std::path::Path,
-    agent_dir: &std::path::Path,
-) -> Option<DefaultProjectTrust> {
-    let settings = SettingsManager::create(
-        cwd,
-        agent_dir,
-        SettingsManagerCreateOptions {
-            project_trusted: None,
-        },
-    );
+fn startup_default_project_trust(settings: &SettingsManager) -> Option<DefaultProjectTrust> {
     match settings
         .get("defaultProjectTrust")
         .and_then(|value| value.as_str())
@@ -136,26 +125,71 @@ fn startup_default_project_trust(
 }
 
 /// Assemble the runtime shared by print/JSON/RPC modes. Mirrors the startup
-/// path of upstream `cli.ts` for non-interactive runs: settings, model,
-/// credentials, session, tools, system prompt.
+/// path of upstream `main.ts` for non-interactive runs: settings, the
+/// extensions host (discovery, pre-trust pass, trust decision, final load,
+/// bind, flag claiming), model, credentials, session, tools, system prompt.
+#[allow(clippy::too_many_lines)] // mirrors the main.ts createRuntime assembly; split when extending
 fn build_runtime(
     args: &Args,
     cwd: &std::path::Path,
     cwd_string: &str,
+    mode: &str,
 ) -> Result<PrintRuntime, String> {
     let agent_dir = config::get_agent_dir();
+    let trust_store = ProjectTrustStore::new(&agent_dir);
+    let startup_settings = SettingsManager::create(
+        cwd,
+        &agent_dir,
+        SettingsManagerCreateOptions {
+            project_trusted: None,
+        },
+    );
+    let default_project_trust = startup_default_project_trust(&startup_settings);
+
+    // Extensions (E2 slice 3). Diagnostics report in order: warnings to
+    // stderr, error-level entries abort with the load-failure hint
+    // (`main.ts:982-990`).
+    let (extensions, diagnostics) = extensions::load(
+        args,
+        cwd,
+        &agent_dir,
+        &trust_store,
+        default_project_trust,
+        &startup_settings,
+        mode,
+    )?;
+    for diagnostic in &diagnostics {
+        if diagnostic.kind == DiagnosticKind::Warning {
+            eprintln!("Warning: {}", diagnostic.message);
+        }
+    }
+    let errors: Vec<&str> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.kind == DiagnosticKind::Error)
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    if !errors.is_empty() {
+        let mut message = errors
+            .iter()
+            .map(|error| format!("Error: {error}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if errors
+            .iter()
+            .any(|error| error.contains("Failed to load extension"))
+        {
+            message.push('\n');
+            message.push_str(extensions::EXTENSION_LOAD_FAILURE_HINT);
+        }
+        return Err(message);
+    }
+    let project_trusted = extensions.project_trusted;
+
     // `resolveProjectTrusted` (`project-trust.ts:47-97`): the `--approve`
     // override, the trust store, then the `defaultProjectTrust` setting
     // ("ask" without a UI resolves to not-trusted, like upstream's
-    // non-interactive paths).
-    let trust_store = ProjectTrustStore::new(&agent_dir);
-    let default_project_trust = startup_default_project_trust(cwd, &agent_dir);
-    let project_trusted = resolve_project_trusted(&ResolveProjectTrustedOptions {
-        cwd,
-        store: &trust_store,
-        trust_override: args.project_trust_override,
-        default_project_trust,
-    })?;
+    // non-interactive paths) — with the extension hook consulted when the
+    // bootstrap pass ran.
     let settings = SettingsManager::create(
         cwd,
         &agent_dir,
@@ -224,10 +258,12 @@ fn build_runtime(
     }
     .map_err(|error| error.to_string())?;
 
-    // Tools.
-    let available = ToolRegistry::all().definitions().to_vec();
-    let selected = select_builtin_tools(args, &available)?;
-    let executor = ToolRegistry::new(selected).executor(cwd_string);
+    // Tools: builtins plus extension tools (the CLI filters apply to both;
+    // extension tools append after the builtins, like the upstream
+    // registry order).
+    let builtin_available = ToolRegistry::all().definitions().to_vec();
+    let selected = select_tools(args, &builtin_available, extensions.host.tool_definitions())?;
+    let executor = extensions.host.executor(&selected, cwd_string);
 
     // System prompt.
     let system_prompt = system_prompt_for(args, cwd_string)?;
@@ -264,6 +300,7 @@ fn build_runtime(
         executor,
         system_prompt,
         session,
+        project_trusted,
     })
 }
 
@@ -297,7 +334,7 @@ fn resolve_prompt_messages(args: &Args, cwd: &std::path::Path) -> Result<PromptP
 }
 
 fn run_print(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
-    let mut runtime = build_runtime(args, cwd, cwd_string)?;
+    let mut runtime = build_runtime(args, cwd, cwd_string, "print")?;
     let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd)?;
     let options = PrintModeOptions {
         mode: Mode::Text,
@@ -311,19 +348,11 @@ fn run_print(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32
 /// Interactive mode: the chat TUI. Initial `@file`/message arguments ride
 /// along like upstream's `initialMessage` (P6 part 2).
 fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
-    let mut runtime = build_runtime(args, cwd, cwd_string)?;
-    // The trust ladder resolved once: the selector displays the session's
-    // state and the theme seeding uses the same settings access.
+    let mut runtime = build_runtime(args, cwd, cwd_string, "interactive")?;
+    // The trust ladder resolved once in build_runtime — extensions may have
+    // decided through the `project_trust` hook.
+    let project_trusted = runtime.project_trusted;
     let agent_dir = config::get_agent_dir();
-    let trust_store = ProjectTrustStore::new(&agent_dir);
-    let default_project_trust = startup_default_project_trust(cwd, &agent_dir);
-    let project_trusted = resolve_project_trusted(&ResolveProjectTrustedOptions {
-        cwd,
-        store: &trust_store,
-        trust_override: args.project_trust_override,
-        default_project_trust,
-    })
-    .unwrap_or(false);
     // The theme setting seeds the controller: `--use-theme` wins, else
     // settings.json's `theme` (upstream passes the settings manager into the
     // mode; the port funnels the resolved setting through options).
@@ -355,7 +384,7 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
 }
 
 fn run_json(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
-    let mut runtime = build_runtime(args, cwd, cwd_string)?;
+    let mut runtime = build_runtime(args, cwd, cwd_string, "json")?;
     let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd)?;
     let options = PrintModeOptions {
         mode: Mode::Json,
@@ -371,7 +400,7 @@ fn run_rpc(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, 
         // `main.ts:708-711`.
         return Err("Error: @file arguments are not supported in RPC mode".to_string());
     }
-    let mut runtime = build_runtime(args, cwd, cwd_string)?;
+    let mut runtime = build_runtime(args, cwd, cwd_string, "rpc")?;
     let mut stdin = BufReader::new(std::io::stdin());
     let out = stdout();
     run_rpc_mode(&mut runtime, &mut stdin, &mut out.lock())

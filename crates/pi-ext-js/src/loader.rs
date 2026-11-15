@@ -104,34 +104,60 @@ pub fn discover_extensions(
         push(path, ExtensionOrigin::User, &mut all);
     }
     for configured in configured_paths {
-        let resolved = if Path::new(configured).is_absolute() {
-            PathBuf::from(configured)
-        } else {
-            cwd.join(configured)
-        };
-        if resolved.is_dir() {
-            match resolve_directory_entries(&resolved) {
-                Some(DirectoryEntry::Manifest(entries)) => {
-                    for entry in entries {
-                        push(entry, ExtensionOrigin::Explicit, &mut all);
-                    }
-                    continue;
-                }
-                Some(DirectoryEntry::Index(index)) => {
-                    push(index, ExtensionOrigin::Explicit, &mut all);
-                    continue;
-                }
-                None => {
-                    for path in discover_extensions_in_dir(&resolved) {
-                        push(path, ExtensionOrigin::Explicit, &mut all);
-                    }
-                    continue;
-                }
-            }
-        }
-        push(resolved, ExtensionOrigin::Explicit, &mut all);
+        push_explicit(configured, cwd, &mut all);
     }
     all
+}
+
+/// The `-e` paths only (`noExtensions` keeps loading CLI extensions —
+/// `resource-loader.ts:609-610` uses just `cliEnabledExtensions`): a
+/// directory resolves through the entry rules, else discovers its
+/// contents; everything is [`ExtensionOrigin::Explicit`].
+pub fn discover_cli_paths(configured_paths: &[String], cwd: &Path) -> Vec<DiscoveredPath> {
+    let mut all = Vec::new();
+    for configured in configured_paths {
+        push_explicit(configured, cwd, &mut all);
+    }
+    all
+}
+
+/// One explicit path: absolute or cwd-relative; a directory resolves
+/// through the entry rules, else discovers its contents.
+fn push_explicit(configured: &str, cwd: &Path, all: &mut Vec<DiscoveredPath>) {
+    let resolved = if Path::new(configured).is_absolute() {
+        PathBuf::from(configured)
+    } else {
+        cwd.join(configured)
+    };
+    let push = |path: PathBuf, all: &mut Vec<DiscoveredPath>| {
+        if !all.iter().any(|existing| existing.path == path) {
+            all.push(DiscoveredPath {
+                path,
+                origin: ExtensionOrigin::Explicit,
+            });
+        }
+    };
+    if resolved.is_dir() {
+        match resolve_directory_entries(&resolved) {
+            Some(DirectoryEntry::Manifest(entries)) => {
+                for entry in entries {
+                    push(entry, all);
+                }
+                return;
+            }
+            Some(DirectoryEntry::Index(index)) => {
+                push(index, all);
+                return;
+            }
+            None => {
+                for path in discover_extensions_in_dir(&resolved) {
+                    push(path, all);
+                }
+                return;
+            }
+        }
+    }
+    push(resolved, all);
 }
 
 /// The pre-trust split (`loadProjectTrustExtensions`,
@@ -167,7 +193,9 @@ pub struct LoadExtensionsResult {
 
 /// Loads a path list into the runner, collecting errors as values
 /// (`loadExtensionsInternal`, `loader.ts:688-728`: one failing extension
-/// never stops the others).
+/// never stops the others). Errors are the raw failure; the host formats
+/// the `Failed to load extension "{path}": {error}` diagnostic
+/// (`main.ts:861-864`).
 pub fn load_paths(runner: &mut ExtensionRunner, paths: &[PathBuf]) -> LoadExtensionsResult {
     let mut result = LoadExtensionsResult::default();
     for path in paths {
@@ -176,7 +204,7 @@ pub fn load_paths(runner: &mut ExtensionRunner, paths: &[PathBuf]) -> LoadExtens
             Ok(()) => result.extensions.push(display),
             Err(error) => result.errors.push(LoadError {
                 path: display,
-                error: format!("Failed to load extension: {error}"),
+                error: error.to_string(),
             }),
         }
     }
@@ -342,6 +370,32 @@ mod tests {
     }
 
     #[test]
+    fn cli_path_discovery_loads_only_configured_paths() {
+        let root = temp_tree("cli-only");
+        let cwd = root.join("project");
+        let agent = root.join("agent");
+        write(
+            &cwd.join(".pi").join("extensions").join("project_ext.ts"),
+            FACTORY,
+        );
+        write(&agent.join("extensions").join("user_ext.ts"), FACTORY);
+        let explicit = root.join("extra.ts");
+        write(&explicit, FACTORY);
+
+        // `--no-extensions` keeps CLI extensions (`resource-loader.ts:609`):
+        // project/user discovery is skipped entirely.
+        let found = discover_cli_paths(&[explicit.to_string_lossy().into_owned()], &cwd);
+        assert_eq!(
+            found.iter().map(|entry| entry.origin).collect::<Vec<_>>(),
+            vec![ExtensionOrigin::Explicit]
+        );
+        assert_eq!(found[0].path, explicit);
+        // A relative path resolves against the cwd.
+        let found = discover_cli_paths(&["rel.ts".to_string()], &cwd);
+        assert_eq!(found[0].path, cwd.join("rel.ts"));
+    }
+
+    #[test]
     fn trust_split_excludes_project_before_the_decision() {
         let discovered = vec![
             DiscoveredPath {
@@ -380,7 +434,8 @@ mod tests {
         let result = load_paths(&mut runner, &[bad, good.clone(), missing]);
         assert_eq!(result.extensions, vec![good.to_string_lossy().into_owned()]);
         assert_eq!(result.errors.len(), 2);
-        assert!(result.errors[0].error.contains("Failed to load extension:"));
+        // Raw failures; the host adds the `Failed to load extension`
+        // diagnostic wrapper (`main.ts:861-864`).
         assert!(
             result.errors[0]
                 .error
