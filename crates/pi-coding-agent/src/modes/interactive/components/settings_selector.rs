@@ -77,6 +77,17 @@ pub enum SettingsSelectorEvent {
     ModelThinkingLevelRemove { provider: String, model_id: String },
     /// `onDefaultProjectTrustChange`.
     DefaultProjectTrustChange(String),
+    /// `onTuiModeChange` — the mode to switch to; the orchestrator refuses
+    /// while a selector occupies the editor slot.
+    TuiModeChange(String),
+    /// `onFullscreenExitOutputChange`.
+    FullscreenExitOutputChange(String),
+    /// `onFullscreenScrollbarChange`.
+    FullscreenScrollbarChange(String),
+    /// `onFullscreenCopyOnSelectChange`.
+    FullscreenCopyOnSelectChange(bool),
+    /// `onFullscreenWheelScrollLinesChange` — `"auto"` or a line count.
+    FullscreenWheelScrollLinesChange(String),
     /// `onCancel`.
     Cancel,
 }
@@ -103,6 +114,16 @@ pub struct SettingsSelectorConfig {
     pub terminal_theme: String,
     /// `ask` | `always` | `never`.
     pub default_project_trust: String,
+    /// The resolved TUI mode: `regular` or `fullscreen`.
+    pub tui_mode: String,
+    /// `transcript` or `resume-hint`.
+    pub fullscreen_exit_output: String,
+    /// `auto`, `always`, or `hidden`.
+    pub fullscreen_scrollbar: String,
+    /// Whether a selection copies itself when completed.
+    pub fullscreen_copy_on_select: bool,
+    /// `"auto"` or the resolved lines-per-wheel number.
+    pub fullscreen_wheel_scroll_lines: String,
 }
 
 /// State the submenu factories mutate between steps: the live per-model
@@ -802,9 +823,80 @@ pub struct SettingsSelectorComponent {
     events: Arc<Mutex<Vec<SettingsSelectorEvent>>>,
 }
 
+/// `fullscreenWheelScrollLines`'s row values (`settings-selector.ts:516-524`):
+/// `"auto"`, then the presets and the current count deduplicated and sorted.
+fn wheel_scroll_values(current: &str) -> Vec<String> {
+    let mut values = vec!["auto".to_string()];
+    let mut numbers: Vec<f64> = vec![1.0, 2.0, 3.0, 5.0, 10.0];
+    if let Ok(lines) = current.parse::<f64>()
+        && !numbers.contains(&lines)
+    {
+        numbers.push(lines);
+    }
+    numbers.sort_by(|a, b| a.partial_cmp(b).expect("finite line counts"));
+    values.extend(numbers.iter().map(f64::to_string));
+    values
+}
+
+/// The five fullscreen rows (`settings-selector.ts:489-525`), verbatim.
+fn fullscreen_items(config: &SettingsSelectorConfig) -> Vec<SettingItem> {
+    vec![
+        SettingItem::new("tui-mode", "TUI mode", config.tui_mode.clone())
+            .with_description(
+                "Interface layout; regular mode uses the terminal's normal scrollback",
+            )
+            .with_values(vec!["regular".to_string(), "fullscreen".to_string()]),
+        SettingItem::new(
+            "fullscreen-exit-output",
+            "Fullscreen exit output",
+            config.fullscreen_exit_output.clone(),
+        )
+        .with_description(
+            "Print the transcript or only a session resume hint when exiting \
+             fullscreen mode",
+        )
+        .with_values(vec!["transcript".to_string(), "resume-hint".to_string()]),
+        SettingItem::new(
+            "fullscreen-scrollbar",
+            "Fullscreen scrollbar",
+            config.fullscreen_scrollbar.clone(),
+        )
+        .with_description("Scrollbar behavior in fullscreen mode; has no effect in regular mode")
+        .with_values(vec![
+            "auto".to_string(),
+            "always".to_string(),
+            "hidden".to_string(),
+        ]),
+        SettingItem::new(
+            "fullscreen-copy-on-select",
+            "Fullscreen copy on select",
+            if config.fullscreen_copy_on_select {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .with_description(
+            "Automatically copy selected text in fullscreen mode; disable to \
+             copy selections with Ctrl+X",
+        )
+        .with_values(vec!["true".to_string(), "false".to_string()]),
+        SettingItem::new(
+            "fullscreen-wheel-scroll-lines",
+            "Fullscreen wheel scrolling",
+            config.fullscreen_wheel_scroll_lines.clone(),
+        )
+        .with_description(
+            "Lines per mouse-wheel event in fullscreen mode; 'auto' speeds up \
+             fast wheel spins where the terminal does not",
+        )
+        .with_values(wheel_scroll_values(&config.fullscreen_wheel_scroll_lines)),
+    ]
+}
+
 /// The dialog rows (`settings-selector.ts:256-394`), in upstream order:
-/// queue modes, thinking visibility, project trust, per-model thinking, and
-/// the theme.
+/// queue modes, thinking visibility, project trust, per-model thinking, the
+/// fullscreen items, and the theme.
 fn selector_items(
     config: &SettingsSelectorConfig,
     default_project_trust_label: &str,
@@ -813,7 +905,7 @@ fn selector_items(
 ) -> Vec<SettingItem> {
     let follow_up_key = theme::key_text(theme::app_keys::MESSAGE_FOLLOW_UP);
     let cycle_thinking_key = theme::key_text(theme::app_keys::THINKING_CYCLE);
-    vec![
+    let mut items = vec![
         SettingItem::new(
             "steering-mode",
             "Steering mode",
@@ -874,7 +966,13 @@ fn selector_items(
         SettingItem::new("theme", "Theme", config.current_theme.clone())
             .with_description("Color theme for the interface")
             .with_submenu(theme_factory),
-    ]
+    ];
+    // The five fullscreen rows sit between the per-model thinking summary
+    // and the theme (`settings-selector.ts:489-525`).
+    let theme = items.pop().expect("the theme row");
+    items.extend(fullscreen_items(config));
+    items.push(theme);
+    items
 }
 
 impl SettingsSelectorComponent {
@@ -982,6 +1080,25 @@ impl SettingsSelectorComponent {
                         ));
                     }
                 }
+                "tui-mode" => {
+                    self.push(SettingsSelectorEvent::TuiModeChange(value));
+                }
+                "fullscreen-exit-output" => {
+                    self.push(SettingsSelectorEvent::FullscreenExitOutputChange(value));
+                }
+                "fullscreen-scrollbar" => {
+                    self.push(SettingsSelectorEvent::FullscreenScrollbarChange(value));
+                }
+                "fullscreen-copy-on-select" => {
+                    self.push(SettingsSelectorEvent::FullscreenCopyOnSelectChange(
+                        value == "true",
+                    ));
+                }
+                "fullscreen-wheel-scroll-lines" => {
+                    self.push(SettingsSelectorEvent::FullscreenWheelScrollLinesChange(
+                        value,
+                    ));
+                }
                 // The theme row's value is delivered by the submenu's done
                 // callback; the summary updates of the model-thinking row
                 // carry no event.
@@ -1066,6 +1183,11 @@ mod tests {
             current_theme: "system".to_string(),
             terminal_theme: "dark".to_string(),
             default_project_trust: "ask".to_string(),
+            tui_mode: "fullscreen".to_string(),
+            fullscreen_exit_output: "transcript".to_string(),
+            fullscreen_scrollbar: "auto".to_string(),
+            fullscreen_copy_on_select: true,
+            fullscreen_wheel_scroll_lines: "auto".to_string(),
         }
     }
 
@@ -1079,7 +1201,7 @@ mod tests {
 
     #[test]
     fn renders_the_scoped_rows_with_values_and_search() {
-        let selector = SettingsSelectorComponent::new(&config(), queue());
+        let mut selector = SettingsSelectorComponent::new(&config(), queue());
         let lines = plain(&selector, 90);
         let joined = lines.join("\n");
         for label in [
@@ -1088,18 +1210,27 @@ mod tests {
             "Hide thinking",
             "Default project trust",
             "Default thinking level per model",
-            "Theme",
+            "TUI mode",
         ] {
             assert!(joined.contains(label), "missing {label}: {joined}");
         }
         // The rows this port cannot apply are absent.
         assert!(!joined.contains("Auto-compact"), "{joined}");
         assert!(!joined.contains("Mermaid"), "{joined}");
-        assert!(!joined.contains("TUI mode"), "{joined}");
         // The search row leads the list.
         assert!(lines.iter().any(|line| line.contains("Type to search")));
         assert!(joined.contains("Ask"), "{joined}");
         assert!(joined.contains("none"), "{joined}");
+        // The ten-row window hides the tail until the selection scrolls.
+        for _ in 0..10 {
+            selector.handle_input("\x1b[B");
+        }
+        let tail = plain(&selector, 90).join("\n");
+        assert!(
+            tail.contains("Fullscreen wheel scrolling"),
+            "missing the wheel row: {tail}"
+        );
+        assert!(tail.contains("Theme"), "missing the theme row: {tail}");
     }
 
     #[test]
@@ -1120,8 +1251,8 @@ mod tests {
     fn the_theme_submenu_previews_and_persists_through_done() {
         let events = queue();
         let mut selector = SettingsSelectorComponent::new(&config(), events);
-        // Navigate to the theme row (last) and open its submenu.
-        for _ in 0..5 {
+        // Navigate to the theme row (last of eleven) and open its submenu.
+        for _ in 0..10 {
             selector.handle_input("\x1b[B");
         }
         selector.handle_input("\r");
@@ -1148,16 +1279,16 @@ mod tests {
                 .any(|event| matches!(event, SettingsSelectorEvent::ThemeChange(_))),
             "{drained:?}"
         );
-        // Back on the main list.
+        // Back on the main list (scrolled to the selected last row).
         let lines = plain(&selector, 80);
-        assert!(lines.iter().any(|line| line.contains("Steering mode")));
+        assert!(lines.iter().any(|line| line.contains("Theme")), "{lines:?}");
     }
 
     #[test]
     fn the_automatic_theme_menu_applies_the_light_dark_setting() {
         let events = queue();
         let mut selector = SettingsSelectorComponent::new(&config(), events);
-        for _ in 0..5 {
+        for _ in 0..10 {
             selector.handle_input("\x1b[B");
         }
         selector.handle_input("\r"); // open theme submenu
@@ -1270,5 +1401,52 @@ mod tests {
                 "always".to_string()
             )]
         );
+    }
+
+    /// The five fullscreen rows sit between the per-model thinking summary
+    /// and the theme (`settings-selector.ts:489-525`), and each delivers its
+    /// event with the row's raw value.
+    #[test]
+    fn the_fullscreen_rows_deliver_their_events() {
+        let events = queue();
+        let mut selector = SettingsSelectorComponent::new(&config(), events);
+        // Row 5 (0-based): tui-mode.
+        for _ in 0..5 {
+            selector.handle_input("\x1b[B");
+        }
+        selector.handle_input("\r"); // cycle fullscreen → regular
+        selector.handle_input("\x1b[B");
+        selector.handle_input("\r"); // transcript → resume-hint
+        selector.handle_input("\x1b[B");
+        selector.handle_input("\r"); // auto → always
+        selector.handle_input("\x1b[B");
+        selector.handle_input("\r"); // true → false
+        selector.handle_input("\x1b[B");
+        selector.handle_input("\r"); // auto → 1
+        assert_eq!(
+            selector.drain(),
+            vec![
+                SettingsSelectorEvent::TuiModeChange("regular".to_string()),
+                SettingsSelectorEvent::FullscreenExitOutputChange("resume-hint".to_string()),
+                SettingsSelectorEvent::FullscreenScrollbarChange("always".to_string()),
+                SettingsSelectorEvent::FullscreenCopyOnSelectChange(false),
+                SettingsSelectorEvent::FullscreenWheelScrollLinesChange("1".to_string()),
+            ]
+        );
+    }
+
+    /// The wheel row's values: `"auto"` first, then the presets and the
+    /// current count deduplicated and sorted (`settings-selector.ts:516-524`).
+    #[test]
+    fn wheel_values_are_the_presets_plus_the_current_count() {
+        assert_eq!(
+            wheel_scroll_values("auto"),
+            ["auto", "1", "2", "3", "5", "10"]
+        );
+        assert_eq!(
+            wheel_scroll_values("7"),
+            ["auto", "1", "2", "3", "5", "7", "10"]
+        );
+        assert_eq!(wheel_scroll_values("5"), ["auto", "1", "2", "3", "5", "10"]);
     }
 }

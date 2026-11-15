@@ -27,6 +27,7 @@ use pi_agent::types::{
 use pi_tui::color::{TextAttributes, style_text_with_ansi};
 use pi_tui::component::{Component, ComponentMutation};
 use pi_tui::components::editor::{Editor, EditorOptions};
+use pi_tui::components::scroll_view::ScrollView;
 use pi_tui::components::stack::VStack;
 use pi_tui::components::text::Text;
 use pi_tui::mouse::{ComponentId, MouseEvent, MouseEventResult, component_id};
@@ -41,7 +42,7 @@ use pi_tui::tui_alt_screen::AltScreenOptions;
 use crate::cli::args::TuiMode;
 use crate::cli::project_trust::ProjectTrustStore;
 use crate::config::settings::{
-    FullscreenExitOutput, SettingsManager, SettingsManagerCreateOptions,
+    FullscreenExitOutput, FullscreenScrollbar, SettingsManager, SettingsManagerCreateOptions,
 };
 use crate::modes::print_mode::PrintRuntime;
 use crate::session::store::{NewSessionOptions, SessionManager};
@@ -1887,6 +1888,22 @@ impl InteractiveMode {
                     .and_then(|value| value.as_str())
                     .unwrap_or("ask")
                     .to_string(),
+                tui_mode: tui_mode_as_setting(self.settings.get_tui_mode()).to_string(),
+                fullscreen_exit_output: match self.settings.get_fullscreen_exit_output() {
+                    FullscreenExitOutput::Transcript => "transcript",
+                    FullscreenExitOutput::ResumeHint => "resume-hint",
+                }
+                .to_string(),
+                fullscreen_scrollbar: match self.settings.get_fullscreen_scrollbar() {
+                    FullscreenScrollbar::Auto => "auto",
+                    FullscreenScrollbar::Always => "always",
+                    FullscreenScrollbar::Hidden => "hidden",
+                }
+                .to_string(),
+                fullscreen_copy_on_select: self.settings.get_fullscreen_copy_on_select(),
+                fullscreen_wheel_scroll_lines: wheel_lines_as_setting(
+                    self.settings.get_fullscreen_wheel_scroll_lines(),
+                ),
             },
             Arc::clone(&events),
         );
@@ -1907,6 +1924,13 @@ impl InteractiveMode {
     /// (`showSettingsSelector`'s callbacks, `interactive-mode.ts:4227-4412`).
     fn handle_settings_event(&mut self, event: SettingsSelectorEvent) {
         match event {
+            SettingsSelectorEvent::TuiModeChange(_)
+            | SettingsSelectorEvent::FullscreenExitOutputChange(_)
+            | SettingsSelectorEvent::FullscreenScrollbarChange(_)
+            | SettingsSelectorEvent::FullscreenCopyOnSelectChange(_)
+            | SettingsSelectorEvent::FullscreenWheelScrollLinesChange(_) => {
+                self.handle_fullscreen_settings_event(event);
+            }
             SettingsSelectorEvent::ThemeChange(setting) => {
                 // `onThemeChange` (`interactive-mode.ts:4301-4304`):
                 // persist, then re-apply through the controller.
@@ -1970,6 +1994,78 @@ impl InteractiveMode {
             SettingsSelectorEvent::Cancel => {
                 self.close_settings_selector();
             }
+        }
+    }
+
+    /// The fullscreen rows' handlers (`onTuiModeChange` and the four
+    /// fullscreen callbacks, `interactive-mode.ts:4374-4402`).
+    fn handle_fullscreen_settings_event(&mut self, event: SettingsSelectorEvent) {
+        match event {
+            SettingsSelectorEvent::TuiModeChange(mode) => {
+                // A selector occupying the editor slot blocks the switch; the
+                // row reverts to the current mode and the status says why.
+                // On success the setting persists and the mode shows.
+                let target = match mode.as_str() {
+                    "regular" => TuiMode::Regular,
+                    _ => TuiMode::Fullscreen,
+                };
+                if !self.switch_tui_mode(target) {
+                    let current = tui_mode_as_setting(self.tui_mode).to_string();
+                    if let Some(selector) =
+                        self.downcast_tree::<SettingsSelectorComponent>(HostSlot::Editor)
+                    {
+                        selector.settings_list().update_value("tui-mode", &current);
+                    }
+                    self.show_status("Close active overlays before changing TUI mode");
+                    return;
+                }
+                self.settings.set_tui_mode(target);
+                self.show_status(&format!("TUI mode: {mode}"));
+            }
+            SettingsSelectorEvent::FullscreenExitOutputChange(output) => {
+                // `onFullscreenExitOutputChange` (`interactive-mode.ts:4386-4388`).
+                self.settings
+                    .set_fullscreen_exit_output(match output.as_str() {
+                        "resume-hint" => FullscreenExitOutput::ResumeHint,
+                        _ => FullscreenExitOutput::Transcript,
+                    });
+            }
+            SettingsSelectorEvent::FullscreenScrollbarChange(scrollbar) => {
+                // `onFullscreenScrollbarChange` (`interactive-mode.ts:4389-4392`):
+                // persist, then re-apply to the live transcript
+                // (`applyFullscreenScrollbarSetting`, `:1659-1661`); in
+                // regular mode the setting is read at the next mount.
+                let parsed = match scrollbar.as_str() {
+                    "always" => FullscreenScrollbar::Always,
+                    "hidden" => FullscreenScrollbar::Hidden,
+                    _ => FullscreenScrollbar::Auto,
+                };
+                self.settings.set_fullscreen_scrollbar(parsed);
+                let transcript_id = self.viewport.as_ref().map(ChatViewport::transcript_id);
+                if let Some(transcript_id) = transcript_id
+                    && let Some(transcript) = self
+                        .tui
+                        .component_by_id_deep_mut(transcript_id)
+                        .and_then(|component| component.as_any_mut())
+                        .and_then(|any| any.downcast_mut::<ScrollView>())
+                {
+                    transcript.state.set_scrollbar(parsed.into());
+                }
+            }
+            SettingsSelectorEvent::FullscreenCopyOnSelectChange(enabled) => {
+                // `onFullscreenCopyOnSelectChange` (`interactive-mode.ts:4393-4397`):
+                // persist, then push to the live alt screen.
+                self.settings.set_fullscreen_copy_on_select(enabled);
+                self.tui.set_copy_on_select(enabled);
+            }
+            SettingsSelectorEvent::FullscreenWheelScrollLinesChange(lines) => {
+                // `onFullscreenWheelScrollLinesChange` (`interactive-mode.ts:4398-4402`):
+                // persist, then push to the live alt screen.
+                let parsed = fullscreen_wheel_lines(&lines);
+                self.settings.set_fullscreen_wheel_scroll_lines(parsed);
+                self.tui.set_wheel_scroll_lines(parsed);
+            }
+            _ => {}
         }
     }
 
@@ -3173,6 +3269,35 @@ fn key_display_text(action: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
+    }
+}
+
+/// The `TuiMode` → its settings string.
+fn tui_mode_as_setting(mode: TuiMode) -> &'static str {
+    match mode {
+        TuiMode::Regular => "regular",
+        TuiMode::Fullscreen => "fullscreen",
+    }
+}
+
+/// The resolved wheel setting → its row value (`String(...)` in
+/// `settings-selector.ts:518`).
+fn wheel_lines_as_setting(lines: pi_tui::wheel_scroll::WheelScrollLines) -> String {
+    match lines {
+        pi_tui::wheel_scroll::WheelScrollLines::Auto => "auto".to_string(),
+        pi_tui::wheel_scroll::WheelScrollLines::Fixed(lines) => lines.to_string(),
+    }
+}
+
+/// The wheel-scrolling row value → the setting, with the getter's validation
+/// (`getFullscreenWheelScrollLines`, `settings-manager.js:1041-1049`):
+/// `"auto"`, or whole lines clamped to 1-100.
+fn fullscreen_wheel_lines(value: &str) -> pi_tui::wheel_scroll::WheelScrollLines {
+    match value.parse::<f64>() {
+        Ok(lines) if lines.is_finite() => {
+            pi_tui::wheel_scroll::WheelScrollLines::Fixed(lines.clamp(1.0, 100.0).floor())
+        }
+        _ => pi_tui::wheel_scroll::WheelScrollLines::Auto,
     }
 }
 
