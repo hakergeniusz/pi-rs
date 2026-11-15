@@ -35,6 +35,8 @@ pub struct JsonRpcResponse {
     pub error: Option<JsonRpcError>,
 }
 
+/// A JSON-RPC error object: numeric `code`, human-readable `message`, optional
+/// `data`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JsonRpcError {
     pub code: i64,
@@ -111,6 +113,8 @@ pub struct InitializeParams {
     pub client_info: Implementation,
 }
 
+/// The capabilities the client declares in `initialize`. The port declares
+/// none.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ClientCapabilities {}
 
@@ -133,6 +137,7 @@ pub struct InitializeResult {
     pub server_info: Implementation,
 }
 
+/// The capabilities the server reports in `initialize`'s result.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ServerCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,6 +148,8 @@ pub struct ServerCapabilities {
     pub prompts: Option<Value>,
 }
 
+/// The server's `tools` capability: whether it offers tools and reports
+/// `listChanged`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ToolsCapability {
     #[serde(

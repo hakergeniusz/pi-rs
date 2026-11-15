@@ -9,57 +9,116 @@ use crate::keys::matches_key;
 
 /// Every action pi's editor and select list can bind. `keybindings.ts:9-43`.
 pub mod action {
+    /// Move the editor cursor up one line.
     pub const EDITOR_CURSOR_UP: &str = "tui.editor.cursorUp";
+    /// Move the editor cursor down one line.
     pub const EDITOR_CURSOR_DOWN: &str = "tui.editor.cursorDown";
+    /// Step back through the input history.
+    ///
+    /// Unbound in pi's default table; a host supplies its own history keys.
     pub const EDITOR_HISTORY_PREVIOUS: &str = "tui.editor.historyPrevious";
+    /// Step forward through the input history.
+    ///
+    /// Unbound in pi's default table; a host supplies its own history keys.
     pub const EDITOR_HISTORY_NEXT: &str = "tui.editor.historyNext";
+    /// Move the editor cursor one column left.
     pub const EDITOR_CURSOR_LEFT: &str = "tui.editor.cursorLeft";
+    /// Move the editor cursor one column right.
     pub const EDITOR_CURSOR_RIGHT: &str = "tui.editor.cursorRight";
+    /// Move the editor cursor to the start of the word before it.
     pub const EDITOR_CURSOR_WORD_LEFT: &str = "tui.editor.cursorWordLeft";
+    /// Move the editor cursor to the end of the word after it.
     pub const EDITOR_CURSOR_WORD_RIGHT: &str = "tui.editor.cursorWordRight";
+    /// Move the editor cursor to the start of the line.
     pub const EDITOR_CURSOR_LINE_START: &str = "tui.editor.cursorLineStart";
+    /// Move the editor cursor to the end of the line.
     pub const EDITOR_CURSOR_LINE_END: &str = "tui.editor.cursorLineEnd";
+    /// Enter character-jump mode, moving forward to the next typed character.
     pub const EDITOR_JUMP_FORWARD: &str = "tui.editor.jumpForward";
+    /// Enter character-jump mode, moving backward to the next typed character.
     pub const EDITOR_JUMP_BACKWARD: &str = "tui.editor.jumpBackward";
+    /// Scroll the editor view up one page.
     pub const EDITOR_PAGE_UP: &str = "tui.editor.pageUp";
+    /// Scroll the editor view down one page.
     pub const EDITOR_PAGE_DOWN: &str = "tui.editor.pageDown";
+    /// Delete the character before the cursor.
     pub const EDITOR_DELETE_CHAR_BACKWARD: &str = "tui.editor.deleteCharBackward";
+    /// Delete the character after the cursor.
     pub const EDITOR_DELETE_CHAR_FORWARD: &str = "tui.editor.deleteCharForward";
+    /// Delete the word before the cursor.
     pub const EDITOR_DELETE_WORD_BACKWARD: &str = "tui.editor.deleteWordBackward";
+    /// Delete the word after the cursor.
     pub const EDITOR_DELETE_WORD_FORWARD: &str = "tui.editor.deleteWordForward";
+    /// Delete from the cursor back to the start of the line.
     pub const EDITOR_DELETE_TO_LINE_START: &str = "tui.editor.deleteToLineStart";
+    /// Delete from the cursor to the end of the line.
     pub const EDITOR_DELETE_TO_LINE_END: &str = "tui.editor.deleteToLineEnd";
+    /// Yank: paste the current kill-ring entry at the cursor.
     pub const EDITOR_YANK: &str = "tui.editor.yank";
+    /// After a yank, cycle to the previous kill-ring entry.
     pub const EDITOR_YANK_POP: &str = "tui.editor.yankPop";
+    /// Undo the last editor change.
     pub const EDITOR_UNDO: &str = "tui.editor.undo";
+    /// Insert a newline into the input instead of submitting.
     pub const INPUT_NEW_LINE: &str = "tui.input.newLine";
+    /// Submit the current input.
     pub const INPUT_SUBMIT: &str = "tui.input.submit";
+    /// Trigger completion, or accept the open autocomplete's selection.
     pub const INPUT_TAB: &str = "tui.input.tab";
+    /// Copy (or interrupt) request, left for the host to act on.
     pub const INPUT_COPY: &str = "tui.input.copy";
+    /// Select list: move the highlight up one entry.
     pub const SELECT_UP: &str = "tui.select.up";
+    /// Select list: move the highlight down one entry.
     pub const SELECT_DOWN: &str = "tui.select.down";
+    /// Select list: page the highlight up.
     pub const SELECT_PAGE_UP: &str = "tui.select.pageUp";
+    /// Select list: page the highlight down.
     pub const SELECT_PAGE_DOWN: &str = "tui.select.pageDown";
+    /// Select list: confirm the highlighted entry.
     pub const SELECT_CONFIRM: &str = "tui.select.confirm";
+    /// Select list: cancel without choosing.
     pub const SELECT_CANCEL: &str = "tui.select.cancel";
 
     // Alternate-screen viewport navigation. pi notes that these "intentionally
     // shadow the unmodified editor bindings in fullscreen mode"
     // (`keybindings.ts:159`), so the same key reaches the viewport and not the
     // editor while the alt screen owns the tree.
+    /// Alternate screen: scroll the transcript up one page.
     pub const ALT_SCREEN_PAGE_UP: &str = "tui.altScreen.pageUp";
+    /// Alternate screen: scroll the transcript down one page.
     pub const ALT_SCREEN_PAGE_DOWN: &str = "tui.altScreen.pageDown";
+    /// Alternate screen: scroll up half a page.
+    ///
+    /// Unbound in pi's defaults (`keybindings.ts:170-181`).
     pub const ALT_SCREEN_HALF_PAGE_UP: &str = "tui.altScreen.halfPageUp";
+    /// Alternate screen: scroll down half a page.
+    ///
+    /// Unbound in pi's defaults (`keybindings.ts:170-181`).
     pub const ALT_SCREEN_HALF_PAGE_DOWN: &str = "tui.altScreen.halfPageDown";
+    /// Alternate screen: scroll up one line.
+    ///
+    /// Unbound in pi's defaults (`keybindings.ts:170-181`).
     pub const ALT_SCREEN_LINE_UP: &str = "tui.altScreen.lineUp";
+    /// Alternate screen: scroll down one line.
+    ///
+    /// Unbound in pi's defaults (`keybindings.ts:170-181`).
     pub const ALT_SCREEN_LINE_DOWN: &str = "tui.altScreen.lineDown";
+    /// Alternate screen: jump to the previous prompt.
     pub const ALT_SCREEN_PREVIOUS_PROMPT: &str = "tui.altScreen.previousPrompt";
+    /// Alternate screen: jump to the next prompt.
     pub const ALT_SCREEN_NEXT_PROMPT: &str = "tui.altScreen.nextPrompt";
+    /// Alternate screen: open the transcript search overlay.
     pub const ALT_SCREEN_SEARCH: &str = "tui.altScreen.search";
+    /// Search overlay: move to the next match.
     pub const ALT_SCREEN_SEARCH_NEXT: &str = "tui.altScreen.searchNext";
+    /// Search overlay: move to the previous match.
     pub const ALT_SCREEN_SEARCH_PREVIOUS: &str = "tui.altScreen.searchPrevious";
+    /// Search overlay: close it.
     pub const ALT_SCREEN_SEARCH_CLOSE: &str = "tui.altScreen.searchClose";
+    /// Alternate screen: jump to the top of the transcript.
     pub const ALT_SCREEN_TOP: &str = "tui.altScreen.top";
+    /// Alternate screen: jump to the bottom of the transcript.
     pub const ALT_SCREEN_BOTTOM: &str = "tui.altScreen.bottom";
 }
 

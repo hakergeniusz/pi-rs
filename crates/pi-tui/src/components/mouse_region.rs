@@ -25,6 +25,7 @@ impl MouseRegion {
         Self { child, on_mouse }
     }
 
+    /// The wrapped child.
     pub fn child(&self) -> &DynComponent {
         self.child.as_ref()
     }

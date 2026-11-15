@@ -78,6 +78,7 @@ pub fn encode_sgr_mouse_event(event: CtMouseEvent) -> Option<String> {
 
 /// A write sink. The trait exists so the renderer can be tested without a TTY.
 pub trait TerminalWrite {
+    /// Write one chunk of output to the terminal.
     fn write_str(&mut self, text: &str) -> io::Result<()>;
 }
 
@@ -97,6 +98,7 @@ pub trait Terminal: Send {
     fn stop(&mut self) -> io::Result<()>;
     /// Current size, re-queried when the host supports it.
     fn size(&self) -> io::Result<TerminalSize>;
+    /// Write one chunk of output; every rendered frame goes through this.
     fn write(&mut self, text: &str) -> io::Result<()>;
     /// `terminal.ts:315-317`. Returns false for backends without a tty.
     fn is_tty(&self) -> bool;
@@ -301,18 +303,31 @@ fn decimal_value(digits: &str) -> Option<f64> {
 
 /// Keys `Terminal.query` understands. `terminal.ts:169-182`.
 pub mod query_ids {
+    /// Terminal name and version query, sent as `CSI > 0 q`.
     pub const XT_VERSION: &str = "xtversion";
+    /// Supported-escape-sequences query, sent as the DA1-style `CSI c`.
     pub const XT_GET_ESCAPE_SEQUENCES: &str = "xtgetescapesequences";
+    /// Modifier-key reporting query, sent as `CSI > 4 ; 2 m`.
     pub const XT_GET_MODIFIER_KEYS: &str = "xtgetmodifierkeys";
+    /// Pointer-mode query, sent as `CSI ? 1004 p`.
     pub const XT_GET_POINTER_MODE: &str = "xtgetpointermode";
+    /// Grapheme-clustering query, sent as `CSI ? 2027 $ p`.
     pub const XT_GET_GRAPHEME_CLUSTERING: &str = "xtgetgraphemeclustering";
+    /// Primary device attributes, sent as `CSI c`.
     pub const DA1: &str = "da1";
+    /// Secondary device attributes, sent as `CSI > 0 c`.
     pub const DA2: &str = "da2";
+    /// Color-stack push query, sent as the same `CSI > 0 q` as [`query_ids::XT_VERSION`].
     pub const XT_PUSH_COLORS: &str = "xtpushcolors";
+    /// Color-stack pop report query, sent as `CSI ? 1021 ; 1 $ y`.
     pub const XT_REP_POP_COLORS: &str = "xtreppopcolors";
+    /// Light/dark color-scheme query, sent as `CSI ? 996 n`.
     pub const COLOR_SCHEME_REPORT: &str = "colorscheme";
+    /// Default background color query, sent as OSC 11.
     pub const BGCOLOR: &str = "bgcolor";
+    /// Default foreground color query, sent as OSC 10.
     pub const FGCOLOR: &str = "fgcolor";
+    /// Second `"xtversion"` constant, byte-identical to [`query_ids::XT_VERSION`].
     pub const XTVERSION: &str = "xtversion";
 }
 
@@ -455,6 +470,7 @@ struct FrameCaptureInner {
 }
 
 impl FrameCapture {
+    /// A fresh, empty capture; the same as [`FrameCapture::default`].
     pub fn new() -> Self {
         Self::default()
     }
@@ -507,10 +523,12 @@ impl FrameCapture {
         }
     }
 
+    /// Whether [`Terminal::start`] ran without a matching [`Terminal::stop`].
     pub fn started(&self) -> bool {
         self.inner.lock().is_ok_and(|inner| inner.started)
     }
 
+    /// Drop every recorded byte and frame.
     pub fn clear(&self) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.output.clear();
@@ -615,14 +633,17 @@ impl CrosstermTerminal {
         self.mouse_mode = enabled;
     }
 
+    /// Choose whether [`Terminal::start`] switches to the alternate screen.
     pub fn set_use_alternate_screen(&mut self, value: bool) {
         self.use_alternate_screen = value;
     }
 
+    /// Choose whether [`Terminal::start`] hides the cursor.
     pub fn set_hide_cursor(&mut self, value: bool) {
         self.hide_cursor = value;
     }
 
+    /// Choose whether [`Terminal::start`] puts stdin into raw mode.
     pub fn set_stdin_raw(&mut self, value: bool) {
         self.stdin_raw = value;
     }
@@ -923,6 +944,7 @@ impl CaptureTerminal {
         }
     }
 
+    /// A terminal that reports `size` instead of pi's 80x24 default.
     pub fn with_size(size: TerminalSize) -> Self {
         Self {
             size,
@@ -930,14 +952,17 @@ impl CaptureTerminal {
         }
     }
 
+    /// The capture handle, kept by a test while the terminal moves elsewhere.
     pub fn capture(&self) -> FrameCapture {
         self.capture.clone()
     }
 
+    /// Record the mouse mode [`Terminal::take_mouse_mode`] hands over.
     pub fn set_mouse_mode(&mut self, enabled: bool) {
         self.mouse_mode = enabled;
     }
 
+    /// Set the size [`Terminal::size`] reports.
     pub fn set_size(&mut self, size: TerminalSize) {
         self.size = size;
     }
@@ -948,6 +973,7 @@ impl CaptureTerminal {
         self.queried_size = Some(size);
     }
 
+    /// Queue a reply for [`Terminal::poll_response`], or a matching callback.
     pub fn push_response(&self, response: &str) {
         self.responses.push(response.to_string());
     }
@@ -957,10 +983,12 @@ impl CaptureTerminal {
         self.responses.expect(id, sequence);
     }
 
+    /// How many times [`Terminal::start`] ran.
     pub fn start_calls(&self) -> usize {
         self.start_calls
     }
 
+    /// How many times [`Terminal::stop`] ran.
     pub fn stop_calls(&self) -> usize {
         self.stop_calls
     }

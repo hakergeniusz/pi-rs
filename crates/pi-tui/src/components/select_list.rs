@@ -12,27 +12,40 @@ use crate::mouse::{MouseButton, MouseEvent, MouseEventKind, MouseEventResult};
 
 /// `tui.select.*` defaults. `keybindings.ts:147-158`.
 pub mod select_keys {
+    /// Move the selection up, wrapping past the top.
     pub const UP: &str = "up";
+    /// Move the selection down, wrapping past the bottom.
     pub const DOWN: &str = "down";
+    /// Move the selection up a page.
     pub const PAGE_UP: &str = "pageUp";
+    /// Move the selection down a page.
     pub const PAGE_DOWN: &str = "pageDown";
+    /// Confirm the current selection.
     pub const CONFIRM: &str = "enter";
+    /// Cancel the list.
     pub const CANCEL: [&str; 2] = ["escape", "ctrl+c"];
 }
 
+/// Default primary-column width when the layout sets no bounds.
 pub const DEFAULT_PRIMARY_COLUMN_WIDTH: usize = 32;
+/// Columns between the primary column and the description.
 pub const PRIMARY_COLUMN_GAP: usize = 2;
+/// The description renders only when more columns than this remain.
 pub const MIN_DESCRIPTION_WIDTH: usize = 10;
 
 /// One row. `select-list.ts:15-19`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectItem {
+    /// The identity the host reads back; the filter matches its prefix.
     pub value: String,
+    /// The rendered label; when empty, `value` is shown instead.
     pub label: String,
+    /// Optional second-column text, shown on wide terminals.
     pub description: Option<String>,
 }
 
 impl SelectItem {
+    /// An item with a `value` and a `label`; no description.
     pub fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
             value: value.into(),
@@ -41,6 +54,7 @@ impl SelectItem {
         }
     }
 
+    /// Builder: attach a description to the item.
     #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
@@ -60,10 +74,15 @@ impl SelectItem {
 /// Style hooks. `select-list.ts:24-30`.
 #[derive(Clone)]
 pub struct SelectListTheme {
+    /// Style hook for the selected row's prefix; the renderer draws `→ ` itself.
     pub selected_prefix: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
+    /// Style hook for the whole selected row.
     pub selected_text: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
+    /// Style hook for the description column.
     pub description: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
+    /// Style hook for the `(selected/total)` scroll indicator.
     pub scroll_info: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
+    /// Style hook for the no-match message.
     pub no_match: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
 }
 
@@ -88,7 +107,9 @@ impl std::fmt::Debug for SelectListTheme {
 /// Column bounds. `select-list.ts:36-41`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SelectListLayout {
+    /// Lower bound for the primary column; `None` defers to the max bound.
     pub min_primary_column_width: Option<usize>,
+    /// Upper bound for the primary column; `None` defers to the min bound.
     pub max_primary_column_width: Option<usize>,
 }
 
@@ -191,10 +212,12 @@ impl SelectList {
         self.selection_change_count = self.selection_change_count.saturating_add(1);
     }
 
+    /// The selected row's position in the filtered list.
     pub fn selected_index(&self) -> usize {
         self.selected_index
     }
 
+    /// How many items survive the filter.
     pub fn filtered_len(&self) -> usize {
         self.filtered_items.len()
     }

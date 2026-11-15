@@ -14,6 +14,7 @@ pub struct KillRing {
 }
 
 impl KillRing {
+    /// An empty ring.
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -46,10 +47,14 @@ impl KillRing {
         self.index = self.entries.len();
     }
 
+    /// Whether nothing has been killed yet.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// The entry a yank takes: the latest kill, or where [`KillRing::rotate`] points.
+    ///
+    /// `None` when the ring is empty.
     pub fn peek(&self) -> Option<&str> {
         if self.entries.is_empty() {
             return None;
@@ -74,6 +79,7 @@ impl KillRing {
         };
     }
 
+    /// How many entries the ring holds.
     pub fn len(&self) -> usize {
         self.entries.len()
     }

@@ -27,8 +27,11 @@ const CURSOR_OFF: &str = "\x1b[27m";
 /// `InputOptions`, `input.ts:19-23`.
 #[derive(Clone)]
 pub struct InputOptions {
+    /// Drawn before the value on the rendered line.
     pub prompt: String,
+    /// Shown while the value is empty.
     pub placeholder: String,
+    /// Style hook for the placeholder text.
     pub placeholder_style: Arc<dyn Fn(&str) -> String + Send + Sync>,
 }
 
@@ -115,6 +118,7 @@ impl Input {
         }
     }
 
+    /// An input with `prompt` and the remaining defaults.
     pub fn with_prompt(prompt: impl Into<String>) -> Self {
         Self::new(InputOptions {
             prompt: prompt.into(),
@@ -142,6 +146,7 @@ impl Input {
         self.cursor = self.cursor.min(length);
     }
 
+    /// The cursor as a byte offset into the value.
     pub fn cursor(&self) -> usize {
         self.cursor
     }

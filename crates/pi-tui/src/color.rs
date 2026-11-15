@@ -107,22 +107,29 @@ fn gray_values() -> [f64; 24] {
 /// `colors.ts:4-24`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Color {
+    /// An entry in the terminal's 256-color palette, expanded on demand.
     Indexed(u16),
+    /// Concrete sRGB channels, 0-255.
     Rgb(Rgb),
+    /// Perceptual OKLCH, converted to sRGB on demand.
     Oklch { l: f64, c: f64, h: f64 },
 }
 
 /// Terminal color capability. `colors.ts:25`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalColorMode {
+    /// Downscale colors to the 256-color palette.
     Color256,
+    /// Emit direct 24-bit color sequences.
     TrueColor,
 }
 
 /// Space `mix_colors` interpolates in. `colors.ts:26`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorMixSpace {
+    /// Interpolate in OKLCH: hue travels the short way around the wheel.
     Oklch,
+    /// Interpolate componentwise in sRGB.
     Srgb,
 }
 
@@ -706,15 +713,20 @@ pub struct TerminalColors {
 /// Whether the terminal is in a light or dark scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalColorScheme {
+    /// The terminal reports a dark background.
     Dark,
+    /// The terminal reports a light background.
     Light,
 }
 
 /// What an OSC color reply reports. `terminal-colors.ts:39`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OscColorTarget {
+    /// An OSC 10 reply: the default foreground.
     Foreground,
+    /// An OSC 11 reply: the default background.
     Background,
+    /// An OSC 4 reply: one palette entry.
     Palette(u16),
 }
 

@@ -661,6 +661,40 @@ pump cadence stands in for upstream's `setInterval`).
   (`packages/coding-agent` 1.5.2) — the "WIPED (tmpfs)" warning in the header
   above is stale.
 
+## Item-level doc pass (landed on `docs/code-docs`, 2026-11-15)
+- Workspace scan found **521 pub items without `///` docs**; this pass landed
+  ~470 of them, leaving **69** (almost all `pi-coding-agent`'s smaller files —
+  the tier whose helper agent was stopped mid-flight — plus a few
+  `//`-comment-separated false positives a naive scanner counts).
+  Covered: lib.rs per-module one-liners ×5 crates; `pi-agent` complete
+  (agent builder/setters, `ThinkingLevel`, `AbortSignal`, `PendingMessageQueue`,
+  state setters); `pi-mcp` types; `pi-ai` provider module docs;
+  `pi-tui` keybindings/terminal/keys/mouse/undo/kill-ring/search/ansi/color/
+  oklab/layout + framework core (theme, tui, tui_alt_screen, component,
+  system_theme, frame) + all of `components/`; `pi-coding-agent`
+  tools/mod.rs one-liners + interactive/theme.rs app_keys + style helpers.
+- The pass ran as three helper agents (pi-tui plumbing 174 docs, framework
+  core 45, components 163) plus main-agent work (94 + 37 + fixes); every
+  agent diff was verified docs-only (0 removed lines, only `///` additions).
+- **Fixed pre-existing doc bug**: `ansi.rs` `flatten_lines` carried the first
+  sentence + citation of `apply_background_to_line` (docs merged onto the
+  wrong item); `flatten_lines` now cites only `utils.ts:896-898`.
+- **Incident, caught by the gate**: a batch edit replaced `theme()`'s
+  signature line instead of inserting a doc above it (syntax error at
+  `theme.rs:216`); restored, gate re-run green with unpiped exit codes
+  (CLIPPY/TEST/FMT all 0, 0 failed suites) — piped `| tail` again masked
+  exit codes on the first attempt, so the log+exit-code pattern stays.
+- **Findings from the pass worth future attention** (reported, not fixed):
+  `components/input.rs` and `line_input.rs` are two parallel ports of the
+  same upstream `input.ts` (byte-offset vs char-index cursors) — hosts must
+  not mix them; `input.rs` redeclares `CURSOR_MARKER` locally;
+  `SelectListTheme::selected_prefix` is declared/defaulted but never read
+  (`render_item` hardcodes `"→ "`); `terminal.rs` `KEY_PROTOCOLS` is
+  referenced nowhere; `LayoutBox::layer` is always written 0 so the
+  hit-test z-order key is constant; `LayoutNode::VStack` ignores `align`;
+  stale citations `editor.ts:2665-2282` (reversed range) and the module doc's
+  "2,472 lines" claim.
+
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
   slot shifted every later index — the `*_INDEX` consts are the single source of

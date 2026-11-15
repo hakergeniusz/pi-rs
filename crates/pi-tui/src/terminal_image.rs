@@ -201,6 +201,7 @@ pub struct TerminalEnv {
 }
 
 impl TerminalEnv {
+    /// An empty environment; the same as [`TerminalEnv::default`].
     pub fn new() -> Self {
         Self::default()
     }
@@ -234,6 +235,7 @@ impl TerminalEnv {
         env
     }
 
+    /// Set `name` to `value`, replacing any earlier value.
     pub fn set(&mut self, name: &str, value: &str) -> &mut Self {
         match self.vars.iter_mut().find(|(key, _)| key == name) {
             Some(entry) => entry.1 = value.to_string(),
@@ -242,6 +244,7 @@ impl TerminalEnv {
         self
     }
 
+    /// Remove `name`; [`TerminalEnv::get`] also reads an empty value as unset.
     pub fn unset(&mut self, name: &str) -> &mut Self {
         self.vars.retain(|(key, _)| key != name);
         self

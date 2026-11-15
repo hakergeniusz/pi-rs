@@ -636,14 +636,21 @@ impl Tui {
         self.request_render();
     }
 
+    /// How many root children are mounted.
+    ///
+    /// These are the children [`Tui::add_child`] pushes to; once the alt
+    /// screen is entered they live in its implicit document, and these
+    /// accessors follow it.
     pub fn children_len(&self) -> usize {
         self.root_children().len()
     }
 
+    /// The root child at `index`, if any.
     pub fn child(&self, index: usize) -> Option<&crate::component::DynComponent> {
         self.root_children().get(index).map(AsRef::as_ref)
     }
 
+    /// The root child at `index`, mutably.
     pub fn child_mut(&mut self, index: usize) -> Option<&mut crate::component::DynComponent> {
         self.root_children_mut().get_mut(index).map(AsMut::as_mut)
     }
@@ -692,6 +699,7 @@ impl Tui {
         lines
     }
 
+    /// The terminal backend this renderer writes to and queries.
     pub fn terminal(&self) -> &dyn Terminal {
         self.terminal.as_ref()
     }
@@ -702,6 +710,7 @@ impl Tui {
         self.terminal.as_mut()
     }
 
+    /// How many `Redraw::Full` frames have been painted, by either renderer.
     pub fn full_redraws(&self) -> usize {
         self.full_redraw_count
     }
@@ -774,6 +783,7 @@ impl Tui {
         }
     }
 
+    /// Whether a frame is waiting; the host drives it via [`Tui::render_due_at`].
     pub fn render_requested(&self) -> bool {
         self.render_requested
     }
@@ -1992,6 +2002,7 @@ impl Tui {
             .any(|entry| self.is_overlay_visible(entry))
     }
 
+    /// How many overlays are registered, hidden ones included.
     pub fn overlay_count(&self) -> usize {
         self.overlays.len()
     }

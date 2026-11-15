@@ -15,13 +15,21 @@
 //! throw on request/model/runtime failures; failures are encoded as protocol
 //! events and a final assistant message with stop reason `error`/`aborted`.
 
+/// The embedded model catalog: generated data, overlay, lookup.
 pub mod catalog;
+/// The tool-declared constrained-sampling config (`ConstrainedSamplingConfig`).
 pub mod constrained_sampling;
+/// Cost calculation from usage and catalog prices (TS `calculateCost`).
 pub mod cost;
+/// The async [`AssistantMessageEventStream`] over provider events.
 pub mod event_stream;
+/// Provider-API adapters, dispatched per `Model.api`.
 pub mod providers;
+/// Server-Sent Events parsing over a reqwest byte stream.
 pub mod sse;
+/// Tolerant JSON parsing for streamed tool-call arguments.
 pub mod streaming_json;
+/// Core wire types: messages, content blocks, usage, models, events.
 pub mod types;
 
 pub use constrained_sampling::{ConstrainedSampling, GrammarFormat, GrammarVariants, StrictMode};

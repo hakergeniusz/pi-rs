@@ -4,9 +4,13 @@
 //! `models.ts`. Each adapter exposes `stream()` (see `StreamFn` contract:
 //! errors are encoded in the event stream, never thrown).
 
+/// Anthropic Messages API adapter (TS `api/anthropic-messages.ts`).
 pub mod anthropic;
+/// Shared adapter helpers: message assembly, finalization, abort.
 pub mod common;
+/// OpenAI Codex (ChatGPT backend) adapter (TS `api/openai-codex-responses.ts`).
 pub mod openai_codex;
+/// OpenAI Chat Completions adapter, shared by the compatible relays.
 pub mod openai_completions;
 
 use crate::event_stream::AssistantMessageEventStream;

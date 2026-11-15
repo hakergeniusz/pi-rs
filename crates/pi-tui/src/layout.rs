@@ -33,12 +33,19 @@ pub struct LayoutRect {
 /// The tree the layout pass produces. `layout.ts:23-34`.
 #[derive(Debug)]
 pub struct LayoutBox {
+    /// Where the box sits, relative to the frame's top-left corner.
     pub rect: LayoutRect,
+    /// The visible region: [`intersect`] of the inherited clip and [`LayoutBox::rect`].
     pub clip: LayoutRect,
+    /// Laid-out children, painted after this box's own lines.
     pub children: Vec<LayoutBox>,
+    /// This box's own rendered lines, when it is a leaf.
     pub lines: Option<Vec<String>>,
+    /// Rows dropped from the top of [`LayoutBox::lines`] so the cursor line stays visible.
     pub line_offset: usize,
+    /// Scrollbar snapshot to paint, set only on a scroll box.
     pub scroll: Option<ScrollSnapshot>,
+    /// Hit-test z-order; [`get_layout_boxes_at`] sorts on it, deepest first within a layer.
     pub layer: usize,
     /// `LayoutBox.component` (`layout.ts:24`): the component this box laid
     /// out. `dispatchMouseToLayout` dispatches the hit to it and then walks
@@ -111,17 +118,21 @@ pub struct LayoutFrame {
 /// What a component tells the layout engine about itself.
 /// `layout-node.ts:42`.
 pub enum LayoutNode<'a> {
+    /// A plain component: its rendered lines are the layout.
     Leaf,
+    /// Children stacked top to bottom, `gap` rows between entries.
     VStack {
         entries: Vec<(&'a dyn Component, StackEntryOptions)>,
         gap: usize,
         align: Align,
     },
+    /// Children laid left to right, `gap` columns between entries.
     HStack {
         entries: Vec<(&'a dyn Component, StackEntryOptions)>,
         gap: usize,
         align: Align,
     },
+    /// A scroll view wrapping `component`, driven by `state`.
     Scroll {
         component: &'a dyn Component,
         state: &'a ScrollViewState,

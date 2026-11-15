@@ -50,7 +50,9 @@ type Style = Arc<dyn Fn(&str) -> String + Send + Sync>;
 /// `editor.ts:373-382`: the theme's two hooks.
 #[derive(Clone)]
 pub struct EditorTheme {
+    /// Style hook for the top and bottom borders.
     pub border_color: Style,
+    /// Theme for the autocomplete popup's `SelectList`.
     pub select_list: crate::components::select_list::SelectListTheme,
 }
 
@@ -72,6 +74,7 @@ impl Default for EditorTheme {
 /// `editorOptions`. `editor.ts:242-250`.
 #[derive(Debug, Clone, Copy)]
 pub struct EditorOptions {
+    /// Blank columns on each side of the text.
     pub padding_x: usize,
     /// `editor.ts:250`: clamped to 3..=20.
     pub autocomplete_max_visible: usize,
@@ -89,8 +92,11 @@ impl Default for EditorOptions {
 /// The text state. `editor.ts:218-223`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EditorState {
+    /// The buffer, one entry per logical line.
     pub lines: Vec<String>,
+    /// The cursor's line index.
     pub cursor_line: usize,
+    /// The cursor's column, in chars.
     pub cursor_col: usize,
 }
 
@@ -107,16 +113,22 @@ impl EditorState {
 /// The undo unit: text state plus the paste registry. `editor.ts:225-231`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EditorSnapshot {
+    /// The text state the snapshot restores.
     pub state: EditorState,
+    /// The paste registry at snapshot time.
     pub pastes: BTreeMap<u64, String>,
+    /// The paste id counter at snapshot time.
     pub paste_counter: u64,
 }
 
 /// A word-wrap chunk. `editor.ts:106-110`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextChunk {
+    /// The chunk's text.
     pub text: String,
+    /// The chunk's first char index in its logical line.
     pub start_index: usize,
+    /// One past the chunk's last char index.
     pub end_index: usize,
 }
 
@@ -346,6 +358,7 @@ pub enum EditorEvent {
 /// Autocomplete's answer. `autocomplete.ts`'s `AutocompleteSuggestions`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Suggestions {
+    /// The suggestion rows to pick from.
     pub items: Vec<crate::components::select_list::SelectItem>,
     /// The token being completed, replaced on apply.
     pub prefix: String,
@@ -460,7 +473,9 @@ pub type TopBorderDecorator = dyn Fn(usize, usize) -> String + Send + Sync;
 /// `editor.ts:332`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutocompleteState {
+    /// Opened by typing a trigger; closes when the token stops matching.
     Regular,
+    /// Opened by an explicit Tab request.
     Force,
 }
 
@@ -524,6 +539,7 @@ impl Editor {
         self.placeholder = placeholder;
     }
 
+    /// The horizontal padding the editor renders with.
     pub fn padding_x(&self) -> usize {
         self.padding_x
     }
@@ -536,6 +552,7 @@ impl Editor {
         }
     }
 
+    /// The clamped autocomplete row cap.
     pub fn autocomplete_max_visible(&self) -> usize {
         self.autocomplete_max_visible
     }
@@ -565,6 +582,7 @@ impl Editor {
         }
     }
 
+    /// The prompt history, newest first.
     pub fn history(&self) -> &[String] {
         &self.history
     }
@@ -1651,6 +1669,7 @@ impl Editor {
         self.history_draft = None;
     }
 
+    /// The history-browsing index; `-1` is the live draft.
     pub fn history_index(&self) -> isize {
         self.history_index
     }
@@ -2295,6 +2314,7 @@ impl Editor {
         self.last_terminal_rows = rows;
     }
 
+    /// The terminal height the host last reported.
     pub fn terminal_rows(&self) -> usize {
         self.last_terminal_rows
     }
@@ -2320,18 +2340,22 @@ impl Editor {
         self.rendered_visible_line_count
     }
 
+    /// The lines the last render spent on the autocomplete list.
     pub fn rendered_autocomplete_height(&self) -> usize {
         self.rendered_autocomplete_height
     }
 
+    /// How many undo snapshots are stacked.
     pub fn undo_stack_depth(&self) -> usize {
         self.undo_depth()
     }
 
+    /// The kill ring, for hosts that inspect it.
     pub fn kill_ring(&self) -> &KillRing {
         &self.kill_ring
     }
 
+    /// The configured placeholder, if any.
     pub fn placeholder(&self) -> Option<&str> {
         self.placeholder.as_deref()
     }

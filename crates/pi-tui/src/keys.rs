@@ -25,35 +25,55 @@ pub fn is_kitty_protocol_active() -> bool {
 
 /// Modifier bits. `keys.ts:292-299`.
 pub mod modifiers {
+    /// Shift modifier bit.
     pub const SHIFT: u8 = 1;
+    /// Alt modifier bit.
     pub const ALT: u8 = 2;
+    /// Ctrl modifier bit.
     pub const CTRL: u8 = 4;
+    /// Super modifier bit.
     pub const SUPER: u8 = 8;
     /// Caps Lock + Num Lock.
     pub const LOCK_MASK: u8 = 64 + 128;
+    /// The modifier bits a key name can carry; higher bits stay unmatched.
     pub const SUPPORTED: u8 = SHIFT | ALT | CTRL | SUPER;
 }
 
 /// Codepoints pi assigns to keys. `keys.ts:301-325`.
 pub mod codepoints {
+    /// Escape.
     pub const ESCAPE: i64 = 27;
+    /// Tab.
     pub const TAB: i64 = 9;
+    /// Enter (Return).
     pub const ENTER: i64 = 13;
+    /// Space.
     pub const SPACE: i64 = 32;
+    /// Backspace.
     pub const BACKSPACE: i64 = 127;
     /// Numpad Enter (Kitty protocol).
     pub const KP_ENTER: i64 = 57414;
 
+    /// Up arrow; non-text keys carry negative codepoints.
     pub const UP: i64 = -1;
+    /// Down arrow.
     pub const DOWN: i64 = -2;
+    /// Right arrow.
     pub const RIGHT: i64 = -3;
+    /// Left arrow.
     pub const LEFT: i64 = -4;
 
+    /// Delete.
     pub const DELETE: i64 = -10;
+    /// Insert.
     pub const INSERT: i64 = -11;
+    /// Page Up.
     pub const PAGE_UP: i64 = -12;
+    /// Page Down.
     pub const PAGE_DOWN: i64 = -13;
+    /// Home.
     pub const HOME: i64 = -14;
+    /// End.
     pub const END: i64 = -15;
 }
 
@@ -266,19 +286,24 @@ pub enum KeyEventType {
 /// Parsed Kitty CSI sequence. `keys.ts:511-518`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KittySequence {
+    /// The key's primary codepoint; negative for arrows and functional keys.
     pub codepoint: i64,
     /// Shifted version of the key (when shift is pressed).
     pub shifted_key: Option<i64>,
     /// Key in the standard PC-101 layout (for non-Latin layouts).
     pub base_layout_key: Option<i64>,
+    /// Modifier bits (see [`modifiers`]); the 1-indexed wire value is already decoded.
     pub modifier: u8,
+    /// Press, repeat or release; the latter two need Kitty's event-type flag.
     pub event_type: KeyEventType,
 }
 
 /// xterm modifyOtherKeys sequence. `keys.ts:520-523`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModifyOtherKeysSequence {
+    /// The key's codepoint.
     pub codepoint: i64,
+    /// Modifier bits, already 0-indexed.
     pub modifier: u8,
 }
 

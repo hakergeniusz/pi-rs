@@ -10,9 +10,13 @@
 //! * [`client`] — `initialize` handshake, tool discovery and calls.
 //! * [`error`] — the error surface.
 
+/// The MCP client: `initialize` handshake, tool discovery and calls.
 pub mod client;
+/// The error surface ([`McpError`]).
 pub mod error;
+/// Subprocess stdio framing with request/response correlation.
 pub mod transport;
+/// JSON-RPC 2.0 envelope + MCP message types.
 pub mod types;
 
 /// MCP protocol version this port targets.

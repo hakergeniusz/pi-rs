@@ -29,21 +29,37 @@
 //! Windows-only `powershell.ts` is deliberately skipped and recorded as an
 //! unsupported variant in [`index::UNSUPPORTED_TOOLS`].
 
+/// The bash tool (`bash.ts`).
 pub mod bash;
+/// The file-edit tool (`edit.ts`).
 pub mod edit;
+/// The edit tool's matcher, line endings, and diffs (`edit-diff.ts`).
 pub mod edit_diff;
+/// The file-find tool (`find.ts`).
 pub mod find;
+/// The content-grep tool (`grep.ts`).
 pub mod grep;
+/// The tool registry: schemas, execution, and the [`pi_agent::types::ToolExecutor`] impl (`index.ts`).
 pub mod index;
+/// The directory-listing tool (`ls.ts`).
 pub mod ls;
+/// Per-file mutation serialization (`file-mutation-queue.ts`).
 pub mod mutation_queue;
+/// Bounded-memory accumulator for streaming tool output (`output-accumulator.ts`).
 pub mod output_accumulator;
+/// Path resolution for the file tools (`path-utils.ts` + `utils/paths.ts`).
 pub mod path_utils;
+/// The file-read tool (`read.ts`).
 pub mod read;
+/// Tool-result text shaping (`render-utils.ts`).
 pub mod render_utils;
+/// Presentation text for the TUI tool rows (`renderers/*.ts`).
 pub mod renderers;
+/// Tool-argument preparation, coercion, and validation (`validation.ts`).
 pub mod schema;
+/// The shared output limits (`truncate.ts`).
 pub mod truncate;
+/// The file-write tool (`write.ts`).
 pub mod write;
 
 pub use index::{

@@ -773,6 +773,7 @@ fn replace_last_assistant(context: &mut AgentContext, message: &AssistantMessage
     }
 }
 
+/// A blank assistant message: empty content, empty api/provider/model fields.
 pub fn empty_assistant_message() -> AssistantMessage {
     AssistantMessage {
         content: Vec::new(),

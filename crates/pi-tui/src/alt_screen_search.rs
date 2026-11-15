@@ -286,6 +286,7 @@ pub struct AltScreenSearchIndex {
 }
 
 impl AltScreenSearchIndex {
+    /// An empty index; the first [`AltScreenSearchIndex::search`] builds the corpus.
     pub fn new() -> Self {
         Self::default()
     }
@@ -352,6 +353,7 @@ pub type SearchQueryChangeHandler = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// `const PREVIOUS = -1` / `NEXT = 1`, `alt-screen-search.ts:225`.
 pub const SEARCH_DIRECTION_PREVIOUS: SearchNavigationDirection = -1;
+/// The "next match" button: `+1`, addable to a match index.
 pub const SEARCH_DIRECTION_NEXT: SearchNavigationDirection = 1;
 
 /// How the overlay labels a key. `alt-screen-search.ts:252-262`.
@@ -391,6 +393,7 @@ pub struct AltScreenSearchComponentOptions {
 }
 
 impl AltScreenSearchComponentOptions {
+    /// Options with pi's defaults: identity button style, no navigation keys.
     pub fn new(on_query_change: SearchQueryChangeHandler) -> Self {
         Self {
             on_query_change,
@@ -484,10 +487,12 @@ impl AltScreenSearchComponent {
         }
     }
 
+    /// The current query text.
     pub fn value(&self) -> &str {
         self.input.value()
     }
 
+    /// Replace the query; notifies only when the value actually changed.
     pub fn set_value(&mut self, value: impl Into<String>) {
         let previous = self.input.value().to_string();
         self.input.set_value(value);
@@ -497,6 +502,7 @@ impl AltScreenSearchComponent {
         }
     }
 
+    /// Whether the overlay currently has keyboard focus.
     pub fn focused(&self) -> bool {
         self.focused
     }
@@ -556,6 +562,7 @@ impl AltScreenSearchComponent {
         true
     }
 
+    /// Which navigation button is hovered, if either.
     pub fn hovered_navigation_direction(&self) -> Option<SearchNavigationDirection> {
         self.hovered_navigation_direction
     }

@@ -44,18 +44,26 @@ use crate::tui::{OverlayBounds, OverlayId, OverlayMargin, SizeValue, Tui, TuiSto
 use crate::wheel_scroll::{WheelScrollAccelerator, WheelScrollLines};
 /// `tui-alt-screen.ts:50-67`.
 pub const ENTER_ALT_SCREEN: &str = "\x1b[?1049h";
+/// Leave the alternate screen; pairs with [`ENTER_ALT_SCREEN`].
 pub const EXIT_ALT_SCREEN: &str = "\x1b[?1049l";
+/// Turn autowrap off (DECRST 7): the painter writes fixed-width lines.
 pub const DISABLE_AUTOWRAP: &str = "\x1b[?7l";
+/// Turn autowrap back on before the terminal is handed back.
 pub const ENABLE_AUTOWRAP: &str = "\x1b[?7h";
 /// Button-motion tracking: enough for clicks, the wheel, selection and
 /// scrollbar drags without forwarding every pointer move.
 pub const ENABLE_BUTTON_MOTION_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h";
 /// All-motion tracking, used when no multiplexer is detected.
 pub const ENABLE_ALL_MOTION_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h";
+/// Disable everything the enable sequences can set, in reverse order.
 pub const DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+/// The terminal's focus-gained report, consumed by [`Tui::alt_screen_handle_focus`].
 pub const FOCUS_IN: &str = "\x1b[I";
+/// The terminal's focus-lost report; handling it also releases every gesture.
 pub const FOCUS_OUT: &str = "\x1b[O";
+/// Begin a synchronized update (DECSET 2026); the enclosed writes land atomically.
 pub const BEGIN_SYNCHRONIZED_OUTPUT: &str = "\x1b[?2026h";
+/// End the synchronized update.
 pub const END_SYNCHRONIZED_OUTPUT: &str = "\x1b[?2026l";
 
 /// `PAGE_SCROLL_OVERLAP`, `tui-alt-screen.ts:69`.
@@ -376,6 +384,7 @@ impl AltScreenState {
             .as_mut()
             .and_then(|root| crate::component::implicit_document_mut(root.child_mut()))
     }
+    /// A fresh state: no gestures, no selection, no screen history, default options.
     pub fn new() -> Self {
         Self {
             mouse_capture: None,

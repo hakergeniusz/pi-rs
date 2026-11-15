@@ -9,6 +9,7 @@ use std::cell::RefCell;
 /// The background painter `Box` applies to every rendered line.
 pub type BackgroundFn = Box<dyn Fn(&str) -> String + Send + Sync>;
 
+/// pi's `Box`: children stacked vertically with padding and an optional background.
 #[derive(Default)]
 pub struct BoxComponent {
     children: Vec<Box<dyn Component>>,
@@ -62,18 +63,22 @@ impl BoxComponent {
         self.children.clear();
     }
 
+    /// How many children the box holds.
     pub fn len(&self) -> usize {
         self.children.len()
     }
 
+    /// Whether the box has no children.
     pub fn is_empty(&self) -> bool {
         self.children.is_empty()
     }
 
+    /// The child at `index`, if in range.
     pub fn get(&self, index: usize) -> Option<&crate::component::DynComponent> {
         self.children.get(index).map(AsRef::as_ref)
     }
 
+    /// A mutable borrow of the child at `index`, if in range.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut crate::component::DynComponent> {
         self.children.get_mut(index).map(AsMut::as_mut)
     }

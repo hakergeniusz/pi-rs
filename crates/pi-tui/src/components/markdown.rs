@@ -41,19 +41,33 @@ fn identity() -> Style {
 /// text to styled text, exactly as in pi.
 #[derive(Clone)]
 pub struct MarkdownTheme {
+    /// Style hook for heading text.
     pub heading: Style,
+    /// Style hook for link text.
     pub link: Style,
+    /// Style hook for the URL printed after a link label.
     pub link_url: Style,
+    /// Style hook for inline code spans.
     pub code: Style,
+    /// Style hook for code-block body lines.
     pub code_block: Style,
+    /// Style hook for the fence lines around a code block.
     pub code_block_border: Style,
+    /// Style hook for block-quote text.
     pub quote: Style,
+    /// Style hook for the `│ ` quote bar.
     pub quote_border: Style,
+    /// Style hook for horizontal rules.
     pub hr: Style,
+    /// Style hook for list bullets.
     pub list_bullet: Style,
+    /// Style hook for bold runs.
     pub bold: Style,
+    /// Style hook for italic runs.
     pub italic: Style,
+    /// Style hook for strikethrough runs.
     pub strikethrough: Style,
+    /// Style hook for underlined runs; links use it too.
     pub underline: Style,
     /// `theme.highlightCode` (`markdown.ts:233`), optional. When absent each
     /// code line goes through `code_block`, which is pi's own fallback.
@@ -107,11 +121,17 @@ impl MarkdownTheme {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Default)]
 pub struct DefaultTextStyle {
+    /// Style hook for the base text color.
     pub color: Option<Style>,
+    /// Apply the theme's bold hook to base text.
     pub bold: bool,
+    /// Apply the theme's italic hook to base text.
     pub italic: bool,
+    /// Apply the theme's strikethrough hook to base text.
     pub strikethrough: bool,
+    /// Apply the theme's underline hook to base text.
     pub underline: bool,
+    /// Background painter applied at the padding stage.
     pub bg_color: Option<Style>,
 }
 
@@ -169,8 +189,11 @@ pub enum Block {
 /// A list. `Tokens.List`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct List {
+    /// Ordered (`1.`) versus bulleted (`-`) list.
     pub ordered: bool,
+    /// The first marker's number.
     pub start: usize,
+    /// The list's items.
     pub items: Vec<ListItem>,
     /// pi's `list.loose`: blank lines between items render a spacer.
     pub loose: bool,
@@ -183,13 +206,16 @@ pub struct ListItem {
     pub marker: Option<String>,
     /// pi's `item.task` / `item.checked`.
     pub task: Option<bool>,
+    /// The item's block content.
     pub blocks: Vec<Block>,
 }
 
 /// A table. `Tokens.Table`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Table {
+    /// The header row's cells.
     pub header: Vec<Vec<Inline>>,
+    /// The body rows, one cell vector per row.
     pub rows: Vec<Vec<Vec<Inline>>>,
     /// `token.raw`, used as the fallback when the table cannot be laid out.
     pub raw: String,
@@ -848,10 +874,12 @@ impl Markdown {
         }
     }
 
+    /// Replace the markdown source; the next render uses it.
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
     }
 
+    /// The markdown source.
     pub fn text(&self) -> &str {
         &self.text
     }

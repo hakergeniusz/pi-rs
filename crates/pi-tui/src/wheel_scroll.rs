@@ -44,6 +44,7 @@ pub struct SshEnv {
 }
 
 impl SshEnv {
+    /// Whether any SSH variable was set (macOS then keeps one line per event).
     pub fn any(&self) -> bool {
         self.connection || self.client || self.tty
     }
@@ -118,6 +119,7 @@ impl WheelScrollAccelerator {
         self.reset();
     }
 
+    /// The configured line mode, as set by [`WheelScrollAccelerator::set_lines`].
     pub fn lines(&self) -> WheelScrollLines {
         self.lines
     }

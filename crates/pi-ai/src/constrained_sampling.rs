@@ -85,6 +85,7 @@ impl ConstrainedSampling {
         }
     }
 
+    /// The config's wire discriminant: `false`, `json_schema`, or `grammar`.
     pub fn type_name(&self) -> &'static str {
         match self {
             ConstrainedSampling::Disabled => "false",

@@ -316,22 +316,27 @@ pub fn editor_theme() -> pi_tui::components::editor::EditorTheme {
 }
 
 // chalk-equivalent attribute helpers (`theme.ts:314-331` — chalk.bold etc.).
+/// Wrap `text` in the theme's bold sequence.
 pub fn bold(text: &str) -> String {
     format!("\x1b[1m{text}\x1b[22m")
 }
 
+/// Wrap `text` in the theme's italic sequence.
 pub fn italic(text: &str) -> String {
     format!("\x1b[3m{text}\x1b[23m")
 }
 
+/// Wrap `text` in the theme's underline sequence.
 pub fn underline(text: &str) -> String {
     format!("\x1b[4m{text}\x1b[24m")
 }
 
+/// Wrap `text` in the theme's strikethrough sequence.
 pub fn strikethrough(text: &str) -> String {
     format!("\x1b[9m{text}\x1b[29m")
 }
 
+/// Wrap `text` in the theme's inverse sequence.
 pub fn inverse(text: &str) -> String {
     format!("\x1b[7m{text}\x1b[27m")
 }
@@ -350,23 +355,38 @@ pub mod app_keys {
     /// actions whose handlers exist in the interactive mode; the dialog-only
     /// actions join with their dialogs).
     pub const INTERRUPT: &str = "app.interrupt";
+    /// Clear the screen.
     pub const CLEAR: &str = "app.clear";
+    /// Exit pi.
     pub const EXIT: &str = "app.exit";
+    /// Suspend to the shell (SIGTSTP).
     pub const SUSPEND: &str = "app.suspend";
+    /// Cycle the thinking level forward.
     pub const THINKING_CYCLE: &str = "app.thinking.cycle";
+    /// Cycle to the next model (ctrl+p).
     pub const MODEL_CYCLE_FORWARD: &str = "app.model.cycleForward";
+    /// Cycle to the previous model.
     pub const MODEL_CYCLE_BACKWARD: &str = "app.model.cycleBackward";
+    /// Toggle tool-row expansion (ctrl+o).
     pub const TOOLS_EXPAND: &str = "app.tools.expand";
+    /// Toggle the hide-thinking setting.
     pub const THINKING_TOGGLE: &str = "app.thinking.toggle";
+    /// Queue the editor text as a follow-up (alt+enter).
     pub const MESSAGE_FOLLOW_UP: &str = "app.message.followUp";
+    /// Dequeue the last queued message (alt+up).
     pub const MESSAGE_DEQUEUE: &str = "app.message.dequeue";
     /// Dialog-only actions (`keybindings.ts:86-104`), bound inside their
     /// selectors.
     pub const SESSION_TOGGLE_NAMED_FILTER: &str = "app.session.toggleNamedFilter";
+    /// Toggle the session selector's path display.
     pub const SESSION_TOGGLE_PATH: &str = "app.session.togglePath";
+    /// Toggle the session selector's sort.
     pub const SESSION_TOGGLE_SORT: &str = "app.session.toggleSort";
+    /// Rename the selected session.
     pub const SESSION_RENAME: &str = "app.session.rename";
+    /// Trash-delete the selected session.
     pub const SESSION_DELETE: &str = "app.session.delete";
+    /// Remove the selected session without touching its file on disk.
     pub const SESSION_DELETE_NONINVASIVE: &str = "app.session.deleteNoninvasive";
 
     /// pi's default keys, in `APP_KEYBINDINGS` order.

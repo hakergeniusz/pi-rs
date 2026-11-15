@@ -42,6 +42,7 @@ pub enum ThinkingLevel {
 }
 
 impl ThinkingLevel {
+    /// The wire name: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
     pub fn as_str(self) -> &'static str {
         match self {
             ThinkingLevel::Off => "off",
@@ -54,6 +55,7 @@ impl ThinkingLevel {
         }
     }
 
+    /// Parse a level from its wire name ([`ThinkingLevel::as_str`]).
     pub fn parse(value: &str) -> Option<ThinkingLevel> {
         match value {
             "off" => Some(ThinkingLevel::Off),
@@ -326,15 +328,18 @@ pub struct AbortSignal {
 }
 
 impl AbortSignal {
+    /// A signal that is not aborted.
     pub fn new() -> AbortSignal {
         AbortSignal::default()
     }
 
+    /// Flag the signal: every check from now on reports aborted.
     pub fn abort(&self) {
         self.aborted
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Whether [`AbortSignal::abort`] has been called.
     pub fn aborted(&self) -> bool {
         self.aborted.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -389,6 +394,7 @@ impl MessageQueue for PendingMessageQueue {
 }
 
 impl PendingMessageQueue {
+    /// An empty queue with the given drain mode.
     pub fn new(mode: QueueMode) -> PendingMessageQueue {
         PendingMessageQueue {
             messages: Vec::new(),
@@ -396,10 +402,12 @@ impl PendingMessageQueue {
         }
     }
 
+    /// Append a message to the end of the queue.
     pub fn enqueue(&mut self, message: AgentMessage) {
         self.messages.push(message);
     }
 
+    /// Whether any message is queued.
     pub fn has_items(&self) -> bool {
         !self.messages.is_empty()
     }
@@ -412,12 +420,14 @@ impl PendingMessageQueue {
         }
     }
 
+    /// Take what [`PendingMessageQueue::peek`] would return, removing it.
     pub fn drain(&mut self) -> Vec<AgentMessage> {
         let drained = self.peek();
         self.messages.drain(..drained.len());
         drained
     }
 
+    /// Drop every queued message.
     pub fn clear(&mut self) {
         self.messages.clear();
     }

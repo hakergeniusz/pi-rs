@@ -3,7 +3,7 @@
 //! Ground truth: `packages/coding-agent/src` in earendil-works/pi. Module
 //! docs cite the TS file and line range each piece mirrors.
 //!
-//! Layout (Phase P4, non-interactive core):
+//! Layout:
 //!
 //! * [`config`] — global + project config loading (`config.ts`).
 //! * [`auth`] — credential storage for provider auth (`core/auth-storage.ts`).
@@ -23,14 +23,25 @@
 
 #![forbid(unsafe_code)]
 
+/// Credential storage for provider auth (`core/auth-storage.ts`).
 pub mod auth;
+/// Argument parsing, `@file` processing, project trust.
 pub mod cli;
+/// Global + project config loading (`config.ts`).
 pub mod config;
+/// Runtime-agnostic extension host seam (runtime decision pending at the P5 gate).
 pub mod extensions;
+/// Print, JSON-event, RPC, and interactive modes.
 pub mod modes;
+/// System prompt assembly (`core/system-prompt.ts`).
 pub mod prompt;
+/// Command prompt templates (`core/prompt-templates.ts`).
 pub mod prompt_templates;
+/// Process-wide tokio runtime driving async work from the sync CLI paths.
 pub mod runtime;
+/// The JSONL session tree: v3 records, store, migrations, compaction.
 pub mod session;
+/// Skill discovery and packaging (`core/skills.ts`).
 pub mod skills;
+/// The built-in tools — read, bash, edit, write, ls, find, grep — plus renderers.
 pub mod tools;

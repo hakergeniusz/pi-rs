@@ -13,8 +13,11 @@
 /// sRGB channels, 0-255. `terminal-colors.ts:1-5`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rgb {
+    /// Red channel, 0-255.
     pub r: f64,
+    /// Green channel, 0-255.
     pub g: f64,
+    /// Blue channel, 0-255.
     pub b: f64,
 }
 
@@ -303,8 +306,11 @@ pub fn okhsl_to_rgb(hue: f64, saturation: f64, lightness: f64) -> Rgb {
 /// `colors.ts:38-42`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Okhsl {
+    /// Hue in degrees.
     pub h: f64,
+    /// Saturation, 0-1.
     pub s: f64,
+    /// Lightness, 0-1.
     pub l: f64,
 }
 

@@ -231,6 +231,7 @@ pub enum ThemeAppearance {
 }
 
 impl ThemeAppearance {
+    /// The name as it appears in theme JSON and theme settings: `dark` or `light`.
     pub fn as_str(self) -> &'static str {
         match self {
             ThemeAppearance::Dark => "dark",
@@ -828,18 +829,23 @@ impl Theme {
         }
     }
 
+    /// The theme's name, or `None` when the builder gave none.
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
 
+    /// The path the theme document was read from, when the caller supplied one.
     pub fn source_path(&self) -> Option<&str> {
         self.source_path.as_deref()
     }
 
+    /// The [`TerminalColorMode`] this theme's escape sequences are built for.
     pub fn color_mode(&self) -> TerminalColorMode {
         self.mode
     }
 
+    /// The resolved `export` block, for the HTML theme export. The system
+    /// theme carries none.
     pub fn export_colors(&self) -> &ThemeExportColors {
         &self.export
     }
@@ -1094,6 +1100,7 @@ pub struct ThemePaths {
 }
 
 impl ThemePaths {
+    /// Paths for the built-in and custom theme directories.
     pub fn new(builtin_dir: impl Into<PathBuf>, custom_dir: impl Into<PathBuf>) -> ThemePaths {
         ThemePaths {
             builtin_dir: builtin_dir.into(),
@@ -1125,6 +1132,7 @@ pub struct ThemeRegistry {
 }
 
 impl ThemeRegistry {
+    /// An empty registry.
     pub fn new() -> ThemeRegistry {
         ThemeRegistry::default()
     }
@@ -1137,14 +1145,20 @@ impl ThemeRegistry {
         Ok(())
     }
 
+    /// Forget every registered theme.
     pub fn clear(&mut self) {
         self.entries.clear();
     }
 
+    /// The registered source path for `name`.
+    ///
+    /// `None` means unregistered; `Some(None)` is a registered theme without
+    /// a file, which cannot be exported.
     pub fn get(&self, name: &str) -> Option<&Option<PathBuf>> {
         self.entries.get(name)
     }
 
+    /// The registered names, sorted.
     pub fn names(&self) -> Vec<String> {
         self.entries.keys().cloned().collect()
     }
@@ -1512,6 +1526,7 @@ impl ThemeWatcher {
         })
     }
 
+    /// The theme this watcher polls.
     pub fn theme_name(&self) -> &str {
         &self.theme_name
     }
@@ -1575,6 +1590,11 @@ pub struct ThemeController {
 }
 
 impl ThemeController {
+    /// Load `name` and take ownership of its watcher.
+    ///
+    /// Like [`ThemeController::new_with_system`] with
+    /// [`SystemThemeMode::reported`]: the terminal is assumed to have answered
+    /// its colour report.
     pub fn new(
         paths: ThemePaths,
         registry: ThemeRegistry,
@@ -1617,10 +1637,12 @@ impl ThemeController {
         })
     }
 
+    /// The active theme.
     pub fn theme(&self) -> &Theme {
         &self.theme
     }
 
+    /// The active theme's name, after any `light/dark` setting was resolved.
     pub fn theme_name(&self) -> &str {
         &self.theme_name
     }

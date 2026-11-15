@@ -43,6 +43,7 @@ pub enum MouseButton {
     Left,
     Middle,
     Right,
+    /// No button: motion and wheel reports carry none.
     None,
 }
 
@@ -57,6 +58,7 @@ impl MouseButton {
         }
     }
 
+    /// pi's button name: `"left"`, `"middle"`, `"right"` or `"none"`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Left => "left",
@@ -137,18 +139,21 @@ impl MouseEvent {
         }
     }
 
+    /// Builder: attach a wheel delta in logical lines.
     #[must_use]
     pub fn with_wheel_delta(mut self, delta: i64) -> Self {
         self.wheel_delta = Some(delta);
         self
     }
 
+    /// Builder: attach a click count.
     #[must_use]
     pub fn with_click_count(mut self, count: u32) -> Self {
         self.click_count = Some(count);
         self
     }
 
+    /// Builder: attach a click count that may be absent.
     #[must_use]
     pub fn with_optional_click_count(mut self, count: Option<u32>) -> Self {
         self.click_count = count;
@@ -188,6 +193,7 @@ impl MouseEventResult {
         focus_target: None,
     };
 
+    /// Handled, with every other flag unset.
     pub const fn handled() -> Self {
         Self {
             handled: Some(true),
@@ -195,10 +201,12 @@ impl MouseEventResult {
         }
     }
 
+    /// Not handled: the same as [`MouseEventResult::EMPTY`].
     pub const fn unhandled() -> Self {
         Self::EMPTY
     }
 
+    /// Handled, with an explicit render request.
     pub fn handled_with_render(render: bool) -> Self {
         Self {
             handled: Some(true),
@@ -207,6 +215,7 @@ impl MouseEventResult {
         }
     }
 
+    /// Handled, and asking for keyboard focus.
     pub fn focus() -> Self {
         Self {
             handled: Some(true),
@@ -215,6 +224,7 @@ impl MouseEventResult {
         }
     }
 
+    /// Handled, and capturing the drag until release.
     pub fn capture() -> Self {
         Self {
             handled: Some(true),
@@ -223,6 +233,7 @@ impl MouseEventResult {
         }
     }
 
+    /// Whether any of the handled, capture or focus flags is set.
     pub fn is_handled(&self) -> bool {
         self.handled.unwrap_or(false)
             || self.capture.unwrap_or(false)
@@ -501,10 +512,12 @@ pub struct ComponentClickTracker {
 }
 
 impl ComponentClickTracker {
+    /// A tracker with no remembered click.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Forget the last click, so the next one counts 1.
     pub fn reset(&mut self) {
         self.last = None;
     }
@@ -547,6 +560,7 @@ struct SelectionClick {
 }
 
 impl SelectionClickTracker {
+    /// A tracker with no remembered click.
     pub fn new() -> Self {
         Self::default()
     }

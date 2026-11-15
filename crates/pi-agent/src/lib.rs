@@ -29,15 +29,25 @@
 
 #![forbid(unsafe_code)]
 
+/// The stateful [`Agent`] facade over the loop.
 pub mod agent;
+/// The request/stream/tool-calls loop (`run_agent_loop`).
 pub mod agent_loop;
+/// The transcript message union (`AgentMessage`).
 pub mod agent_message;
+/// The [`AgentEvent`] union every consumer observes.
 pub mod events;
+/// Serde for the crate's value types, in pi's wire shapes.
 pub mod json;
+/// Per-request model/thinking overrides and the [`SettingsHandle`] write seam.
 pub mod live_settings;
+/// The steering/follow-up queues and the [`QueueHandle`] callers steer through.
 pub mod queues;
+/// pi's agent state object and the transitions that mutate it.
 pub mod state;
+/// System-prompt and tool-declaration replay helpers.
 pub mod transcript;
+/// The injected seams: [`StreamFn`], [`ToolExecutor`], hooks, loop config.
 pub mod types;
 
 pub use agent::Agent;

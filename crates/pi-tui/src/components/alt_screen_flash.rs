@@ -35,6 +35,7 @@ pub struct AltScreenFlashContainer {
 }
 
 impl AltScreenFlashContainer {
+    /// An empty container.
     pub fn new() -> Self {
         Self::default()
     }
@@ -70,6 +71,7 @@ impl AltScreenFlashContainer {
             .collect()
     }
 
+    /// Whether nothing is currently flashing.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

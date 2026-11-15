@@ -953,6 +953,11 @@ fn solve_order() -> &'static [Token] {
 // Public API
 // ============================================================================
 
+/// What the generator knows about the terminal (`system-theme.ts:381-390`).
+///
+/// The reported colors, plus the two knobs pi derives from its state: the
+/// saturation multiplier (0 grayscales the first frame) and an appearance
+/// hint for terminals that reported no background of their own.
 // `SystemThemeInput` (`system-theme.ts:381-390`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SystemThemeInput {
@@ -969,6 +974,7 @@ pub struct SystemThemeInput {
 }
 
 impl SystemThemeInput {
+    /// Exactly what the terminal reported, at full saturation.
     // The terminal's reported colors, with full saturation.
     pub fn from_terminal(colors: &TerminalColors) -> SystemThemeInput {
         SystemThemeInput {
@@ -981,6 +987,11 @@ impl SystemThemeInput {
     }
 }
 
+/// The generated theme: one [`ColorValue`] per token (`system-theme.ts:392-398`).
+///
+/// Values are hex strings, palette indices, or [`ColorValue::Default`] to keep
+/// the terminal's own color; `dim` names the foreground tokens a terminal that
+/// reported nothing renders faint (SGR 2).
 // `SystemThemeColors` (`system-theme.ts:392-398`). Colors are hex strings,
 // ANSI palette indices, or [`ColorValue::Default`] for the terminal default.
 #[derive(Debug, Clone, PartialEq)]
@@ -1015,6 +1026,7 @@ impl SystemThemeColors {
         }
     }
 
+    /// The foreground token's value, or [`ColorValue::Default`] when unset.
     // A foreground token's colour, defaulting to the terminal default like
     // pi's `Record` lookup would.
     pub fn color(&self, token: ThemeColor) -> ColorValue {
@@ -1024,6 +1036,7 @@ impl SystemThemeColors {
             .unwrap_or(ColorValue::Default)
     }
 
+    /// The background token's value, or [`ColorValue::Default`] when unset.
     // A background token's colour.
     pub fn background(&self, token: ThemeBg) -> ColorValue {
         self.backgrounds
@@ -1136,6 +1149,14 @@ fn with_text_contrast(color: Rgb, surfaces: &[Rgb], lighter: bool) -> Rgb {
     at(high)
 }
 
+/// Generate the `system` theme's color values from the terminal's report.
+///
+/// Every token must reach its contrast level on each surface it is drawn on;
+/// when a mid-gray background cannot satisfy them all, the levels relax as
+/// little as a binary search allows (`system-theme.ts:461-573`). With no
+/// reported background the indexed fallback applies: tokens become ANSI
+/// palette indices or [`ColorValue::Default`], which the terminal renders
+/// with its own theme.
 // The generator (`generateSystemThemeColors`, `system-theme.ts:461-573`).
 // Upstream parity: this mirrors `generateSystemThemeColors` step for step and
 // splitting it would obscure that mapping.

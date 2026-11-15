@@ -201,6 +201,7 @@ impl AgentState {
         &self.model
     }
 
+    /// Set `Agent.state.model` for the next request.
     pub fn set_model(&mut self, model: Model) {
         self.model = model;
     }
@@ -212,6 +213,8 @@ impl AgentState {
         self.live.thinking_level()
     }
 
+    /// Set `Agent.state.thinkingLevel` through the live cell, so a run in
+    /// flight reads it on its next request.
     pub fn set_thinking_level(&mut self, level: ThinkingLevel) {
         self.live.set_thinking_level(level);
     }
@@ -231,6 +234,7 @@ impl AgentState {
         self.tool_execution
     }
 
+    /// Set `Agent.toolExecution`, read into the loop config for the next turn.
     pub fn set_tool_execution(&mut self, mode: ToolExecutionMode) {
         self.tool_execution = mode;
     }

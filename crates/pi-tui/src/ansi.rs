@@ -234,7 +234,9 @@ fn visible_run_end(s: &str, i: usize) -> usize {
 /// Result of `slice_with_width`: the sliced text and its visible width.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slice {
+    /// The kept text, with the SGR state around it re-emitted.
     pub text: String,
+    /// Visible width of [`Slice::text`].
     pub width: usize,
 }
 
@@ -301,9 +303,13 @@ pub fn slice_by_column(line: &str, start_col: usize, length: usize, strict: bool
 /// The before/after pair `extractSegments` returns. `utils.ts:1326-1396`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Segments {
+    /// Columns `[0, before_end)` of the line, SGR state included.
     pub before: String,
+    /// Visible width of [`Segments::before`].
     pub before_width: usize,
+    /// The `[after_start, after_start + after_len)` columns, with the styling active there.
     pub after: String,
+    /// Visible width of [`Segments::after`].
     pub after_width: usize,
 }
 
@@ -378,12 +384,13 @@ pub fn extract_segments(
     segments
 }
 
-/// Pad `line` to `width` and hand it to `bg_fn`. `utils.ts:1099-1110`.
-/// `utils.ts:896-898`. pi's `flattenLines` is a V8 string-flattening hint
+/// pi's `flattenLines` (`utils.ts:896-898`) is a V8 string-flattening hint
 /// with no observable effect; the port keeps it as an explicit no-op so the
 /// call sites stay one-to-one with pi's.
 pub fn flatten_lines(_lines: &mut [String]) {}
 
+/// Pad `line` to `width` columns and hand the padded text to `bg_fn`.
+/// `utils.ts:1099-1110`.
 pub fn apply_background_to_line(
     line: &str,
     width: usize,

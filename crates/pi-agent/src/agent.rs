@@ -123,36 +123,43 @@ impl Agent {
         }
     }
 
+    /// Builder: the session id recorded on the loop config.
     #[must_use]
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Agent {
         self.config.session_id = Some(session_id.into());
         self
     }
 
+    /// Builder: an explicit api-key override passed to the provider request.
     #[must_use]
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Agent {
         self.config.api_key = Some(api_key.into());
         self
     }
 
+    /// Builder: the initial reasoning level.
     #[must_use]
     pub fn with_thinking_level(mut self, thinking_level: ThinkingLevel) -> Agent {
         self.state.set_thinking_level(thinking_level);
         self
     }
 
+    /// Builder: how tool calls execute ([`ToolExecutionMode`]).
     #[must_use]
     pub fn with_tool_execution(mut self, mode: ToolExecutionMode) -> Agent {
         self.state.set_tool_execution(mode);
         self
     }
 
+    /// Builder: the tool-call hooks the loop fires around each call.
     #[must_use]
     pub fn with_hooks(mut self, hooks: crate::types::ToolCallHooks) -> Agent {
         self.config.hooks = hooks;
         self
     }
 
+    /// Builder: the [`FinishTurn`] hook deciding whether the loop continues
+    /// after a turn.
     #[must_use]
     pub fn with_finish_turn(
         mut self,
@@ -162,6 +169,7 @@ impl Agent {
         self
     }
 
+    /// Builder: the [`PrepareRequest`] hook run before each provider request.
     #[must_use]
     pub fn with_prepare_request(
         mut self,
@@ -171,6 +179,7 @@ impl Agent {
         self
     }
 
+    /// Builder: the [`PrepareNextTurn`] hook run before each follow-up turn.
     #[must_use]
     pub fn with_prepare_next_turn(
         mut self,
@@ -180,6 +189,8 @@ impl Agent {
         self
     }
 
+    /// Builder: the [`TransformContext`] hook applied to the context before
+    /// serialization.
     #[must_use]
     pub fn with_transform_context(
         mut self,
@@ -273,6 +284,7 @@ impl Agent {
         self.state.tools()
     }
 
+    /// Whether a run is live right now (`Agent.state.isStreaming`).
     pub fn is_streaming(&self) -> bool {
         self.state.is_streaming()
     }
@@ -295,10 +307,14 @@ impl Agent {
         self.state.error_message()
     }
 
+    /// The model the next request uses (`Agent.state.model`).
     pub fn model(&self) -> &Model {
         self.state.model()
     }
 
+    /// Set the model for the next request. A model written through the
+    /// [`SettingsHandle`] mid-run stays pending until the loop takes it; an
+    /// explicit set here wins, so the pending override is dropped.
     pub fn set_model(&mut self, model: Model) {
         // A model written through the handle mid-run is a pending override
         // until the loop or this call takes it; an explicit set through the
@@ -307,6 +323,8 @@ impl Agent {
         self.state.set_model(model);
     }
 
+    /// Set the reasoning level the next request asks for
+    /// (`AgentState::set_thinking_level`).
     pub fn set_thinking_level(&mut self, level: ThinkingLevel) {
         self.state.set_thinking_level(level);
     }

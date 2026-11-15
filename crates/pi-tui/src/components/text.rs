@@ -9,6 +9,9 @@ pub type CustomBgFn = Box<dyn Fn(&str) -> String + Send + Sync>;
 /// A background painter applied to every rendered line.
 pub type BgFn<'a> = &'a dyn Fn(&str) -> String;
 
+/// A text block wrapped to the width, with margins and an optional background.
+///
+/// Empty or whitespace-only content renders no lines at all.
 pub struct Text {
     content: String,
     padding_x: usize,
@@ -58,6 +61,7 @@ impl Text {
         self.content = text.into();
     }
 
+    /// The current text.
     pub fn text(&self) -> &str {
         &self.content
     }

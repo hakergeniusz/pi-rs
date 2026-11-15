@@ -121,6 +121,7 @@ pub struct ComponentMutation {
 /// A component that can show a hardware cursor when focused.
 /// `tui.ts:174-187`.
 pub trait Focusable {
+    /// Show or hide this component's focused indicator.
     fn set_focused(&mut self, focused: bool);
 }
 
@@ -143,6 +144,7 @@ impl std::fmt::Debug for Container {
 }
 
 impl Container {
+    /// An empty container.
     pub fn new() -> Self {
         Self::default()
     }
@@ -169,30 +171,38 @@ impl Container {
         std::mem::take(&mut self.children)
     }
 
+    /// Append a child; it renders below the children already present.
     pub fn add_child(&mut self, component: Box<dyn Component>) {
         self.children.push(component);
     }
 
+    /// Remove and return the child at `index`; the children after it shift
+    /// down one slot.
     pub fn remove_child(&mut self, index: usize) -> Box<dyn Component> {
         self.children.remove(index)
     }
 
+    /// Remove every child.
     pub fn clear(&mut self) {
         self.children.clear();
     }
 
+    /// How many children are mounted.
     pub fn len(&self) -> usize {
         self.children.len()
     }
 
+    /// Whether there are no children.
     pub fn is_empty(&self) -> bool {
         self.children.is_empty()
     }
 
+    /// The child at `index`, if any.
     pub fn get(&self, index: usize) -> Option<&DynComponent> {
         self.children.get(index).map(AsRef::as_ref)
     }
 
+    /// The child at `index`, mutably.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut DynComponent> {
         self.children.get_mut(index).map(AsMut::as_mut)
     }

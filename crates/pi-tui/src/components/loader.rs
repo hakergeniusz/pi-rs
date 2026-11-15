@@ -17,7 +17,9 @@ pub const DEFAULT_INTERVAL_MS: u64 = 80;
 /// `loader.ts:12-16`.
 #[derive(Debug, Clone)]
 pub struct LoaderIndicator {
+    /// The frames cycled in order.
     pub frames: Vec<String>,
+    /// Milliseconds between frames; `0` falls back to [`DEFAULT_INTERVAL_MS`].
     pub interval_ms: u64,
 }
 
@@ -85,10 +87,12 @@ impl Loader {
         self.running = false;
     }
 
+    /// Whether the spinner is running.
     pub fn is_running(&self) -> bool {
         self.running
     }
 
+    /// The frame currently shown; empty when there are no frames.
     pub fn current_frame(&self) -> &str {
         self.frames
             .get(self.current_frame)

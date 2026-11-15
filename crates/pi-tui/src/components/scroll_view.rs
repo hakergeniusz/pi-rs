@@ -26,15 +26,22 @@ pub enum Scrollbar {
 /// `scroll-view.ts:18`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overscroll {
+    /// The host forwards leftover scroll to an outer view.
     Chain,
+    /// Leftover scroll stops at this view's edges.
     Contain,
 }
 
+/// Construction options for [`ScrollView::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScrollViewOptions {
+    /// Start pinned to the bottom, following new content.
     pub follow_end: bool,
+    /// Prefer this view when the layout picks its primary scroll target.
     pub primary: bool,
+    /// What happens to scroll past the edge; see [`Overscroll`].
     pub overscroll: Overscroll,
+    /// Which scrollbar column is drawn; see [`Scrollbar`].
     pub scrollbar: Scrollbar,
 }
 
@@ -52,7 +59,9 @@ impl Default for ScrollViewOptions {
 /// Scrollbar painters, kept out of the state so they can be swapped.
 #[derive(Clone)]
 pub struct ScrollbarStyles {
+    /// Painter for the scrollbar track cells.
     pub track: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
+    /// Painter for the scrollbar thumb cells.
     pub thumb: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>,
 }
 
@@ -75,14 +84,18 @@ impl std::fmt::Debug for ScrollbarStyles {
 /// Options for [`ScrollView::scroll_to`]. `scroll-view.ts:22-25`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScrollToOptions {
+    /// When the scroll lands at the bottom, follow-end stays off.
     pub disable_follow: bool,
 }
 
 /// A pending layout-driven update to a [`ScrollViewState`].
 #[derive(Clone)]
 pub struct ScrollUpdate {
+    /// The offset the update settles on.
     pub scroll_top: usize,
+    /// The full next state to store over the current one.
     pub state: ScrollViewState,
+    /// Whether `scroll_top` moved and a new frame is wanted.
     pub changed: bool,
 }
 
@@ -104,6 +117,7 @@ pub struct ScrollViewState {
     primary: bool,
     overscroll: Overscroll,
     scrollbar: Scrollbar,
+    /// The scrollbar painters the layout pass paints with.
     pub styles: ScrollbarStyles,
 }
 
@@ -143,26 +157,32 @@ impl ScrollViewState {
         self.current_scroll_top
     }
 
+    /// Whether the view is pinned to the bottom and following new content.
     pub fn is_following_end(&self) -> bool {
         self.following_end
     }
 
+    /// The viewport height the last layout pass measured.
     pub fn viewport_height(&self) -> usize {
         self.current_viewport_height
     }
 
+    /// The content height the last layout pass measured.
     pub fn content_height(&self) -> usize {
         self.content_height
     }
 
+    /// The scrollbar mode.
     pub fn scrollbar(&self) -> Scrollbar {
         self.scrollbar
     }
 
+    /// Whether this view is flagged as the layout's primary scroll target.
     pub fn primary(&self) -> bool {
         self.primary
     }
 
+    /// The overscroll hand-off mode.
     pub fn overscroll(&self) -> Overscroll {
         self.overscroll
     }
@@ -378,6 +398,7 @@ impl ScrollViewState {
 /// A viewport over exactly one child. `scroll-view.ts:26-64`.
 pub struct ScrollView {
     child: Box<dyn Component>,
+    /// The scrolling state, shared with the layout engine.
     pub state: ScrollViewState,
 }
 
@@ -410,22 +431,27 @@ impl ScrollView {
         self.state.request_render = Some(request);
     }
 
+    /// The current scroll offset; see [`ScrollViewState::scroll_top`].
     pub fn scroll_top(&self) -> usize {
         self.state.scroll_top()
     }
 
+    /// Scroll to `scroll_top`, clamped; see [`ScrollViewState::scroll_to`].
     pub fn scroll_to(&mut self, scroll_top: usize) {
         self.state.scroll_to(scroll_top, ScrollToOptions::default());
     }
 
+    /// Scroll by `lines`, returning the unapplied remainder; see [`ScrollViewState::scroll_by`].
     pub fn scroll_by(&mut self, lines: i64) -> i64 {
         self.state.scroll_by(lines)
     }
 
+    /// Scroll to the bottom; see [`ScrollViewState::scroll_to_end`].
     pub fn scroll_to_end(&mut self) {
         self.state.scroll_to_end();
     }
 
+    /// Scroll to the top; see [`ScrollViewState::scroll_to_start`].
     pub fn scroll_to_start(&mut self) {
         self.state.scroll_to_start();
     }
@@ -435,10 +461,12 @@ impl ScrollView {
         self.state.update_layout(content_height, viewport_height);
     }
 
+    /// The wrapped child.
     pub fn child(&self) -> &dyn Component {
         self.child.as_ref()
     }
 
+    /// A mutable borrow of the wrapped child.
     pub fn child_mut(&mut self) -> &mut dyn Component {
         self.child.as_mut()
     }

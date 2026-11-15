@@ -16,10 +16,15 @@ use crate::layout::LayoutNode;
 pub struct StackEntryOptions {
     /// Fixed size, or `None` for "auto" (measure the component).
     pub basis: Option<usize>,
+    /// Grow weight for absorbing slack; `None` or `0` never grows.
     pub grow: Option<usize>,
+    /// Shrink weight for giving space up; `None` defaults to 1.
     pub shrink: Option<usize>,
+    /// Floor for the allocated size; `None` means 0.
     pub min_size: Option<usize>,
+    /// Ceiling for the allocated size; `None` means unbounded.
     pub max_size: Option<usize>,
+    /// Viewport predicate; an entry failing it is skipped by the layout pass.
     pub visible: Option<fn(&LayoutViewport) -> bool>,
 }
 
@@ -64,7 +69,9 @@ pub enum Align {
 /// The viewport handed to `visible` callbacks. `layout-node.ts:5-8`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayoutViewport {
+    /// The viewport's width in columns.
     pub width: usize,
+    /// The viewport's height in rows.
     pub height: usize,
 }
 
@@ -131,18 +138,22 @@ impl Stack {
         self.entries.clear();
     }
 
+    /// How many children the stack holds.
     pub fn len(&self) -> usize {
         self.children.len()
     }
 
+    /// Whether the stack has no children.
     pub fn is_empty(&self) -> bool {
         self.children.is_empty()
     }
 
+    /// The child at `index`, if in range.
     pub fn get(&self, index: usize) -> Option<&crate::component::DynComponent> {
         self.children.get(index).map(AsRef::as_ref)
     }
 
+    /// A mutable borrow of the child at `index`, if in range.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut crate::component::DynComponent> {
         self.children.get_mut(index).map(AsMut::as_mut)
     }
@@ -152,14 +163,17 @@ impl Stack {
         self.gap = gap;
     }
 
+    /// The gap between entries.
     pub fn gap(&self) -> usize {
         self.gap
     }
 
+    /// The cross-axis alignment.
     pub fn align(&self) -> Align {
         self.align
     }
 
+    /// The [`StackType`] the layout node is built from.
     pub fn layout_type(&self) -> StackType {
         self.layout_type
     }
@@ -223,10 +237,12 @@ pub struct VStack {
 }
 
 impl VStack {
+    /// A vertical stack with no gap; every child gets [`StackEntryOptions::default`].
     pub fn new(children: Vec<Box<dyn Component>>) -> Self {
         Self::with_gap(children, 0)
     }
 
+    /// A vertical stack with `gap` between entries; every child gets [`StackEntryOptions::default`].
     pub fn with_gap(children: Vec<Box<dyn Component>>, gap: usize) -> Self {
         let mut stack = Stack::new(gap, Align::Stretch, StackType::Vertical);
         for child in children {
@@ -235,10 +251,12 @@ impl VStack {
         Self { inner: stack }
     }
 
+    /// The wrapped [`Stack`], for entry-level operations.
     pub fn stack(&mut self) -> &mut Stack {
         &mut self.inner
     }
 
+    /// Appends a child with its entry options. See [`Stack::add_child`].
     pub fn add_child(&mut self, component: Box<dyn Component>, options: StackEntryOptions) {
         self.inner.add_child(component, options);
     }
@@ -258,6 +276,7 @@ impl VStack {
         self.inner.entry_options(index)
     }
 
+    /// The stack's rendered lines at `width`, without going through the [`Component`] seam.
     pub fn render_lines(&self, width: usize) -> Vec<String> {
         self.inner.render(width)
     }
@@ -291,10 +310,12 @@ pub struct HStack {
 }
 
 impl HStack {
+    /// A horizontal stack with no gap; every child gets [`StackEntryOptions::default`].
     pub fn new(children: Vec<Box<dyn Component>>) -> Self {
         Self::with_gap(children, 0)
     }
 
+    /// A horizontal stack with `gap` between entries; every child gets [`StackEntryOptions::default`].
     pub fn with_gap(children: Vec<Box<dyn Component>>, gap: usize) -> Self {
         let mut stack = Stack::new(gap, Align::Stretch, StackType::Horizontal);
         for child in children {
@@ -303,10 +324,12 @@ impl HStack {
         Self { inner: stack }
     }
 
+    /// The wrapped [`Stack`], for entry-level operations.
     pub fn stack(&mut self) -> &mut Stack {
         &mut self.inner
     }
 
+    /// Appends a child with its entry options. See [`Stack::add_child`].
     pub fn add_child(&mut self, component: Box<dyn Component>, options: StackEntryOptions) {
         self.inner.add_child(component, options);
     }
