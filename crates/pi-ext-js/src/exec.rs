@@ -308,10 +308,15 @@ mod tests {
 
     #[test]
     fn timeout_kills_the_command() {
+        // Spawn the binary directly: `sh -c "sleep 30"` is unsafe here —
+        // dash (CI's /bin/sh) forks instead of exec-ing, so SIGTERM kills
+        // the shell and the orphaned sleep keeps the pipe write ends open
+        // until its natural exit (hit on CI 2026-11-15; bash exec-optimizes,
+        // which masked it locally).
         let started = Instant::now();
         let result = run(
-            "/bin/sh",
-            &["-c", "sleep 30"],
+            "/bin/sleep",
+            &["30"],
             &serde_json::json!({ "timeout": 100 }),
         );
         assert_eq!(result["killed"], true);

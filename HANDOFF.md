@@ -896,6 +896,14 @@ pump cadence stands in for upstream's `setInterval`).
   port needed); BuiltInHeader/Footer needed `as_any_mut` opt-ins (downcasts
   silently no-oped). Lesson: run the full suite, not just the new crate's subset.
 - Ported code once arrived with a systematic corruption: `map_or((default,` (extra `(` after `map_or(`) — fixed crate-wide by rewriting to `map_or(`. (Store.rs E0308 in old `test-log.txt` was another artifact of that batch, already fixed.)
+- **`sh -c` + SIGTERM orphans the grandchild (CI hit 2026-11-15)**: dash (the
+  CI runner's `/bin/sh`) does not exec-optimize `sh -c "sleep 30"` — SIGTERM
+  kills the shell, the orphaned sleep keeps the pipe write ends open, and
+  reader `join()` blocks until its natural exit (test ran the full 30 s; bash
+  exec-optimizes, which masked it in the local container). Node upstream has
+  the same characteristic (close waits on stdio), so `exec()` behavior is
+  faithful — never spawn long-lived commands via `sh -c` in exec tests; use
+  the binary directly (`/bin/sleep 30`).
 - Workspace lints: clippy `all+pedantic`, CI `-D warnings`, `cargo fmt --check`, MSRV 1.87 (`rust-version = "1.87"`, bumped from 1.85 at the E0 spike for `rquickjs` 0.14). Newer-API fixes must respect MSRV (the `f64::midpoint` scoped `#[allow]` from the 1.85 era can be lifted now).
 - `ToolDefinition.name` is `&'static str`; `Mode`/`PrintModeOptions` have no `Default`.
 - pi-ai `StreamOptions.reasoning` has only 5 levels; `xhigh`/`max` clamp to `High` in `ProviderStreamFn` until P5.
