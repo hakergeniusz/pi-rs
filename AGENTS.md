@@ -79,13 +79,14 @@ there (and only there), these limits apply:
 
 - Run heavy cargo commands inside the podman container `pi-rs-build`
   (workspace mounted at `/work`), never on the host.
-- Always: `nice -n 19`, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`,
+- Always: `nice -n 19`, `CARGO_BUILD_JOBS=8`, `CARGO_INCREMENTAL=0`,
   `CARGO_PROFILE_DEV_DEBUGINFO=0` (and the release equivalent). Use the
   shared target dir `/build-target` so artifacts are reused.
 - Never run memory-stress probes, `ulimit` experiments, or parallel heavy
   builds. If a command might OOM, reduce parallelism first and say so.
-- The container may run with up to 5 CPUs / 7 GB RAM (user-approved) — that
-  is cgroup headroom, not an invitation to raise `-j`.
+- The container runs with 8 CPUs / 7 GB RAM (user-ordered 2026-11-15; was
+  4/4 earlier that day, 5/7 before that) — `-j 8` matches the 8 threads;
+  if a container OOM ever reappears, drop `-j` first and report it.
 - Do not block-wait on background tasks; poll. Do not pipe clippy through
   `tail`/`head` — the pipe masks its exit status. Log files written inside
   the container stay inside it (`podman exec pi-rs-build cat …`).
@@ -93,7 +94,7 @@ there (and only there), these limits apply:
 The full gate as run on that machine:
 
 ```sh
-podman exec pi-rs-build sh -c 'export CARGO_TARGET_DIR=/build-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUGINFO=0; cd /work; nice -n 19 sh -c "cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace -- --test-threads=4 && cargo fmt --all -- --check"'
+podman exec pi-rs-build sh -c 'export CARGO_TARGET_DIR=/build-target CARGO_BUILD_JOBS=8 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUGINFO=0; cd /work; nice -n 19 sh -c "cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace -- --test-threads=4 && cargo fmt --all -- --check"'
 ```
 
 ## Git workflow
