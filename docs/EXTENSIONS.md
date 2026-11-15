@@ -9,7 +9,7 @@ lives in `crates/pi-coding-agent/src/extensions/mod.rs`.
 
 This document is the recon deliverable PLAN.md §2 asked for: what the extension
 system actually is, what the first Rust host must support, and which runtime to
-build it on. Sections marked *(pending)* are filled from the inventory surveys.
+build it on.
 
 ## 1. What the system is
 
