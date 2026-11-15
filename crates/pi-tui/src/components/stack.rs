@@ -189,6 +189,12 @@ impl Component for Stack {
         }
     }
 
+    /// The chat viewport's disassemble walks concrete stacks (root, dock) by
+    /// identity to hand the hosts back.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     /// `stack.ts:101-108`.
     fn layout_node(&self) -> Option<LayoutNode<'_>> {
         let entries = self.entries_ref();
@@ -266,6 +272,10 @@ impl Component for VStack {
         self.inner.invalidate();
     }
 
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     fn layout_node(&self) -> Option<LayoutNode<'_>> {
         self.inner.layout_node()
     }
@@ -309,6 +319,10 @@ impl Component for HStack {
 
     fn invalidate(&mut self) {
         self.inner.invalidate();
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 
     fn layout_node(&self) -> Option<LayoutNode<'_>> {

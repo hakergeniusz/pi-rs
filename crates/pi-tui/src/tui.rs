@@ -1441,8 +1441,9 @@ impl Tui {
         component.layout_node().is_some() && !component.overrides_mouse_handler()
     }
 
-    /// Downcast a mounted component to a concrete type. Only `ScrollView`
-    /// implements [`Component::as_any_mut`].
+    /// Downcast a mounted component to a concrete type. The tree's own
+    /// containers opt in (`ScrollView`, the stacks); leaves keep the default
+    /// `None` unless they need host-side downcasting.
     pub(crate) fn component_any_mut(&mut self, id: ComponentId) -> Option<&mut dyn std::any::Any> {
         self.component_mut(id)?.as_any_mut()
     }

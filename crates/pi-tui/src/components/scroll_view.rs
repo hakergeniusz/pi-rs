@@ -443,6 +443,13 @@ impl ScrollView {
         self.child.as_mut()
     }
 
+    /// Swap the scrollbar painters. Upstream takes the themed styles as
+    /// constructor options (`chat-viewport.js:14-17`); the port builds the
+    /// transcript view inside the chat viewport, so they land after.
+    pub fn set_styles(&mut self, styles: ScrollbarStyles) {
+        self.state.styles = styles;
+    }
+
     /// Give the child back. `implicitScrollView`, `tui-alt-screen.ts:268`: the
     /// alt screen's implicit root is a scroll view it owns for the length of
     /// one frame, wrapping the host's own children.
