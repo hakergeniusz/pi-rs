@@ -801,6 +801,191 @@ impl InteractiveMode {
         self.tui.request_render();
     }
 
+    /// `renderInitialMessages` (`interactive-mode.ts:3589-3592`): replay the
+    /// resumed session's compaction-aware context entries into the chat so a
+    /// `--continue`/`--session` start shows the prior transcript.
+    fn render_initial_messages(&mut self) {
+        let entries = self.session.build_context_entries();
+        self.render_session_entries(&entries, true);
+        self.refresh_footer();
+        self.tui.request_render();
+    }
+
+    /// `renderSessionEntries` + `renderSessionItems` (`interactive-mode.ts:3437-3464`,
+    /// `:3340-3425`): walk session entries and re-create the chat rows. The
+    /// compaction summary and its billed-tokens notice come from the
+    /// `compaction` entry; assistant tool calls open tool rows that later
+    /// `toolResult` messages complete; rows with no result stay pending, like
+    /// upstream's `pendingTools` handoff.
+    ///
+    /// Deviations: entries with no ported component are skipped —
+    /// `custom_message`, `branch_summary` (forking is unported), and the
+    /// cache-miss/cache-warm usage notices (`showCacheMissNotices` is not
+    /// ported). `bashExecution` rows likewise (upstream's `!` persistence).
+    fn render_session_entries(&mut self, entries: &[crate::session::records::SessionEntry], populate_history: bool) {
+        self.pending_tools.clear();
+        let mut rendered_pending: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for entry in entries {
+            match entry {
+                crate::session::records::SessionEntry::Message(message_entry) => {
+                    self.render_replayed_message(
+                        &message_entry.message,
+                        &mut rendered_pending,
+                        populate_history,
+                    );
+                }
+                crate::session::records::SessionEntry::Compaction(compaction) => {
+                    self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+                    let mut row =
+                        super::components::compaction_summary::CompactionSummaryMessageComponent::new(
+                            &compaction.summary,
+                            compaction.tokens_before as u64,
+                            1,
+                        );
+                    row.set_expanded(self.tool_output_expanded);
+                    self.add_to_chat(Box::new(row));
+                    if let Some(usage) = &compaction.usage {
+                        let tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+                        let cost = if usage.cost.total >= 0.01 {
+                            format!(" (~${:.2})", usage.cost.total)
+                        } else {
+                            String::new()
+                        };
+                        self.add_to_chat(Box::new(Text::new(
+                            theme::theme().fg(
+                                pi_tui::theme::ThemeColor::Warning,
+                                &format!(
+                                    "Compaction: {} tokens billed{cost}",
+                                    super::components::footer::format_tokens(tokens)
+                                ),
+                            ),
+                            1,
+                            0,
+                        )));
+                    }
+                }
+                // `sessionEntryToContextMessages` returns [] for every other
+                // entry type this port models.
+                _ => {}
+            }
+        }
+        // Unmatched tool rows stay open — upstream moves them into
+        // `pendingTools` so late results still land.
+        for (tool_call_id, index) in rendered_pending {
+            self.pending_tools
+                .insert(tool_call_id, PendingTool { chat_index: index });
+        }
+    }
+
+    /// The per-message branch of the replay (`addMessageToChat` +
+    /// `renderSessionItems`, `interactive-mode.ts:3261-3338`, `:3359-3416`).
+    fn render_replayed_message(
+        &mut self,
+        message: &AgentMessage,
+        rendered_pending: &mut std::collections::HashMap<String, usize>,
+        populate_history: bool,
+    ) {
+        match message {
+            AgentMessage::User(user) => {
+                let text = match &user.content {
+                    pi_ai::types::UserContent::Text(text) => text.clone(),
+                    pi_ai::types::UserContent::Blocks(blocks) => blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            pi_ai::types::InputContent::Text(text) => Some(text.text.clone()),
+                            pi_ai::types::InputContent::Image(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                if !text.trim().is_empty() {
+                    if self.chat_len() > 0 {
+                        self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+                    }
+                    self.add_to_chat(Box::new(UserMessageComponent::new(&text, 1)));
+                    if populate_history {
+                        self.editor_mut().editor.add_to_history(&text);
+                    }
+                }
+            }
+            AgentMessage::Assistant(assistant) => {
+                let mut component =
+                    AssistantMessageComponent::new(self.hide_thinking_block, "Thinking...", 1);
+                component.update_content(assistant, false);
+                self.add_to_chat(Box::new(component));
+                let aborted = assistant.stop_reason == pi_ai::types::StopReason::Aborted;
+                let failed = aborted
+                    || assistant.stop_reason == pi_ai::types::StopReason::Error;
+                for block in &assistant.content {
+                    let pi_ai::types::AssistantContent::ToolCall(call) = block else {
+                        continue;
+                    };
+                    let mut tool = ToolExecutionComponent::new(
+                        &call.name,
+                        &call.id,
+                        serde_json::Value::Object(call.arguments.clone()),
+                        1,
+                        &self.session.get_cwd().to_string_lossy(),
+                        crate::tools::renderers::renderers_for(&call.name),
+                    );
+                    tool.set_args_complete();
+                    tool.set_expanded(self.tool_output_expanded);
+                    if failed {
+                        // `renderSessionItems` (`:3389-3400`): aborted rows
+                        // show the abort note, errored rows the error text.
+                        let error = if aborted {
+                            "Operation aborted".to_string()
+                        } else {
+                            assistant
+                                .error_message
+                                .clone()
+                                .unwrap_or_else(|| "Error".to_string())
+                        };
+                        tool.update_result(
+                            ToolResultView {
+                                text: error,
+                                is_error: true,
+                                duration_ms: None,
+                            },
+                            false,
+                        );
+                        self.add_to_chat(Box::new(tool));
+                    } else {
+                        let index = self.add_to_chat(Box::new(tool));
+                        rendered_pending.insert(call.id.clone(), index);
+                    }
+                }
+            }
+            AgentMessage::ToolResult(result) => {
+                let Some(index) = rendered_pending.remove(&result.tool_call_id) else {
+                    return;
+                };
+                let blocks: Vec<pi_ai::types::ContentBlock> = result
+                    .content
+                    .iter()
+                    .cloned()
+                    .map(pi_ai::types::ContentBlock::from)
+                    .collect();
+                let text = crate::tools::render_utils::get_text_output(&blocks, true);
+                if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
+                    component.update_result(
+                        ToolResultView {
+                            text,
+                            is_error: result.is_error,
+                            duration_ms: result.duration_ms,
+                        },
+                        false,
+                    );
+                }
+            }
+            // System messages render nothing upstream either
+            // (`case "system": break`); custom/bash/branch/compaction-summary
+            // messages have no ported component.
+            _ => {}
+        }
+    }
+
     fn start_assistant_stream(&mut self) {
         let component = AssistantMessageComponent::new(self.hide_thinking_block, "Thinking...", 1);
         self.streaming_index = Some(self.add_to_chat(Box::new(component)));
@@ -2164,6 +2349,8 @@ impl InteractiveMode {
             })
             .is_ok();
         let stdin_rx = spawned.then_some(rx);
+        // A resumed session replays its transcript (`renderInitialMessages`).
+        self.render_initial_messages();
         loop {
             self.pump();
             if self.exiting {
@@ -2817,6 +3004,90 @@ mod tests {
         );
         let mode = InteractiveMode::new(&mut runtime, &options, Box::new(terminal));
         (mode, handle)
+    }
+
+    #[test]
+    fn resumed_session_replays_its_transcript() {
+        use pi_ai::types::{ToolResultMessage, UserContent, UserMessage};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A persisted session with a full round trip: user prompt, assistant
+        // tool call, tool result, final answer.
+        let mut session =
+            SessionManager::create(dir.path(), None, &NewSessionOptions::default()).expect("session");
+        session
+            .append_message(AgentMessage::User(UserMessage {
+                content: UserContent::Text("list the files".to_string()),
+                timestamp: 0,
+            }))
+            .expect("append user");
+        let assistant_call: pi_ai::types::AssistantMessage =
+            serde_json::from_value(serde_json::json!({
+                "content": [{
+                    "type": "toolCall", "id": "call-1", "name": "ls",
+                    "arguments": {"path": "."}
+                }],
+                "api": "test", "provider": "test", "model": "test-model",
+                "timestamp": 0,
+                "usage": {"input": 5, "output": 3, "cacheRead": 0, "cacheWrite": 0,
+                          "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}},
+                "stopReason": "toolUse"
+            }))
+            .expect("assistant call");
+        session
+            .append_message(AgentMessage::Assistant(assistant_call))
+            .expect("append call");
+        let result: ToolResultMessage = serde_json::from_value(serde_json::json!({
+            "toolCallId": "call-1", "toolName": "ls",
+            "content": [{"type": "text", "text": "note.txt"}],
+            "isError": false, "timestamp": 0
+        }))
+        .expect("tool result");
+        session
+            .append_message(AgentMessage::ToolResult(result))
+            .expect("append result");
+        let assistant_final: pi_ai::types::AssistantMessage =
+            serde_json::from_value(serde_json::json!({
+                "content": [{"type": "text", "text": "done listing"}],
+                "api": "test", "provider": "test", "model": "test-model",
+                "timestamp": 0,
+                "usage": {"input": 5, "output": 3, "cacheRead": 0, "cacheWrite": 0,
+                          "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}},
+                "stopReason": "stop"
+            }))
+            .expect("assistant final");
+        session
+            .append_message(AgentMessage::Assistant(assistant_final))
+            .expect("append final");
+        let path = session.session_file().expect("session file").to_path_buf();
+        drop(session);
+
+        // Reopen it and render the transcript into a capture terminal.
+        let terminal = CaptureTerminal::with_size(TerminalSize {
+            columns: 100,
+            rows: 40,
+        });
+        let capture = terminal.capture();
+        let options = InteractiveOptions {
+            auth_path: Some(dir.path().join("auth.json")),
+            ..InteractiveOptions::default()
+        };
+        let stream: Arc<dyn pi_agent::types::StreamFn> = Arc::new(ScriptedStream {
+            calls: AtomicUsize::new(0),
+            file_path: "unused".to_string(),
+        });
+        let mut runtime = test_runtime(dir.path(), stream);
+        runtime.session = SessionManager::open(&path, None, None).expect("reopen");
+        let mut mode = InteractiveMode::new(&mut runtime, &options, Box::new(terminal));
+        mode.tui.start().expect("tui start");
+        mode.render_initial_messages();
+        mode.tui.render_now(false);
+
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("list the files"), "{plain}");
+        // The tool row rendered with its replayed result.
+        assert!(plain.contains("note.txt"), "{plain}");
+        assert!(plain.contains("done listing"), "{plain}");
     }
 
     #[test]
