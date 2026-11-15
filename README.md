@@ -7,9 +7,10 @@ extensible agent harness — aiming for behavioral and on-disk compatibility
 **Status: `v0.1.0-alpha.1` (pre-alpha).** The core pipeline is proven
 end-to-end against a live provider (`pi -p` prompt → answer, tool round-trips,
 JSON event mode), and bare `pi` renders the interactive chat TUI ported from
-upstream, including the `/model`, `/trust`, and `/settings` selector dialogs.
-Not at feature parity yet: the session selector, fullscreen mode, extensions,
-and the MCP tool bridge are still landing. See [PLAN.md](PLAN.md) for the
+upstream, including the `/model`, `/trust`, `/settings`, and `/resume`
+selector dialogs and fullscreen mode (`--tui-mode regular` opts out).
+Not at feature parity yet: extensions, the 3D easter egg, and the MCP tool
+bridge are still landing. See [PLAN.md](PLAN.md) for the
 phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
 
 ## What works

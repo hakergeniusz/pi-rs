@@ -1,7 +1,7 @@
 # Handoff: Pi in Rust (`pi-rs`)
 
 > Written 2026-11-11, updated same day after gate attempts. Repo: `/home/hakergeniusz/Projects/pi-rs` on `acer`.
-> **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). **`main` = P0–P5-part-1 + codex adapter + interactive TUI (parts 1+2a) + XDG paths; E2E PROVEN LIVE** — `pi -p` smoke test PASSED 2026-11-14 (PONG / read-tool round-trip ALBATROSS / JSON event mode) with the openai-codex stored OAuth credential and default model `openai-codex/gpt-6-luna`; required (1) a new `openai-codex-responses` adapter in pi-ai (`8efb00b`) and (2) the agent loop driven on a process-wide tokio runtime (`4c4d62c`, was futures::executor::block_on → "no reactor running"). — landing fast-forwarded `39b22ad..37782d1` on 2026-11-14; first landing CI failed only because ubuntu-latest ships **neither rg nor fd** (12 grep tests: `which("rg")` failed) → fixed in ci.yml (`8c6d178`, installs `ripgrep` + `fd-find`); CI run `43578686739` on `8c6d178` = **ok**. Interactive TUI landed `27769a9..500302b` + part 2a `8ae806d` on 2026-11-14 (see P6 sections). `wip/p4-pre-gate` == `main`; local checkout is ON `wip/p4-pre-gate`.
+> **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). **`main` = P0–P5-part-1 + codex adapter + interactive TUI (parts 1+2a+2b fullscreen) + XDG paths; E2E PROVEN LIVE** — `pi -p` smoke test PASSED 2026-11-14 (PONG / read-tool round-trip ALBATROSS / JSON event mode) with the openai-codex stored OAuth credential and default model `openai-codex/gpt-6-luna`; required (1) a new `openai-codex-responses` adapter in pi-ai (`8efb00b`) and (2) the agent loop driven on a process-wide tokio runtime (`4c4d62c`, was futures::executor::block_on → "no reactor running"). — landing fast-forwarded `39b22ad..37782d1` on 2026-11-14; first landing CI failed only because ubuntu-latest ships **neither rg nor fd** (12 grep tests: `which("rg")` failed) → fixed in ci.yml (`8c6d178`, installs `ripgrep` + `fd-find`); CI run `43578686739` on `8c6d178` = **ok**. Interactive TUI landed `27769a9..500302b` + part 2a `8ae806d` on 2026-11-14 (see P6 sections). `wip/p4-pre-gate` == `main`; local checkout is ON `wip/p4-pre-gate`.
 > ALL development happens on `acer` (per user). Reference checkout: `/tmp/ai-agent/pi` on `acer` — **WIPED (tmpfs); re-clone before P5 work: `gh repo clone earendil-works/pi /tmp/ai-agent/pi`** (was @ `b22e525b3`).
 
 ## Goal
@@ -17,7 +17,7 @@ Rewrite Pi (earendil-works/pi — TypeScript coding-agent harness monorepo, ~236
 | P3 | `pi-tui` full TUI crate (~40.5K lines, 17 components, themes, keys, alt screen) | ✅ committed `39b22ad` — 740 workspace tests, clippy all+pedantic clean, fmt clean |
 | P4 | `pi-coding-agent`: config, auth, sessions (JSONL v3 byte-compat), built-in tools, system prompt, prompt templates, skills, CLI args, print mode (`pi -p`) | ✅ committed — gate green in-container (1205 tests, 44 targets), landed on `main` 2026-11-14 |
 | P5 | JSON/RPC modes, extensions seam, MCP client, trust, `@file`, OAuth | ⚠️ part 1 landed on `main` (`c8e1818` + reconciliation `a6b9934`); remainder open (rpc envelope, MCP server-manager/tool-bridge, package-manager, codemode, ext host, `defaultProjectTrust` getter) |
-| P6 | Interactive mode | ⚠️ **part 1 landed on `main` (`500302b`)** — regular chat TUI 1:1 (theme, components, orchestrator, themed renderers, CaptureTerminal e2e, real-PTY smoke); remainder open (fullscreen mode, autocomplete/selector dialogs, extensions, compaction, queues, mouse toggles, OSC theme query) |
+| P6 | Interactive mode | ⚠️ **parts 1+2a+2b landed on `main`** — regular chat TUI 1:1 (theme, components, orchestrator, themed renderers, CaptureTerminal e2e, real-PTY smoke) + autocomplete/model/trust/settings/session selectors + compaction + queues + mouse toggles + OSC theme + **fullscreen mode (alt screen + chat viewport + switch)**; remainder open (extensions host, 3D easter egg, rpc/MCP hardening) |
 
 P4 detail (uncommitted, in working tree):
 - `src/session/` (`records.rs` byte-exact Record envelope + V8-exact JSON writer in `session/json.rs`, `store.rs` SessionManager, `migrate.rs` v1→v3, `mod.rs`), `src/auth.rs` (auth.json store, lock protocol, `$VAR`/`!cmd` config-value resolution), `src/config.rs` + `src/config/settings.rs` (SettingsManager).
@@ -91,7 +91,7 @@ Remaining before landing on `main` — **ALL DONE 2026-11-14**:
 2. ~~Real `pi -p` smoke test~~ **DONE 2026-11-14** — first true end-to-end proof PASSED: `pi -p "Reply with exactly: PONG"` → `PONG`; read-tool round-trip → `ALBATROSS`; `--mode json` → correct JSONL wire. (Working binary: build in the container, `podman cp` out, run from a temp dir with `--no-session`.)
 3. Golden session fixtures from the TS pi (byte-compat proof beyond synthetic fixtures).
 4. P5 remainder: reconcile `rpc.rs` against `rpc-entry.ts`; MCP server-manager + tool bridge into the agent registry, package-manager subset (`package-manager-cli.ts`, 41.6K), codemode sandbox (`pi-codemode` stub, blocked on host decision), extension runtime host (decision pending), `defaultProjectTrust` settings getter.
-5. ~~**P6 — Interactive mode**~~ **part 1 DONE 2026-11-14** (see P6 section below); part 2 remains.
+5. ~~**P6 — Interactive mode**~~ **parts 1+2a DONE 2026-11-14, part 2b (fullscreen) DONE 2026-11-15** (see the P6 sections below); the extension host + easter egg remain.
 6. **P7 — Hardening** (compaction, cache warmer, crash log, signals/backpressure + stdin piping, release).
 
 ## P6 progress — interactive chat TUI (part 1, landed `500302b` 2026-11-14)
@@ -523,6 +523,73 @@ transcript replay, on one branch (4 commits + this doc).
   measured as width → left side squeezed to nothing). And `Input` has BOTH
   `Focusable::set_focused` and `Component::set_focused` — call as
   `Focusable::set_focused(&mut input, …)` to disambiguate.
+
+## Fullscreen mode (landed on `feat/p6b-fullscreen`, 2026-11-15)
+
+P6 part 2b: the alt-screen renderer + chat viewport + the mode switch, on
+one branch (7 commits + this doc). Upstream has NO fullscreen-mode.ts — it
+is `createInteractiveTui({tuiMode})` (tui-renderer.js) choosing
+`TuiAltScreen` vs `TuiMainScreen`, `createChatViewport`
+(chat-viewport.js) building the transcript ScrollView + dock, and
+`switchTuiMode` (interactive-mode.ts:641-700) swapping renderers under one
+shared component tree. The port's pi-tui already contained the full
+alt-screen machinery (P3); this slice is the pi-coding-agent integration.
+
+- **pi-tui groundwork** (`efb8bde`, `5791096`): `FocusTarget::Id(ComponentId)`
+  names nested components (component ids are heap addresses — taken AFTER
+  boxing); `Tui::component_by_id_deep_mut` walks the tree through
+  `layout_children_mut`; `Stack/VStack::replace_child` (swap in place,
+  entries untouched) + `entry_options`; `ScrollView::set_styles` +
+  `take_child` + public `state`; `set_copy_on_select`/`set_wheel_scroll_lines`
+  runtime setters; `clear_alt_screen_root`.
+- **Chat viewport** (`1ac55fc`): `chat_viewport.rs` ports
+  chat-viewport.js — `mount` moves the six flat hosts into
+  Container[header,chat] → ScrollView (follow_end, primary, overscroll
+  chain, themed scrollbar) + dock VStack[pending, status, editor(min 3),
+  footer] → root VStack[transcript grow, dock] → `set_alt_screen_root`;
+  `disassemble` hands them back in flat order. Ownership is THE structural
+  deviation: JS shares the tree by reference; Rust needs one owner, so the
+  hosts MOVE and the recorded `HostSlot` ids find them in either
+  arrangement.
+- **Settings** (`e68434b`): getTuiMode (fullscreen default; only "regular"
+  opts out), getFullscreenExitOutput, getFullscreenScrollbar (+ From into
+  pi-tui Scrollbar), getFullscreenCopyOnSelect (default on),
+  getFullscreenWheelScrollLines (clamp 1-100 floor, "auto" else), + setters.
+- **Exit API** (`2fd47af`): `Tui::exit_alt_screen(TuiStopOptions)` runs the
+  before/after stop hooks without stopping the terminal, drops the alt
+  state (root children route flat again), resets the render state like the
+  fresh TuiMainScreen a switch builds, and returns leftover root children.
+- **Wiring** (`41f1e10`): InteractiveOptions.tui_mode (--tui-mode wins,
+  else settings); `run()` enters fullscreen before the first frame;
+  `switch_tui_mode` refuses while a selector occupies the editor slot
+  (upstream's overlay guard) and moves the hosts via
+  take_root_children/mount ↔ disassemble/exit_alt_screen; `downcast_tree`
+  takes a HostSlot and reaches the hosts by identity in either arrangement;
+  `replace_editor_slot` swaps selectors into the flat index or the dock
+  slot; focus rides `FocusTarget::Id(editor_id)` across switches (upstream
+  preserves the focused component). `fullscreen_options` ports
+  tui-renderer.js:9-29 (theme-styled search matches + navigation buttons,
+  the themed "↓ Jump to latest message · End" label, copy-on-select + wheel
+  settings). `shutdown` ports stopInteractiveTui (:632-639): transcript
+  exit → drain (restore editor, drop selector queues) → switch to regular →
+  stop(preserveScreen:false) so the stop repaints the transcript into the
+  scrollback; resume-hint exit → stop(preserveScreen:true). e2e test drives
+  enter → viewport root mounted → selector blocks switch → exit → flat
+  tree renders.
+- **Settings selector rows** (`a94a262`): the five fullscreen items verbatim
+  (settings-selector.ts:489-525) + their events + handlers
+  (:4374-4402) — TuiModeChange reverts the row and shows "Close active
+  overlays before changing TUI mode" when refused; scrollbar re-applies to
+  the live transcript; copy-on-select/wheel push to the live alt screen.
+- **Deviations**: the viewport is REBUILT per switch (upstream reuses the
+  same viewport object), so the transcript scroll offset resets to
+  follow-the-end and the scrollbar setting is re-read at mount —
+  documented in chat_viewport.rs; `open_url`/`on_right_click_paste`
+  unset (no browser opener; Windows-only upstream); `keyDisplayText`
+  reduced to a one-key capitalized helper ("end"→"End"); `copySelection`
+  is the alt screen's internal OSC-52 path (upstream passes a clipboard
+  callback); upstream's `restoreProgress` (terminal progress bar on switch)
+  has no port counterpart.
 
 ## Gotchas / decisions
 - **Tree-index churn when inserting a container (part 2a)**: the pending-messages
