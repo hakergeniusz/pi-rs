@@ -652,7 +652,9 @@ fn run_agent_turn(
             // `_prepareRetry` (`agent-session.ts:3959-3963`): the failed
             // attempt persists raw and drops out of the projection.
             for entry in crate::modes::retry::omit_attempt(&messages, &mut runtime.session) {
-                crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::EntryAppended { entry }));
+                crate::runtime::block_on(
+                    sink.emit(pi_agent::events::AgentEvent::EntryAppended { entry }),
+                );
             }
             crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AutoRetryStart {
                 attempt,
@@ -716,10 +718,11 @@ fn run_agent_turn(
                 if will_retry {
                     // `_omitRecoveryAttempt` before the recovery compaction
                     // (`agent-session.ts:3209-3211`).
-                    for entry in
-                        crate::modes::retry::omit_attempt(&messages, &mut runtime.session)
+                    for entry in crate::modes::retry::omit_attempt(&messages, &mut runtime.session)
                     {
-                        crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::EntryAppended { entry }));
+                        crate::runtime::block_on(
+                            sink.emit(pi_agent::events::AgentEvent::EntryAppended { entry }),
+                        );
                     }
                 }
                 // The overflow compact-and-retry re-runs the turn once

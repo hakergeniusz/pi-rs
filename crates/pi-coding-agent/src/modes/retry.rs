@@ -119,8 +119,14 @@ pub fn last_error_text(messages: &[AgentMessage]) -> String {
 /// and its orphaned tool results here, then appends the `context_edit`
 /// omission records. Returns the serialized edit records for the
 /// `entry_appended` emissions (:1336).
-pub fn omit_attempt(messages: &[AgentMessage], session: &mut crate::session::SessionManager) -> Vec<serde_json::Value> {
-    let Some(index) = messages.iter().rposition(|message| matches!(message, AgentMessage::Assistant(_))) else {
+pub fn omit_attempt(
+    messages: &[AgentMessage],
+    session: &mut crate::session::SessionManager,
+) -> Vec<serde_json::Value> {
+    let Some(index) = messages
+        .iter()
+        .rposition(|message| matches!(message, AgentMessage::Assistant(_)))
+    else {
         return Vec::new();
     };
     let AgentMessage::Assistant(assistant) = &messages[index] else {
@@ -262,21 +268,25 @@ mod tests {
         // both persist raw, both drop from the projection (:1318-1336).
         let mut failed = test_assistant(StopReason::Error);
         failed.error_message = Some("HTTP 503".to_string());
-        failed.content = vec![pi_ai::types::AssistantContent::ToolCall(pi_ai::types::ToolCall {
-            id: "t1".to_string(),
-            name: "read".to_string(),
-            arguments: serde_json::Map::new(),
-            thought_signature: None,
-            namespace: None,
-            arguments_error: None,
-        })];
+        failed.content = vec![pi_ai::types::AssistantContent::ToolCall(
+            pi_ai::types::ToolCall {
+                id: "t1".to_string(),
+                name: "read".to_string(),
+                arguments: serde_json::Map::new(),
+                thought_signature: None,
+                namespace: None,
+                arguments_error: None,
+            },
+        )];
         let result = AgentMessage::ToolResult(pi_ai::types::ToolResultMessage {
             tool_call_id: "t1".to_string(),
             tool_name: "read".to_string(),
-            content: vec![pi_ai::types::InputContent::Text(pi_ai::types::TextContent {
-                text: "ok".to_string(),
-                text_signature: None,
-            })],
+            content: vec![pi_ai::types::InputContent::Text(
+                pi_ai::types::TextContent {
+                    text: "ok".to_string(),
+                    text_signature: None,
+                },
+            )],
             details: None,
             usage: None,
             nested_calls: None,
@@ -297,12 +307,13 @@ mod tests {
             .count();
         assert_eq!(message_entries, 2);
         // ...and the projection omits both.
-        let projection =
-            crate::session::store::build_session_projection_from(&branch, None);
-        assert!(projection
-            .entries
-            .iter()
-            .all(|entry| entry.messages.is_empty()));
+        let projection = crate::session::store::build_session_projection_from(&branch, None);
+        assert!(
+            projection
+                .entries
+                .iter()
+                .all(|entry| entry.messages.is_empty())
+        );
         // Both edits omit their targets (JSON null replacements).
         assert_eq!(records[1]["type"], "context_edit");
         assert_eq!(records[1]["replacement"], serde_json::Value::Null);
