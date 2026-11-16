@@ -353,7 +353,8 @@ pub fn fg_styler(token: pi_tui::theme::ThemeColor) -> Styler {
 pub mod app_keys {
     /// The app-level actions this port binds (`APP_KEYBINDINGS` subset — the
     /// actions whose handlers exist in the interactive mode; the dialog-only
-    /// actions join with their dialogs).
+    /// actions join with their dialogs, and the display-only ones are listed
+    /// because `/hotkeys` shows every upstream action's binding).
     pub const INTERRUPT: &str = "app.interrupt";
     /// Clear the screen.
     pub const CLEAR: &str = "app.clear";
@@ -365,16 +366,25 @@ pub mod app_keys {
     pub const THINKING_CYCLE: &str = "app.thinking.cycle";
     /// Cycle to the next model (ctrl+p).
     pub const MODEL_CYCLE_FORWARD: &str = "app.model.cycleForward";
+    /// Open the model selector (`keybindings.ts:49`).
+    pub const MODEL_SELECT: &str = "app.model.select";
     /// Cycle to the previous model.
     pub const MODEL_CYCLE_BACKWARD: &str = "app.model.cycleBackward";
     /// Toggle tool-row expansion (ctrl+o).
     pub const TOOLS_EXPAND: &str = "app.tools.expand";
     /// Toggle the hide-thinking setting.
     pub const THINKING_TOGGLE: &str = "app.thinking.toggle";
+    /// Open the external editor (`keybindings.ts:59-62`).
+    pub const EDITOR_EXTERNAL: &str = "app.editor.external";
+    /// Copy the selection or last assistant message (`keybindings.ts:63-66`).
+    pub const MESSAGE_COPY: &str = "app.message.copy";
     /// Queue the editor text as a follow-up (alt+enter).
     pub const MESSAGE_FOLLOW_UP: &str = "app.message.followUp";
     /// Dequeue the last queued message (alt+up).
     pub const MESSAGE_DEQUEUE: &str = "app.message.dequeue";
+    /// Paste files on macOS, images, or text from clipboard
+    /// (`keybindings.ts:75-78`).
+    pub const CLIPBOARD_PASTE_IMAGE: &str = "app.clipboard.pasteImage";
     /// Dialog-only actions (`keybindings.ts:86-104`), bound inside their
     /// selectors.
     pub const SESSION_TOGGLE_NAMED_FILTER: &str = "app.session.toggleNamedFilter";
@@ -397,11 +407,15 @@ pub mod app_keys {
         (SUSPEND, &["ctrl+z"]),
         (THINKING_CYCLE, &["shift+tab"]),
         (MODEL_CYCLE_FORWARD, &["ctrl+p"]),
-        (MODEL_CYCLE_BACKWARD, &["ctrl+shift+p"]),
+        (MODEL_SELECT, &["ctrl+l"]),
         (TOOLS_EXPAND, &["ctrl+o"]),
         (THINKING_TOGGLE, &["ctrl+t"]),
+        (EDITOR_EXTERNAL, &["ctrl+g"]),
+        (MODEL_CYCLE_BACKWARD, &["ctrl+shift+p"]),
+        (MESSAGE_COPY, &["ctrl+x"]),
         (MESSAGE_FOLLOW_UP, &["alt+enter"]),
         (MESSAGE_DEQUEUE, &["alt+up"]),
+        (CLIPBOARD_PASTE_IMAGE, &["ctrl+v"]),
         (SESSION_TOGGLE_NAMED_FILTER, &["ctrl+n"]),
         (SESSION_TOGGLE_PATH, &["ctrl+p"]),
         (SESSION_TOGGLE_SORT, &["ctrl+s"]),
@@ -449,6 +463,32 @@ pub fn key_hint(action: &str, description: &str) -> String {
         theme.fg(C::Dim, &key_text(action)),
         theme.fg(C::Muted, description)
     )
+}
+
+/// `keyDisplayText` (`keybinding-hints.ts:38-40`): every bound key of
+/// `action` joined `a/b`, each `mod+key` part capitalized. Editor actions
+/// resolve through [`pi_tui::keybindings::keys_for`], app actions through
+/// [`app_keys::keys_for`].
+pub fn key_display_text(action: &str) -> String {
+    let keys = if action.starts_with("app.") {
+        app_keys::keys_for(action)
+    } else {
+        pi_tui::keybindings::keys_for(action)
+    };
+    keys.iter()
+        .map(|key| {
+            key.split('+')
+                .map(|part| match part.chars().next() {
+                    Some(first) => {
+                        first.to_uppercase().collect::<String>() + &part[first.len_utf8()..]
+                    }
+                    None => String::new(),
+                })
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// `rawKeyHint` (`keybinding-hints.ts:46-48`).
