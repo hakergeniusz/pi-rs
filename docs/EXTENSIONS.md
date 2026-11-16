@@ -566,6 +566,90 @@ fidelity rule applies per phase (deviations recorded as they appear).
   fork/tree exist), extension-provided compaction results. Exit: RPC-mode
   extension dialogs match upstream's rpc-extension-ui contract; codemode
   E1 port decided (needs worker-subprocess JS execution).
+
+### 8.1 Slice 6 — dynamic providers (recon 2026-11-16, ground truth @1.5.2)
+
+Upstream architecture, four modules:
+
+- **`core/provider-composer.ts` (745 lines) — the composer.**
+  `composeModelProvider(providerId, base, modelConfig, extension)`
+  (`:547-696`) layers built-in `Provider` ← `models.json` provider entry ←
+  extension `ProviderConfigInput` (`:93-110`, `types.ts:1979-2036`). Model
+  list = `applyExtension` ∘ `applyModelsJson` ∘ `base.getAllModels`, then
+  `modelOverrides` as the topmost user layer (`:560-580`);
+  `extensionModelFromDefinition` (`:277-300`) defaults `api`/`baseUrl` from
+  same-id → same-api → `openai-completions` → first candidate. Auth:
+  `composeApiKeyAuth` (`:422-486`) merges the inherited
+  login/check/resolve with the configured `apiKey` (env `$VAR`/`${VAR}` or
+  `!command` via resolve-config-value), custom `headers`, and
+  `authHeader` Bearer (`:379-391`); OAuth-only providers get no fabricated
+  API-key method (`:432`). `composeOAuthAuth` (`:488-511`) adapts the
+  extension's `oauth` via `adaptOAuth` (`:358-377`): login callbacks map to
+  notify/prompt (`onAuth`→`auth_url`, `onDeviceCode`→`device_code`,
+  `onPrompt`→text, `onManualCodeInput`→`manual_code`, `onSelect`→select).
+  Stream dispatch `streamWith` (`:588-613`): extension `streamSimple` when
+  `model.api === extension.api` → base provider when it supports the
+  model's api → `getApiProvider(model.api)` fallback; `refreshModels`
+  merges an extension refresh through `context.publish({update})`
+  (`:626-648`).
+- **`core/model-registry.ts` (244) — sync facade** over `ModelRuntime`:
+  `registerProvider(name, config)` → runtime; `registerProvider(Provider)`
+  → `registerNativeProvider`; `ResolvedRequestAuth`
+  `{ok, apiKey?, headers?, baseUrl?, env?}` (`:33-41`); `AuthStatus`
+  source labels `stored|runtime|environment|fallback|models_json_key|
+  models_json_command` (`:112-116`).
+- **`core/auth-storage.ts` (508) — CredentialStore over auth.json**:
+  proper-lockfile sync/async locking (stale 30 s, EPERM retries,
+  `:81-157`), revision-cached read state shared per path (`:39-51`,
+  `:333-347`), credential-shape validation (`api_key`: optional key
+  string + env map; `oauth`: `access`/`refresh` strings + finite
+  `expires`, `:230-254`), mode 0600 (`:37`), BOM strip, `read()`
+  resolves configured values (`:443-449`).
+- **Auto-retry** lives in the coding agent, not the loop:
+  `packages/ai/src/utils/retry.ts:281` `isRetryableAssistantError`;
+  `agent-session.ts` owns the state machine (`_retryAttempt`/
+  `_retryAbortController` `:445-446`, `_willRetryAfterAgentEnd`
+  `:1267-1277`, `_handlePostAgentRun` `:2060-2094` retryable →
+  `_prepareRetry`; `auto_retry_start {attempt, maxAttempts, delayMs}` /
+  `auto_retry_end {success, attempt, finalError}` (`:235-237`);
+  `willRetry` merged into `agent_end` (`:1211`); summarization-retry
+  variants (`:238-250`). Settings gate from the settings schema.
+- **Threshold compaction**: `_isAboveCompactionThreshold`
+  (`agent-session.ts:829-846`, `shouldCompact` — already ported,
+  `compaction.rs:396`) → `_runAutoCompaction("threshold"|"overflow")`;
+  `compaction_start/end` events carry the reason (`:223-248`); Case 3
+  "threshold compaction without retry" (`:3108-3217`) is the
+  retry-interplay detail.
+
+Port state: exists — `AuthStorage` read/list/modify/delete +
+`read_stored_credential` (`auth.rs:505-684`), config-value env
+interpolation (`auth.rs:263-356`), the credential ladder (flag →
+auth.json → env), catalog + 3 API adapters, `shouldCompact`, manual
+compaction, virtual-model routing (static-catalog lookups). Missing —
+slice-6 units:
+
+- **6a** `models.json` loader (`model-config.ts`, 220) +
+  `composeModelProvider` port (`provider_composer.rs`, new module).
+- **6b** `registerProvider`/`unregisterProvider`/
+  `registerNativeProvider` bridge ops + provider-list rebuild +
+  extension-provider models in the routing resolvers (replace the
+  static-catalog lookups in `virtual_models.rs`).
+- **6c** OAuth: `adaptOAuth` + `OAuthLoginCallbacks` mapped onto the
+  existing UiSink/RPC dialog flows; `/login`/`/logout` ride on this.
+- **6d** `streamSimple`: the extension handler as a per-request
+  `StreamFn` override keyed on `model.api` (JS function → same
+  session-drive pattern as `route`).
+- **6e** auto-retry subsystem: pi-ai retry utils + the agent-session
+  machine + `auto_retry_*` events + `willRetry` on `agent_end` (closes
+  the documented `json_event` deviation).
+- **6f** threshold/overflow auto-compaction keyed on the routed model.
+- **6g** `entry_appended` emission + abort signal into `RouteRequest`.
+- **6h** (optional hardening, could defer to P7) auth-storage file
+  locking + revision-cached reload + credential-shape validation.
+
+Order: 6a → 6b → 6d → 6c → 6e → 6f → 6g; each unit (or pair) on its own
+topic branch behind the container gate.
+
 - **E3 — TUI bridging**: shortcuts, message/entry/tool renderers, markdown
   transformers, widgets-as-components, `ctx.ui.custom` with overlay handles,
   editor component, autocomplete, themes; component handles crossing as
@@ -577,6 +661,6 @@ fidelity rule applies per phase (deviations recorded as they appear).
   semantics. Exit: golden extension fixtures generated by the real TS pi
   (shared with the P4 fixture work) pass.
 
-Backlog order: **E2 UI over protocol + host wiring** next (E0 and E1 done
-2026-11-15). The 69-item
-doc remainder and P5 rpc-envelope reconciliation stay queued behind E1.
+Backlog order: slice 6 (§8.1, recon done) → golden session fixtures →
+P5 remainder (rpc-envelope reconciliation, MCP bridge, codemode,
+package manager) → P7 hardening → 69-doc tail → E3.
