@@ -19,8 +19,9 @@
 //! - [`runner`] — the `ExtensionRunner` dispatch semantics, ported method
 //!   by method from `core/extensions/runner.ts` (§2 of
 //!   `docs/EXTENSIONS.md` tabulates them).
-//! - [`mcp_registry`], [`exec`] — the MCP registration bridge and the
-//!   `pi.exec` process primitive.
+//! - [`mcp_registry`], [`mcp_manager`], [`exec`] — the MCP registration
+//!   bridge and validation, the native server manager (the host half of
+//!   the bundled `mcp` extension), and the `pi.exec` process primitive.
 //!
 //! Deliberately E1-scoped (§8 of `docs/EXTENSIONS.md`): no UI surface
 //! beyond the headless no-op matrix, no `node:*` built-ins, no
@@ -33,6 +34,7 @@ pub mod events;
 pub mod exec;
 pub mod glue;
 pub mod loader;
+pub mod mcp_manager;
 pub mod mcp_registry;
 pub mod provider_registry;
 pub mod resolver;
@@ -45,5 +47,6 @@ pub use error::{ExtensionError, JsHostError, LoadError};
 pub use loader::{ExtensionOrigin, LoadExtensionsResult, discover_and_load, discover_extensions};
 pub use provider_registry::{RegisteredNativeProvider, RegisteredProvider, RegisteredVirtualModel};
 pub use runner::{
-    ExtensionRunner, ProviderStreamOutcome, ResolvedCommand, ToolInfo, UiSink, UserBashDecision,
+    ExtensionRunner, McpServerReport, ProviderStreamOutcome, ResolvedCommand, ToolInfo, UiSink,
+    UserBashDecision,
 };

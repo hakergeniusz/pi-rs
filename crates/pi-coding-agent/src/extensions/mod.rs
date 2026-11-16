@@ -22,7 +22,9 @@
 //! (`sdk.ts:430-434`), the `session_before_switch`/`session_before_compact`
 //! gates at the reachable switch points (`agent-session-runtime.ts:133-166`,
 //! `agent-session.ts:2964-2982`), and the UI-context binding the RPC mode
-//! drives (`modes/rpc.rs`).
+//! drives (`modes/rpc.rs`). The MCP slice adds the missing `bindCore` call
+//! and the extension-registered MCP servers connecting on `session_start`
+//! (`extensions/mcp/index.ts:1112-1149`, the manager in `pi-ext-js`).
 //!
 //! Deliberately slice-4 scoped (§8 of `docs/EXTENSIONS.md`): the full
 //! active-loadout machinery (`prepareLoadout`, pending tools), the
@@ -813,11 +815,43 @@ fn load_with_engine(
     if let Some((sink, ui_mode)) = ui {
         runner.set_ui_context(sink, &ui_mode);
     }
+    // bindCore (`runner.ts:417-551`): the runtime binds once loading
+    // completes — action methods stop throwing, the MCP change listener
+    // arms, and queued provider registrations flush.
+    if let Err(err) = runner.bind() {
+        diagnostics.push(warning(format!("Extension error: bind: {err}")));
+    }
     if let Err(err) = runner.emit(&json!({ "type": "session_start", "reason": "startup" })) {
         diagnostics.push(warning(format!("Extension error: session_start: {err}")));
     }
     // The reason is "startup"; the "reload" path arrives with the
-    // session-reload work. MCP reporting and `resources_discover` are P5.
+    // session-reload work. `resources_discover` is P5.
+
+    // The MCP servers registered through `pi.registerMcpServer` connect on
+    // session_start (`index.ts:1112-1149`, the registered-servers half —
+    // `mcp.json` entries are P5). Failed connections are values: they
+    // report as one attention notice (`reportProblems`,
+    // `index.ts:641-653`), and the affected servers' tools stay absent.
+    match runner.connect_mcp_servers() {
+        Ok(reports) => {
+            let failures: Vec<String> = reports
+                .iter()
+                .filter(|report| report.state == "failed")
+                .map(|report| {
+                    let error = report.error.as_deref().unwrap_or("unknown error");
+                    let first_line = error.split('\n').next().unwrap_or(error);
+                    format!("  {}: failed: {first_line}", report.name)
+                })
+                .collect();
+            if !failures.is_empty() {
+                diagnostics.push(warning(format!(
+                    "MCP servers need attention:\n{}\nRun /mcp to fix.",
+                    failures.join("\n")
+                )));
+            }
+        }
+        Err(err) => diagnostics.push(warning(format!("Extension error: MCP connect: {err}"))),
+    }
 
     // Bind-time registration failures report without failing the load
     // (the bindCore `emitError` reports, `runner.ts:470-521`).
@@ -908,9 +942,14 @@ fn unknown_options_diagnostic(names: &[&str]) -> Option<Diagnostic> {
 #[cfg(feature = "ext-js")]
 fn tool_definition(info: &pi_ext_js::ToolInfo) -> ToolDefinition {
     let name: &'static str = Box::leak(info.name.clone().into_boxed_str());
+    let label: &'static str = if info.label.is_empty() {
+        name
+    } else {
+        Box::leak(info.label.clone().into_boxed_str())
+    };
     ToolDefinition {
         name,
-        label: name,
+        label,
         description: info.description.clone(),
         parameters: info
             .parameters

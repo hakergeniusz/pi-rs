@@ -45,6 +45,7 @@ globset = "0.4"
 walkdir = "2"
 regex = "1"
 base64 = "0.22"
+sha2 = "0.10"
 tempfile = "3"
 
 # internal crates

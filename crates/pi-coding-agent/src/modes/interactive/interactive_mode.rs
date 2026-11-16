@@ -3774,6 +3774,11 @@ impl InteractiveMode {
             if let Err(error) = crate::extensions::emit_gate(runner, &event) {
                 eprintln!("Warning: Extension error: session_shutdown: {error}");
             }
+            // The MCP extension closes every connection on session_shutdown
+            // (`index.ts:1250-1256`); a later `session_start` reconnects.
+            if let Ok(mut runner) = runner.lock() {
+                runner.shutdown_mcp();
+            }
         }
         #[cfg(not(feature = "ext-js"))]
         {

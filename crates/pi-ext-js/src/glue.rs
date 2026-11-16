@@ -27,7 +27,11 @@
 //!    a promise the host resolves with the `before_provider_request`
 //!    chain's value, the one-way hooks queue through `providerHookEvent`,
 //!    `signal` is a plain object the host flips — the handler contract is
-//!    `custom-provider.md:195-198`).
+//!    `custom-provider.md:195-198`), and the MCP tool bridge
+//!    (`__piMcpRegisterTools` + the `mcpCallTool` op — the `pi.registerTool`
+//!    calls the bundled `mcp` extension makes when a server connects,
+//!    `index.ts:416-443`; the execute wrappers forward to the native
+//!    manager, `mcp_manager.rs`).
 //! 2. [`TYPEBOX_SHIM`] — the `typebox` virtual module. Upstream serves the
 //!    real bundled `TypeBox` (`virtual-modules.ts`); the E1 shim reproduces
 //!    the exact construction semantics of the builders extensions use
@@ -173,6 +177,19 @@ globalThis.__piCommitExtension = function (extIdx) {
 // bindCore; post-bind they apply immediately and throw into the caller.
 globalThis.__piRunProviderChange = function (extIdx, change) {
   const extensionPath = globalThis.__piExtensions[extIdx].path;
+  // MCP registrations apply immediately once the extension is active —
+  // pre-bind without an event (the change listener is only set at
+  // bindCore, `runner.ts:465`), post-bind through the change queue the
+  // runner drains (`mcp_servers_change`, `runner.ts:465-466`).
+  if (change.kind === "mcpRegister") {
+    const error = globalThis.__piOps.mcpRegister(change.name, extensionPath, change.configJson);
+    if (error !== "") throw new Error(error);
+    return;
+  }
+  if (change.kind === "mcpUnregister") {
+    globalThis.__piOps.mcpUnregister(change.name, extensionPath);
+    return;
+  }
   if (!globalThis.__piRuntime.bound) {
     if (change.kind === "provider") {
       globalThis.__piRuntime.pendingProviderRegistrations.push({
@@ -513,13 +530,18 @@ globalThis.__piCreateApi = function (extIdx) {
       if (validationError !== "") {
         throw new Error(`Invalid MCP server registered by extension "${ext.path}": ${validationError}`);
       }
-      const registrationError = globalThis.__piOps.mcpRegister(name, ext.path, JSON.stringify(config ?? null));
-      if (registrationError !== "") throw new Error(registrationError);
+      // Ownership and namespace clashes throw into the caller immediately
+      // (loader.ts:489-504); the registration itself defers while this
+      // extension loads like the other runtime changes
+      // (applyRuntimeChange, loader.ts:269-272, 499), so a failed load
+      // drops it.
+      const ownershipError = globalThis.__piOps.mcpOwnership(name, ext.path);
+      if (ownershipError !== "") throw new Error(ownershipError);
+      applyProviderChange("mcpRegister", { name, configJson: JSON.stringify(config ?? null) });
     },
     unregisterMcpServer(name) {
       assertActive();
-      const error = globalThis.__piOps.mcpUnregister(name, ext.path);
-      if (error !== "") throw new Error(error);
+      applyProviderChange("mcpUnregister", { name });
     },
     getMcpServers() {
       assertActive();
@@ -1621,6 +1643,7 @@ globalThis.__piInspect = function () {
       events: Object.fromEntries(Object.entries(ext.events).map(([name, list]) => [name, list.map((_, index) => index)])),
       tools: Object.entries(ext.tools).map(([name, tool]) => ({
         name,
+        label: tool.label ?? name,
         description: tool.description ?? "",
         parameters: tool.parameters ?? null,
         exposure: tool.exposure ?? "direct",
@@ -1640,6 +1663,62 @@ globalThis.__piInspect = function () {
       })),
     })),
   );
+};
+
+// The index of a loaded extension by path, or -1 (the runner looks the
+// synthetic `builtin:mcp` record up before registering bridge tools).
+globalThis.__piFindExtension = function (path) {
+  const index = globalThis.__piExtensions.findIndex((ext) => ext.path === path);
+  return index;
+};
+
+// The MCP tool bridge (the `pi.registerTool(definition)` calls the bundled
+// MCP extension makes when a server connects, `index.ts:416-443`): each
+// definition lands in the synthetic extension's tool registry with an
+// execute wrapper that forwards to the `mcpCallTool` op — the host maps the
+// wire result (`convertMcpResult`, `tools.ts:215-235`) and the wrapper
+// throws its `error` payload, so a failed call is a tool error.
+// Registration rules match `pi.registerTool` (loader.ts:298-358): the
+// parameters must be an object schema.
+globalThis.__piMcpRegisterTools = function (path, toolsJson) {
+  const extIdx = globalThis.__piFindExtension(path);
+  if (extIdx === -1) {
+    throw new Error(`MCP tools registered for unknown extension "${path}"`);
+  }
+  const ext = globalThis.__piExtensions[extIdx];
+  const tools = JSON.parse(toolsJson);
+  for (const tool of tools) {
+    if (
+      typeof tool.parameters !== "object" ||
+      tool.parameters === null ||
+      Array.isArray(tool.parameters)
+    ) {
+      throw new Error(
+        `Tool "${tool.name}" registered by extension "${path}" must define an object parameter schema.`,
+      );
+    }
+    const server = tool.server;
+    const serverTool = tool.serverTool;
+    ext.tools[tool.name] = {
+      name: tool.name,
+      label: tool.label,
+      description: tool.description,
+      parameters: tool.parameters,
+      exposure: tool.exposure,
+      namespace: tool.namespace,
+      execute: (toolCallId, params) => {
+        const raw = globalThis.__piOps.mcpCallTool(
+          server,
+          serverTool,
+          JSON.stringify(params ?? {}),
+        );
+        const parsed = JSON.parse(raw);
+        if (parsed.error !== undefined) throw new Error(parsed.error);
+        return parsed.result;
+      },
+    };
+  }
+  globalThis.__piOps.refreshTools();
 };
 "#;
 

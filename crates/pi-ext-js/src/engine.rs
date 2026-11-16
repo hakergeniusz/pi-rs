@@ -122,6 +122,14 @@ pub struct HostCore {
     pub flag_values: BTreeMap<String, Json>,
     /// The MCP server registry.
     pub mcp: McpRegistry,
+    /// Registered MCP server names whose registry change has not been
+    /// emitted yet; the runner drains them into `mcp_servers_change`
+    /// emissions (the `McpServerRegistry` change listener,
+    /// `runner.ts:465-466`).
+    pub mcp_changes: Vec<String>,
+    /// The native MCP server manager (connections to the registered
+    /// servers; `mcp_manager`).
+    pub mcp_manager: crate::mcp_manager::McpManager,
     /// The provider / virtual-model registry (`pi.registerProvider` and
     /// friends).
     pub providers: ProviderRegistry,
@@ -368,9 +376,34 @@ impl JsHost {
                                   json: String|
          -> String {
             let mut core = core.lock().expect("host core mutex poisoned");
-            let config: Json = serde_json::from_str(&json).unwrap_or(Json::Null);
-            core.mcp
+            let raw: Json = serde_json::from_str(&json).unwrap_or(Json::Null);
+            // The validated (alias-resolved) config copy is what the
+            // registry stores (`loader.ts:497`).
+            let config = match crate::mcp_registry::validate_mcp_server_config(&name, &raw) {
+                Ok(config) => config,
+                Err(error) => return error,
+            };
+            let error = core
+                .mcp
                 .register(&name, &ext_path, config)
+                .err()
+                .unwrap_or_default();
+            if error.is_empty() {
+                // Every applied registration reaches the change queue
+                // (registry.register fires the listener unconditionally,
+                // `mcp-servers.ts:243-246`); the runner emits only once
+                // bound, mirroring the listener being set at bindCore
+                // (`runner.ts:465`).
+                core.mcp_changes.push(name);
+            }
+            error
+        });
+        op!("mcpOwnership", core, |name: String,
+                                    ext_path: String|
+         -> String {
+            let core = core.lock().expect("host core mutex poisoned");
+            core.mcp
+                .check_register(&name, &ext_path)
                 .err()
                 .unwrap_or_default()
         });
@@ -378,10 +411,19 @@ impl JsHost {
                                     ext_path: String|
          -> String {
             let mut core = core.lock().expect("host core mutex poisoned");
-            core.mcp
-                .unregister(&name, &ext_path)
-                .err()
-                .unwrap_or_default()
+            // Silent no-op for unknown or foreign servers
+            // (`mcp-servers.ts:249-253`); a removed entry reaches the
+            // change queue (the listener fires only on actual removal).
+            let owned = core
+                .mcp
+                .list()
+                .iter()
+                .any(|server| server.name == name && server.extension_path == ext_path);
+            if owned {
+                core.mcp.unregister(&name, ext_path);
+                core.mcp_changes.push(name);
+            }
+            String::new()
         });
         op!("getMcpServers", core, || -> String {
             let core = core.lock().expect("host core mutex poisoned");
@@ -398,6 +440,24 @@ impl JsHost {
                 })
                 .collect();
             serde_json::to_string(&servers).unwrap_or_else(|_| "[]".to_string())
+        });
+        // One MCP tool call from a registered tool's execute wrapper: the
+        // manager enforces the `getClient` guards (`index.ts:424-438`) and
+        // maps the result (`convertMcpResult`, `tools.ts:215-235`). The
+        // reply is `{"result": ...}` or `{"error": "..."}` — the wrapper
+        // throws the error, so a failed call is a tool error, and a
+        // protocol-level `isError` result stays a result.
+        op!("mcpCallTool", core, |server: String,
+                                  tool: String,
+                                  args: String|
+         -> String {
+            let manager = {
+                let core = core.lock().expect("host core mutex poisoned");
+                core.mcp_manager.clone()
+            };
+            let arguments: Json = serde_json::from_str(&args).unwrap_or(Json::Null);
+            serde_json::to_string(&manager.call_tool(&server, &tool, arguments))
+                .unwrap_or_else(|_| r#"{"error":"mcp tool result serialization failed"}"#.to_string())
         });
         op!("cwd", core, || -> String {
             core.lock().expect("host core mutex poisoned").cwd.clone()
@@ -770,6 +830,41 @@ impl JsHost {
             let inspect: Function = ctx.globals().get("__piInspect")?;
             inspect
                 .call::<(), String>(())
+                .map_err(|err| Self::js_error(&ctx, err))
+        })
+    }
+
+    /// Ensures a record exists for a synthetic extension path (the port's
+    /// native `builtin:mcp` host; upstream loads the bundled extension as a
+    /// real module with the synthetic `builtin:<name>` path). Returns its
+    /// index.
+    pub fn ensure_extension_record(&self, path: &str) -> Result<usize, JsHostError> {
+        let existing = self.ctx.with(|ctx| -> Result<Option<usize>, JsHostError> {
+            let find: Function = ctx.globals().get("__piFindExtension")?;
+            let index: i64 = find
+                .call((path,))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok((index >= 0).then(|| index as usize))
+        })?;
+        if let Some(index) = existing {
+            return Ok(index);
+        }
+        let index = self.begin_extension(path)?;
+        self.commit_extension(index)?;
+        Ok(index)
+    }
+
+    /// Registers MCP tool definitions into a synthetic extension's tool
+    /// registry with execute wrappers that call the `mcpCallTool` op (the
+    /// `pi.registerTool` surface the bundled MCP extension uses,
+    /// `index.ts:442`). `tools` is the JSON array of definitions.
+    pub fn register_mcp_tools(&self, path: &str, tools: &Json) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let register: Function = ctx.globals().get("__piMcpRegisterTools")?;
+            let tools_json = serde_json::to_string(tools)
+                .map_err(|err| JsHostError::Job(err.to_string()))?;
+            register
+                .call::<(String, String), ()>((path.to_string(), tools_json))
                 .map_err(|err| Self::js_error(&ctx, err))
         })
     }

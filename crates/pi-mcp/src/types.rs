@@ -135,6 +135,10 @@ pub struct InitializeResult {
     pub capabilities: ServerCapabilities,
     #[serde(rename = "serverInfo")]
     pub server_info: Implementation,
+    /// Server instructions describing its tools as a group
+    /// (`client.ts` surfaces it as `instructions`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 /// The capabilities the server reports in `initialize`'s result.
@@ -166,9 +170,24 @@ pub struct McpTool {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Human-facing title (`Tool.title`), the description fallback for the
+    /// tool bridge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// MCP annotations (`readOnlyHint`, `title`, …) kept as raw JSON; the
+    /// bridge forwards the boolean hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
     /// JSON Schema for the arguments.
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
+    /// JSON Schema for `structuredContent` (`Tool.outputSchema`).
+    #[serde(
+        default,
+        rename = "outputSchema",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub output_schema: Option<Value>,
 }
 
 /// `tools/list` result.
@@ -197,6 +216,13 @@ pub struct CallToolParams {
 pub struct CallToolResult {
     #[serde(default)]
     pub content: Vec<ContentBlock>,
+    /// Structured output (`CallToolResult.structuredContent`); any JSON.
+    #[serde(
+        default,
+        rename = "structuredContent",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub structured_content: Option<Value>,
     #[serde(rename = "isError", default)]
     pub is_error: bool,
 }
@@ -213,8 +239,54 @@ pub enum ContentBlock {
         #[serde(rename = "mimeType")]
         mime_type: String,
     },
+    #[serde(rename = "audio")]
+    Audio {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    #[serde(rename = "resource_link")]
+    ResourceLink {
+        uri: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(
+            default,
+            rename = "mimeType",
+            skip_serializing_if = "Option::is_none"
+        )]
+        mime_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<f64>,
+    },
     #[serde(rename = "resource")]
     Resource { resource: Value },
+}
+
+/// An MCP tool's input schema in the shape LLM tool APIs accept
+/// (`input-schema.ts:7-13`): tool parameters must be objects, servers may
+/// omit `type`, and some providers reject object schemas without
+/// `properties`. Other keywords are kept.
+#[must_use]
+pub fn normalize_mcp_input_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Object(fields) => {
+            let mut out = fields.clone();
+            out.entry("type")
+                .or_insert_with(|| Value::String("object".to_string()));
+            out.entry("properties")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            Value::Object(out)
+        }
+        _ => json_schema_object(),
+    }
+}
+
+fn json_schema_object() -> Value {
+    serde_json::json!({ "type": "object", "properties": {} })
 }
 
 #[cfg(test)]

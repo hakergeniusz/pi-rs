@@ -5,7 +5,8 @@
 //! directly (protocol version [`PROTOCOL_VERSION`]); HTTP transport and the
 //! `mcp-servers.json` server-manager wiring land later in P5.
 //!
-//! * [`types`] — JSON-RPC 2.0 envelope + MCP message types.
+//! * [`types`] — JSON-RPC 2.0 envelope + MCP message types, plus the
+//!   input-schema normalizer.
 //! * [`transport`] — subprocess framing with request/response correlation.
 //! * [`client`] — `initialize` handshake, tool discovery and calls.
 //! * [`error`] — the error surface.
@@ -30,4 +31,6 @@ pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use client::{McpClient, McpServerConfig};
 pub use error::McpError;
-pub use types::{CallToolResult, ContentBlock, McpTool, ToolsListResult};
+pub use types::{
+    CallToolResult, ContentBlock, McpTool, ToolsListResult, normalize_mcp_input_schema,
+};

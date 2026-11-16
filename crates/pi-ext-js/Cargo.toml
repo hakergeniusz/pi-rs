@@ -13,6 +13,13 @@ rquickjs = { workspace = true, features = ["loader"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# The native MCP server manager: connections run on a dedicated worker
+# thread with its own runtime, since the engine thread may already be
+# inside the process-wide tokio runtime.
+tokio = { workspace = true }
+pi-mcp = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
 oxc_allocator = "0.158"
 oxc_codegen = "0.158"
 oxc_parser = "0.158"
@@ -24,6 +31,9 @@ oxc_transformer = "0.158"
 # Signal-based exec termination (SIGTERM, then SIGKILL after the grace);
 # std only offers SIGKILL via `Child::kill`.
 nix = { version = "0.30", features = ["signal"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
