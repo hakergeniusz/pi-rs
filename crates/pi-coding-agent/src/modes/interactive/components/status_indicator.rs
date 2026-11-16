@@ -15,6 +15,8 @@ use super::super::theme;
 /// land with their loops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
+    /// `RetryStatusIndicator` (`status-indicator.ts:51-63`).
+    Retry,
     Working,
     Compaction,
 }
@@ -37,6 +39,23 @@ impl StatusIndicator {
                 None,
             ),
             kind: StatusKind::Working,
+        }
+    }
+
+    /// `RetryStatusIndicator` (`status-indicator.ts:51-63`): warning
+    /// spinner, muted label. Upstream counts the seconds down; the port
+    /// shows the initial figure.
+    pub fn retry(message: &str) -> Self {
+        let spinner_theme = theme::theme();
+        let message_theme = theme::theme();
+        StatusIndicator {
+            loader: Loader::new(
+                move |text| spinner_theme.fg(ThemeColor::Warning, text),
+                move |text| message_theme.fg(ThemeColor::Muted, text),
+                message,
+                None,
+            ),
+            kind: StatusKind::Retry,
         }
     }
 

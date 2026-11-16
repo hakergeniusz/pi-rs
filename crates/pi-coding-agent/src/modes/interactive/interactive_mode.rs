@@ -279,6 +279,23 @@ struct AgentRun {
     /// `pi.virtual-model-state` entries persist when the run retires.
     #[cfg(feature = "ext-js")]
     routing: Option<Arc<crate::virtual_models::TurnRouting>>,
+    /// The turn's prompts and context: the retry and overflow recovery
+    /// re-run the same turn (`agent.continue()`).
+    prompts: Vec<AgentMessage>,
+    context: AgentContext,
+}
+
+/// The retry backoff wait (`_prepareRetry`'s sleep, `agent-session.ts`
+/// :3965-3975): a thread sleeps abortably and reports the outcome.
+enum RetryWaitEvent {
+    Fire,
+    Cancelled,
+}
+
+struct RetryWait {
+    abort: Arc<AbortSignal>,
+    events: std::sync::mpsc::Receiver<RetryWaitEvent>,
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Outcome of a compaction worker thread (`compaction_end` event payload).
@@ -294,6 +311,10 @@ struct CompactionRun {
     events: std::sync::mpsc::Receiver<CompactionOutcome>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
+
+/// Whether the automatic compaction re-runs the turn on completion
+/// (`_runAutoCompaction`'s `willRetry` → `agent.continue()`).
+struct AutoContinueAfterCompaction;
 
 /// `QueueSource` over a mutex-shared [`Queues`]: the loop borrows it for the
 /// whole run while the UI keeps enqueueing (`agent.steer`/`followUp`).
@@ -690,6 +711,16 @@ pub struct InteractiveMode {
     compaction_run: Option<CompactionRun>,
     /// The `agent_end` verdict, consumed by the post-run machine.
     last_agent_end_will_retry: bool,
+    /// The `agent_end` messages, consumed by the post-run machine.
+    last_agent_end_messages: Option<Vec<AgentMessage>>,
+    /// The retry budget so far (`_retryAttempt`).
+    retry_attempt: u32,
+    /// The retry backoff in flight, if any.
+    retry_wait: Option<RetryWait>,
+    /// The retired turn's prompts and context for a re-run.
+    last_run_turn: Option<(Vec<AgentMessage>, AgentContext)>,
+    /// The automatic compaction re-runs the turn on completion.
+    auto_continue_after_compaction: bool,
     /// Messages queued while compaction runs
     /// (`compactionQueuedMessages`), `(text, follow_up)`.
     compaction_queued: Vec<(String, bool)>,
@@ -927,6 +958,11 @@ impl InteractiveMode {
             queued_deliveries: Vec::new(),
             compaction_run: None,
             last_agent_end_will_retry: false,
+            last_agent_end_messages: None,
+            retry_attempt: 0,
+            retry_wait: None,
+            last_run_turn: None,
+            auto_continue_after_compaction: false,
             compaction_queued: Vec::new(),
             active_prompt: None,
             stdin_buffer: StdinBuffer::new(StdinBufferOptions::default()),
@@ -1731,9 +1767,12 @@ impl InteractiveMode {
                 }
                 self.tui.request_render();
             }
-            AgentEvent::AgentEnd { will_retry, .. } => {
-                // The pump's post-run machine (part b) consumes the verdict.
+            AgentEvent::AgentEnd { messages, will_retry } => {
+                // The pump's post-run machine consumes the verdict and the
+                // run's messages (`_handlePostAgentRun`, `agent-session.ts`
+                // :2062-2098).
                 self.last_agent_end_will_retry = *will_retry;
+                self.last_agent_end_messages = Some(messages.clone());
                 self.refresh_footer();
                 self.tui.request_render();
             }
@@ -1959,6 +1998,175 @@ impl InteractiveMode {
     /// abort the current run first (manual compaction never retries it),
     /// then prepare + summarize on a worker thread. The session append
     /// happens on the UI thread when the outcome lands, like upstream's
+    /// `_prepareRetry` (`agent-session.ts:3938-3975`): budget the attempt,
+    /// omit the failed attempt from the projection, and sleep abortably.
+    /// The display stands in for `RetryStatusIndicator`'s countdown.
+    fn start_retry_wait(&mut self) {
+        let settings = self.settings.get_retry_settings();
+        self.retry_attempt += 1;
+        if self.retry_attempt > settings.max_retries.max(0) as u32 {
+            // Preserve the completed attempt count so post-run handling can
+            // emit the final failure (:3947-3952).
+            self.retry_attempt -= 1;
+            return;
+        }
+        let policy = pi_ai::retry::RetryPolicy {
+            enabled: settings.enabled,
+            max_retries: settings.max_retries.max(0) as u32,
+            base_delay_ms: settings.base_delay_ms.max(0) as u64,
+            max_agent_delay_ms: Some(settings.max_agent_delay_ms.max(0) as u64),
+        };
+        let delay_ms = pi_ai::retry::retry_delay_ms(&policy, self.retry_attempt);
+        // `_prepareRetry` omits before the backoff (:3959-3963); the failed
+        // attempt is already on the branch (persisted on `MessageEnd`).
+        self.omit_persisted_attempt();
+        let seconds = delay_ms.div_ceil(1000);
+        self.set_working_status(Some(StatusIndicator::retry(&format!(
+            "Retrying ({}/{}) in {seconds}s... (esc to cancel)",
+            self.retry_attempt,
+            settings.max_retries.max(0) as u32
+        ))));
+        self.tui.request_render();
+
+        let (tx, rx) = std::sync::mpsc::channel::<RetryWaitEvent>();
+        let signal = Arc::new(AbortSignal::new());
+        let run_signal = Arc::clone(&signal);
+        let base_delay_ms = settings.base_delay_ms.max(0) as u64;
+        let max_agent_delay_ms = settings.max_agent_delay_ms.max(0) as u64;
+        let attempt = self.retry_attempt;
+        let max_retries = settings.max_retries.max(0) as u32;
+        let handle = std::thread::spawn(move || {
+            let policy = pi_ai::retry::RetryPolicy {
+                enabled: true,
+                max_retries,
+                base_delay_ms,
+                max_agent_delay_ms: Some(max_agent_delay_ms),
+            };
+            let delay_ms = pi_ai::retry::retry_delay_ms(&policy, attempt);
+            let outcome = if crate::modes::retry::sleep_abortable(delay_ms, &run_signal) {
+                RetryWaitEvent::Fire
+            } else {
+                RetryWaitEvent::Cancelled
+            };
+            let _ = tx.send(outcome);
+        });
+        self.retry_wait = Some(RetryWait {
+            abort: signal,
+            events: rx,
+            handle: Some(handle),
+        });
+    }
+
+    /// `agent.continue()`: the retry or overflow recovery re-runs the same
+    /// turn with the retired run's prompts and context.
+    fn spawn_retry_run(&mut self) {
+        if let Some((prompts, context)) = self.last_run_turn.take() {
+            self.spawn_run(prompts, context);
+        }
+    }
+
+    /// `_checkCompaction` on the retired turn (`agent-session.ts:3119-3252`):
+    /// the automatic cases the run tails drive; the pump owns the session,
+    /// so the machine decides here and the threaded compaction runs from
+    /// `handle_compact_command`.
+    fn post_run_compaction(&mut self, aborted: bool) {
+        let Some(messages) = self.last_agent_end_messages.clone() else {
+            return;
+        };
+        let Some((_, context)) = self.last_run_turn.clone() else {
+            return;
+        };
+        let mut full_messages = context.messages.clone();
+        full_messages.extend(messages.iter().cloned());
+        let settings = self
+            .settings
+            .get_compaction_settings(Some((self.model.provider.as_str(), self.model.id.as_str())))
+            .unwrap_or(crate::session::compaction::DEFAULT_COMPACTION_SETTINGS);
+        let mut machine = crate::modes::compaction::AutoCompaction::new(settings);
+        match machine.post_run_decision(
+            aborted,
+            &messages,
+            &full_messages,
+            &self.session,
+            &self.model,
+        ) {
+            crate::modes::compaction::Decision::None => {}
+            crate::modes::compaction::Decision::Threshold => {
+                self.auto_continue_after_compaction = false;
+                self.handle_compact_command(None);
+            }
+            crate::modes::compaction::Decision::Overflow { will_retry } => {
+                if will_retry {
+                    // `_omitRecoveryAttempt` before the recovery compaction
+                    // (`agent-session.ts:3209-3211`).
+                    self.omit_persisted_attempt();
+                }
+                self.auto_continue_after_compaction = will_retry;
+                self.handle_compact_command(None);
+            }
+            crate::modes::compaction::Decision::RecoveryFailed { message } => {
+                self.show_error(&message);
+            }
+        }
+    }
+
+    /// `_omitRecoveryAttempt` (`agent-session.ts:1311-1336`) on the session
+    /// side: the failed attempt is already persisted (the pump's `MessageEnd`
+    /// handler appends mid-run, like upstream), so the omission finds the
+    /// branch's trailing failed assistant and its tool results and appends
+    /// the `context_edit` records. Upstream emits `entry_appended` for each
+    /// edit; the interactive UI renders nothing for context edits.
+    fn omit_persisted_attempt(&mut self) {
+        let Ok(branch) = self.session.get_branch(None) else {
+            return;
+        };
+        let Some(index) = branch.iter().rposition(|entry| {
+            matches!(
+                entry,
+                crate::session::records::SessionEntry::Message(message)
+                    if matches!(message.message, AgentMessage::Assistant(_))
+            )
+        }) else {
+            return;
+        };
+        let tool_call_ids: std::collections::HashSet<String> = match &branch[index] {
+            crate::session::records::SessionEntry::Message(message) => match &message.message {
+                AgentMessage::Assistant(assistant) => assistant
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        pi_ai::types::AssistantContent::ToolCall(call) => {
+                            Some(call.id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                _ => return,
+            },
+            _ => return,
+        };
+        let mut target_ids = vec![branch[index].id().to_string()];
+        for entry in &branch[index + 1..] {
+            let crate::session::records::SessionEntry::Message(message) = entry else {
+                continue;
+            };
+            match &message.message {
+                AgentMessage::Assistant(_) => break,
+                AgentMessage::ToolResult(result)
+                    if tool_call_ids.contains(&result.tool_call_id) =>
+                {
+                    target_ids.push(entry.id().to_string());
+                }
+                _ => {}
+            }
+        }
+        for id in target_ids {
+            let _ = self
+                .session
+                .append_context_edit(&id, &crate::session::records::ContextReplacement::Omit);
+        }
+    }
+
     /// `compaction_end` handling.
     #[allow(clippy::too_many_lines)] // mirrors the TS compaction flow incl. virtual routing; split when extending
     fn handle_compact_command(&mut self, custom_instructions: Option<&str>) {
@@ -1967,9 +2175,10 @@ impl InteractiveMode {
         }
         self.abort_active_run();
 
-        // Settings-driven tuning lands with a settings handle in this mode;
-        // `getCompactionSettings` itself is ported and tested.
-        let settings = crate::session::compaction::DEFAULT_COMPACTION_SETTINGS;
+        let settings = self
+            .settings
+            .get_compaction_settings(Some((self.model.provider.as_str(), self.model.id.as_str())))
+            .unwrap_or(crate::session::compaction::DEFAULT_COMPACTION_SETTINGS);
 
         let path_entries = self.session.get_branch(None).unwrap_or_default();
         let already_compacted = matches!(
@@ -2154,11 +2363,20 @@ impl InteractiveMode {
                 self.handle_agent_event(&event);
             }
         }
+        // `_finishCancelledRetry` (`agent-session.ts:3922-3932`): an abort
+        // during a run or its wait cancels the pending retry.
+        if self.retry_attempt > 0 {
+            let attempt = self.retry_attempt;
+            self.retry_attempt = 0;
+            self.show_error(&format!("Retry failed after {attempt} attempts: Retry cancelled"));
+        }
+        self.last_run_turn = None;
         self.set_working_status(None);
     }
 
     /// `compaction_end` handling (`interactive-mode.ts:3820-3855`): persist
     /// the summary, render the rows, flush the queue.
+    #[allow(clippy::too_many_lines)] // mirrors the TS compaction flow; split when extending
     fn handle_compaction_outcome(&mut self, outcome: CompactionOutcome) {
         match outcome {
             CompactionOutcome::Completed(result) => {
@@ -2183,6 +2401,12 @@ impl InteractiveMode {
             CompactionOutcome::Cancelled => self.show_status("Compaction cancelled"),
         }
         self.flush_compaction_queue();
+        // `_runAutoCompaction`'s `willRetry` → `agent.continue()`:
+        // the overflow recovery re-runs the turn once the compaction lands.
+        if self.auto_continue_after_compaction {
+            self.auto_continue_after_compaction = false;
+            self.spawn_retry_run();
+        }
     }
 
     /// The summary row + the billed-tokens notice (`addCompactionCostNotice`,
@@ -3571,8 +3795,14 @@ impl InteractiveMode {
             messages: context_messages,
             tools: self.executor.tools(),
         };
-        // Under a virtual selection every request routes first and the
-        // stream dispatches per routed model.
+
+        self.spawn_run(vec![user_message], context);
+    }
+
+    /// The turn's run thread: one `run_agent_loop` pass; the retry and
+    /// overflow recovery re-runs happen on the UI thread's post-run machine
+    /// (`_handlePostAgentRun`), which re-enters here with the same turn.
+    fn spawn_run(&mut self, prompts: Vec<AgentMessage>, context: AgentContext) {
         #[cfg(feature = "ext-js")]
         let routing = crate::virtual_models::TurnRouting::install(
             &self.model,
@@ -3618,11 +3848,21 @@ impl InteractiveMode {
         let run_signal = Arc::clone(&signal);
         let shared_queues = SharedQueues(Arc::clone(&self.queues));
         let mut shared_queues = shared_queues;
+        let retry_attempt = self.retry_attempt;
+        let retry_settings = self.settings.get_retry_settings();
+        let thread_prompts = prompts.clone();
+        let thread_context = context.clone();
         let handle = std::thread::spawn(move || {
-            let mut sink = ChannelSink { tx: tx.clone() };
+            let mut inner_sink = ChannelSink { tx: tx.clone() };
+            let mut sink = crate::modes::retry::RetryAwareSink {
+                inner: &mut inner_sink,
+                retry_attempt,
+                settings: retry_settings,
+                signal: Arc::clone(&run_signal),
+            };
             let _messages = crate::runtime::block_on(pi_agent::run_agent_loop(
-                vec![user_message],
-                context,
+                thread_prompts,
+                thread_context,
                 executor.as_ref(),
                 &config,
                 &mut shared_queues,
@@ -3638,6 +3878,8 @@ impl InteractiveMode {
             handle: Some(handle),
             #[cfg(feature = "ext-js")]
             routing: routing.map(Arc::new),
+            prompts,
+            context,
         });
         self.set_working_status(Some(StatusIndicator::working("Working...")));
         self.tui.request_render();
@@ -4781,8 +5023,75 @@ impl InteractiveMode {
                 if let Some(routing) = &run.routing {
                     routing.persist_state(&mut self.session);
                 }
+                // The turn's prompts and context: a retry or overflow
+                // recovery re-runs the same turn (`agent.continue()`).
+                self.last_run_turn = Some((run.prompts, run.context));
             }
             self.set_working_status(None);
+            // `_handlePostAgentRun` (`agent-session.ts:2062-2098`): the
+            // retry decision first — compaction only when no retry was
+            // scheduled.
+            if self.last_agent_end_will_retry {
+                self.start_retry_wait();
+            } else {
+                if self.retry_attempt > 0 {
+                    // `auto_retry_end` on the final failure (:2081-2089);
+                    // a successful retry just resets the budget (:1252).
+                    let failed = self
+                        .last_agent_end_messages
+                        .as_ref()
+                        .is_some_and(|messages| !crate::modes::retry::run_succeeded(messages));
+                    if failed {
+                        let error = self
+                            .last_agent_end_messages
+                            .as_deref()
+                            .map(crate::modes::retry::last_error_text)
+                            .unwrap_or_else(|| "Unknown error".to_string());
+                        self.show_error(&format!(
+                            "Retry failed after {} attempts: {error}",
+                            self.retry_attempt
+                        ));
+                    }
+                    self.retry_attempt = 0;
+                }
+                self.post_run_compaction(false);
+            }
+            self.tui.request_render();
+        }
+
+        // The retry backoff fires (`_prepareRetry`'s sleep resolves; the
+        // loop continues with the same turn) or is cancelled
+        // (`session.abortRetry()` → `_finishCancelledRetry`).
+        let mut retry_wait_outcome: Option<RetryWaitEvent> = None;
+        if let Some(wait) = &self.retry_wait {
+            loop {
+                match wait.events.try_recv() {
+                    Ok(outcome) => retry_wait_outcome = Some(outcome),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        retry_wait_outcome = Some(RetryWaitEvent::Cancelled);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(outcome) = retry_wait_outcome {
+            if let Some(wait) = self.retry_wait.take() {
+                if let Some(handle) = wait.handle {
+                    let _ = handle.join();
+                }
+            }
+            self.set_working_status(None);
+            match outcome {
+                RetryWaitEvent::Fire => self.spawn_retry_run(),
+                RetryWaitEvent::Cancelled => {
+                    let attempt = self.retry_attempt;
+                    self.retry_attempt = 0;
+                    self.show_error(&format!(
+                        "Retry failed after {attempt} attempts: Retry cancelled"
+                    ));
+                }
+            }
             self.tui.request_render();
         }
 
@@ -4853,10 +5162,14 @@ impl InteractiveMode {
             }
             AppAction::Exit => self.exiting = true,
             AppAction::Interrupt => {
-                // While compacting, interrupt cancels the compaction
+                // While retrying, interrupt cancels the backoff
+                // (`session.abortRetry()`, `interactive-mode.ts:3874-3877`);
+                // while compacting, it cancels the compaction
                 // (`CompactionStatusIndicator`'s cancel hint + the escape
                 // override at `interactive-mode.ts:3810-3813`).
-                if let Some(run) = &self.compaction_run {
+                if let Some(run) = &self.retry_wait {
+                    run.abort.abort();
+                } else if let Some(run) = &self.compaction_run {
                     run.abort.abort();
                 } else if let Some(run) = &self.agent_run {
                     run.abort.abort();

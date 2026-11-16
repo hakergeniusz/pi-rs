@@ -18,6 +18,8 @@ use pi_ai::types::StopReason;
 
 use crate::config::settings::RetrySettings;
 use crate::session::records::ContextReplacement;
+use std::sync::Arc;
+
 use pi_agent::events::{AgentEvent, AgentEventSink};
 
 /// One retry budget over a run (attempts reset when a run succeeds).
@@ -37,13 +39,7 @@ impl AgentRetry {
     /// `_willRetryAfterAgentEnd` (`agent-session.ts:1266-1281`): the last
     /// assistant message of the run decides; aborts never retry.
     pub fn will_retry(&self, aborted: bool, messages: &[AgentMessage]) -> bool {
-        if aborted {
-            return false;
-        }
-        if !self.settings.enabled || self.attempt >= self.max_attempts() {
-            return false;
-        }
-        last_assistant(messages).is_some_and(pi_ai::retry::is_retryable_assistant_error)
+        will_retry_after_agent_end(aborted, self.attempt, &self.settings, messages)
     }
 
     /// Advance the attempt and compute the backoff. Returns
@@ -78,16 +74,7 @@ impl AgentRetry {
     /// The backoff sleep, abortable (`retry.ts` races the sleep against the
     /// signal; the port polls in 50 ms slices). Returns `false` when aborted.
     pub fn sleep(&self, delay_ms: u64, signal: &AbortSignal) -> bool {
-        let mut remaining = delay_ms;
-        while remaining > 0 {
-            if signal.aborted() {
-                return false;
-            }
-            let step = remaining.min(50);
-            crate::runtime::block_on(tokio::time::sleep(std::time::Duration::from_millis(step)));
-            remaining -= step;
-        }
-        !signal.aborted()
+        sleep_abortable(delay_ms, signal)
     }
 
     /// Reset the budget after a successful run (`agent-session.ts:1252`).
@@ -120,21 +107,60 @@ pub fn last_error_text(messages: &[AgentMessage]) -> String {
 /// `false`; without this wrapper the wire would never see a retry.
 pub struct RetryAwareSink<'a, S: AgentEventSink> {
     pub inner: &'a mut S,
-    pub retry: &'a AgentRetry,
-    pub signal: &'a AbortSignal,
+    /// The machine's attempt count so far, copied into the run thread.
+    pub retry_attempt: u32,
+    pub settings: RetrySettings,
+    pub signal: Arc<AbortSignal>,
 }
 
 impl<S: AgentEventSink> AgentEventSink for RetryAwareSink<'_, S> {
     fn emit(&mut self, event: AgentEvent) -> pi_agent::types::BoxFuture<'_, ()> {
         let event = match event {
             AgentEvent::AgentEnd { messages, .. } => AgentEvent::AgentEnd {
-                will_retry: self.retry.will_retry(self.signal.aborted(), &messages),
+                will_retry: will_retry_after_agent_end(
+                    self.signal.aborted(),
+                    self.retry_attempt,
+                    &self.settings,
+                    &messages,
+                ),
                 messages,
             },
             event => event,
         };
         self.inner.emit(event)
     }
+}
+
+/// The backoff sleep, abortable (`retry.ts` races the sleep against the
+/// signal; the port polls in 50 ms slices). Returns `false` when aborted.
+pub fn sleep_abortable(delay_ms: u64, signal: &AbortSignal) -> bool {
+    let mut remaining = delay_ms;
+    while remaining > 0 {
+        if signal.aborted() {
+            return false;
+        }
+        let step = remaining.min(50);
+        crate::runtime::block_on(tokio::time::sleep(std::time::Duration::from_millis(step)));
+        remaining -= step;
+    }
+    !signal.aborted()
+}
+
+/// `_willRetryAfterAgentEnd` (`agent-session.ts:1267-1281`): the emit
+/// wrapper's verdict — aborts, the budget, and the last assistant decide.
+pub fn will_retry_after_agent_end(
+    aborted: bool,
+    retry_attempt: u32,
+    settings: &RetrySettings,
+    messages: &[AgentMessage],
+) -> bool {
+    if aborted {
+        return false;
+    }
+    if !settings.enabled || retry_attempt >= settings.max_retries.max(0) as u32 {
+        return false;
+    }
+    last_assistant(messages).is_some_and(pi_ai::retry::is_retryable_assistant_error)
 }
 
 /// `_omitRecoveryAttempt` (`agent-session.ts:1311-1336`): the failed

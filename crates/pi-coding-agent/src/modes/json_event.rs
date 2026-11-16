@@ -341,7 +341,7 @@ pub fn run_json_mode(
 
     let mut queues = Queues::new();
     let mut sink = JsonEventSink::new(io::stdout().lock());
-    let signal = AbortSignal::new();
+    let signal = Arc::new(AbortSignal::new());
     // Under a virtual selection every request routes first
     // (`_installAgentRequestProjection`).
     #[cfg(feature = "ext-js")]
@@ -413,8 +413,9 @@ pub fn run_json_mode(
             // (`agent-session.ts:1211`).
             let mut aware = crate::modes::retry::RetryAwareSink {
                 inner: &mut sink,
-                retry: &retry,
-                signal: &signal,
+                retry_attempt: retry.attempt(),
+                settings: runtime.retry_settings,
+                signal: Arc::clone(&signal),
             };
             crate::runtime::block_on(pi_agent::run_agent_loop(
                 prompts.clone(),
