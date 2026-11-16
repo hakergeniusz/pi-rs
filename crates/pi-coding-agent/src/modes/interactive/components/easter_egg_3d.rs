@@ -7,7 +7,11 @@
 //! Port of `components/easter-egg-3d.js`. The pi logo lifts off the header,
 //! flies to the center, and grows; the dust spreads out from the header
 //! logo. Armin grows out of a speck at the center; the dust spreads out from
-//! the center.
+//! the center. The backwards exit runs over `EXIT_DURATION` (1.1s): `close()`
+//! `:916-935` snapshots the exit timeline, the render pass applies it
+//! `:962-981` (reverse dissolve, gathered offsets, yaw eased to the front
+//! view, hint/star alpha fading), and `exitProgress` `:1114-1118` reaches 1
+//! to finish (`:1120-1125`).
 //!
 //! The blocks are ray cast per braille dot. A braille cell holds 2x4 roughly
 //! square dots, so one pixel of a half-block bitmap is exactly 2x2 dots, and
@@ -1765,7 +1769,11 @@ impl Component for EasterEgg3dAnimation {
     }
 
     fn handle_input(&mut self, data: &str) -> Option<pi_tui::component::ComponentMutation> {
-        if keybindings::matches(data, action::SELECT_CANCEL) {
+        // `tui.select.cancel` and `app.clear` both close
+        // (`easter-egg-3d.ts:935-937`).
+        if keybindings::matches(data, action::SELECT_CANCEL)
+            || theme::app_keys::matches(data, theme::app_keys::CLEAR)
+        {
             self.close();
         }
         None
@@ -2190,6 +2198,64 @@ mod tests {
         assert!(
             done.load(Ordering::SeqCst),
             "the completed exit tells the host to hide the overlay"
+        );
+    }
+
+    /// The exit runs the intro backwards (`render`'s exit branch,
+    /// `easter-egg-3d.ts:962-981`): from the fully dissolved screen the text
+    /// layer reassembles, and the completed exit finishes the animation
+    /// (`exitProgress`, `easter-egg-3d.ts:1114-1118`, finishing at >= 1).
+    #[test]
+    fn the_exit_reassembles_the_screen() {
+        let (animation, done) = test_animation(Some((0, 0)));
+        // Age the intro past the dissolve (`DISSOLVE_END`) so the exit starts
+        // from a fully dissolved screen.
+        animation.start = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(3000))
+            .expect("backdate");
+        animation.close();
+        let lines = animation.render(40);
+        let plain = pi_tui::ansi::strip_terminal_sequences(&lines[0]);
+        assert!(
+            !plain.contains("world"),
+            "the exit starts from the dissolved screen: {plain:?}"
+        );
+        // Run the exit to completion: the same render pass reports done
+        // (upstream's interval finishes when `exitProgress() >= 1`) and the
+        // captured screen is back, reassembled in reverse order.
+        {
+            let mut inner = animation.inner.lock().expect("animation state");
+            let exit = inner.exit.as_mut().expect("exit armed");
+            exit.start = Instant::now()
+                .checked_sub(std::time::Duration::from_millis(
+                    (EXIT_DURATION * 1000.0 + 100.0) as u64,
+                ))
+                .expect("backdate");
+        }
+        let lines = animation.render(40);
+        assert!(done.load(Ordering::SeqCst), "the completed exit finishes");
+        let plain = pi_tui::ansi::strip_terminal_sequences(&lines[0]);
+        assert!(plain.contains("world"), "the screen reassembles: {plain:?}");
+    }
+
+    /// `handleInput` closes on cancel and clear (`easter-egg-3d.ts:935-937`):
+    /// escape and ctrl+c arm the exit, and a second close skips straight to
+    /// finish.
+    #[test]
+    fn cancel_and_clear_input_close_the_egg() {
+        let (mut animation, done) = test_animation(None);
+        let _ = animation.handle_input("\x1b");
+        {
+            let inner = animation.inner.lock().expect("animation state");
+            assert!(inner.exit.is_some(), "escape arms the exit");
+        }
+        assert!(!done.load(Ordering::SeqCst), "one close only arms the exit");
+        // ctrl+c matches `tui.select.cancel` and `app.clear` alike; with the
+        // exit already armed this second close finishes immediately.
+        let _ = animation.handle_input("\x03");
+        assert!(
+            done.load(Ordering::SeqCst),
+            "a second close skips to finish"
         );
     }
 

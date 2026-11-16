@@ -1,8 +1,13 @@
 //! `FooterComponent` — the two status lines at the bottom of the dock: the
 //! working directory (with git branch and session name) and the token/cost/
-//! context stats with the model on the right.
+//! context stats with the model on the right. The right cell adds the
+//! thinking level for reasoning models (` • thinking off` or the level), the
+//! routed virtual model (` → id[ • level]`), and a `(provider)` prefix when
+//! more than one provider has available models and the line still fits.
 //!
-//! Ground truth: `modes/interactive/components/footer.ts`.
+//! Ground truth: `modes/interactive/components/footer.ts` (the right cell at
+//! `footer.ts:219-255`; the provider count from `footer-data-provider.ts` +
+//! `interactive-mode.ts:5444-5451`).
 
 use std::path::Path;
 
@@ -158,6 +163,9 @@ pub fn get_usage_cost_breakdown(
     breakdown
 }
 
+/// The minimum gap between the stats and the model (`footer.ts:231`).
+const MIN_PADDING: usize = 2;
+
 /// The data the footer renders, gathered by the interactive loop.
 #[derive(Debug, Clone, Default)]
 pub struct FooterData {
@@ -174,6 +182,15 @@ pub struct FooterData {
     pub model_provider: String,
     pub model_supports_reasoning: bool,
     pub thinking_level: String,
+    /// Unique providers with available models (`getAvailableProviderCount`,
+    /// `footer-data-provider.ts:159-167`, fed by `updateAvailableProviderCount`,
+    /// `interactive-mode.ts:5444-5451`).
+    pub available_provider_count: usize,
+    /// Under a virtual selection, the physical model the latest response used
+    /// (`session.routedModel`, `agent-session.ts:1538-1543`).
+    pub routed_model_id: Option<String>,
+    /// The routed response's thinking level, when one was recorded.
+    pub routed_thinking_level: Option<String>,
     pub auto_compact_enabled: bool,
 }
 
@@ -182,22 +199,53 @@ pub struct FooterComponent {
     pub data: FooterData,
 }
 
-/// The stats line's right cell: model id, plus ` • thinking <level>` when the
-/// model supports reasoning (`footer.ts:219-245`).
-fn stats_right_side(data: &FooterData) -> String {
-    let base = if data.model_id.is_empty() {
+/// The stats line's right cell (`footer.ts:233-255`): the model id, plus
+/// ` • thinking <level>` when the model supports reasoning, the routed
+/// virtual model's ` → id[ • level]`, and a `(provider)` prefix when more
+/// than one provider has available models and the cell still fits.
+/// `stats_left_width` is the already-truncated left cell's width.
+fn stats_right_side(data: &FooterData, stats_left_width: usize, width: usize) -> String {
+    // The model name (`footer.ts:220`).
+    let model_name = if data.model_id.is_empty() {
         "no-model".to_string()
     } else {
         data.model_id.clone()
     };
-    if !data.model_supports_reasoning {
-        return base;
+    // The thinking level indicator (`footer.ts:233-239`).
+    let mut right_side_without_provider = model_name.clone();
+    if data.model_supports_reasoning {
+        let level = if data.thinking_level.is_empty() {
+            "off"
+        } else {
+            data.thinking_level.as_str()
+        };
+        right_side_without_provider = if level == "off" {
+            format!("{model_name} • thinking off")
+        } else {
+            format!("{model_name} • {level}")
+        };
     }
-    if data.thinking_level.is_empty() || data.thinking_level == "off" {
-        format!("{base} • thinking off")
-    } else {
-        format!("{base} • {}", data.thinking_level)
+    // A virtual model routes each request; show where the latest response
+    // went (`footer.ts:240-245`; an empty level is falsy in TS).
+    if let Some(routed_id) = &data.routed_model_id {
+        let level = data
+            .routed_thinking_level
+            .as_deref()
+            .filter(|level| !level.is_empty())
+            .map_or(String::new(), |level| format!(" • {level}"));
+        right_side_without_provider = format!("{right_side_without_provider} → {routed_id}{level}");
     }
+    // The provider in parentheses when there are multiple providers and
+    // there's enough room (`footer.ts:247-255`).
+    let mut right_side = right_side_without_provider.clone();
+    if data.available_provider_count > 1 && !data.model_id.is_empty() {
+        right_side = format!("({}) {right_side_without_provider}", data.model_provider);
+        if stats_left_width + MIN_PADDING + visible_width(&right_side) > width {
+            // Too wide, fall back.
+            right_side = right_side_without_provider;
+        }
+    }
+    right_side
 }
 
 impl FooterComponent {
@@ -270,23 +318,24 @@ impl FooterComponent {
 
         let mut stats_left = stats_parts.join(" ");
 
-        // The model on the right, with the thinking level when supported
-        // (`footer.ts:219-245`).
-        let right_side = stats_right_side(data);
-
+        // The left cell truncates before the right side is built, so the
+        // provider prefix knows the room left (`footer.ts:222-231`).
         let mut stats_left_width = visible_width(&stats_left);
         if stats_left_width > width {
             stats_left = truncate_to_width(&stats_left, width, "...", false);
             stats_left_width = visible_width(&stats_left);
         }
 
-        let min_padding = 2usize;
+        // The model on the right, with the thinking level, the routed virtual
+        // model, and the provider prefix (`footer.ts:233-255`).
+        let right_side = stats_right_side(data, stats_left_width, width);
+
         let right_side_width = visible_width(&right_side);
-        let stats_line = if stats_left_width + min_padding + right_side_width <= width {
+        let stats_line = if stats_left_width + MIN_PADDING + right_side_width <= width {
             let padding = " ".repeat(width - stats_left_width - right_side_width);
             format!("{stats_left}{padding}{right_side}")
         } else {
-            let available_for_right = width.saturating_sub(stats_left_width + min_padding);
+            let available_for_right = width.saturating_sub(stats_left_width + MIN_PADDING);
             if available_for_right > 0 {
                 let truncated_right =
                     truncate_to_width(&right_side, available_for_right, "", false);
@@ -370,7 +419,7 @@ mod tests {
             model_supports_reasoning: true,
             thinking_level: "medium".to_string(),
             auto_compact_enabled: true,
-            session_name: None,
+            ..FooterData::default()
         });
         let lines = footer.render_lines(80);
         assert_eq!(lines.len(), 2);
@@ -385,6 +434,139 @@ mod tests {
         assert!(plain.contains("$0.013"), "{plain}");
         assert!(plain.contains("12.3%/200k (auto)"), "{plain}");
         assert!(plain.ends_with("test-model • medium"), "{plain}");
+    }
+
+    /// A reasoning model at `off` spells the level out; a non-reasoning model
+    /// shows the bare id (`footer.ts:233-239`).
+    #[test]
+    fn thinking_level_display() {
+        let data = FooterData {
+            model_id: "test-model".to_string(),
+            model_provider: "test".to_string(),
+            ..FooterData::default()
+        };
+        let mut footer = FooterComponent::new(FooterData {
+            model_supports_reasoning: true,
+            thinking_level: "off".to_string(),
+            ..data.clone()
+        });
+        let plain = pi_tui::ansi::strip_terminal_sequences(&footer.render_lines(120)[1]);
+        assert!(plain.ends_with("test-model • thinking off"), "{plain}");
+        footer = FooterComponent::new(FooterData {
+            model_supports_reasoning: true,
+            thinking_level: "high".to_string(),
+            ..data.clone()
+        });
+        let plain = pi_tui::ansi::strip_terminal_sequences(&footer.render_lines(120)[1]);
+        assert!(plain.ends_with("test-model • high"), "{plain}");
+        // An empty level reads as `off` (`state.thinkingLevel || "off"`).
+        footer = FooterComponent::new(FooterData {
+            model_supports_reasoning: true,
+            ..data.clone()
+        });
+        let plain = pi_tui::ansi::strip_terminal_sequences(&footer.render_lines(120)[1]);
+        assert!(plain.ends_with("test-model • thinking off"), "{plain}");
+        // No reasoning support: the bare model id.
+        footer = FooterComponent::new(FooterData { ..data });
+        let plain = pi_tui::ansi::strip_terminal_sequences(&footer.render_lines(120)[1]);
+        assert!(plain.ends_with("test-model"), "{plain}");
+    }
+
+    /// With more than one available provider the model cell gains the
+    /// `(provider)` prefix (`footer.ts:247-255`).
+    #[test]
+    fn provider_prefix_shows_when_it_fits() {
+        let data = FooterData {
+            model_id: "test-model".to_string(),
+            model_provider: "anthropic".to_string(),
+            model_supports_reasoning: true,
+            thinking_level: "medium".to_string(),
+            auto_compact_enabled: true,
+            ..FooterData::default()
+        };
+        let footer = FooterComponent::new(FooterData {
+            available_provider_count: 3,
+            ..data.clone()
+        });
+        // Left cell "?/0 (auto)" (10) + 2 padding + "(anthropic) test-model
+        // • medium" (31) needs 43 columns; 60 leaves room for the prefix.
+        let plain = pi_tui::ansi::strip_terminal_sequences(&footer.render_lines(60)[1]);
+        assert!(
+            plain.ends_with("(anthropic) test-model • medium"),
+            "{plain}"
+        );
+        // One provider: no prefix.
+        let footer = FooterComponent::new(FooterData {
+            available_provider_count: 1,
+            ..data
+        });
+        let plain = pi_tui::ansi::strip_terminal_sequences(&footer.render_lines(60)[1]);
+        assert!(plain.ends_with("test-model • medium"), "{plain}");
+        assert!(!plain.contains("(anthropic)"), "{plain}");
+    }
+
+    /// The prefix falls back to the unprefixed cell when it would push the
+    /// line past the width (`footer.ts:251-254`).
+    #[test]
+    fn provider_prefix_falls_back_when_too_wide() {
+        let footer = FooterComponent::new(FooterData {
+            model_id: "test-model".to_string(),
+            model_provider: "anthropic".to_string(),
+            model_supports_reasoning: true,
+            thinking_level: "medium".to_string(),
+            available_provider_count: 3,
+            auto_compact_enabled: true,
+            ..FooterData::default()
+        });
+        // Left cell (10) + 2 padding + the prefixed cell (31) = 43 > 36, while
+        // the unprefixed cell (19) fits at 31 <= 36.
+        let plain = pi_tui::ansi::strip_terminal_sequences(&footer.render_lines(36)[1]);
+        assert!(plain.ends_with("test-model • medium"), "{plain}");
+        assert!(!plain.contains("(anthropic)"), "{plain}");
+    }
+
+    /// A virtual selection shows the physical model the latest response used
+    /// (`footer.ts:240-245`), before the provider prefix is applied.
+    #[test]
+    fn routed_virtual_model_appends_the_physical_model() {
+        let data = FooterData {
+            model_id: "acme/pool".to_string(),
+            model_provider: "acme".to_string(),
+            model_supports_reasoning: true,
+            thinking_level: "high".to_string(),
+            ..FooterData::default()
+        };
+        let footer = FooterComponent::new(FooterData {
+            routed_model_id: Some("claude-opus-4-5".to_string()),
+            routed_thinking_level: Some("medium".to_string()),
+            ..data.clone()
+        });
+        let plain = pi_tui::ansi::strip_terminal_sequences(&footer.render_lines(120)[1]);
+        assert!(
+            plain.ends_with("acme/pool • high → claude-opus-4-5 • medium"),
+            "{plain}"
+        );
+        // Without a recorded level the arrow ends at the model id.
+        let footer = FooterComponent::new(FooterData {
+            routed_model_id: Some("claude-opus-4-5".to_string()),
+            ..data.clone()
+        });
+        let plain = pi_tui::ansi::strip_terminal_sequences(&footer.render_lines(120)[1]);
+        assert!(
+            plain.ends_with("acme/pool • high → claude-opus-4-5"),
+            "{plain}"
+        );
+        // The prefix wraps the routed cell when there is room.
+        let footer = FooterComponent::new(FooterData {
+            routed_model_id: Some("claude-opus-4-5".to_string()),
+            available_provider_count: 2,
+            ..data
+        });
+        let plain = pi_tui::ansi::strip_terminal_sequences(&footer.render_lines(120)[1]);
+        assert!(
+            plain.ends_with("(acme) acme/pool • high → claude-opus-4-5"),
+            "{plain}"
+        );
     }
 
     #[test]

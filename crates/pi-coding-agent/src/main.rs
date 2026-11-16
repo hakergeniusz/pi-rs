@@ -143,6 +143,43 @@ type ModeUi = Option<Arc<dyn pi_ext_js::UiSink>>;
 #[cfg(not(feature = "ext-js"))]
 type ModeUi = ();
 
+/// `DEFAULT_THINKING_LEVEL` (`core/defaults.ts:3`): the session's starting
+/// level when neither the CLI, a resumed session, the per-model override,
+/// nor the `defaultThinkingLevel` setting provides one.
+const DEFAULT_THINKING_LEVEL: pi_agent::types::ThinkingLevel =
+    pi_agent::types::ThinkingLevel::Medium;
+
+/// The session's thinking level at startup (`createAgentSession`,
+/// `core/sdk.ts:253-278`): `cli_level` wins; else a resumed session with
+/// messages restores `recorded`, or the settings default when it recorded
+/// none; else the per-model override; else the settings default; else
+/// [`DEFAULT_THINKING_LEVEL`]. The result clamps to the model's supported
+/// levels (`clampThinkingLevel`, `packages/ai/src/models.ts:1315-1334`) —
+/// upstream's no-model arm (`sdk.ts:274`) cannot fire here, because
+/// `resolve_model_with` errors before a model-less runtime reaches this.
+fn initial_thinking_level(
+    cli_level: Option<pi_agent::types::ThinkingLevel>,
+    has_existing_session: bool,
+    recorded: Option<pi_agent::types::ThinkingLevel>,
+    per_model: Option<pi_agent::types::ThinkingLevel>,
+    default_setting: Option<pi_agent::types::ThinkingLevel>,
+    model: &pi_ai::types::Model,
+) -> pi_agent::types::ThinkingLevel {
+    let default_level = default_setting.unwrap_or(DEFAULT_THINKING_LEVEL);
+    let level = if let Some(level) = cli_level {
+        level
+    } else if has_existing_session {
+        // sdk.ts:255-260: a session with data restores its recorded level;
+        // with no recorded entry, the settings default (the per-model
+        // override is not consulted).
+        recorded.unwrap_or(default_level)
+    } else {
+        // sdk.ts:262-271: the per-model override, then the global default.
+        per_model.unwrap_or(default_level)
+    };
+    pi_agent::types::clamp_thinking_level(model, level)
+}
+
 /// Every non-RPC mode: headless extension host, like upstream's
 /// non-interactive paths that pass no `uiContext`.
 fn build_runtime(
@@ -371,6 +408,33 @@ fn build_runtime_with_ui(
     }
     .map_err(|error| error.to_string())?;
 
+    // Restore facts (`createAgentSession`, `core/sdk.ts:195-198`): whether the
+    // resumed session carries messages, and the level its branch recorded
+    // (`getSessionContextSettings`, `session-manager.ts:418-432` — the last
+    // `thinking_level_change` on the leaf path).
+    let projection = session.build_session_projection().ok();
+    let has_existing_session = projection
+        .as_ref()
+        .is_some_and(|projection| !projection.messages.is_empty());
+    let branch_has_thinking_entry =
+        session
+            .get_branch(None)
+            .unwrap_or_default()
+            .iter()
+            .any(|entry| {
+                matches!(
+                    entry,
+                    pi_coding_agent::session::records::SessionEntry::ThinkingLevelChange(_)
+                )
+            });
+    let recorded_thinking_level = if branch_has_thinking_entry {
+        projection
+            .as_ref()
+            .and_then(|projection| thinking_level_from_str(&projection.thinking_level).ok())
+    } else {
+        None
+    };
+
     // Tools: builtins plus extension tools (the CLI filters apply to both;
     // extension tools append after the builtins, like the upstream
     // registry order).
@@ -381,28 +445,32 @@ fn build_runtime_with_ui(
     // System prompt.
     let system_prompt = system_prompt_for(args, cwd_string)?;
 
-    // Thinking level: the `--thinking` flag wins; else the per-model
-    // override (`modelThinkingLevels[provider/id]`), then the
-    // `defaultThinkingLevel` setting, else off
-    // (`model-resolver.js:386-421`).
-    let thinking_level = if let Some(level) = args
-        .thinking
-        .as_deref()
-        .map(thinking_level_from_str)
-        .transpose()?
-    {
-        level
-    } else {
-        let key = format!("{}/{}", model.provider, model.id);
-        let level = settings
+    // Thinking level (`createAgentSession`, `core/sdk.ts:253-278`): the
+    // `--thinking` flag wins; else a resumed session restores its recorded
+    // level (or the default when the session recorded none — the per-model
+    // override is not consulted); else the per-model override
+    // (`modelThinkingLevels[provider/id]`); else the `defaultThinkingLevel`
+    // setting; else `DEFAULT_THINKING_LEVEL` = "medium"
+    // (`core/defaults.ts:3`). The resolved level clamps to the model's
+    // supported levels (`clampThinkingLevel`,
+    // `packages/ai/src/models.ts:1315-1334`).
+    let thinking_level = initial_thinking_level(
+        args.thinking
+            .as_deref()
+            .map(thinking_level_from_str)
+            .transpose()?,
+        has_existing_session,
+        recorded_thinking_level,
+        settings
             .get("modelThinkingLevels")
-            .and_then(|value| value.get(key.as_str()))
+            .and_then(|value| value.get(format!("{}/{}", model.provider, model.id).as_str()))
             .and_then(|value| value.as_str())
-            .map(str::to_string)
-            .or_else(|| settings.get_default_thinking_level())
-            .unwrap_or_else(|| "off".to_string());
-        thinking_level_from_str(&level).unwrap_or_default()
-    };
+            .and_then(|level| thinking_level_from_str(level).ok()),
+        settings
+            .get_default_thinking_level()
+            .and_then(|level| thinking_level_from_str(&level).ok()),
+        &model,
+    );
 
     let compaction_settings = settings
         .get_compaction_settings(Some((model.provider.as_str(), model.id.as_str())))
@@ -534,4 +602,145 @@ fn run_rpc(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, 
     #[cfg(not(feature = "ext-js"))]
     let mut runtime = build_runtime(args, cwd, cwd_string, "rpc")?;
     run_rpc_mode(&mut runtime, &mut bridge)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(reasoning: bool) -> pi_ai::types::Model {
+        pi_ai::types::Model {
+            id: "test-model".to_string(),
+            api: "anthropic-messages".to_string(),
+            provider: "anthropic".to_string(),
+            reasoning,
+            ..pi_ai::types::Model::default()
+        }
+    }
+
+    /// Nothing configured: upstream starts a reasoning model at
+    /// `DEFAULT_THINKING_LEVEL` = "medium" (`core/defaults.ts:3`,
+    /// `core/sdk.ts:270`).
+    #[test]
+    fn a_reasoning_model_defaults_to_medium() {
+        assert_eq!(
+            initial_thinking_level(None, false, None, None, None, &model(true)),
+            pi_agent::types::ThinkingLevel::Medium
+        );
+    }
+
+    /// A resumed session restores its recorded level; an explicit "off" wins
+    /// over the default, and a session without a recorded entry takes the
+    /// settings default with the per-model override ignored (`sdk.ts:255-260`).
+    #[test]
+    fn a_resumed_session_restores_its_recorded_level() {
+        let reasoning = model(true);
+        assert_eq!(
+            initial_thinking_level(
+                None,
+                true,
+                Some(pi_agent::types::ThinkingLevel::High),
+                Some(pi_agent::types::ThinkingLevel::Low),
+                None,
+                &reasoning
+            ),
+            pi_agent::types::ThinkingLevel::High
+        );
+        assert_eq!(
+            initial_thinking_level(
+                None,
+                true,
+                Some(pi_agent::types::ThinkingLevel::Off),
+                Some(pi_agent::types::ThinkingLevel::Low),
+                None,
+                &reasoning
+            ),
+            pi_agent::types::ThinkingLevel::Off
+        );
+        assert_eq!(
+            initial_thinking_level(
+                None,
+                true,
+                None,
+                Some(pi_agent::types::ThinkingLevel::Low),
+                None,
+                &reasoning
+            ),
+            pi_agent::types::ThinkingLevel::Medium
+        );
+        assert_eq!(
+            initial_thinking_level(
+                None,
+                true,
+                None,
+                Some(pi_agent::types::ThinkingLevel::Low),
+                Some(pi_agent::types::ThinkingLevel::High),
+                &reasoning
+            ),
+            pi_agent::types::ThinkingLevel::High
+        );
+    }
+
+    /// A fresh session takes the per-model override, then the settings
+    /// default, then "medium" (`sdk.ts:262-271`).
+    #[test]
+    fn a_fresh_session_takes_the_override_then_the_default() {
+        let reasoning = model(true);
+        assert_eq!(
+            initial_thinking_level(
+                None,
+                false,
+                None,
+                Some(pi_agent::types::ThinkingLevel::Low),
+                Some(pi_agent::types::ThinkingLevel::High),
+                &reasoning
+            ),
+            pi_agent::types::ThinkingLevel::Low
+        );
+        assert_eq!(
+            initial_thinking_level(
+                None,
+                false,
+                None,
+                None,
+                Some(pi_agent::types::ThinkingLevel::High),
+                &reasoning
+            ),
+            pi_agent::types::ThinkingLevel::High
+        );
+        assert_eq!(
+            initial_thinking_level(None, false, None, None, None, &reasoning),
+            pi_agent::types::ThinkingLevel::Medium
+        );
+    }
+
+    /// The CLI flag wins over everything and the resolved level clamps to the
+    /// model's supported levels (`sdk.ts:253` + `sdk.ts:277`,
+    /// `clampThinkingLevel`): `xhigh` without a `thinkingLevelMap` lands on
+    /// `high`, and a non-reasoning model only ever supports `off`.
+    #[test]
+    fn the_cli_flag_wins_and_clamps_to_the_model() {
+        assert_eq!(
+            initial_thinking_level(
+                Some(pi_agent::types::ThinkingLevel::Xhigh),
+                true,
+                Some(pi_agent::types::ThinkingLevel::Off),
+                None,
+                None,
+                &model(true)
+            ),
+            pi_agent::types::ThinkingLevel::High
+        );
+        assert_eq!(
+            initial_thinking_level(
+                Some(pi_agent::types::ThinkingLevel::High),
+                false,
+                None,
+                None,
+                None,
+                &model(false)
+            ),
+            pi_agent::types::ThinkingLevel::Off
+        );
+    }
 }

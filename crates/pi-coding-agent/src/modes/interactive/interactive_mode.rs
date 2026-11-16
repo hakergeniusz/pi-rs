@@ -693,6 +693,41 @@ fn model_thinking_levels(settings: &SettingsManager) -> BTreeMap<String, String>
         .unwrap_or_default()
 }
 
+/// The wire name of a level recorded on an assistant message (TS
+/// `ThinkingLevel`'s string union; `pi-ai`'s enum serializes camelCase).
+fn recorded_level_name(level: pi_ai::types::ThinkingLevel) -> &'static str {
+    match level {
+        pi_ai::types::ThinkingLevel::Minimal => "minimal",
+        pi_ai::types::ThinkingLevel::Off => "off",
+        pi_ai::types::ThinkingLevel::Low => "low",
+        pi_ai::types::ThinkingLevel::Medium => "medium",
+        pi_ai::types::ThinkingLevel::High => "high",
+    }
+}
+
+/// `updateAvailableProviderCount` (`interactive-mode.ts:5444-5451`): the
+/// unique providers among the available models — upstream the
+/// `scopedModels` list, else `modelRuntime.getAvailableSnapshot()`, which
+/// keeps the composed catalog's models on providers with configured
+/// credentials (`model-runtime.ts:332-341` `snapshot.available`). The port's
+/// snapshot is the composed catalog (`models_state::all`); availability is
+/// the provider's resolvable wire credential, the same ladder the requests
+/// use.
+fn available_provider_count(auth_path: &std::path::Path) -> usize {
+    let mut providers: Vec<String> = Vec::new();
+    for model in crate::models_state::all() {
+        if !providers.iter().any(|existing| existing == &model.provider) {
+            providers.push(model.provider.clone());
+        }
+    }
+    providers
+        .into_iter()
+        .filter(|provider| {
+            crate::modes::print_mode::resolve_wire_credential(provider, None, auth_path).is_some()
+        })
+        .count()
+}
+
 /// The interactive mode (`InteractiveMode`, reduced to the chat core).
 // The booleans mirror upstream TS state flags; the port keeps them one-to-one.
 #[allow(clippy::struct_excessive_bools)]
@@ -1319,6 +1354,9 @@ impl InteractiveMode {
             model_provider: runtime.model.provider.clone(),
             model_supports_reasoning: runtime.model.reasoning,
             thinking_level: runtime.thinking_level.as_str().to_string(),
+            available_provider_count: available_provider_count(&crate::config::get_auth_path()),
+            routed_model_id: None,
+            routed_thinking_level: None,
             auto_compact_enabled: false,
         }
     }
@@ -1818,8 +1856,9 @@ impl InteractiveMode {
         }
     }
 
-    /// Recompute the footer's usage totals from the session
-    /// (`FooterComponent.getSessionStats`).
+    /// Recompute the footer's session-derived cells: the usage totals
+    /// (`FooterComponent.getSessionStats`), the model and thinking level, the
+    /// available provider count, and the routed virtual model.
     fn refresh_footer(&mut self) {
         let mut totals = UsageTotals::default();
         let mut latest_cache_hit_rate: Option<f64> = None;
@@ -1844,6 +1883,40 @@ impl InteractiveMode {
         let thinking_level = self.thinking_level.as_str().to_string();
         let model_id = self.model.id.clone();
         let model_supports_reasoning = self.model.reasoning;
+        // The provider count behind the `(provider)` prefix
+        // (`updateAvailableProviderCount`, `interactive-mode.ts:5444-5451`).
+        let provider_count = available_provider_count(&self.auth_path);
+        // Under a virtual selection, the physical model of the latest
+        // successful response (`session.routedModel`, `agent-session.ts:1538-1543`;
+        // `findLatestResponse`, `virtual-models.ts:110-118`; `getPhysicalModel`
+        // keeps only non-virtual answers).
+        let routed = if crate::virtual_models::is_virtual_model(&self.model) {
+            self.session
+                .build_session_projection()
+                .ok()
+                .and_then(|projection| {
+                    crate::virtual_models::find_latest_response(&projection.messages).and_then(
+                        |latest| {
+                            crate::models_state::lookup(&latest.provider, &latest.model)
+                                .filter(|physical| {
+                                    !crate::virtual_models::is_virtual_model(physical)
+                                })
+                                .map(|physical| {
+                                    (
+                                        physical.id.clone(),
+                                        latest
+                                            .thinking_level
+                                            .map(|level| recorded_level_name(level).to_string()),
+                                    )
+                                })
+                        },
+                    )
+                })
+        } else {
+            None
+        };
+        let (routed_model_id, routed_thinking_level) =
+            routed.map_or((None, None), |(id, level)| (Some(id), level));
         let Some(footer) = self.downcast_tree::<FooterComponent>(HostSlot::Footer) else {
             return;
         };
@@ -1853,6 +1926,9 @@ impl InteractiveMode {
         footer.data.thinking_level = thinking_level;
         footer.data.model_id = model_id;
         footer.data.model_supports_reasoning = model_supports_reasoning;
+        footer.data.available_provider_count = provider_count;
+        footer.data.routed_model_id = routed_model_id;
+        footer.data.routed_thinking_level = routed_thinking_level;
     }
 
     // --------------------------------------------------------------
