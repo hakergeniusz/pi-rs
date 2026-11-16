@@ -22,7 +22,12 @@
 //!    callbacks whose one-way notifications cross the `oauthNotify` op
 //!    and whose prompt promises the host resolves token-verified through
 //!    `oauthResolvePrompt`; `core/provider-composer.ts:358-377, 488-511`,
-//!    `packages/ai/src/compat/extension-oauth-types.ts:39-47`).
+//!    `packages/ai/src/compat/extension-oauth-types.ts:39-47`), and the
+//!    stream options' fn-valued instrumentation (`onPayload` suspends on
+//!    a promise the host resolves with the `before_provider_request`
+//!    chain's value, the one-way hooks queue through `providerHookEvent`,
+//!    `signal` is a plain object the host flips — the handler contract is
+//!    `custom-provider.md:195-198`).
 //! 2. [`TYPEBOX_SHIM`] — the `typebox` virtual module. Upstream serves the
 //!    real bundled `TypeBox` (`virtual-modules.ts`); the E1 shim reproduces
 //!    the exact construction semantics of the builders extensions use
@@ -1300,8 +1305,46 @@ globalThis.__piSessionCallProviderStream = function (id, provider) {
     return;
   }
   session.eventName = "providerStream";
+  // The `SimpleStreamOptions` instrumentation crosses as functions
+  // (custom-provider.md:195-198 — handlers call the hooks; pi sets them
+  // on every run, `sdk.ts:424-426`): `onPayload` suspends on a promise
+  // the host resolves with the `before_provider_request` chain's final
+  // value; the one-way hooks queue FIFO through the `providerHookEvent`
+  // op; `signal` is a plain object the host flips when the run aborts.
+  const options =
+    session.event.options && typeof session.event.options === "object"
+      ? session.event.options
+      : (session.event.options = {});
+  session.providerHookToken = 0;
+  session.providerHookPrompts = new Map();
+  session.streamSignal = { aborted: false };
+  options.signal = session.streamSignal;
+  options.onPayload = (payload) =>
+    new Promise((resolve) => {
+      const token = ++session.providerHookToken;
+      session.providerHookPrompts.set(token, resolve);
+      globalThis.__piOps.providerHookPayload(
+        id,
+        token,
+        JSON.stringify(payload ?? null),
+      );
+    });
+  options.onResponse = (response) => {
+    globalThis.__piOps.providerHookEvent(
+      id,
+      "after_provider_response",
+      JSON.stringify(response ?? null),
+    );
+  };
+  options.onProviderStreamEvent = (data, model) => {
+    globalThis.__piOps.providerHookEvent(
+      id,
+      "provider_stream_event",
+      JSON.stringify({ data: data ?? null, model: model ?? null }),
+    );
+  };
   Promise.resolve()
-    .then(() => streamFn(session.event.model, session.event.context, session.event.options))
+    .then(() => streamFn(session.event.model, session.event.context, options))
     .then(async (stream) => {
       for await (const event of stream) {
         globalThis.__piOps.providerStreamEvent(id, JSON.stringify(event));
@@ -1383,6 +1426,34 @@ globalThis.__piResolveOAuthPrompt = function (id, token, answerJson) {
   }
   pending.resolve(answer);
   return "ok";
+};
+
+// Resolves a stream session's pending `onPayload` promise with the
+// `before_provider_request` chain's final value (the handler uses any
+// non-undefined replacement, like the built-in adapters do). Token
+// verified like the oauth prompts; prompts live on the session object,
+// so `session_end` releases them.
+globalThis.__piResolveProviderHook = function (id, token, resultJson) {
+  const session = globalThis.__piSessions.get(id);
+  if (!session || !session.providerHookPrompts) return "no-prompt";
+  const pending = session.providerHookPrompts.get(token);
+  if (pending === undefined) return "token-mismatch";
+  session.providerHookPrompts.delete(token);
+  let value;
+  try {
+    value = JSON.parse(resultJson);
+  } catch {
+    value = undefined;
+  }
+  pending(value);
+  return "ok";
+};
+
+// Flags a stream session's crossed `signal.aborted` — the run's abort
+// reaching a handler that polls it between yields.
+globalThis.__piFlipProviderSignal = function (id) {
+  const session = globalThis.__piSessions.get(id);
+  if (session && session.streamSignal) session.streamSignal.aborted = true;
 };
 
 globalThis.__piOAuthHasLogin = function (provider) {

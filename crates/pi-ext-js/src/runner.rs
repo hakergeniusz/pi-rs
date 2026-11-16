@@ -15,7 +15,12 @@
 //! (`core/provider-composer.ts:588-613`): the stashed `streamSimple`
 //! handler (`core/extensions/types.ts:1989-2007`) is invoked with the
 //! marshalled request and its event stream drains through the
-//! `providerStreamEvent` op. The oauth surface is the host half of
+//! `providerStreamEvent` op. The crossed options' instrumentation is
+//! serviced by the drain: `onPayload` runs `before_provider_request`'s
+//! transform chain (`emitBeforeProviderRequest`, `runner.ts:1375-1398`;
+//! pi sets the three hooks on every run, `sdk.ts:424-426`), the one-way
+//! `onResponse`/`onProviderStreamEvent` events emit FIFO, and the run's
+//! abort flips the crossed `signal` object. The oauth surface is the host half of
 //! `adaptOAuth` (`core/provider-composer.ts:358-377, 488-511`):
 //! [`ExtensionRunner::oauth_login_start`] drives the stashed `login` in a
 //! dispatch session (notifications poll through the oauth slots, prompts
@@ -1744,18 +1749,40 @@ impl ExtensionRunner {
     /// events already emitted, mirroring upstream's lazyStream: a
     /// setup/iteration failure appends the terminal error event after the
     /// events already forwarded (`packages/ai/src/api/lazy.ts:65-105`).
+    ///
+    /// The `SimpleStreamOptions` instrumentation the glue decorated the
+    /// options with is serviced here: `onPayload` asks run the
+    /// `before_provider_request` transform chain and resolve with its
+    /// final value (`sdk.ts:374-382`'s `transformProviderPayload`), the
+    /// one-way `onResponse`/`onProviderStreamEvent` events emit FIFO, and
+    /// `signal` — a reader over the run's abort flag — flips the crossed
+    /// object once the run aborts. `signal` is a closure because this
+    /// crate stays `pi-agent`-free.
     pub fn provider_stream(
         &mut self,
         provider: &str,
         request: &Json,
+        signal: Option<&dyn Fn() -> bool>,
     ) -> Result<ProviderStreamOutcome, JsHostError> {
         let payload =
             serde_json::to_string(request).map_err(|err| JsHostError::Job(err.to_string()))?;
+        // The `provider_stream_event` model fallback: a handler may omit
+        // the model argument; upstream's adapters always pass the request
+        // model (the shape sdk.ts:388-397 emits).
+        let fallback = request.get("model").cloned().unwrap_or(Json::Null);
+        let model_field = |model: &Json, field: &str, backstop: &str| -> String {
+            model
+                .get(field)
+                .and_then(Json::as_str)
+                .unwrap_or(backstop)
+                .to_string()
+        };
         let id = self
             .host
             .session_begin(&payload, ContextKind::ProviderStream, None)?;
         let call = self.host.session_call_provider_stream(id, provider);
-        let outcome = match call.and_then(|()| self.settle_session(id)) {
+        let outcome = match call.and_then(|()| self.drain_stream_session(id, signal, &fallback, &model_field))
+        {
             Ok(()) => parse_session_outcome(&self.host.session_last(id)?),
             Err(err) => {
                 let events = self.host.take_provider_stream_events(id);
@@ -1779,6 +1806,145 @@ impl ExtensionRunner {
             None => Some("the handler never settled while draining the job queue".to_string()),
         };
         Ok(ProviderStreamOutcome { events, error })
+    }
+
+    /// The stream session's drain: job rounds interleaved with the
+    /// hook servicing (`onPayload` transforms, one-way emissions, the
+    /// abort flip). Stops when the session settles or a round makes no
+    /// progress — the caller reads the pending slot like
+    /// [`Self::settle_session`]'s contract.
+    fn drain_stream_session(
+        &mut self,
+        id: u32,
+        signal: Option<&dyn Fn() -> bool>,
+        fallback_model: &Json,
+        model_field: &dyn Fn(&Json, &str, &str) -> String,
+    ) -> Result<(), JsHostError> {
+        let mut flipped = false;
+        loop {
+            self.host.drive_jobs()?;
+            let requests = self.host.drain_ui_requests();
+            if !requests.is_empty() {
+                for request in &requests {
+                    self.deliver_ui_request(request)?;
+                    self.host.drive_jobs()?;
+                }
+                continue;
+            }
+            if !flipped && signal.is_some_and(|signal| signal()) {
+                self.host.provider_flip_signal(id)?;
+                flipped = true;
+            }
+            let mut progressed = false;
+            let hooks = self.host.take_provider_hook_requests(id);
+            if !hooks.is_empty() {
+                progressed = true;
+            }
+            for (token, payload) in hooks {
+                let replaced = self.emit_before_provider_request(&payload)?;
+                self.host.provider_resolve_hook(id, token, &replaced)?;
+                self.host.drive_jobs()?;
+            }
+            let events = self.host.take_provider_hook_events(id);
+            if !events.is_empty() {
+                progressed = true;
+            }
+            for (kind, payload) in events {
+                match kind.as_str() {
+                    "after_provider_response" => {
+                        let status = payload.get("status").and_then(Json::as_i64).unwrap_or(0);
+                        let headers =
+                            payload.get("headers").cloned().unwrap_or(Json::Null);
+                        self.emit_after_provider_response(status, &headers)?;
+                    }
+                    "provider_stream_event" => {
+                        let data = payload.get("data").cloned().unwrap_or(Json::Null);
+                        let model = payload.get("model").cloned().unwrap_or(Json::Null);
+                        let provider = model_field(
+                            &model,
+                            "provider",
+                            &model_field(fallback_model, "provider", "unknown"),
+                        );
+                        let api =
+                            model_field(&model, "api", &model_field(fallback_model, "api", "unknown"));
+                        let model_id =
+                            model_field(&model, "id", &model_field(fallback_model, "id", "unknown"));
+                        self.emit_provider_stream_event(&data, &provider, &api, &model_id)?;
+                    }
+                    _ => {}
+                }
+            }
+            if self.session_settled(id)? {
+                return Ok(());
+            }
+            if !progressed {
+                // A promise only host actions can settle; leave the slot
+                // pending (the caller reads `{done:false}`).
+                return Ok(());
+            }
+        }
+    }
+
+    /// `before_provider_request`'s transform chain
+    /// (`emitBeforeProviderRequest`, `runner.ts:1375-1398`): each handler
+    /// receives a fresh event carrying the current payload; a
+    /// non-undefined return replaces it (a `null` replacement crosses as
+    /// `null`). Handler errors report through the error listeners; the
+    /// chain always answers the final payload.
+    pub fn emit_before_provider_request(&mut self, payload: &Json) -> Result<Json, JsHostError> {
+        let mut current = payload.clone();
+        for (index, handler) in self.handlers_for("before_provider_request") {
+            let event = json!({ "type": "before_provider_request", "payload": current });
+            let event_payload = serde_json::to_string(&event)
+                .map_err(|err| JsHostError::Job(err.to_string()))?;
+            let id = self
+                .host
+                .session_begin(&event_payload, ContextKind::Event, None)?;
+            self.host
+                .session_call(id, index, "before_provider_request", handler)?;
+            self.settle_session(id)?;
+            let raw = self.host.session_last(id)?;
+            let outcome = parse_session_outcome(&raw).map_err(|err| JsHostError::Job(err.to_string()))?;
+            let _ = self.host.session_end(id);
+            if let Some(error) = outcome.error {
+                self.report_error(index, "before_provider_request", error);
+            } else if let Some(value) = outcome.value {
+                current = value;
+            }
+        }
+        Ok(current)
+    }
+
+    /// `after_provider_response`'s notification fan-out
+    /// (`sdk.ts:379-387`'s `handleProviderResponse`): `{type, status,
+    /// headers}`; handler errors report, nothing returns.
+    pub fn emit_after_provider_response(&mut self, status: i64, headers: &Json) -> Result<(), JsHostError> {
+        self.emit(&json!({
+            "type": "after_provider_response",
+            "status": status,
+            "headers": headers,
+        }))?;
+        Ok(())
+    }
+
+    /// `provider_stream_event`'s notification fan-out (`sdk.ts:388-397`):
+    /// `{type, data, provider, api, model}`; handler errors report,
+    /// nothing returns.
+    pub fn emit_provider_stream_event(
+        &mut self,
+        data: &Json,
+        provider: &str,
+        api: &str,
+        model_id: &str,
+    ) -> Result<(), JsHostError> {
+        self.emit(&json!({
+            "type": "provider_stream_event",
+            "data": data,
+            "provider": provider,
+            "api": api,
+            "model": model_id,
+        }))?;
+        Ok(())
     }
 
     /// Provider registrations that failed validation at the bind-time
@@ -2687,6 +2853,7 @@ export default function (pi) {
                     "context": { "messages": [{ "role": "user", "content": "hi" }] },
                     "options": { "reasoning": "high", "apiKey": "sk-acme" },
                 }),
+                None,
             )
             .expect("stream");
         assert!(outcome.error.is_none());
@@ -2707,6 +2874,7 @@ export default function (pi) {
             .provider_stream(
                 "acme",
                 &json!({ "model": {}, "context": {}, "options": {} }),
+                None,
             )
             .expect("stream");
         assert_eq!(
@@ -2722,7 +2890,9 @@ export default function (pi) {
         // No stash entry: the glue settles the session with the
         // not-registered error (the route-glue's unregistered branch
         // shape), which the runner reports as the outcome error.
-        let outcome = runner.provider_stream("acme", &json!({})).expect("settled");
+        let outcome = runner
+            .provider_stream("acme", &json!({}), None)
+            .expect("settled");
         assert_eq!(outcome.events, Vec::<Json>::new());
         assert_eq!(
             outcome.error.as_deref(),
@@ -2748,7 +2918,9 @@ export default function (pi) {
         // The discard removed the stash entry, so the glue answers with the
         // not-registered error even though a live registration could have
         // survived.
-        let outcome = runner.provider_stream("acme", &json!({})).expect("settled");
+        let outcome = runner
+            .provider_stream("acme", &json!({}), None)
+            .expect("settled");
         assert_eq!(
             outcome.error.as_deref(),
             Some("Provider acme is not registered with a streamSimple handler.")
@@ -3145,6 +3317,231 @@ export default function (pi) {
     fn runner_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<ExtensionRunner>();
+    }
+
+    // ---- Provider-stream options instrumentation (E2 slice 6k:
+    // `SimpleStreamOptions` crosses as functions — pi sets the three hooks
+    // on every run, `sdk.ts:424-426`; the handler contract is
+    // `custom-provider.md:195-198`) ----
+
+    /// A provider whose handler exercises the whole crossed surface: the
+    /// `onPayload` round-trip (its return feeds the handler), the one-way
+    /// `onResponse`/`onProviderStreamEvent` events, and the `signal`
+    /// object. A sibling extension listens to all three bridged events —
+    /// the `before_provider_request` handler replaces the payload, the
+    /// notifications append entries the test reads back.
+    const EXT_PROVIDER_HOOKS: &str = r#"
+export default function (pi) {
+  pi.on("before_provider_request", (event) => ({ replaced: true, saw: event.payload }));
+  pi.on("after_provider_response", (event) => pi.appendEntry("hook-response", { status: event.status, header: event.headers["x-a"] }));
+  pi.on("provider_stream_event", (event) => pi.appendEntry("hook-event", { data: event.data, provider: event.provider, api: event.api, model: event.model }));
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    baseUrl: "https://acme.test/v1",
+    streamSimple: async function* (model, context, options) {
+      const payload = await options.onPayload({ original: true });
+      yield { type: "text_delta", contentIndex: 0, delta: `payload:${JSON.stringify(payload)}` };
+      options.onResponse({ status: 201, headers: { "x-a": "b" } });
+      await options.onProviderStreamEvent?.({ raw: "chunk" }, model);
+      yield { type: "done", reason: "stop", message: { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [] } };
+    },
+  });
+}
+"#;
+
+    #[test]
+    fn provider_stream_options_carry_the_instrumentation() {
+        let mut runner = runner_with(&[EXT_PROVIDER_HOOKS]);
+        let outcome = runner
+            .provider_stream(
+                "acme",
+                &json!({
+                    "model": { "id": "acme-1", "name": "Acme One", "api": "acme-api", "provider": "acme",
+                               "baseUrl": "https://acme.test/v1", "reasoning": true, "input": ["text"],
+                               "contextWindow": 90000, "maxTokens": 4096 },
+                    "context": { "messages": [] },
+                    "options": { "reasoning": "high" },
+                }),
+                None,
+            )
+            .expect("stream");
+        assert!(outcome.error.is_none());
+        // The handler's `onPayload` resolved with the transform chain's
+        // replacement — and the replacement carried the payload the
+        // handler sent (the fresh-event-per-handler chain).
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.get("delta").and_then(Json::as_str)
+                    == Some(r#"payload:{"replaced":true,"saw":{"original":true}}"#)
+            }),
+            "events: {:?}",
+            outcome.events
+        );
+        // The one-way hooks reached the extension listeners in FIFO order.
+        let core = runner.core().lock().expect("core");
+        let entry_data = |key: &str| -> Json {
+            core.entries
+                .iter()
+                .find(|(custom_type, _)| custom_type == key)
+                .map(|(_, data)| data.clone())
+                .expect(key)
+        };
+        assert_eq!(
+            entry_data("hook-response"),
+            json!({ "status": 201, "header": "b" })
+        );
+        assert_eq!(
+            entry_data("hook-event"),
+            json!({
+                "data": { "raw": "chunk" },
+                "provider": "acme",
+                "api": "acme-api",
+                "model": "acme-1",
+            })
+        );
+    }
+
+    /// Without listeners the chain answers the payload unchanged (upstream's
+    /// `transformProviderPayload` returns it; the handler still observes a
+    /// callable hook).
+    const EXT_PROVIDER_HOOKS_NO_LISTENERS: &str = r#"
+export default function (pi) {
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    streamSimple: async function* (model, context, options) {
+      const payload = await options.onPayload({ keep: "me" });
+      yield { type: "text_delta", contentIndex: 0, delta: `payload:${JSON.stringify(payload)}` };
+      yield { type: "done", reason: "stop", message: { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [] } };
+    },
+  });
+}
+"#;
+
+    #[test]
+    fn provider_stream_payload_chain_without_listeners_answers_the_input() {
+        let mut runner = runner_with(&[EXT_PROVIDER_HOOKS_NO_LISTENERS]);
+        let outcome = runner
+            .provider_stream(
+                "acme",
+                &json!({
+                    "model": { "id": "acme-1", "api": "acme-api", "provider": "acme" },
+                    "context": { "messages": [] },
+                    "options": {},
+                }),
+                None,
+            )
+            .expect("stream");
+        assert!(outcome.error.is_none());
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.get("delta").and_then(Json::as_str) == Some(r#"payload:{"keep":"me"}"#)
+            }),
+            "events: {:?}",
+            outcome.events
+        );
+    }
+
+    /// The transform chain feeds forward in listener order: the second
+    /// listener's replacement carries the first listener's, and an
+    /// undefined return keeps the current payload (upstream's
+    /// `handlerResult !== undefined` check).
+    const EXT_PROVIDER_HOOK_CHAIN: &str = r#"
+export default function (pi) {
+  pi.on("before_provider_request", (event) => ({ order: 1, saw: event.payload.order }));
+  pi.on("before_provider_request", () => undefined);
+  pi.on("before_provider_request", (event) => ({ order: event.payload.order + 1 }));
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    streamSimple: async function* (model, context, options) {
+      const payload = await options.onPayload({ order: 0 });
+      yield { type: "text_delta", contentIndex: 0, delta: `order:${payload.order}` };
+      yield { type: "done", reason: "stop", message: { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [] } };
+    },
+  });
+}
+"#;
+
+    #[test]
+    fn provider_stream_payload_chain_feeds_forward_in_listener_order() {
+        let mut runner = runner_with(&[EXT_PROVIDER_HOOK_CHAIN]);
+        let outcome = runner
+            .provider_stream(
+                "acme",
+                &json!({
+                    "model": { "id": "acme-1", "api": "acme-api", "provider": "acme" },
+                    "context": { "messages": [] },
+                    "options": {},
+                }),
+                None,
+            )
+            .expect("stream");
+        assert!(outcome.error.is_none());
+        // listener 1 → {order:1}, listener 2 keeps it, listener 3 → {order:2}.
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|event| event.get("delta").and_then(Json::as_str) == Some("order:2")),
+            "events: {:?}",
+            outcome.events
+        );
+    }
+
+    /// The crossed `signal` flips when the run aborts: a handler polling
+    /// it between yields observes the host's flag (`signal` rides the
+    /// options, `agent-loop.ts:414`).
+    const EXT_PROVIDER_SIGNAL: &str = r#"
+export default function (pi) {
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    streamSimple: async function* (model, context, options) {
+      yield { type: "text_delta", contentIndex: 0, delta: "before" };
+      // A handler passes the crossed signal to its own network waits; the
+      // host's abort during such an await is observed on resume.
+      await options.onPayload(null);
+      yield { type: "text_delta", contentIndex: 0, delta: options.signal.aborted ? "aborted" : "live" };
+      yield { type: "done", reason: "stop", message: { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [] } };
+    },
+  });
+}
+"#;
+
+    fn signal_request() -> Json {
+        json!({
+            "model": { "id": "acme-1", "api": "acme-api", "provider": "acme" },
+            "context": { "messages": [] },
+            "options": {},
+        })
+    }
+
+    #[test]
+    fn provider_stream_signal_flip_reaches_the_handler() {
+        let mut runner = runner_with(&[EXT_PROVIDER_SIGNAL]);
+        let outcome = runner
+            .provider_stream("acme", &signal_request(), Some(&|| true))
+            .expect("stream");
+        assert!(outcome.error.is_none());
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|event| event.get("delta").and_then(Json::as_str) == Some("aborted")),
+            "events: {:?}",
+            outcome.events
+        );
+        // No abort: the handler sees the live signal.
+        let mut runner = runner_with(&[EXT_PROVIDER_SIGNAL]);
+        let outcome = runner
+            .provider_stream("acme", &signal_request(), None)
+            .expect("stream");
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|event| event.get("delta").and_then(Json::as_str) == Some("live")),
+            "events: {:?}",
+            outcome.events
+        );
     }
 
     // ---- OAuth bridge (E2 slice 6j: `adaptOAuth`, provider-composer.ts:488-511;

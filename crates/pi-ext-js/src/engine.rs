@@ -145,6 +145,16 @@ pub struct HostCore {
     /// Sessions whose oauth `signal` the host aborted
     /// (`oauthAbortSignal`); the login function polls `signal.aborted`.
     pub oauth_aborted: Vec<u32>,
+    /// Provider-stream `onPayload` asks awaiting the host's transform
+    /// chain: (session id, token, payload) in ask order
+    /// (`__piSessionCallProviderStream` decorates the options; the
+    /// `before_provider_request` fan-out replaces the payload, its final
+    /// value resolves the handler's promise).
+    pub provider_hook_requests: Vec<(u32, u64, Json)>,
+    /// One-way provider-stream hook events: (session id, event kind —
+    /// `"after_provider_response"` or `"provider_stream_event"` — payload)
+    /// in emission order. The drain emits them FIFO.
+    pub provider_hook_events: Vec<(u32, String, Json)>,
     /// Provider registrations that failed validation at the bind-time
     /// flush, in flush order (the bindCore `emitError` reports).
     pub provider_bind_errors: Vec<crate::events::ProviderBindError>,
@@ -510,6 +520,41 @@ impl JsHost {
                 .push((
                     id,
                     token,
+                    serde_json::from_str(&payload).unwrap_or(Json::Null),
+                ));
+            String::new()
+        });
+        // A provider-stream `onPayload` ask: the handler awaits the
+        // returned promise until the host runs the
+        // `before_provider_request` transform chain and resolves it with
+        // the (possibly replaced) payload (`__piResolveProviderHook`).
+        op!("providerHookPayload", core, |id: u32,
+                                          token: u64,
+                                          payload: String|
+         -> String {
+            core.lock()
+                .expect("host core mutex poisoned")
+                .provider_hook_requests
+                .push((
+                    id,
+                    token,
+                    serde_json::from_str(&payload).unwrap_or(Json::Null),
+                ));
+            String::new()
+        });
+        // A provider-stream one-way hook (`onResponse` /
+        // `onProviderStreamEvent`): the event queues FIFO; the drain
+        // emits it to the extension listeners.
+        op!("providerHookEvent", core, |id: u32,
+                                        kind: String,
+                                        payload: String|
+         -> String {
+            core.lock()
+                .expect("host core mutex poisoned")
+                .provider_hook_events
+                .push((
+                    id,
+                    kind,
                     serde_json::from_str(&payload).unwrap_or(Json::Null),
                 ));
             String::new()
@@ -1051,6 +1096,73 @@ impl JsHost {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let abort: Function = ctx.globals().get("__piAbortOAuthSignal")?;
             let _: Value = abort.call((id,)).map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
+    /// Takes the stream session's pending `onPayload` asks, in ask
+    /// order; other sessions' asks are kept.
+    pub fn take_provider_hook_requests(&self, id: u32) -> Vec<(u64, Json)> {
+        let mut core = self.core.lock().expect("host core mutex poisoned");
+        let mut taken = Vec::new();
+        let mut rest = Vec::new();
+        for (queued, token, payload) in std::mem::take(&mut core.provider_hook_requests) {
+            if queued == id {
+                taken.push((token, payload));
+            } else {
+                rest.push((queued, token, payload));
+            }
+        }
+        core.provider_hook_requests = rest;
+        taken
+    }
+
+    /// Takes the stream session's queued one-way hook events, in
+    /// emission order; other sessions' events are kept.
+    pub fn take_provider_hook_events(&self, id: u32) -> Vec<(String, Json)> {
+        let mut core = self.core.lock().expect("host core mutex poisoned");
+        let mut taken = Vec::new();
+        let mut rest = Vec::new();
+        for (queued, kind, payload) in std::mem::take(&mut core.provider_hook_events) {
+            if queued == id {
+                taken.push((kind, payload));
+            } else {
+                rest.push((queued, kind, payload));
+            }
+        }
+        core.provider_hook_events = rest;
+        taken
+    }
+
+    /// Resolves the stream session's pending `onPayload` promise with the
+    /// transform chain's final value, verifying the ask's token
+    /// (`__piResolveProviderHook` answers `"ok"`, `"no-prompt"`, or
+    /// `"token-mismatch"`); the caller drains jobs so the handler resumes.
+    pub fn provider_resolve_hook(
+        &self,
+        id: u32,
+        token: u64,
+        payload: &Json,
+    ) -> Result<String, JsHostError> {
+        let payload_json =
+            serde_json::to_string(payload).map_err(|err| JsHostError::Job(err.to_string()))?;
+        self.ctx.with(|ctx| -> Result<String, JsHostError> {
+            let resolve: Function = ctx.globals().get("__piResolveProviderHook")?;
+            let resolution: String = resolve
+                .call((id, token, payload_json))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(resolution)
+        })
+    }
+
+    /// Flags the stream session's `signal.aborted` — the run's abort
+    /// reaching a handler that polls the crossed signal.
+    pub fn provider_flip_signal(&self, id: u32) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let flip: Function = ctx.globals().get("__piFlipProviderSignal")?;
+            let _: Value = flip
+                .call((id,))
+                .map_err(|err| Self::js_error(&ctx, err))?;
             Ok(())
         })
     }

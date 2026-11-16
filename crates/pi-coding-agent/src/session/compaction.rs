@@ -945,6 +945,7 @@ async fn complete_summarization(
         session_id: None,
         api_key: api_key.map(str::to_string),
         access_token: access_token.map(str::to_string),
+        signal: None,
     };
     let mut stream = stream_fn.stream(request);
     let mut partial: Option<pi_ai::types::AssistantMessage> = None;

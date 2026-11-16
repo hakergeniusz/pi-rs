@@ -350,6 +350,10 @@ pub struct StreamRequest {
     pub api_key: Option<String>,
     /// OAuth bearer credential (pi's `accessToken`); wins over `api_key`.
     pub access_token: Option<String>,
+    /// The run's live abort signal (pi's `options.signal`,
+    /// `agent-loop.ts:410-417`) — shared flag: a clone observes the run's
+    /// abort. `None` for engine-free constructions (compaction summaries).
+    pub signal: Option<AbortSignal>,
 }
 
 /// The injected stream seam.

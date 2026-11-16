@@ -651,6 +651,9 @@ async fn stream_assistant_response(
         session_id: config.session_id.clone(),
         api_key: config.api_key.clone(),
         access_token: config.access_token.clone(),
+        // The run's signal rides the options (`signal` in the spread,
+        // `agent-loop.ts:414`); streams observe the abort through it.
+        signal: Some(signal.clone()),
     };
 
     let mut stream = stream_fn.stream(request);

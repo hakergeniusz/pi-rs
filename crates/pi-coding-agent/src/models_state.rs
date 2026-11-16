@@ -308,10 +308,17 @@ pub fn stream_with_extension(
         }
     }
     let payload = marshal_stream_request(request);
+    // The run's abort flag as the drain's reader (`options.signal`,
+    // `agent-loop.ts:414`): the drain flips the crossed object once.
+    let signal = request
+        .signal
+        .as_ref()
+        .map(|signal| move || signal.aborted());
+    let signal = signal.as_ref().map(|read| read as &dyn Fn() -> bool);
     let (events, mut failure) = match runner
         .lock()
         .expect("extension runner mutex poisoned")
-        .provider_stream(&request.model.provider, &payload)
+        .provider_stream(&request.model.provider, &payload, signal)
     {
         Ok(outcome) => (outcome.events, outcome.error),
         Err(err) => (Vec::new(), Some(err.to_string())),
@@ -339,7 +346,12 @@ pub fn stream_with_extension(
 /// `apiKey`/`accessToken` ride `ProviderRequestOptions`
 /// (`packages/ai/src/types.ts:161-183`) and only present values cross
 /// (JSON drops `undefined`); `reasoning` is the clamped thinking level, the
-/// same clamp `ProviderStreamFn` applies (`xhigh`/`max` → `high`).
+/// same clamp `ProviderStreamFn` applies (`xhigh`/`max` → `high`). The
+/// fn-valued instrumentation (`onPayload`/`onResponse`/
+/// `onProviderStreamEvent`/`signal` — pi sets the three hooks on every
+/// run, `sdk.ts:424-426`) crosses in the stream glue, not here: the
+/// functions cannot ride JSON (`custom-provider.md:195-198` makes the
+/// handler call them).
 #[cfg(feature = "ext-js")]
 fn marshal_stream_request(request: &pi_agent::types::StreamRequest) -> Value {
     use pi_agent::types::ThinkingLevel;
@@ -615,6 +627,7 @@ export default function (pi) {
             session_id: Some("s1".to_string()),
             api_key: Some("sk-acme".to_string()),
             access_token: None,
+            signal: None,
         }
     }
 
@@ -754,6 +767,61 @@ export default function (pi) {
         assert_eq!(
             extension_oauth_api_key("nosuch", &serde_json::json!({})),
             None
+        );
+    }
+
+    /// The run's abort flag reaches the extension handler through the
+    /// marshalled `options.signal` (`agent-loop.ts:414` → the glue's
+    /// decoration): a handler polling it between awaits observes the
+    /// abort (slice 6k).
+    #[test]
+    #[cfg(feature = "ext-js")]
+    fn stream_with_extension_crosses_the_run_signal() {
+        const SOURCE: &str = r#"
+export default function (pi) {
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  const message = (text) => ({ role: "assistant", content: [{ type: "text", text }],
+    api: "acme-api", provider: "acme", model: "acme-1", usage, stopReason: "stop", timestamp: 0 });
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    streamSimple: async function* (model, context, options) {
+      await options.onPayload(null);
+      yield { type: "text_delta", contentIndex: 0, partial: message(""),
+              delta: options.signal.aborted ? "aborted" : "live" };
+      yield { type: "done", reason: "stop", message: message("done") };
+    },
+  });
+}
+"#;
+        let runner = Arc::new(std::sync::Mutex::new(stream_runner(SOURCE)));
+        let mut request = stream_request("acme-api");
+        let aborted = pi_agent::types::AbortSignal::default();
+        aborted.abort();
+        request.signal = Some(aborted);
+        let events = collect(
+            stream_with_extension(&runner, &request).expect("extension arm"),
+        );
+        assert!(
+            events.iter().any(|event| match event {
+                pi_agent::types::AssistantMessageEvent::TextDelta { delta, .. } => {
+                    delta == "aborted"
+                }
+                _ => false,
+            }),
+            "events: {events:?}"
+        );
+        // Without an abort the same handler sees the live signal.
+        let runner = Arc::new(std::sync::Mutex::new(stream_runner(SOURCE)));
+        let events = collect(
+            stream_with_extension(&runner, &stream_request("acme-api")).expect("extension arm"),
+        );
+        assert!(
+            events.iter().any(|event| match event {
+                pi_agent::types::AssistantMessageEvent::TextDelta { delta, .. } => delta == "live",
+                _ => false,
+            }),
+            "events: {events:?}"
         );
     }
 }
