@@ -17,6 +17,7 @@ use pi_agent::types::AbortSignal;
 use pi_ai::types::StopReason;
 
 use crate::config::settings::RetrySettings;
+use crate::session::records::ContextReplacement;
 
 /// One retry budget over a run (attempts reset when a run succeeds).
 pub struct AgentRetry {
@@ -111,6 +112,57 @@ pub fn last_error_text(messages: &[AgentMessage]) -> String {
         .unwrap_or_else(|| "Unknown error".to_string())
 }
 
+/// `_omitRecoveryAttempt` (`agent-session.ts:1311-1336`): the failed
+/// attempt stays in raw history but is omitted from the model projection.
+/// Upstream persists messages on `MessageEnd` mid-run; the port's tails
+/// persist after the loop, so the omission persists the failed assistant
+/// and its orphaned tool results here, then appends the `context_edit`
+/// omission records. Returns the serialized edit records for the
+/// `entry_appended` emissions (:1336).
+pub fn omit_attempt(messages: &[AgentMessage], session: &mut crate::session::SessionManager) -> Vec<serde_json::Value> {
+    let Some(index) = messages.iter().rposition(|message| matches!(message, AgentMessage::Assistant(_))) else {
+        return Vec::new();
+    };
+    let AgentMessage::Assistant(assistant) = &messages[index] else {
+        return Vec::new();
+    };
+    let tool_call_ids: std::collections::HashSet<&str> = assistant
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            pi_ai::types::AssistantContent::ToolCall(call) => Some(call.id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut targets: Vec<&AgentMessage> = vec![&messages[index]];
+    for message in &messages[index + 1..] {
+        match message {
+            AgentMessage::Assistant(_) => break,
+            AgentMessage::ToolResult(result)
+                if tool_call_ids.contains(result.tool_call_id.as_str()) =>
+            {
+                targets.push(message);
+            }
+            _ => {}
+        }
+    }
+    let mut records = Vec::new();
+    for target in targets {
+        let Ok(entry) = session.append_message(target.clone()) else {
+            continue;
+        };
+        let entry_id = entry.id().to_string();
+        if let Ok(edit_id) = session.append_context_edit(&entry_id, &ContextReplacement::Omit) {
+            if let Some(edit_entry) = session.get_entry(&edit_id) {
+                records.push(serde_json::Value::Object(
+                    edit_entry.to_record().object().clone(),
+                ));
+            }
+        }
+    }
+    records
+}
+
 /// Whether the run ended in success (`stopReason !== "error"`, the
 /// `auto_retry_end` success rule at `agent-session.ts:1246`).
 pub fn run_succeeded(messages: &[AgentMessage]) -> bool {
@@ -196,6 +248,64 @@ mod tests {
         )];
         let fresh = AgentRetry::new(settings(true));
         assert!(!fresh.will_retry(false, &quota));
+    }
+
+    #[test]
+    fn omit_attempt_persists_raw_and_appends_the_projection_edits() {
+        let mut session = crate::session::SessionManager::in_memory(
+            std::path::Path::new("/tmp"),
+            &crate::session::store::NewSessionOptions::default(),
+            Vec::new(),
+        )
+        .expect("session");
+        // A failed assistant with a tool call whose result follows it —
+        // both persist raw, both drop from the projection (:1318-1336).
+        let mut failed = test_assistant(StopReason::Error);
+        failed.error_message = Some("HTTP 503".to_string());
+        failed.content = vec![pi_ai::types::AssistantContent::ToolCall(pi_ai::types::ToolCall {
+            id: "t1".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::Map::new(),
+            thought_signature: None,
+            namespace: None,
+            arguments_error: None,
+        })];
+        let result = AgentMessage::ToolResult(pi_ai::types::ToolResultMessage {
+            tool_call_id: "t1".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![pi_ai::types::InputContent::Text(pi_ai::types::TextContent {
+                text: "ok".to_string(),
+                text_signature: None,
+            })],
+            details: None,
+            usage: None,
+            nested_calls: None,
+            is_error: false,
+            timestamp: 0,
+            duration_ms: None,
+        });
+        let messages = vec![AgentMessage::Assistant(failed), result];
+        let records = omit_attempt(&messages, &mut session);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["type"], "context_edit");
+        assert_eq!(records[0]["replacement"], serde_json::Value::Null);
+        let branch = session.get_branch(None).expect("branch");
+        // Raw history keeps the attempt and its result...
+        let message_entries = branch
+            .iter()
+            .filter(|entry| matches!(entry, crate::session::records::SessionEntry::Message(_)))
+            .count();
+        assert_eq!(message_entries, 2);
+        // ...and the projection omits both.
+        let projection =
+            crate::session::store::build_session_projection_from(&branch, None);
+        assert!(projection
+            .entries
+            .iter()
+            .all(|entry| entry.messages.is_empty()));
+        // Both edits omit their targets (JSON null replacements).
+        assert_eq!(records[1]["type"], "context_edit");
+        assert_eq!(records[1]["replacement"], serde_json::Value::Null);
     }
 
     #[test]
