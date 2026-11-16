@@ -473,6 +473,19 @@ export default function (pi) {
 "#;
 
     #[cfg(feature = "ext-js")]
+    struct StubStreamFn;
+
+    #[cfg(feature = "ext-js")]
+    impl pi_agent::types::StreamFn for StubStreamFn {
+        fn stream(
+            &self,
+            _request: pi_agent::types::StreamRequest,
+        ) -> futures::stream::BoxStream<'static, pi_agent::types::AssistantMessageEvent> {
+            Box::pin(futures::stream::iter(Vec::new()))
+        }
+    }
+
+    #[cfg(feature = "ext-js")]
     fn stream_runner(extension: &str) -> pi_ext_js::ExtensionRunner {
         let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
             cwd: "/tmp".to_string(),
@@ -542,6 +555,8 @@ export default function (pi) {
     #[test]
     #[cfg(feature = "ext-js")]
     fn stream_with_extension_arms_decide_by_api_and_registration() {
+        use pi_agent::types::StreamFn as _;
+
         let runner = Arc::new(std::sync::Mutex::new(stream_runner(STREAM_EXTENSION)));
         // The api is the streamWith gate: `model.api === extension.api`.
         assert!(stream_with_extension(&runner, &stream_request("other-api")).is_none());
@@ -551,17 +566,6 @@ export default function (pi) {
         assert!(stream_with_extension(&runner, &request).is_none());
         // The composed dispatch consults the arm per request: a matching
         // api replays the handler, any other falls to the base adapter.
-        use pi_agent::types::StreamFn as _;
-        struct StubStreamFn;
-        impl pi_agent::types::StreamFn for StubStreamFn {
-            fn stream(
-                &self,
-                _request: pi_agent::types::StreamRequest,
-            ) -> futures::stream::BoxStream<'static, pi_agent::types::AssistantMessageEvent>
-            {
-                Box::pin(futures::stream::iter(Vec::new()))
-            }
-        }
         let dispatch = ComposedStreamFn {
             runner: Arc::clone(&runner),
             fallback: Arc::new(StubStreamFn),
