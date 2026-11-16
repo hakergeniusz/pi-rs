@@ -253,7 +253,7 @@ impl pi_agent::types::StreamFn for ComposedStreamFn {
 ///
 /// Deviation (mechanism only, see HANDOFF.md): upstream forwards events as
 /// the handler emits them; the port drains the whole iterable inside the
-/// engine (no incremental crossing of the QuickJS boundary) and replays
+/// engine (no incremental crossing of the `QuickJS` boundary) and replays
 /// them, so downstream sees the events once the handler finishes. Ordering
 /// and terminal-event semantics are unchanged.
 #[cfg(feature = "ext-js")]
@@ -477,7 +477,7 @@ export default function (pi) {
         let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
             cwd: "/tmp".to_string(),
             mode: "print".to_string(),
-            settings: json!({}),
+            settings: serde_json::json!({}),
             ..Default::default()
         })
         .expect("runner");

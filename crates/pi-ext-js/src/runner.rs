@@ -1582,7 +1582,10 @@ impl ExtensionRunner {
             .find(|entry| entry.name == provider)?
             .config
             .as_object()?;
-        if !config.get("streamSimple").is_some_and(|v| v.as_bool().unwrap_or(false)) {
+        if !config
+            .get("streamSimple")
+            .is_some_and(|v| v.as_bool().unwrap_or(false))
+        {
             return None;
         }
         config.get("api").and_then(Json::as_str).map(str::to_string)
