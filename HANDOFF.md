@@ -1500,7 +1500,147 @@ pump cadence stands in for upstream's `setInterval`).
   prefix (`interactive-mode.ts:4811-4814`) — new code matched upstream
   via an own `show_warning`; unify later.
 
+## P5 package-manager subset (landed on `feat/p5-package-manager`, 2026-11-16)
+- Ports the git + local source arms of `package-manager.ts` verbatim
+  (`efc51a6`, CI 43950494495 success): `parseSource` over utils/git.ts
+  (`parseGitUrl`/`splitRef`/`buildGitSource`), install/remove/
+  installGit/ensureGitRef/getLocalGitUpdateTarget/removeGit, settings
+  persistence (`addSourceToSettings`/`removeSourceFromSettings`;
+  normalized local paths store relative to the scope base dir —
+  project base `cwd/.pi`), `listConfiguredPackages`, the match keys,
+  and the runCommand/runCommandCapture machinery with verbatim
+  failure/timeout texts. CLI (`cli/package_command.rs`): install/
+  remove/list/update with upstream's verbatim help texts, both trust
+  gates (the PM storage text vs the CLI config text), and the
+  SettingsManager flush contract — writes queue; the handler flushes,
+  then reports `drain_errors`.
+- **npm arm deferred with honest per-call errors** ("npm sources are
+  not implemented in pi-rs yet"): registry resolution, tarball
+  installs, the managed-install machinery (`:1357-1570`), `pi update`'s
+  temporary-scope machinery, and `getInstalledPath`'s legacy global
+  fallback all sit behind it. `build_no_matching_package_message` +
+  `find_suggested_configured_source` (the suggestion form) serve
+  `resolve()`'s missing-source callback — `#[allow(dead_code)]` until
+  that arm lands; the `pi remove` CLI prints the plain no-match form
+  directly, as upstream's CLI does.
+- Deviations: chalk → plain output (upstream's chalk degrades to plain
+  on non-TTY stdout and CLI subcommands run before any TUI exists);
+  the clean-failure progress event in cleanAndInstallGitDependencies
+  has no receiver (progress callback dropped — module doc).
+- Tests: 12 unit tests including a live git e2e (clone → update-in-place
+  fetch/reset via `@{upstream}` → removal with parent pruning) and a
+  container smoke of the real binary (install → settings.json persist
+  → list → remove → list-empty).
+
+## P5 RPC envelope reconciliation (landed on `feat/p5-rpc-envelope`, 2026-11-16)
+- Agent-written slice (two commits + gate fixes, `1cddbc0`, CI
+  43951436483 success). The wire now matches `modes/rpc/` upstream
+  (`rpc-types.ts`/`rpc-mode.ts` — note `rpc-entry.ts` is only the
+  process bootstrap): the discriminant IS `type` (not the port's
+  invented `{type:"command", command}` envelope), response frames
+  `{type:"response", command, success, data?|error}` with absent keys
+  dropped, upstream parse-error/unknown-command texts
+  (`Failed to parse command: <msg>`, `Unknown command: <type>`,
+  missing type → `Unknown command: undefined`), `steer` (upstream
+  name; was `steerable_prompt`) with real queueing and
+  `{disposition:"queued"}`, `follow_up` (was `followup_prompt`),
+  `prompt`'s `{disposition:"started"}` response emitted at preflight
+  BEFORE the event stream with post-preflight errors swallowed,
+  `shutdown`/`command_schemas()` removed (they do not exist upstream —
+  stdin EOF ends the mode), `set_model` with the full `Model` data +
+  transcript record, `get_state` carrying the full `RpcSessionState`
+  (optional keys dropped when unset), thinking-level CLAMP semantics
+  (invalid levels clamp, never reject), and 15 added commands
+  (`clear_queue`, `get_available_models`, `cycle_thinking_level`,
+  `compact`, `get_entries`, `get_tree`, `set_session_name`,
+  `get_fork_messages`, …), each mirroring its `handleCommand` case
+  with verbatim error strings.
+- pi-agent gained `agent_settled`/`queue_update`/
+  `thinking_level_changed`/`session_info_changed` event variants and
+  `duration_ms` on `tool_execution_end` (the invented `args` field is
+  gone); all three run tails emit `agent_settled`.
+- **Documented deviations** (in `rpc.rs`): serial dispatch (upstream
+  processes stdin lines concurrently) — no in-run steer/abort latency;
+  prompt has no extension-command execution, skill/template expansion,
+  auth precheck, or preflight-failure path; `queue_update` is not
+  re-emitted at delivery time; 9 commands parse as Unknown (machinery
+  absent: new/fork/clone/bash/session stats/export/commands);
+  wrong-typed payload fields read as absent rather than JS throws;
+  null request lines answer `Unknown command: undefined` (upstream
+  crashes).
+- Beyond RPC: blank stdin lines now produce the upstream parse-error
+  response (previously skipped); JSON mode emits the session header
+  first line (print-mode.ts:129-134 gap).
+- Tests: 12, including two e2e runs over a pipe pair (full state
+  frame + dropped keys; steering delivered mid-run with the queued
+  disposition, prompt response before events, `agent_settled` last).
+
+## P5 MCP server-manager + tool bridge (landed on `feat/p5-mcp-server-manager`, 2026-11-16)
+- Agent-written slice (+ gate fixes, `6d32c2f`). Server lifecycle
+  mirrors the bundled MCP extension: connections open at
+  `session_start` (the host now calls the previously-missing
+  `runner.bind()` — a fidelity fix; production never bound the
+  runtime), then `connect_mcp_servers()` reconciles the registry
+  against connection states (enabled servers connect through the new
+  `pi-ext-js::mcp_manager::McpManager` honoring `config.timeout ?? 60`;
+  unregistered/re-registered servers drop with their tools
+  re-registered `hidden`; disabled report `disabled`). Post-bind
+  registrations queue and drain at the end of every dispatch session
+  into one `mcp_servers_change` reconcile per change (re-entrancy
+  guarded); `shutdown_mcp()` closes everything at session_shutdown.
+- The tool bridge registers through the REAL extension surface: glue
+  `__piMcpRegisterTools` stores definitions in a synthetic
+  `builtin:mcp` record whose `execute` wrapper forwards to
+  `mcpCallTool` — first-wins aggregation, exposure, active-set,
+  validation, and `execute_tool` dispatch all behave extension-shaped.
+  Naming is `createMcpToolName` (sanitize, 64-char cap, sha256-8
+  suffix including the Codex rule that ALL in-list sanitize collisions
+  get the suffix); exposure = `getMcpToolExposure` → `toToolExposure`
+  (codemode → deferred); `convertMcpResult` is a line-by-line port
+  (text/image/audio/resource_link/resource blocks, empty-error
+  fallback text, 20 KiB middle truncation with a full-output temp
+  file, `details {server, tool, fullOutputPath?}`, structuredContent
+  = whole `CallToolResult` minus `_meta`).
+- E1 `mcp_registry.rs` fixes corrected here: exposure/auth field
+  validation with exact error strings, the `codemode-deferred` alias,
+  the resolved (not raw) config copy stored, `unregisterMcpServer` as
+  a silent no-op, and load-time registrations deferred through
+  `pendingChanges` so a failed extension's server dies with it.
+- Deviations (recorded): connects are synchronous at session_start
+  (upstream connects in background with a first-prompt ≤10 s wait) —
+  a hanging server delays startup by its timeout; `mcp_servers_change`
+  fires only at the next dispatch end; no stderr tail on connect
+  failures; `tools/list_changed` notifications unhandled; URL-pattern
+  globs use an in-order literal scan; block-level `_meta`/`annotations`
+  do not survive the decode. Open items with citations: Streamable
+  HTTP transport + OAuth, resources, `/mcp` manager UI, `mcp.json`
+  loading, `startupWaitMs`, the `mcp_servers` system-prompt section,
+  `pi mcp list`.
+- Tests: 24 new (config-value resolution incl. `!cmd`/`$$`/`$!`,
+  result mapping + truncation, naming, validation, and five full
+  runner pipeline tests through the JS bridge over a bash fixture
+  server answering initialize/tools list/call/ping).
+
 ## Gotchas / decisions
+- **Record the FULL gate output, all steps (hit 2026-11-16)**: the 6j/6k
+  landing notes recorded only FMT/CLIPPY/TEST/FMTCHECK=0 while
+  `.gate.sh`'s no-default-features step had been failing since slice 6j
+  (the login pump touched the ext-js-only `extension_runner` field
+  without cfg gates; CI never runs NDF, so only the container gate can
+  catch it). Record every step status — NDF=0 included — or a step can
+  silently stay red for two slices (fixed on `1024181`).
+- **A shebang-less fixture script dies with "Exec format error"
+  (hit 2026-11-16, MCP slice)**: the MCP manager spawns the server
+  command directly, so a fixture server script needs `#!/bin/sh`;
+  dry-running it under an interpreter masks the missing shebang.
+- **Python cut-and-relocate scripts corrupt files (hit 2026-11-16 on
+  package_manager.rs)**: a regex-signature + doc-walk-back +
+  brace-matching + dedent script applied 4× interleaved junk into the
+  file head; the symptom was bogus rustc "prefix `X` is unknown" errors
+  on plain-ASCII strings. The truncation repair then cut ~650 lines of
+  real definitions — recovered by reconstructing from upstream ground
+  truth with the surviving tests as the spec. Prefer Edit-tool
+  relocations; verify head/tail integrity after any multi-cut script.
 - **CI triggers only on pushes to `main` (2026-11-16)**: branch pushes
   create no runs — branch-level certification is the container gate, and
   `.gate.sh` now exits non-zero when ANY step fails (its per-step echoes
