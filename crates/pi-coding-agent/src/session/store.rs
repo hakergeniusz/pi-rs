@@ -1564,41 +1564,46 @@ impl SessionManager {
     // -- appends -------------------------------------------------------------
 
     /// `appendMessage` (`:1222-1232`): append a message as child of the
-    /// current leaf, then advance the leaf. Returns the entry id.
-    pub fn append_message(&mut self, message: AgentMessage) -> SessionResult<String> {
-        let entry = SessionMessageEntry {
+    /// current leaf, then advance the leaf. Returns the appended entry (the
+    /// `entry_appended` emission consumes it).
+    pub fn append_message(&mut self, message: AgentMessage) -> SessionResult<SessionEntry> {
+        let entry = SessionEntry::Message(SessionMessageEntry {
             base: self.new_entry_base(),
             message,
             unknown: JsonObject::new(),
-        };
-        let id = entry.base.id.clone();
-        self.append_record(SessionEntry::Message(entry).to_record())?;
-        Ok(id)
+        });
+        self.append_record(entry.clone().to_record())?;
+        Ok(entry)
     }
 
-    /// `appendThinkingLevelChange` (`:1235-1245`).
-    pub fn append_thinking_level_change(&mut self, thinking_level: &str) -> SessionResult<String> {
-        let entry = ThinkingLevelChangeEntry {
+    /// `appendThinkingLevelChange` (`:1235-1245`). Returns the appended entry.
+    pub fn append_thinking_level_change(
+        &mut self,
+        thinking_level: &str,
+    ) -> SessionResult<SessionEntry> {
+        let entry = SessionEntry::ThinkingLevelChange(ThinkingLevelChangeEntry {
             base: self.new_entry_base(),
             thinking_level: thinking_level.to_string(),
             unknown: JsonObject::new(),
-        };
-        let id = entry.base.id.clone();
-        self.append_record(SessionEntry::ThinkingLevelChange(entry).to_record())?;
-        Ok(id)
+        });
+        self.append_record(entry.clone().to_record())?;
+        Ok(entry)
     }
 
-    /// `appendModelChange` (`:1248-1259`).
-    pub fn append_model_change(&mut self, provider: &str, model_id: &str) -> SessionResult<String> {
-        let entry = ModelChangeEntry {
+    /// `appendModelChange` (`:1248-1259`). Returns the appended entry.
+    pub fn append_model_change(
+        &mut self,
+        provider: &str,
+        model_id: &str,
+    ) -> SessionResult<SessionEntry> {
+        let entry = SessionEntry::ModelChange(ModelChangeEntry {
             base: self.new_entry_base(),
             provider: provider.to_string(),
             model_id: model_id.to_string(),
             unknown: JsonObject::new(),
-        };
-        let id = entry.base.id.clone();
-        self.append_record(SessionEntry::ModelChange(entry).to_record())?;
-        Ok(id)
+        });
+        self.append_record(entry.clone().to_record())?;
+        Ok(entry)
     }
 
     /// `appendUsage` (`:1262-1276`): append model-attributed usage that does
@@ -1627,7 +1632,7 @@ impl SessionManager {
 
     /// `appendCompaction` (`:1279-1305`): append a compaction summary as child
     /// of the current leaf. Stores the complete prompt/tool checkpoint as its
-    /// `systemMessage`.
+    /// `systemMessage`. Returns the appended entry.
     pub fn append_compaction(
         &mut self,
         summary: &str,
@@ -1636,7 +1641,7 @@ impl SessionManager {
         details: Option<Value>,
         from_hook: Option<bool>,
         usage: Option<Usage>,
-    ) -> SessionResult<String> {
+    ) -> SessionResult<SessionEntry> {
         let timestamp = now_iso8601();
         let projection = self.build_session_projection()?;
         let system_message =
@@ -1659,8 +1664,8 @@ impl SessionManager {
             system_message,
             unknown: JsonObject::new(),
         };
-        self.append_record(SessionEntry::Compaction(entry).to_record())?;
-        Ok(id)
+        self.append_record(SessionEntry::Compaction(entry.clone()).to_record())?;
+        Ok(SessionEntry::Compaction(entry))
     }
 
     /// `AgentSession.compact` (`agent-session.ts:2936-3060`) minus the
@@ -1752,16 +1757,15 @@ impl SessionManager {
     /// `appendSessionInfo` (`:1322-1333`): append a session info entry (e.g. a
     /// display name). Newline runs are collapsed to one space and the name is
     /// trimmed.
-    pub fn append_session_info(&mut self, name: &str) -> SessionResult<String> {
+    pub fn append_session_info(&mut self, name: &str) -> SessionResult<SessionEntry> {
         let sanitized = sanitize_session_name(name);
-        let entry = SessionInfoEntry {
+        let entry = SessionEntry::SessionInfo(SessionInfoEntry {
             base: self.new_entry_base(),
             name: Some(sanitized),
             unknown: JsonObject::new(),
-        };
-        let id = entry.base.id.clone();
-        self.append_record(SessionEntry::SessionInfo(entry).to_record())?;
-        Ok(id)
+        });
+        self.append_record(entry.clone().to_record())?;
+        Ok(entry)
     }
 
     /// `appendCustomMessageEntry` (`:1357-1375`): append an extension message
@@ -2564,7 +2568,7 @@ mod tests {
             // Running privileged: the chmod guard does not apply.
             return;
         }
-        assert_eq!(session.get_leaf_id(), Some(first.as_str()));
+        assert_eq!(session.get_leaf_id(), Some(first.id()));
         assert_eq!(session.get_entries().len(), 1);
     }
 
@@ -2610,7 +2614,7 @@ mod tests {
         let SessionEntry::BranchSummary(entry) = session.get_entry(&summary_id).unwrap() else {
             panic!("expected branch summary");
         };
-        assert_eq!(entry.from_id, id3);
+        assert_eq!(entry.from_id, id3.id());
         assert_eq!(entry.summary, "Summary of abandoned work");
         assert_eq!(entry.usage.map(|u| u.total_tokens), Some(100));
         assert_eq!(entry.base.parent_id, Some(id1));

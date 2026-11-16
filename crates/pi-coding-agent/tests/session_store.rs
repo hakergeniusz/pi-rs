@@ -169,9 +169,21 @@ fn append_message_creates_the_parent_id_chain() {
     )
     .unwrap();
 
-    let id1 = session.append_message(user_msg("first")).unwrap();
-    let id2 = session.append_message(assistant_msg("second")).unwrap();
-    let id3 = session.append_message(user_msg("third")).unwrap();
+    let id1 = session
+        .append_message(user_msg("first"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id2 = session
+        .append_message(assistant_msg("second"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id3 = session
+        .append_message(user_msg("third"))
+        .unwrap()
+        .id()
+        .to_string();
 
     let entries = session.get_entries();
     assert_eq!(entries.len(), 3);
@@ -192,9 +204,21 @@ fn append_thinking_level_change_integrates_into_the_tree() {
         Vec::new(),
     )
     .unwrap();
-    let msg_id = session.append_message(user_msg("hello")).unwrap();
-    let thinking_id = session.append_thinking_level_change("high").unwrap();
-    let _ = session.append_message(assistant_msg("response")).unwrap();
+    let msg_id = session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
+    let thinking_id = session
+        .append_thinking_level_change("high")
+        .unwrap()
+        .id()
+        .to_string();
+    let _ = session
+        .append_message(assistant_msg("response"))
+        .unwrap()
+        .id()
+        .to_string();
 
     let entries = session.get_entries();
     assert_eq!(entries.len(), 3);
@@ -215,9 +239,21 @@ fn append_model_change_integrates_into_the_tree() {
         Vec::new(),
     )
     .unwrap();
-    let msg_id = session.append_message(user_msg("hello")).unwrap();
-    let model_id = session.append_model_change("openai", "gpt-4").unwrap();
-    let _ = session.append_message(assistant_msg("response")).unwrap();
+    let msg_id = session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
+    let model_id = session
+        .append_model_change("openai", "gpt-4")
+        .unwrap()
+        .id()
+        .to_string();
+    let _ = session
+        .append_message(assistant_msg("response"))
+        .unwrap()
+        .id()
+        .to_string();
 
     let entries = session.get_entries();
     let SessionEntry::ModelChange(change) = session.get_entry(&model_id).unwrap() else {
@@ -244,8 +280,16 @@ fn append_compaction_integrates_into_the_tree() {
         Vec::new(),
     )
     .unwrap();
-    let id1 = session.append_message(user_msg("1")).unwrap();
-    let id2 = session.append_message(assistant_msg("2")).unwrap();
+    let id1 = session
+        .append_message(user_msg("1"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id2 = session
+        .append_message(assistant_msg("2"))
+        .unwrap()
+        .id()
+        .to_string();
     let compaction_id = session
         .append_compaction(
             "summary",
@@ -255,8 +299,14 @@ fn append_compaction_integrates_into_the_tree() {
             Some(false),
             Some(big_usage()),
         )
-        .unwrap();
-    let _ = session.append_message(user_msg("3")).unwrap();
+        .unwrap()
+        .id()
+        .to_string();
+    let _ = session
+        .append_message(user_msg("3"))
+        .unwrap()
+        .id()
+        .to_string();
 
     let entries = session.get_entries();
     let SessionEntry::Compaction(compaction) = session.get_entry(&compaction_id).unwrap() else {
@@ -278,11 +328,19 @@ fn append_custom_entry_integrates_into_the_tree() {
         Vec::new(),
     )
     .unwrap();
-    let msg_id = session.append_message(user_msg("hello")).unwrap();
+    let msg_id = session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
     let custom_id = session
         .append_custom_entry("my_data", Some(serde_json::json!({"key": "value"})))
         .unwrap();
-    let _ = session.append_message(assistant_msg("response")).unwrap();
+    let _ = session
+        .append_message(assistant_msg("response"))
+        .unwrap()
+        .id()
+        .to_string();
 
     let entries = session.get_entries();
     assert_eq!(entries.len(), 3);
@@ -305,11 +363,23 @@ fn leaf_pointer_advances_after_each_append() {
     .unwrap();
     assert_eq!(session.get_leaf_id(), None);
 
-    let id1 = session.append_message(user_msg("1")).unwrap();
+    let id1 = session
+        .append_message(user_msg("1"))
+        .unwrap()
+        .id()
+        .to_string();
     assert_eq!(session.get_leaf_id(), Some(id1.as_str()));
-    let id2 = session.append_message(assistant_msg("2")).unwrap();
+    let id2 = session
+        .append_message(assistant_msg("2"))
+        .unwrap()
+        .id()
+        .to_string();
     assert_eq!(session.get_leaf_id(), Some(id2.as_str()));
-    let id3 = session.append_thinking_level_change("high").unwrap();
+    let id3 = session
+        .append_thinking_level_change("high")
+        .unwrap()
+        .id()
+        .to_string();
     assert_eq!(session.get_leaf_id(), Some(id3.as_str()));
 }
 
@@ -325,11 +395,19 @@ fn custom_entries_participate_in_tree_traversal_but_not_in_context() {
         Vec::new(),
     )
     .unwrap();
-    let first_msg_id = session.append_message(user_msg("hello")).unwrap();
+    let first_msg_id = session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
     let custom_id = session
         .append_custom_entry("my_data", Some(serde_json::json!({"foo": "bar"})))
         .unwrap();
-    let second_msg_id = session.append_message(assistant_msg("hi")).unwrap();
+    let second_msg_id = session
+        .append_message(assistant_msg("hi"))
+        .unwrap()
+        .id()
+        .to_string();
 
     let entries = session.get_entries();
     assert_eq!(entries.len(), 3);
@@ -376,10 +454,26 @@ fn get_branch_returns_the_root_to_leaf_path() {
         Vec::new(),
     )
     .unwrap();
-    let id1 = session.append_message(user_msg("1")).unwrap();
-    let id2 = session.append_message(assistant_msg("2")).unwrap();
-    let id3 = session.append_thinking_level_change("high").unwrap();
-    let id4 = session.append_message(user_msg("3")).unwrap();
+    let id1 = session
+        .append_message(user_msg("1"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id2 = session
+        .append_message(assistant_msg("2"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id3 = session
+        .append_thinking_level_change("high")
+        .unwrap()
+        .id()
+        .to_string();
+    let id4 = session
+        .append_message(user_msg("3"))
+        .unwrap()
+        .id()
+        .to_string();
 
     let path = session.get_branch(None).unwrap();
     assert_eq!(path.len(), 4);
@@ -405,9 +499,21 @@ fn get_tree_returns_a_single_root_for_a_linear_session() {
         Vec::new(),
     )
     .unwrap();
-    let id1 = session.append_message(user_msg("1")).unwrap();
-    let id2 = session.append_message(assistant_msg("2")).unwrap();
-    let id3 = session.append_message(user_msg("3")).unwrap();
+    let id1 = session
+        .append_message(user_msg("1"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id2 = session
+        .append_message(assistant_msg("2"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id3 = session
+        .append_message(user_msg("3"))
+        .unwrap()
+        .id()
+        .to_string();
 
     let tree = session.get_tree();
     assert_eq!(tree.len(), 1);
@@ -426,13 +532,29 @@ fn get_tree_returns_branches_after_branch() {
         Vec::new(),
     )
     .unwrap();
-    let _id1 = session.append_message(user_msg("1")).unwrap();
-    let id2 = session.append_message(assistant_msg("2")).unwrap();
-    let id3 = session.append_message(user_msg("3")).unwrap();
+    let _id1 = session
+        .append_message(user_msg("1"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id2 = session
+        .append_message(assistant_msg("2"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id3 = session
+        .append_message(user_msg("3"))
+        .unwrap()
+        .id()
+        .to_string();
 
     // Branch from id2, add a new path: 2 -> 4.
     session.branch(&id2).unwrap();
-    let id4 = session.append_message(user_msg("4-branch")).unwrap();
+    let id4 = session
+        .append_message(user_msg("4-branch"))
+        .unwrap()
+        .id()
+        .to_string();
 
     let tree = session.get_tree();
     assert_eq!(tree.len(), 1);
@@ -458,20 +580,40 @@ fn get_tree_handles_multiple_branches_at_the_same_point() {
         Vec::new(),
     )
     .unwrap();
-    let _ = session.append_message(user_msg("root")).unwrap();
-    let id2 = session.append_message(assistant_msg("response")).unwrap();
+    let _ = session
+        .append_message(user_msg("root"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id2 = session
+        .append_message(assistant_msg("response"))
+        .unwrap()
+        .id()
+        .to_string();
 
     let id_a = {
         session.branch(&id2).unwrap();
-        session.append_message(user_msg("branch-A")).unwrap()
+        session
+            .append_message(user_msg("branch-A"))
+            .unwrap()
+            .id()
+            .to_string()
     };
     let id_b = {
         session.branch(&id2).unwrap();
-        session.append_message(user_msg("branch-B")).unwrap()
+        session
+            .append_message(user_msg("branch-B"))
+            .unwrap()
+            .id()
+            .to_string()
     };
     let id_c = {
         session.branch(&id2).unwrap();
-        session.append_message(user_msg("branch-C")).unwrap()
+        session
+            .append_message(user_msg("branch-C"))
+            .unwrap()
+            .id()
+            .to_string()
     };
 
     let tree = session.get_tree();
@@ -497,9 +639,21 @@ fn branch_moves_the_leaf_pointer_and_throws_for_unknown_entries() {
         Vec::new(),
     )
     .unwrap();
-    let id1 = session.append_message(user_msg("1")).unwrap();
-    let _ = session.append_message(assistant_msg("2")).unwrap();
-    let id3 = session.append_message(user_msg("3")).unwrap();
+    let id1 = session
+        .append_message(user_msg("1"))
+        .unwrap()
+        .id()
+        .to_string();
+    let _ = session
+        .append_message(assistant_msg("2"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id3 = session
+        .append_message(user_msg("3"))
+        .unwrap()
+        .id()
+        .to_string();
     assert_eq!(session.get_leaf_id(), Some(id3.as_str()));
 
     session.branch(&id1).unwrap();
@@ -517,11 +671,23 @@ fn new_appends_become_children_of_the_branch_point() {
         Vec::new(),
     )
     .unwrap();
-    let id1 = session.append_message(user_msg("1")).unwrap();
-    let _ = session.append_message(assistant_msg("2")).unwrap();
+    let id1 = session
+        .append_message(user_msg("1"))
+        .unwrap()
+        .id()
+        .to_string();
+    let _ = session
+        .append_message(assistant_msg("2"))
+        .unwrap()
+        .id()
+        .to_string();
 
     session.branch(&id1).unwrap();
-    let id3 = session.append_message(user_msg("branched")).unwrap();
+    let id3 = session
+        .append_message(user_msg("branched"))
+        .unwrap()
+        .id()
+        .to_string();
     assert_eq!(
         session.get_entry(&id3).unwrap().parent_id(),
         Some(id1.as_str())
@@ -536,7 +702,11 @@ fn branch_with_summary_throws_for_unknown_entries() {
         Vec::new(),
     )
     .unwrap();
-    session.append_message(user_msg("hello")).unwrap();
+    session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
     let error = session
         .branch_with_summary(Some("nonexistent"), "summary", None, None, None)
         .unwrap_err();
@@ -552,8 +722,16 @@ fn get_leaf_entry_and_get_entry() {
     )
     .unwrap();
     assert_eq!(session.get_leaf_entry(), None);
-    session.append_message(user_msg("1")).unwrap();
-    let id2 = session.append_message(assistant_msg("2")).unwrap();
+    session
+        .append_message(user_msg("1"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id2 = session
+        .append_message(assistant_msg("2"))
+        .unwrap()
+        .id()
+        .to_string();
     assert_eq!(session.get_leaf_entry().unwrap().id(), id2);
 
     assert_eq!(session.get_entry("nonexistent"), None);
@@ -571,14 +749,28 @@ fn build_session_context_returns_messages_from_the_current_branch_only() {
         Vec::new(),
     )
     .unwrap();
-    let _ = session.append_message(user_msg("msg1")).unwrap();
-    let id2 = session.append_message(assistant_msg("msg2")).unwrap();
-    let _ = session.append_message(user_msg("msg3")).unwrap();
+    let _ = session
+        .append_message(user_msg("msg1"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id2 = session
+        .append_message(assistant_msg("msg2"))
+        .unwrap()
+        .id()
+        .to_string();
+    let _ = session
+        .append_message(user_msg("msg3"))
+        .unwrap()
+        .id()
+        .to_string();
 
     session.branch(&id2).unwrap();
     session
         .append_message(assistant_msg("msg4-branch"))
-        .unwrap();
+        .unwrap()
+        .id()
+        .to_string();
 
     let ctx = session.build_session_context().unwrap();
     assert_eq!(ctx.messages.len(), 3); // msg1, msg2, msg4-branch (not msg3)
@@ -599,7 +791,11 @@ fn sets_and_gets_labels() {
         Vec::new(),
     )
     .unwrap();
-    let msg_id = session.append_message(user_msg("hello")).unwrap();
+    let msg_id = session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
     assert_eq!(session.get_label(&msg_id), None);
 
     let label_id = session
@@ -622,7 +818,11 @@ fn clears_labels_with_none() {
         Vec::new(),
     )
     .unwrap();
-    let msg_id = session.append_message(user_msg("hello")).unwrap();
+    let msg_id = session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
     session
         .append_label_change(&msg_id, Some("checkpoint"))
         .unwrap();
@@ -639,7 +839,11 @@ fn last_label_wins_and_the_tree_carries_the_label_timestamp() {
         Vec::new(),
     )
     .unwrap();
-    let msg_id = session.append_message(user_msg("hello")).unwrap();
+    let msg_id = session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
     session.append_label_change(&msg_id, Some("first")).unwrap();
     session
         .append_label_change(&msg_id, Some("second"))
@@ -666,8 +870,16 @@ fn labels_are_included_in_tree_nodes() {
         Vec::new(),
     )
     .unwrap();
-    let msg1_id = session.append_message(user_msg("hello")).unwrap();
-    let msg2_id = session.append_message(assistant_msg("hi")).unwrap();
+    let msg1_id = session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
+    let msg2_id = session
+        .append_message(assistant_msg("hi"))
+        .unwrap()
+        .id()
+        .to_string();
     let msg1_label_id = session
         .append_label_change(&msg1_id, Some("start"))
         .unwrap();
@@ -705,8 +917,16 @@ fn labels_are_preserved_in_create_branched_session() {
         Vec::new(),
     )
     .unwrap();
-    let msg1_id = session.append_message(user_msg("hello")).unwrap();
-    let msg2_id = session.append_message(assistant_msg("hi")).unwrap();
+    let msg1_id = session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
+    let msg2_id = session
+        .append_message(assistant_msg("hi"))
+        .unwrap()
+        .id()
+        .to_string();
     let msg1_label_id = session
         .append_label_change(&msg1_id, Some("important"))
         .unwrap();
@@ -750,14 +970,24 @@ fn rewires_children_of_removed_labels_when_forking() {
         Vec::new(),
     )
     .unwrap();
-    let msg1_id = session.append_message(user_msg("hello")).unwrap();
+    let msg1_id = session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
     session
         .append_label_change(&msg1_id, Some("checkpoint"))
         .unwrap();
     let model_change_id = session
         .append_model_change("anthropic", "claude-test")
-        .unwrap();
-    let msg2_id = session.append_message(user_msg("followup")).unwrap();
+        .unwrap()
+        .id()
+        .to_string();
+    let msg2_id = session
+        .append_message(user_msg("followup"))
+        .unwrap()
+        .id()
+        .to_string();
 
     session.create_branched_session(&msg2_id).unwrap();
     assert_eq!(
@@ -774,9 +1004,21 @@ fn labels_not_on_the_path_are_not_preserved() {
         Vec::new(),
     )
     .unwrap();
-    let msg1_id = session.append_message(user_msg("hello")).unwrap();
-    let msg2_id = session.append_message(assistant_msg("hi")).unwrap();
-    let msg3_id = session.append_message(user_msg("followup")).unwrap();
+    let msg1_id = session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
+    let msg2_id = session
+        .append_message(assistant_msg("hi"))
+        .unwrap()
+        .id()
+        .to_string();
+    let msg3_id = session
+        .append_message(user_msg("followup"))
+        .unwrap()
+        .id()
+        .to_string();
 
     session
         .append_label_change(&msg1_id, Some("first"))
@@ -803,7 +1045,11 @@ fn labels_are_not_included_in_build_session_context() {
         Vec::new(),
     )
     .unwrap();
-    let msg_id = session.append_message(user_msg("hello")).unwrap();
+    let msg_id = session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
     session
         .append_label_change(&msg_id, Some("checkpoint"))
         .unwrap();
@@ -838,7 +1084,11 @@ fn create_branched_session_throws_for_a_non_existent_entry() {
         Vec::new(),
     )
     .unwrap();
-    session.append_message(user_msg("hello")).unwrap();
+    session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
     let error = session.create_branched_session("nonexistent").unwrap_err();
     assert_eq!(error.to_string(), "Entry nonexistent not found");
 }
@@ -851,14 +1101,34 @@ fn create_branched_session_extracts_the_path_from_a_branched_tree() {
         Vec::new(),
     )
     .unwrap();
-    let id1 = session.append_message(user_msg("1")).unwrap();
-    let id2 = session.append_message(assistant_msg("2")).unwrap();
-    let _ = session.append_message(user_msg("3")).unwrap();
+    let id1 = session
+        .append_message(user_msg("1"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id2 = session
+        .append_message(assistant_msg("2"))
+        .unwrap()
+        .id()
+        .to_string();
+    let _ = session
+        .append_message(user_msg("3"))
+        .unwrap()
+        .id()
+        .to_string();
 
     // Branch from 2: 2 -> 4 -> 5.
     session.branch(&id2).unwrap();
-    let id4 = session.append_message(user_msg("4")).unwrap();
-    let id5 = session.append_message(assistant_msg("5")).unwrap();
+    let id4 = session
+        .append_message(user_msg("4"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id5 = session
+        .append_message(assistant_msg("5"))
+        .unwrap()
+        .id()
+        .to_string();
 
     // Branched session from id5 should have 1 -> 2 -> 4 -> 5.
     session.create_branched_session(&id5).unwrap();
@@ -881,13 +1151,33 @@ fn create_branched_session_keeps_only_the_path_to_the_leaf() {
         Vec::new(),
     )
     .unwrap();
-    let id1 = session.append_message(user_msg("1")).unwrap();
-    let id2 = session.append_message(assistant_msg("2")).unwrap();
-    let id3 = session.append_message(user_msg("3")).unwrap();
-    session.append_message(assistant_msg("4")).unwrap();
+    let id1 = session
+        .append_message(user_msg("1"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id2 = session
+        .append_message(assistant_msg("2"))
+        .unwrap()
+        .id()
+        .to_string();
+    let id3 = session
+        .append_message(user_msg("3"))
+        .unwrap()
+        .id()
+        .to_string();
+    session
+        .append_message(assistant_msg("4"))
+        .unwrap()
+        .id()
+        .to_string();
 
     session.branch(&id3).unwrap();
-    let _ = session.append_message(user_msg("5")).unwrap();
+    let _ = session
+        .append_message(user_msg("5"))
+        .unwrap()
+        .id()
+        .to_string();
 
     // Branched session from id2 (should only have 1 -> 2); in-memory returns none.
     let result = session.create_branched_session(&id2).unwrap();
@@ -906,8 +1196,14 @@ fn create_branched_session_writes_the_file_only_once_a_conversation_exists() {
             .unwrap();
     let model_change_id = session
         .append_model_change("anthropic", "claude-sonnet-4-5")
-        .unwrap();
-    session.append_message(user_msg("first question")).unwrap();
+        .unwrap()
+        .id()
+        .to_string();
+    session
+        .append_message(user_msg("first question"))
+        .unwrap()
+        .id()
+        .to_string();
     session
         .append_message(assistant_msg("first answer"))
         .unwrap();
@@ -919,13 +1215,21 @@ fn create_branched_session_writes_the_file_only_once_a_conversation_exists() {
         .unwrap();
     // Nothing to save yet, so the file is created later by the first user message.
     assert!(!new_file.exists());
-    session.append_message(user_msg("new question")).unwrap();
+    session
+        .append_message(user_msg("new question"))
+        .unwrap()
+        .id()
+        .to_string();
     assert!(new_file.exists());
 
     session
         .append_custom_entry("preset-state", Some(serde_json::json!({"name": "plan"})))
         .unwrap();
-    session.append_message(assistant_msg("new answer")).unwrap();
+    session
+        .append_message(assistant_msg("new answer"))
+        .unwrap()
+        .id()
+        .to_string();
 
     // Exactly one header and each entry written once.
     assert_eq!(
@@ -940,14 +1244,22 @@ fn create_branched_session_writes_immediately_when_forking_at_a_user_message() {
     let mut session =
         SessionManager::create(dir.path(), Some(dir.path()), &NewSessionOptions::default())
             .unwrap();
-    let id1 = session.append_message(user_msg("first question")).unwrap();
+    let id1 = session
+        .append_message(user_msg("first question"))
+        .unwrap()
+        .id()
+        .to_string();
     session
         .append_message(assistant_msg("first answer"))
         .unwrap();
 
     let new_file = session.create_branched_session(&id1).unwrap().unwrap();
     assert!(new_file.exists());
-    session.append_message(assistant_msg("new answer")).unwrap();
+    session
+        .append_message(assistant_msg("new answer"))
+        .unwrap()
+        .id()
+        .to_string();
     assert_eq!(
         read_session_file_roles(&new_file),
         vec!["session", "user", "assistant"]
@@ -960,8 +1272,16 @@ fn usage_round_trips_through_a_file_backed_reload() {
     let mut session =
         SessionManager::create(dir.path(), Some(dir.path()), &NewSessionOptions::default())
             .unwrap();
-    let root_id = session.append_message(user_msg("question")).unwrap();
-    session.append_message(assistant_msg("answer")).unwrap();
+    let root_id = session
+        .append_message(user_msg("question"))
+        .unwrap()
+        .id()
+        .to_string();
+    session
+        .append_message(assistant_msg("answer"))
+        .unwrap()
+        .id()
+        .to_string();
     let _ = session.append_message(tool_result_msg());
     session
         .append_compaction(
@@ -1543,11 +1863,19 @@ fn to_records(entries: Vec<SessionEntry>) -> Vec<pi_coding_agent::session::Recor
 #[test]
 fn in_memory_adopts_preloaded_entries_verbatim() {
     let entries = stored_entries(|source| {
-        source.append_message(user_msg_blocks("hello")).unwrap();
+        source
+            .append_message(user_msg_blocks("hello"))
+            .unwrap()
+            .id()
+            .to_string();
         source
             .append_model_change("anthropic", "claude-opus-4-5")
             .unwrap();
-        source.append_message(user_msg_blocks("again")).unwrap();
+        source
+            .append_message(user_msg_blocks("again"))
+            .unwrap()
+            .id()
+            .to_string();
     });
     let session = SessionManager::in_memory(
         Path::new("/project"),
@@ -1568,8 +1896,16 @@ fn in_memory_adopts_preloaded_entries_verbatim() {
 #[test]
 fn in_memory_keeps_the_loaded_leaf_so_appends_continue() {
     let entries = stored_entries(|source| {
-        source.append_message(user_msg_blocks("hello")).unwrap();
-        source.append_message(user_msg_blocks("again")).unwrap();
+        source
+            .append_message(user_msg_blocks("hello"))
+            .unwrap()
+            .id()
+            .to_string();
+        source
+            .append_message(user_msg_blocks("again"))
+            .unwrap()
+            .id()
+            .to_string();
     });
     let last_id = entries.last().unwrap().id().to_string();
     let mut session = SessionManager::in_memory(
@@ -1580,7 +1916,9 @@ fn in_memory_keeps_the_loaded_leaf_so_appends_continue() {
     .unwrap();
     let appended = session
         .append_message(user_msg_blocks("continued"))
-        .unwrap();
+        .unwrap()
+        .id()
+        .to_string();
     assert_eq!(session.get_leaf_id(), Some(appended.as_str()));
     assert_eq!(
         session.get_entry(&appended).unwrap().parent_id(),
@@ -1605,17 +1943,31 @@ fn in_memory_never_mints_an_id_that_collides_with_a_loaded_entry() {
     .unwrap();
     let appended = session
         .append_message(user_msg_blocks("continued"))
-        .unwrap();
+        .unwrap()
+        .id()
+        .to_string();
     assert!(!entries.iter().any(|entry| entry.id() == appended));
 }
 
 #[test]
 fn in_memory_rebuilds_the_branch_structure_rather_than_a_flat_chain() {
     let entries = stored_entries(|source| {
-        let first = source.append_message(user_msg_blocks("hello")).unwrap();
-        source.append_message(user_msg_blocks("abandoned")).unwrap();
+        let first = source
+            .append_message(user_msg_blocks("hello"))
+            .unwrap()
+            .id()
+            .to_string();
+        source
+            .append_message(user_msg_blocks("abandoned"))
+            .unwrap()
+            .id()
+            .to_string();
         source.branch(&first).unwrap();
-        source.append_message(user_msg_blocks("kept")).unwrap();
+        source
+            .append_message(user_msg_blocks("kept"))
+            .unwrap()
+            .id()
+            .to_string();
     });
     let session = SessionManager::in_memory(
         Path::new("/project"),
@@ -1632,7 +1984,11 @@ fn in_memory_rebuilds_the_branch_structure_rather_than_a_flat_chain() {
 fn in_memory_rebuilds_labels() {
     let labelled_id = std::cell::RefCell::new(String::new());
     let entries = stored_entries(|source| {
-        let id = source.append_message(user_msg_blocks("hello")).unwrap();
+        let id = source
+            .append_message(user_msg_blocks("hello"))
+            .unwrap()
+            .id()
+            .to_string();
         labelled_id.replace(id.clone());
         source.append_label_change(&id, Some("checkpoint")).unwrap();
     });
@@ -1649,8 +2005,16 @@ fn in_memory_rebuilds_labels() {
 fn in_memory_resolves_a_compaction_against_its_written_entry() {
     let kept_id = std::cell::RefCell::new(String::new());
     let entries = stored_entries(|source| {
-        source.append_message(user_msg_blocks("dropped")).unwrap();
-        let id = source.append_message(user_msg_blocks("kept")).unwrap();
+        source
+            .append_message(user_msg_blocks("dropped"))
+            .unwrap()
+            .id()
+            .to_string();
+        let id = source
+            .append_message(user_msg_blocks("kept"))
+            .unwrap()
+            .id()
+            .to_string();
         kept_id.replace(id.clone());
         source
             .append_compaction("summary so far", Some(&id), 1000, None, None, None)
@@ -1673,7 +2037,11 @@ fn in_memory_resolves_a_compaction_against_its_written_entry() {
 #[test]
 fn in_memory_creates_a_header_from_the_options_when_entries_carry_none() {
     let entries = stored_entries(|source| {
-        source.append_message(user_msg_blocks("hello")).unwrap();
+        source
+            .append_message(user_msg_blocks("hello"))
+            .unwrap()
+            .id()
+            .to_string();
     });
     let session = SessionManager::in_memory(
         Path::new("/project"),
@@ -1693,7 +2061,11 @@ fn in_memory_creates_a_header_from_the_options_when_entries_carry_none() {
 #[test]
 fn in_memory_takes_the_session_identity_from_a_header_among_the_entries() {
     let body = stored_entries(|source| {
-        source.append_message(user_msg_blocks("hello")).unwrap();
+        source
+            .append_message(user_msg_blocks("hello"))
+            .unwrap()
+            .id()
+            .to_string();
     });
     let mut records = vec![pi_coding_agent::session::Record::from_object(
         serde_json::json!({
@@ -1752,7 +2124,11 @@ fn in_memory_migrates_entries_restored_with_an_older_header() {
 #[test]
 fn in_memory_stays_off_the_filesystem() {
     let entries = stored_entries(|source| {
-        source.append_message(user_msg_blocks("hello")).unwrap();
+        source
+            .append_message(user_msg_blocks("hello"))
+            .unwrap()
+            .id()
+            .to_string();
     });
     let mut session = SessionManager::in_memory(
         Path::new("/project"),
@@ -1798,7 +2174,11 @@ fn list_and_continue_recent_scope_by_cwd() {
     let create_session = |cwd: &Path, label: &str| -> std::path::PathBuf {
         let mut session =
             SessionManager::create(cwd, Some(dir.path()), &NewSessionOptions::default()).unwrap();
-        session.append_message(user_msg(label)).unwrap();
+        session
+            .append_message(user_msg(label))
+            .unwrap()
+            .id()
+            .to_string();
         session
             .append_message(assistant_msg(&format!("reply to {label}")))
             .unwrap();
@@ -1831,11 +2211,19 @@ fn session_info_summarizes_the_transcript() {
     let mut session =
         SessionManager::create(dir.path(), Some(dir.path()), &NewSessionOptions::default())
             .unwrap();
-    session.append_message(user_msg("first question")).unwrap();
+    session
+        .append_message(user_msg("first question"))
+        .unwrap()
+        .id()
+        .to_string();
     session
         .append_message(assistant_msg("first answer"))
         .unwrap();
-    session.append_message(user_msg("second question")).unwrap();
+    session
+        .append_message(user_msg("second question"))
+        .unwrap()
+        .id()
+        .to_string();
     session.append_session_info("My session").unwrap();
 
     let file = session.get_session_file().unwrap().to_path_buf();
@@ -1867,7 +2255,11 @@ fn find_by_id_matches_the_header_id() {
         },
     )
     .unwrap();
-    session.append_message(user_msg("hello")).unwrap();
+    session
+        .append_message(user_msg("hello"))
+        .unwrap()
+        .id()
+        .to_string();
     let file = session.get_session_file().unwrap().to_path_buf();
     assert_eq!(
         SessionManager::find_by_id(dir.path(), "wanted-id", Some(dir.path())),
@@ -1915,7 +2307,11 @@ fn unknown_entry_types_survive_a_load_append_rewrite_cycle() {
 
     let mut session = SessionManager::open(&file, Some(dir.path()), None).unwrap();
     assert_eq!(session.get_entry_count(), 2);
-    session.append_message(user_msg("next")).unwrap();
+    session
+        .append_message(user_msg("next"))
+        .unwrap()
+        .id()
+        .to_string();
 
     let rewritten = fs::read_to_string(&file).unwrap();
     let lines: Vec<&str> = rewritten.trim_end().split('\n').collect();
@@ -1936,7 +2332,11 @@ fn entry_lines_are_byte_compatible_with_the_session_format_doc() {
         Vec::new(),
     )
     .unwrap();
-    let user_entry = session.append_message(user_msg("Hello")).unwrap();
+    let user_entry = session
+        .append_message(user_msg("Hello"))
+        .unwrap()
+        .id()
+        .to_string();
     let lines = session
         .get_entries()
         .iter()
