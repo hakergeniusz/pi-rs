@@ -27,6 +27,7 @@
 //! resolves its wire key through the stashed `getApiKey`.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "ext-js")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 

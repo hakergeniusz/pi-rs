@@ -85,6 +85,7 @@ enum LoginBackStep {
 /// through the engine bridge, slice 6j): the JS `login` runs in an engine
 /// session, its notifications surface as status lines, and its asks mount
 /// the prompt/select dialogs.
+#[cfg(feature = "ext-js")]
 struct ExtensionLoginFlow {
     /// The engine session driving the stashed `login`.
     session: u32,
@@ -775,12 +776,15 @@ pub struct InteractiveMode {
     /// Where a cancelled login returns to (`onBack`).
     login_back: Option<LoginBackStep>,
     /// The running extension-oauth login flow (slice 6j).
+    #[cfg(feature = "ext-js")]
     extension_login_flow: Option<ExtensionLoginFlow>,
     /// Events from the mounted extension-login text prompt (the
     /// `onPrompt`/`onManualCodeInput` asks).
+    #[cfg(feature = "ext-js")]
     extension_login_prompt: Option<Arc<Mutex<Vec<LoginPromptEvent>>>>,
     /// Events from the mounted extension-login option selector (the
     /// `onSelect` ask).
+    #[cfg(feature = "ext-js")]
     extension_login_select: Option<Arc<Mutex<Vec<AuthSelectorEvent>>>>,
     /// The editor, parked while the selector occupies its tree slot.
     suspended_editor: Option<Box<dyn Component>>,
@@ -963,8 +967,11 @@ impl InteractiveMode {
             login_prompt_events: None,
             login_prompt_provider: None,
             login_back: None,
+            #[cfg(feature = "ext-js")]
             extension_login_flow: None,
+            #[cfg(feature = "ext-js")]
             extension_login_prompt: None,
+            #[cfg(feature = "ext-js")]
             extension_login_select: None,
             suspended_editor: None,
             tui_mode,
@@ -4682,6 +4689,7 @@ impl InteractiveMode {
         if provider.auth_type == "oauth" {
             // Extension oauth providers run through the engine bridge
             // (`adaptOAuth`'s login arm, `provider-composer.ts:363-375`).
+            #[cfg(feature = "ext-js")]
             if self.start_extension_oauth_login(provider, back) {
                 return;
             }
@@ -4801,6 +4809,7 @@ impl InteractiveMode {
     /// Starts the extension-oauth login flow when the provider registered
     /// one: `false` leaves the caller to the built-in paths (the upstream
     /// error for the unported per-provider flows).
+    #[cfg(feature = "ext-js")]
     fn start_extension_oauth_login(
         &mut self,
         provider: &AuthSelectorProvider,
@@ -4839,6 +4848,7 @@ impl InteractiveMode {
     /// lands with the E3 TUI slice — the flow's notifications surface as
     /// status lines and the asks reuse the prompt/select components
     /// (HANDOFF deviation, presentation only).
+    #[cfg(feature = "ext-js")]
     fn pump_extension_oauth_login(&mut self) {
         let Some(mut flow) = self.extension_login_flow.take() else {
             return;
@@ -4882,6 +4892,7 @@ impl InteractiveMode {
     /// `notifyAuthDialog` (`interactive-mode.ts:6507-6518`) as status lines:
     /// the sign-in URL (with its instructions), the device code, the
     /// progress text.
+    #[cfg(feature = "ext-js")]
     fn show_extension_login_notification(
         &mut self,
         flow: &ExtensionLoginFlow,
@@ -4932,6 +4943,7 @@ impl InteractiveMode {
     /// `interactive-mode.ts:6483-6505`): a select opens the option
     /// selector, text/manual-code opens the entry dialog. Returns `false`
     /// when the ask was unknown and the flow finished instead.
+    #[cfg(feature = "ext-js")]
     fn mount_extension_login_ask(
         &mut self,
         flow: &mut ExtensionLoginFlow,
@@ -4997,6 +5009,7 @@ impl InteractiveMode {
 
     /// Resolves the flow's pending ask and keeps polling
     /// (`oauth_login_answer` + the next drain); errors finish the flow.
+    #[cfg(feature = "ext-js")]
     fn answer_extension_login_prompt(&mut self, answer: &serde_json::Value) {
         let (session, token) = match self.extension_login_flow.as_ref() {
             Some(flow) => match flow.pending_prompt {
@@ -5033,6 +5046,7 @@ impl InteractiveMode {
     /// and return to the `onBack` target. The abort flips the adapter
     /// `signal` the handler polls; the session ends regardless, so the
     /// abort is the host-side cancel rather than a cooperative stop.
+    #[cfg(feature = "ext-js")]
     fn cancel_extension_login_flow(&mut self) {
         let Some(flow) = self.extension_login_flow.take() else {
             self.tui.request_render();
@@ -5048,6 +5062,7 @@ impl InteractiveMode {
     }
 
     /// The extension-login text prompt's drain (`showPrompt`'s resolver).
+    #[cfg(feature = "ext-js")]
     fn pump_extension_login_prompt(&mut self) {
         if self.extension_login_prompt.is_none() {
             return;
@@ -5079,6 +5094,7 @@ impl InteractiveMode {
     /// The extension-login select's drain (`showAuthSelect`'s resolver,
     /// `interactive-mode.ts:6450-6481`): the picked label maps back to its
     /// option id; an unknown label or escape is `Login cancelled`.
+    #[cfg(feature = "ext-js")]
     fn pump_extension_login_select(&mut self) {
         if self.extension_login_select.is_none() {
             return;
@@ -5131,6 +5147,7 @@ impl InteractiveMode {
     /// The settled credential (`completeProviderAuthentication`'s storage
     /// and status, `interactive-mode.ts:6277-6331`): store the oauth
     /// credential and report the saved path.
+    #[cfg(feature = "ext-js")]
     fn finish_extension_login(&mut self, flow: &ExtensionLoginFlow, credential: serde_json::Value) {
         if let Some(runner) = self.extension_runner.as_ref() {
             let mut runner = runner.lock().expect("extension runner mutex poisoned");
@@ -5165,6 +5182,7 @@ impl InteractiveMode {
 
     /// A failed login (`showLoginDialog`'s catch, `:6584-6592`): report and
     /// drop the flow. Only `Login cancelled` routes to `onBack`; errors stay.
+    #[cfg(feature = "ext-js")]
     fn finish_extension_login_error(&mut self, flow: &ExtensionLoginFlow, message: &str) {
         if let Some(runner) = self.extension_runner.as_ref() {
             let mut runner = runner.lock().expect("extension runner mutex poisoned");
@@ -5382,9 +5400,12 @@ impl InteractiveMode {
         self.pump_session_selector();
         self.pump_auth_selector();
         self.pump_login_prompt();
-        self.pump_extension_login_prompt();
-        self.pump_extension_login_select();
-        self.pump_extension_oauth_login();
+        #[cfg(feature = "ext-js")]
+        {
+            self.pump_extension_login_prompt();
+            self.pump_extension_login_select();
+            self.pump_extension_oauth_login();
+        }
 
         // The 3D easter egg (`playEasterEgg3d`): the header's logo clicks
         // replay from the queue, the animation's rows track the terminal, and
