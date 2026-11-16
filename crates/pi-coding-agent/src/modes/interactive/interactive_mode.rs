@@ -4354,7 +4354,7 @@ impl InteractiveMode {
         let selector = AuthSelectorComponent::options(&title, options, Arc::clone(&events));
         self.auth_selector_events = Some(events);
         self.auth_selector_mode = Some("login");
-        self.pending_auth_type_options = provider_options.map(|options| options.to_vec());
+        self.pending_auth_type_options = provider_options.map(<[AuthSelectorProvider]>::to_vec);
         self.suspend_editor_with(Box::new(selector));
     }
 
@@ -4513,7 +4513,7 @@ impl InteractiveMode {
     fn run_login_back(&mut self, back: Option<LoginBackStep>) {
         match back {
             Some(LoginBackStep::AuthType(options)) => {
-                self.show_login_auth_type_selector(options.as_deref())
+                self.show_login_auth_type_selector(options.as_deref());
             }
             Some(LoginBackStep::Provider(auth_type)) => {
                 self.show_login_provider_selector(auth_type, None);
