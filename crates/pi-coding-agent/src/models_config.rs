@@ -767,6 +767,164 @@ pub fn apply_models_json(
     Ok(models)
 }
 
+/// One extension-registered chat model definition (`ProviderChatModelConfig`,
+/// `provider-composer.ts:64-75`; the base fields `:53-62`). The TS type
+/// requires `name`/`input`/`cost`/`reasoning`/`contextWindow`/`maxTokens`, so
+/// the port makes them non-optional — a definition missing them fails the
+/// registration's load-time report where TS would carry `undefined` through.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionChatModelConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub api: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    pub input: Vec<ModelInputModality>,
+    #[serde(default)]
+    pub input_limits: Option<ModelInputLimits>,
+    #[serde(default)]
+    pub cost: ModelCost,
+    #[serde(default)]
+    pub headers: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub reasoning: bool,
+    #[serde(default)]
+    pub thinking_level_map: Option<JsonObject>,
+    #[serde(default)]
+    pub prompt_cache: Option<ModelPromptCache>,
+    pub context_window: u64,
+    pub max_tokens: u64,
+    #[serde(default)]
+    pub sampling_params: Option<JsonObject>,
+    #[serde(default)]
+    pub sampling_params_by_thinking_level: Option<JsonObject>,
+    #[serde(default)]
+    pub compat: Option<JsonObject>,
+}
+
+/// The model-composition subset of an extension `ProviderConfigInput`
+/// (`provider-composer.ts:93-110`). `streamSimple`/`oauth`/`images`/
+/// `classifiers`/`refreshModels` are functions or per-operation objects the
+/// JSON bridge drops or defers; they land with slices 6c/6d.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionProviderConfig {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub api: Option<String>,
+    #[serde(default)]
+    pub headers: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub auth_header: Option<bool>,
+    #[serde(default)]
+    pub models: Option<Vec<ExtensionChatModelConfig>>,
+}
+
+impl ExtensionProviderConfig {
+    /// Parse a registry config object; the registry already guarantees an
+    /// object (`ProviderRegistry::register`).
+    pub fn from_config(config: &serde_json::Value) -> Result<Self, String> {
+        serde_json::from_value(config.clone())
+            .map_err(|error| format!("Invalid provider config: {error}"))
+    }
+}
+
+/// `extensionModelFromDefinition` (`provider-composer.ts:277-300`): defaults
+/// `api`/`baseUrl` from same-id → same-api → openai-completions → first
+/// (`findExtensionModelDefaults` `:263-275`, reusing [`find_model_defaults`]
+/// — the port's models are chat-only). Verbatim errors, chat variant.
+pub fn extension_model_from_definition(
+    provider_id: &str,
+    config: &ExtensionProviderConfig,
+    definition: &ExtensionChatModelConfig,
+    defaults: Option<&Model>,
+) -> Result<Model, String> {
+    let api = definition
+        .api
+        .clone()
+        .or_else(|| config.api.clone())
+        .or_else(|| defaults.map(|model| model.api.clone()));
+    let Some(api) = api else {
+        return Err(format!(
+            "Provider {provider_id}, model {}: no \"api\" specified. Set it at model level or provider level.",
+            definition.id
+        ));
+    };
+    let base_url = definition
+        .base_url
+        .clone()
+        .or_else(|| config.base_url.clone())
+        .or_else(|| defaults.map(|model| model.base_url.clone()));
+    let Some(base_url) = base_url else {
+        return Err(format!(
+            "Provider {provider_id}: \"baseUrl\" is required when defining custom models."
+        ));
+    };
+    Ok(Model {
+        id: definition.id.clone(),
+        name: definition.name.clone(),
+        api,
+        provider: provider_id.to_string(),
+        base_url,
+        input: definition.input.clone(),
+        input_limits: definition.input_limits,
+        cost: definition.cost,
+        headers: None,
+        r#type: None,
+        reasoning: definition.reasoning,
+        thinking_level_map: definition.thinking_level_map.clone(),
+        prompt_cache: definition.prompt_cache,
+        context_window: definition.context_window,
+        max_tokens: definition.max_tokens,
+        sampling_params: definition.sampling_params.clone(),
+        sampling_params_by_thinking_level: definition.sampling_params_by_thinking_level.clone(),
+        compat: definition.compat.clone(),
+    })
+}
+
+/// `applyExtension` (`provider-composer.ts:346-356`): an extension config
+/// either overrides the `baseUrl` of every existing model or replaces the
+/// provider's models with its definitions.
+pub fn apply_extension(
+    provider_id: &str,
+    models: &[Model],
+    config: Option<&ExtensionProviderConfig>,
+) -> Result<Vec<Model>, String> {
+    let Some(config) = config else {
+        return Ok(models.to_vec());
+    };
+    match &config.models {
+        None => {
+            if let Some(base_url) = &config.base_url {
+                Ok(models
+                    .iter()
+                    .map(|model| Model {
+                        base_url: base_url.clone(),
+                        ..model.clone()
+                    })
+                    .collect())
+            } else {
+                Ok(models.to_vec())
+            }
+        }
+        Some(definitions) => definitions
+            .iter()
+            .map(|definition| {
+                let defaults =
+                    find_model_defaults(models, &definition.id, definition.api.as_deref());
+                extension_model_from_definition(provider_id, config, definition, defaults.as_ref())
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,6 +949,90 @@ mod tests {
 
     fn base_model() -> Model {
         serde_json::from_str::<Model>(BASE_MODEL_JSON).expect("parse base model")
+    }
+
+    #[test]
+    fn apply_extension_overrides_base_urls_without_models() {
+        let config = ExtensionProviderConfig {
+            base_url: Some("https://proxy.local/v1".to_string()),
+            ..Default::default()
+        };
+        let models = apply_extension("acme", &[base_model()], Some(&config)).expect("override");
+        assert_eq!(models[0].base_url, "https://proxy.local/v1");
+        assert_eq!(models[0].id, "builtin-a"); // model object otherwise kept
+        assert_eq!(
+            apply_extension("acme", &[base_model()], None).expect("no config"),
+            vec![base_model()]
+        );
+        let empty = ExtensionProviderConfig::default();
+        assert_eq!(
+            apply_extension("acme", &[base_model()], Some(&empty)).expect("no baseUrl"),
+            vec![base_model()]
+        );
+    }
+
+    #[test]
+    fn apply_extension_replaces_models_with_definitions() {
+        let config = ExtensionProviderConfig {
+            api: Some("openai-completions".to_string()),
+            base_url: Some("https://ext.local/v1".to_string()),
+            models: Some(vec![ExtensionChatModelConfig {
+                id: "ext-a".to_string(),
+                name: "Ext A".to_string(),
+                input: vec![ModelInputModality::Text],
+                cost: ModelCost::default(),
+                reasoning: true,
+                context_window: 200_000,
+                max_tokens: 8_192,
+                thinking_level_map: Some(
+                    serde_json::json!({"off": "off"})
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                ),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let models = apply_extension("acme", &[base_model()], Some(&config)).expect("replace");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "ext-a");
+        assert_eq!(models[0].provider, "acme");
+        assert_eq!(models[0].base_url, "https://ext.local/v1"); // config default
+        assert_eq!(models[0].api, "openai-completions"); // config default
+        assert_eq!(models[0].headers, None); // definitions never carry headers
+        assert_eq!(models[0].context_window, 200_000); // no schema defaults here
+    }
+
+    #[test]
+    fn extension_definition_errors_are_verbatim() {
+        let config = ExtensionProviderConfig::default();
+        let definition = ExtensionChatModelConfig {
+            id: "ext-a".to_string(),
+            name: "Ext A".to_string(),
+            input: vec![ModelInputModality::Text],
+            cost: ModelCost::default(),
+            reasoning: false,
+            context_window: 1,
+            max_tokens: 1,
+            ..Default::default()
+        };
+        let error = extension_model_from_definition("acme", &config, &definition, None)
+            .expect_err("no api");
+        assert_eq!(
+            error,
+            "Provider acme, model ext-a: no \"api\" specified. Set it at model level or provider level."
+        );
+        let with_api = ExtensionProviderConfig {
+            api: Some("openai-completions".to_string()),
+            ..Default::default()
+        };
+        let error = extension_model_from_definition("acme", &with_api, &definition, None)
+            .expect_err("no baseUrl");
+        assert_eq!(
+            error,
+            "Provider acme: \"baseUrl\" is required when defining custom models."
+        );
     }
 
     #[test]
