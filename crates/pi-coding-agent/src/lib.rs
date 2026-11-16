@@ -31,6 +31,10 @@ pub mod cli;
 pub mod config;
 /// Runtime-agnostic extension host seam (runtime decision pending at the P5 gate).
 pub mod extensions;
+/// models.json — the credential-blind provider/model configuration layer
+/// (`core/model-config.ts` plus the models.json halves of
+/// `core/provider-composer.ts`).
+pub mod models_config;
 /// Print, JSON-event, RPC, and interactive modes.
 pub mod modes;
 /// System prompt assembly (`core/system-prompt.ts`).
