@@ -893,9 +893,9 @@ mod tests {
         std::fs::write(
             &auth_path,
             serde_json::to_string(&serde_json::json!({
-                "anthropic": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000},
-                "kimi-coding": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000},
-                "groq": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000},
+                "anthropic": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000i64},
+                "kimi-coding": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000i64},
+                "groq": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000i64},
                 "openai-codex": {"type": "api_key", "key": "sk-test"},
             }))
             .expect("auth.json"),

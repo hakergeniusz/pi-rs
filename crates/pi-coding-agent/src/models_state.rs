@@ -125,7 +125,7 @@ fn rebuild(
     }
     #[cfg(feature = "ext-js")]
     if let Ok(mut slot) = EXTENSION_PROVIDERS.write() {
-        *slot = registered_providers.clone();
+        (*slot).clone_from(&registered_providers);
     }
 
     let mut models: Vec<Model> = Vec::new();

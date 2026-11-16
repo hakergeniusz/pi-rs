@@ -211,13 +211,17 @@ impl AuthSelectorComponent {
                 let status_indicator = provider
                     .status
                     .as_ref()
-                    .map(|status| oauth::format_auth_selector_provider_status(provider, status))
-                    .unwrap_or_else(|| theme.fg(ThemeColor::Muted, " • not configured"));
+                    .map_or(
+                        theme.fg(ThemeColor::Muted, " • not configured"),
+                        |status| oauth::format_auth_selector_provider_status(provider, status),
+                    );
                 // U+2726 is single-width in every terminal, unlike star
                 // emoji (`oauth-selector.ts:166-168`).
-                let partner_marker = oauth::is_preferred_provider(&provider.id)
-                    .then(|| theme.fg(ThemeColor::Muted, " ✦"))
-                    .unwrap_or_default();
+                let partner_marker = if oauth::is_preferred_provider(&provider.id) {
+                    theme.fg(ThemeColor::Muted, " ✦")
+                } else {
+                    Default::default()
+                };
                 let auth_type_label = if self.show_auth_type_labels {
                     theme.fg(
                         ThemeColor::Muted,
@@ -493,7 +497,7 @@ mod tests {
             subscription: auth_type == "oauth",
             method_name: Some(format!("{name} auth")),
             login_label: None,
-            status: configured.then(|| oauth::AuthStatus {
+            status: configured.then_some(oauth::AuthStatus {
                 configured: true,
                 auth_type,
                 source: Some("stored"),

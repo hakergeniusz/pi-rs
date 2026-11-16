@@ -604,7 +604,7 @@ pub fn format_auth_selector_provider_status(
 pub struct LoginProviderCompletionOption {
     pub id: String,
     pub name: String,
-    /// Auth types, oauth before api_key.
+    /// Auth types, oauth before `api_key`.
     pub auth_types: Vec<&'static str>,
     pub subscription: bool,
 }
@@ -619,7 +619,7 @@ pub fn login_provider_completion_options(
                 existing.auth_types.push(provider.auth_type);
                 existing
                     .auth_types
-                    .sort_by_key(|auth_type| if *auth_type == "oauth" { 0 } else { 1 });
+                    .sort_by_key(|auth_type| i32::from(*auth_type != "oauth"));
             }
             continue;
         }
@@ -722,7 +722,7 @@ mod tests {
                 assert!(!oauth.is_subscription);
                 assert_eq!(oauth.login_label, Some("Sign in with OpenRouter"));
             }
-            other => panic!("expected oauth, got {other:?}"),
+            other @ AuthMethod::ApiKey(_) => panic!("expected oauth, got {other:?}"),
         }
     }
 
@@ -819,7 +819,7 @@ mod tests {
     #[test]
     fn stored_credentials_own_the_status() {
         let (dir, path) = auth_path(&json!({
-            "acme": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000},
+            "acme": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000i64},
             "other": {"type": "api_key", "key": "sk-test"},
         }));
         let status = provider_auth_status("acme", None, None, &path).expect("acme status");
@@ -949,8 +949,14 @@ mod tests {
         );
         // Display names match too; partial references do not.
         assert_eq!(find_matching_providers(&providers, "openai codex").len(), 1);
-        assert!(find_matching_providers(&providers, "openai").is_empty());
-        assert!(find_matching_providers(&providers, "").is_empty());
+        assert_eq!(
+            find_matching_providers(&providers, "openai"),
+            [] as [&oauth::AuthSelectorProvider; 0]
+        );
+        assert_eq!(
+            find_matching_providers(&providers, ""),
+            [] as [&oauth::AuthSelectorProvider; 0]
+        );
     }
 
     /// `getLoginProviderCompletionOptions` + the description formatter
