@@ -1,9 +1,10 @@
 //! `AgentEvent` — the agent's public event stream.
 //!
 //! Ground truth: pi-mono `packages/agent/src/types.ts`, the `AgentEvent` union
-//! at the bottom of the file, plus the two shapes the JSON protocol adds on top
-//! (`agent_end.willRetry` and `agent_settled` live in
-//! `packages/coding-agent/src/core/agent-session.ts`).
+//! at the bottom of the file, plus the session-level shapes the JSON protocol
+//! adds on top (`agent_end.willRetry`, `agent_settled`, `queue_update`,
+//! `thinking_level_changed`, and `session_info_changed` live in
+//! `packages/coding-agent/src/core/agent-session.ts:210-251`).
 
 use crate::agent_message::AgentMessage;
 use pi_ai::types::AssistantMessage;
@@ -68,6 +69,9 @@ pub enum AgentEvent {
         tool_name: String,
         result: AgentToolResult,
         is_error: bool,
+        /// Milliseconds `execute()` took, measured with a monotonic clock;
+        /// absent when the tool did not run (`types.ts:549`).
+        duration_ms: Option<u64>,
         parent_tool_call_id: Option<String>,
     },
     // Auto-retry lifecycle (`agent-session.ts:235-237`): the retry machine
@@ -104,6 +108,28 @@ pub enum AgentEvent {
     EntryAppended {
         /// The serialized entry record, pi's on-disk shape.
         entry: serde_json::Value,
+    },
+    // Session-level events (`agent-session.ts:210-251`), merged into this
+    // enum like `willRetry` above: the run tails and command handlers emit
+    // them and the JSON/RPC sinks serialize them onto the wire.
+    /// A run settled (`agent-session.ts:1141-1152`): the last event after
+    /// every run, aborted or not.
+    AgentSettled {
+        aborted: bool,
+    },
+    /// The queued steering/follow-up texts changed
+    /// (`agent-session.ts:1107-1113`).
+    QueueUpdate {
+        steering: Vec<String>,
+        follow_up: Vec<String>,
+    },
+    /// The thinking level changed (`agent-session.ts:2800`).
+    ThinkingLevelChanged {
+        level: String,
+    },
+    /// The session name changed (`agent-session.ts:4120`); `None` clears it.
+    SessionInfoChanged {
+        name: Option<String>,
     },
 }
 
@@ -163,6 +189,10 @@ impl AgentEvent {
             AgentEvent::CompactionStart { .. } => "compaction_start",
             AgentEvent::CompactionEnd { .. } => "compaction_end",
             AgentEvent::EntryAppended { .. } => "entry_appended",
+            AgentEvent::AgentSettled { .. } => "agent_settled",
+            AgentEvent::QueueUpdate { .. } => "queue_update",
+            AgentEvent::ThinkingLevelChanged { .. } => "thinking_level_changed",
+            AgentEvent::SessionInfoChanged { .. } => "session_info_changed",
         }
     }
 }

@@ -424,6 +424,7 @@ mod tests {
             tool_name: "bash".to_string(),
             result: crate::types::AgentToolResult::default(),
             is_error: false,
+            duration_ms: None,
             parent_tool_call_id: None,
         });
         assert!(

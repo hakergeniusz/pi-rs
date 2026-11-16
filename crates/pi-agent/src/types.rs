@@ -468,6 +468,14 @@ impl PendingMessageQueue {
         !self.messages.is_empty()
     }
 
+    /// Every queued message regardless of drain mode. pi reads this shape
+    /// through the session's `_steeringMessages`/`_followUpMessages` text
+    /// copies (`agent-session.ts:2582-2601`): `clearQueue` reports and drops
+    /// them, and `queue_update` carries their texts.
+    pub fn all(&self) -> Vec<AgentMessage> {
+        self.messages.clone()
+    }
+
     /// `peek`: `all` drains everything, `one-at-a-time` only the oldest.
     pub fn peek(&self) -> Vec<AgentMessage> {
         match self.mode {

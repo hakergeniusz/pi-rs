@@ -1253,11 +1253,13 @@ async fn wait_for_abort(signal: AbortSignal) {
 }
 
 async fn emit_tool_execution_end(finalized: &FinalizedToolCall, emit: &mut dyn AgentEventSink) {
+    // `durationMs` is omitted when the tool did not run (`agent-loop.ts:929`).
     emit.emit(AgentEvent::ToolExecutionEnd {
         tool_call_id: finalized.tool_call.id.clone(),
         tool_name: finalized.tool_call.name.clone(),
         result: finalized.result.clone(),
         is_error: finalized.is_error,
+        duration_ms: finalized.duration_ms,
         parent_tool_call_id: None,
     })
     .await;

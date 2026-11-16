@@ -148,6 +148,17 @@ impl Queues {
         None
     }
 
+    /// Every queued steering message regardless of drain mode (see
+    /// [`crate::types::PendingMessageQueue::all`]).
+    pub fn steering_all(&self) -> Vec<AgentMessage> {
+        self.steering.all()
+    }
+
+    /// Every queued follow-up message regardless of drain mode.
+    pub fn follow_up_all(&self) -> Vec<AgentMessage> {
+        self.follow_up.all()
+    }
+
     /// `Agent.steeringMode` (`agent.ts:281-287`).
     pub fn steering_mode(&self) -> QueueMode {
         self.steering.mode
