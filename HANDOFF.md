@@ -1621,7 +1621,102 @@ pump cadence stands in for upstream's `setInterval`).
   runner pipeline tests through the JS bridge over a bash fixture
   server answering initialize/tools list/call/ping).
 
+## User-test round: /settings freeze, footer thinking, /login catalog (landed 2026-11-16)
+
+User tested the release binary side-by-side with upstream 1.5.2 and
+reported four issues. Three fixed and landed (main `8697bd5`, all CI
+green); the fourth pair was killed mid-flight (below).
+
+- **`/settings` FREEZE** (`39408c1`, CI 43961022722): reported as a
+  crash, actually a **self-deadlock** — `open_settings_selector`
+  evaluated two `self.queues.lock()` calls inside the
+  `SettingsSelectorConfig` struct literal, and the first MutexGuard is
+  a temporary of the whole `let` statement (Rust keeps statement
+  temporaries alive to the semicolon), so the second lock ran while the
+  first guard was still held. Shipped with the P6-part-2b settings
+  selector: its component tests construct the selector directly and no
+  interactive e2e ever submitted `/settings`. Fix: one guard in a block
+  reading both queue modes, dropped before the config is built.
+  Regression test `settings_dialog_mounts_on_submit` drives the real
+  submit path (hung 15+ minutes pre-fix, 0.09s post-fix).
+- **Footer thinking levels** (`1062d64`+`37c3f33`, CI 43961421159;
+  display-parity slice agent-authored, coordinator gated): two real
+  gaps. (1) The footer right cell now mirrors `footer.ts:227-263`
+  verbatim — `state.thinkingLevel || "off"` display, the
+  `(provider)` prefix when `getAvailableProviderCount() > 1` and the
+  width fits (count = providers whose wire credential resolves, the
+  `updateAvailableProviderCount` source), and the routed virtual-model
+  suffix ` → id • level`. (2) The actual "no thinking levels visible"
+  bug: the port's session default was `"off"`, upstream's chain is
+  `DEFAULT_THINKING_LEVEL = "medium"` (`core/defaults.ts:3`) with the
+  `sdk.ts:253-278` startup resolution — CLI flag wins; a resumed
+  session restores its recorded level (per-model override NOT
+  consulted); a fresh session takes the per-model override, then
+  `defaultThinkingLevel`, then medium; then `clampThinkingLevel`.
+  Ported as `initial_thinking_level` in `main.rs`, read by all modes.
+- **Easter egg "no fade"**: the exit animation was verified ALREADY
+  ported 1:1 in `7374b40` (close() = reverse dissolve + gather +
+  hint/star alpha fades over the 1s EXIT_DURATION). The slice added
+  the `app.clear` close keybinding join (`easter-egg-3d.ts:935-937`)
+  and exit tests (`the_exit_reassembles_the_screen`,
+  `cancel_and_clear_input_close_the_egg`). If a fresh build still
+  shows no fade, look at the terminal-reporting path, not the
+  animation. Note upstream's second-close-skip finishes immediately —
+  a second escape mid-exit looks like "no fade".
+- **`/login` provider catalog** (`75cb249`+`8697bd5`, CI 43961989648;
+  agent-authored, coordinator gated): the login selector enumerated
+  only model-derived providers (zero-model and api-key-only providers
+  vanished). Now `models_state` keeps a `PROVIDER_IDS` snapshot (the
+  full registry incl. virtual providers), the 43 builtin display names
+  are a verbatim table (`oauth-selector.ts:30-49` row labels,
+  `compareProviders` sort with radius/openrouter first), the four
+  custom-resolver providers get their ambient auth names,
+  `--api-key` registers a runtime key overlay (`RUNTIME_API_KEYS`,
+  `runtime-credentials.ts:36-41` mirror) that shows in status and
+  logout rows, and logout lists stored credentials with
+  " ✓ configured". Upstream has NO "Manage accounts"/"Configure
+  manually" rows in 1.5.2 — none added.
+- **Deviations from the display slice** (recorded in code): the
+  routed suffix renders without the level until
+  `AssistantMessage.thinking_level` exists (pi-ai's 5-level type
+  can't express xhigh/max); `--api-key`-only providers don't count
+  toward the prefix gate (flag key not passed); upstream refreshes the
+  count on login/logout events, the port on `refresh_footer`.
+- **Killed mid-flight** (user ended the day; agents stopped by user):
+  `/fork /clone /tree` (worktree `~/Projects/pi-rs-wt-tree`, branch
+  `feat/session-tree-commands`, no commits — dirty `config/settings.rs`,
+  `interactive/theme.rs`, untracked
+  `components/user_message_selector.rs`) and `/export /import`
+  (worktree `~/Projects/pi-rs-wt-export`, branch
+  `feat/export-import-commands`, no commits — dirty `session/mod.rs`,
+  `session/records.rs`, untracked `session/export.rs` + `export-html/`;
+  `/share` deliberately skipped per the Radius policy). Work preserved
+  uncommitted on disk — resume or wipe and respawn.
+
 ## Gotchas / decisions
+- **Two locks of the same mutex inside one statement self-deadlock**
+  (hit 2026-11-16, `/settings`): `let x = Foo { a: m.lock().f(), b:
+  m.lock().g() }` — the first MutexGuard is a temporary of the whole
+  `let` (Rust keeps statement temporaries to the semicolon), so the
+  second `.lock()` blocks forever on the same non-reentrant mutex.
+  Same class as theme()'s 2026-11-14 deadlock (a read guard temp
+  across a writing closure). Never lock the same mutex twice in one
+  expression; bind one guard in a block first. Component-level tests
+  missed it because they never run the mode's submit path — drive
+  dialog mounts through `mode.submit(...)` in a test.
+- **A hung probe test is a live deadlock repro — bisect with eprintln
+  markers** (hit 2026-11-16): gdb attach is blocked by yama
+  `ptrace_scope=1` (only parents may attach — use
+  `gdb --batch -ex run -ex "thread apply all bt" --args <bin>` from
+  the start if a stack is needed). Cheaper: temporary `eprintln!`
+  markers at each step of the suspect chain, run under `timeout`,
+  read where the markers stop. Remove the markers before landing.
+- **Upstream renders display names, not provider ids, in auth rows AND
+  statuses** (hit 2026-11-16 in the login slice): "Saved API key for
+  Groq", "Removed stored API key for Groq", rows `Groq [API key] ✓
+  configured` — tests asserting raw ids (`groq`) break once the
+  builtin display-name table lands; unknown providers fall back to
+  the id.
 - **Record the FULL gate output, all steps (hit 2026-11-16)**: the 6j/6k
   landing notes recorded only FMT/CLIPPY/TEST/FMTCHECK=0 while
   `.gate.sh`'s no-default-features step had been failing since slice 6j
