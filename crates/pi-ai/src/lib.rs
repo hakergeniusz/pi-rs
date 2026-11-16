@@ -25,6 +25,8 @@ pub mod cost;
 pub mod event_stream;
 /// Provider-API adapters, dispatched per `Model.api`.
 pub mod providers;
+/// Retry classification and policy (`packages/ai/src/utils/retry.ts`).
+pub mod retry;
 /// Server-Sent Events parsing over a reqwest byte stream.
 pub mod sse;
 /// Tolerant JSON parsing for streamed tool-call arguments.
