@@ -217,7 +217,7 @@ impl AuthSelectorComponent {
                 let partner_marker = if oauth::is_preferred_provider(&provider.id) {
                     theme.fg(ThemeColor::Muted, " ✦")
                 } else {
-                    Default::default()
+                    String::default()
                 };
                 let auth_type_label = if self.show_auth_type_labels {
                     theme.fg(
@@ -561,7 +561,8 @@ mod tests {
         );
         // Typing filters the rows; a non-matching query shows the empty state.
         for ch in "gro".chars() {
-            selector.handle_input(&ch.to_string()).expect("typed");
+            // Typed keys filter without consuming (`InputAction::None`).
+            let _ = selector.handle_input(&ch.to_string());
         }
         let plain = strip_terminal_sequences(&selector.render(100).join("\n"));
         assert!(plain.contains("Groq"), "{plain}");
@@ -594,7 +595,8 @@ mod tests {
         assert!(plain.contains("Enter Anthropic API key"), "{plain}");
         assert!(plain.contains("e.g., sk-ant-..."), "{plain}");
         for ch in "sk-test".chars() {
-            prompt.handle_input(&ch.to_string()).expect("typed");
+            // Typed keys are consumed by the input, not the action return.
+            let _ = prompt.handle_input(&ch.to_string());
         }
         prompt.handle_input("\r").expect("submit");
         assert_eq!(

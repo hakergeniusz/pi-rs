@@ -134,11 +134,18 @@ fn preferred_rank(provider_id: &str) -> usize {
 }
 
 /// `compareProviders` (`core/preferred-providers.ts:17-23`): preferred
-/// partners first, in their order, then alphabetically by name.
+/// partners first, in their order, then alphabetically by name —
+/// `name.localeCompare`'s case-insensitive collation, so byte order (upper
+/// before lower) does not leak through; ties fall to a byte comparison.
 pub fn compare_providers(a: (&str, &str), b: (&str, &str)) -> std::cmp::Ordering {
     let (a_id, a_name) = a;
     let (b_id, b_name) = b;
-    (preferred_rank(a_id), a_name).cmp(&(preferred_rank(b_id), b_name))
+    let primary = (preferred_rank(a_id), a_name.to_lowercase());
+    let secondary = (preferred_rank(b_id), b_name.to_lowercase());
+    match primary.cmp(&secondary) {
+        std::cmp::Ordering::Equal => a_name.cmp(b_name),
+        ord => ord,
+    }
 }
 
 /// The standard `envApiKeyAuth` display names (`auth/helpers.ts:8`), per
