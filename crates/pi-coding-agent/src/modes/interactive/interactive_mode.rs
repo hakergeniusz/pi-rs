@@ -2800,10 +2800,13 @@ impl InteractiveMode {
     }
 
     /// `showWarning` (`interactive-mode.ts:4815-4819`): a warning-colored
-    /// line in the chat.
+    /// line in the chat, prefixed `Warning: ` (`interactive-mode.ts:4818`).
     fn show_warning(&mut self, message: &str) {
         self.add_to_chat(Box::new(Text::new(
-            theme::theme().fg(pi_tui::theme::ThemeColor::Warning, message),
+            theme::theme().fg(
+                pi_tui::theme::ThemeColor::Warning,
+                &format!("Warning: {message}"),
+            ),
             1,
             0,
         )));
@@ -5914,7 +5917,7 @@ mod tests {
         let plain = pi_tui::ansi::strip_terminal_sequences(&info);
         assert!(plain.contains("Total: $0.020"), "{plain}");
         assert!(
-            plain.contains("other/virtual: $0.015 (0.7k tokens)"),
+            plain.contains("other/virtual: $0.015 (700 tokens)"),
             "{plain}"
         );
         assert!(
@@ -5971,7 +5974,7 @@ mod tests {
         assert!(plain.contains("**Other**"), "{plain}");
         assert!(plain.contains("| `Enter` | Send message |"), "{plain}");
         assert!(
-            plain.contains("| `Left/Ctrl+B` | Move cursor / browse history"),
+            plain.contains("`Left/Ctrl+B` / `Right/Ctrl+F` | Move cursor / browse history"),
             "{plain}"
         );
         assert!(

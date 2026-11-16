@@ -426,13 +426,11 @@ mod tests {
         let newer = get_new_entries(&entries, "v1.1.9").expect("entries");
         assert_eq!(newer.len(), 1);
         assert_eq!(newer[0].version_string(), "1.2.0");
-        // A prerelease of the same triple shows no notes again (#11703).
-        assert_eq!(
-            get_new_entries(&entries, "1.1.9-20261020.7")
-                .expect("entries")
-                .len(),
-            0
-        );
+        // A prerelease of the same triple counts as that triple (#11703):
+        // the 1.1.9 notes do not re-show, but strictly newer entries do.
+        let prerelease = get_new_entries(&entries, "1.1.9-20261020.7").expect("entries");
+        assert_eq!(prerelease.len(), 1);
+        assert_eq!(prerelease[0].version_string(), "1.2.0");
         assert!(get_new_entries(&entries, "not a version").is_none());
     }
 
@@ -446,10 +444,11 @@ mod tests {
             normalize_changelog_links("[readme](README.md)", "1.2.3"),
             "[readme](https://github.com/earendil-works/pi/blob/v1.2.3/packages/coding-agent/README.md)"
         );
-        // A trailing slash marks a directory (tree).
+        // A trailing slash marks a directory (tree) and survives into the
+        // URL: `path.posix.normalize` keeps it, so the target ends `docs/`.
         assert_eq!(
             normalize_changelog_links("[docs](docs/)", "1.2.3"),
-            "[docs](https://github.com/earendil-works/pi/tree/v1.2.3/packages/coding-agent/docs)"
+            "[docs](https://github.com/earendil-works/pi/tree/v1.2.3/packages/coding-agent/docs/)"
         );
         // A floating main ref pins to the tag.
         assert_eq!(
