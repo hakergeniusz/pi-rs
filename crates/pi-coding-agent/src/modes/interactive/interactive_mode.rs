@@ -2836,16 +2836,21 @@ impl InteractiveMode {
             self.settings.get_default_model(),
         );
         let default_model = provider.zip(model_id);
+        // One guard for both queue modes: two `self.queues.lock()` calls in
+        // one statement deadlock — the first MutexGuard is a temporary of
+        // the whole `let`, still held when the second call runs (the
+        // theme() pattern from 2026-11-14).
+        let (steering_mode, follow_up_mode) = {
+            let queues = self.queues.lock().expect("queues");
+            (
+                queue_mode_as_setting(queues.steering_mode()).to_string(),
+                queue_mode_as_setting(queues.follow_up_mode()).to_string(),
+            )
+        };
         let selector = SettingsSelectorComponent::new(
             &SettingsSelectorConfig {
-                steering_mode: queue_mode_as_setting(
-                    self.queues.lock().expect("queues").steering_mode(),
-                )
-                .to_string(),
-                follow_up_mode: queue_mode_as_setting(
-                    self.queues.lock().expect("queues").follow_up_mode(),
-                )
-                .to_string(),
+                steering_mode,
+                follow_up_mode,
                 hide_thinking_block: self.hide_thinking_block,
                 thinking_level: self
                     .settings
@@ -5953,6 +5958,19 @@ mod tests {
             file_path: file_path.to_string(),
         });
         fixture_with_stream(dir, stream)
+    }
+
+    /// `/settings` mounts the dialog without crashing (user-reported crash
+    /// on the release binary; this drives the real submit path).
+    #[test]
+    fn settings_dialog_mounts_on_submit() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, _capture) = fixture(dir.path(), "unused.txt");
+        mode.submit("/settings");
+        assert!(
+            mode.suspended_editor.is_some(),
+            "the settings dialog occupies the editor slot"
+        );
     }
 
     /// A capture-terminal mode over a read-only executor in `dir`, driven by a
