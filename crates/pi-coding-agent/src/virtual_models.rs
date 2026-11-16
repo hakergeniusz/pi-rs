@@ -13,12 +13,16 @@
 //!   `_installAgentRequestProjection`) as [`VirtualRouteHook`].
 //!
 //! Deviations for this slice (see HANDOFF.md): dynamic providers
-//! (name/config registrations, native providers, OAuth, `streamSimple`) are
-//! slice 6, so routers can only target physical models of the static
-//! catalog; `reason: "retry"` cannot fire (the port has no auto-retry
-//! subsystem); the routed-model compaction-threshold re-prepare and the
+//! (name/config registrations, native providers, OAuth) are slice 6, so
+//! routers can only target physical models of the static catalog;
+//! `reason: "retry"` cannot fire (the port has no auto-retry subsystem);
+//! the routed-model compaction-threshold re-prepare and the
 //! `entry_appended` emission for state entries are not wired; route
 //! requests carry no abort signal (the runner's calls are synchronous).
+//! Slice 6d closed the `streamSimple` gap in the routed dispatch: a routed
+//! model of a provider with a registered `streamSimple` handler streams
+//! through the handler ([`RoutedStreamFn::stream`]'s extension arm, the
+//! `streamWith` ladder, `core/provider-composer.ts:588-613`).
 
 #[cfg(feature = "ext-js")]
 use std::collections::HashMap;
@@ -500,6 +504,13 @@ pub struct RoutedStreamFn {
     pub flag_api_key: Option<String>,
     pub auth_path: PathBuf,
     pub route_error: Arc<RouteErrorSlot>,
+    /// The engine, for the routed `streamWith` ladder: a routed model of a
+    /// provider with a registered `streamSimple` handler streams through
+    /// the handler (upstream's composed providers are what routed requests
+    /// stream through, `provider-composer.ts:588-613`). `None` without the
+    /// engine.
+    #[cfg(feature = "ext-js")]
+    pub runner: Option<Arc<Mutex<pi_ext_js::ExtensionRunner>>>,
 }
 
 impl RoutedStreamFn {
@@ -578,6 +589,18 @@ impl StreamFn for RoutedStreamFn {
             access_token,
             ..request
         };
+        // The routed model's composed provider decides the dispatch
+        // (`streamWith`, provider-composer.ts:588-613): a provider with a
+        // registered `streamSimple` handler covering the model's api wins
+        // before the base adapter.
+        #[cfg(feature = "ext-js")]
+        if let Some(stream) = self
+            .runner
+            .as_ref()
+            .and_then(|runner| crate::models_state::stream_with_extension(runner, &request))
+        {
+            return stream;
+        }
         // The resolved adapter rides `ProviderStreamFn`'s adaptation
         // (LLM-shaped transcript, thinking-level mapping).
         crate::modes::print_mode::ProviderStreamFn(inner).stream(request)
@@ -703,6 +726,9 @@ impl TurnRouting {
             flag_api_key,
             auth_path,
             route_error: hook.route_error(),
+            // Routed requests stream through the routed model's composed
+            // provider, whose `streamSimple` handler may cover the api.
+            runner: Some(Arc::clone(runner)),
         });
         Some(Self { hook, stream_fn })
     }

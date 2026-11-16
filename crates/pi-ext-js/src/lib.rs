@@ -44,4 +44,6 @@ pub use engine::{ContextKind, HostActions, HostCore, JsHost};
 pub use error::{ExtensionError, JsHostError, LoadError};
 pub use loader::{ExtensionOrigin, LoadExtensionsResult, discover_and_load, discover_extensions};
 pub use provider_registry::{RegisteredNativeProvider, RegisteredProvider, RegisteredVirtualModel};
-pub use runner::{ExtensionRunner, ResolvedCommand, ToolInfo, UiSink, UserBashDecision};
+pub use runner::{
+    ExtensionRunner, ProviderStreamOutcome, ResolvedCommand, ToolInfo, UiSink, UserBashDecision,
+};

@@ -11,8 +11,12 @@
 //!    matrix, `runner.ts:331-362, 891-1041`), the dispatch-session
 //!    protocol that lets the Rust runner invoke handlers and observe their
 //!    in-place event mutations (`snapshotEventHandlers` +
-//!    the `emit*` loops, `runner.ts` §2), and the extension event bus
-//!    (`core/event-bus.ts`).
+//!    the `emit*` loops, `runner.ts` §2), the extension event bus
+//!    (`core/event-bus.ts`), and the JS-side stashes for callables that
+//!    cannot cross as JSON — the virtual-model `route` functions and the
+//!    provider `streamSimple` handlers (`__piSessionCallRoute` /
+//!    `__piSessionCallProviderStream`; `core/provider-composer.ts:588-613`,
+//!    `core/extensions/types.ts:1989-2007`).
 //! 2. [`TYPEBOX_SHIM`] — the `typebox` virtual module. Upstream serves the
 //!    real bundled `TypeBox` (`virtual-modules.ts`); the E1 shim reproduces
 //!    the exact construction semantics of the builders extensions use
@@ -69,6 +73,17 @@ globalThis.__piRuntime = {
 // cross to the host as JSON — which drops functions — so the callable stays
 // here and the host invokes it per request through the routing protocol.
 globalThis.__piVirtualModels = new Map();
+// The `streamSimple` handlers of registered providers, keyed by provider
+// name (model-runtime.ts:964-986 stores the function in `extensionProviders`
+// — `core/extensions/types.ts:1989-2007` types it as the StreamFunction
+// `(model, context, options?) => AssistantMessageEventStream`). Config
+// crosses to the host as JSON — which drops functions — so the callable
+// stays here and the host invokes it per request through the
+// provider-stream protocol; the config JSON carries a `streamSimple: true`
+// marker so the host knows the handler exists (the marker merges
+// over-previous like the rest of the config, mirroring the stored
+// function).
+globalThis.__piProviderStreams = new Map();
 globalThis.__piExtensions = [];
 globalThis.__piExtState = [];
 
@@ -118,6 +133,10 @@ globalThis.__piBeginExtension = function (path) {
     // when the record is discarded (the route functions live in
     // __piVirtualModels keyed by the definitions' provider/id).
     virtualModels: [],
+    // The provider streamSimple handlers this extension registered, for
+    // the same discard-time cleanup (they live in __piProviderStreams
+    // keyed by provider name).
+    providerStreams: [],
   });
   globalThis.__piExtState.push("loading");
   return globalThis.__piExtensions.length - 1;
@@ -211,6 +230,14 @@ globalThis.__piDiscardExtension = function (extIdx) {
   for (const entry of ext.virtualModels ?? []) {
     if (globalThis.__piVirtualModels.get(entry.key) === entry.definition) {
       globalThis.__piVirtualModels.delete(entry.key);
+    }
+  }
+  // The same ownership rule for provider streamSimple handlers: only the
+  // entries this extension still owns are removed, so a re-registration by
+  // a live extension survives.
+  for (const entry of ext.providerStreams ?? []) {
+    if (globalThis.__piProviderStreams.get(entry.name) === entry.streamSimple) {
+      globalThis.__piProviderStreams.delete(entry.name);
     }
   }
   globalThis.__piExtensions[extIdx] = { path: ext.path, events: {}, tools: {}, commands: {}, flags: {}, busSubscriptions: [] };
@@ -483,9 +510,40 @@ globalThis.__piCreateApi = function (extIdx) {
         if (!config) {
           throw new Error("Provider config is required when registering by name");
         }
+        // validateExtensionProvider (provider-composer.ts:544-548): the
+        // check throws into the extension before anything is stored, so a
+        // broken re-registration leaves the stored config untouched
+        // (model-runtime.ts:964-968).
+        if (typeof config.streamSimple === "function" && !config.api) {
+          throw new Error(
+            `Provider ${providerOrName}: "api" is required when registering streamSimple.`,
+          );
+        }
+        // `streamSimple` is a function and cannot cross as JSON: stash it
+        // (the map replaces on re-registration like model-runtime.ts's
+        // per-key merge; a re-registration without the key keeps the
+        // previous handler), record ownership for discard-time cleanup,
+        // then send the serializable shape with a `true` marker so the
+        // host knows the handler exists.
+        if (typeof config.streamSimple === "function") {
+          globalThis.__piProviderStreams.set(providerOrName, config.streamSimple);
+          const owned = ext.providerStreams.find((entry) => entry.name === providerOrName);
+          if (owned === undefined) {
+            ext.providerStreams.push({ name: providerOrName, streamSimple: config.streamSimple });
+          } else {
+            owned.streamSimple = config.streamSimple;
+          }
+        }
         applyProviderChange("provider", {
           name: providerOrName,
-          configJson: JSON.stringify(config),
+          // The top-level `streamSimple` function crosses as a `true`
+          // presence marker (a shallow copy keeps nested values verbatim —
+          // nested functions drop like JSON.stringify always did).
+          configJson: JSON.stringify({
+            ...config,
+            streamSimple:
+              typeof config.streamSimple === "function" ? true : config.streamSimple,
+          }),
         });
         return;
       }
@@ -494,7 +552,10 @@ globalThis.__piCreateApi = function (extIdx) {
 
     unregisterProvider(name) {
       assertActive();
-      applyProviderChange("unregisterProvider", { name: String(name) });
+      const provider = String(name);
+      globalThis.__piProviderStreams.delete(provider);
+      ext.providerStreams = ext.providerStreams.filter((entry) => entry.name !== provider);
+      applyProviderChange("unregisterProvider", { name: provider });
     },
 
     registerVirtualModel(model) {
@@ -988,7 +1049,7 @@ globalThis.__piErrorText = function (error) {
 // stays live across handlers so in-place mutations chain (§6.3 of
 // docs/EXTENSIONS.md), and results land in a slot the Rust runner reads
 // after draining the job queue. `kind` selects the context:
-// "event" | "command" | "tool".
+// "event" | "command" | "tool" | "trust" | "route" | "providerStream".
 globalThis.__piSessions = new Map();
 globalThis.__piSessionSeq = 0;
 
@@ -1168,6 +1229,45 @@ globalThis.__piSessionCallRoute = function (id, provider, modelId) {
     .then(() => definition.route(session.event, session.ctx))
     .then(
       (result) => globalThis.__piSessionSettle(session, { value: result }),
+      (error) => globalThis.__piSessionSettle(session, { error: globalThis.__piErrorText(error) }),
+    );
+};
+
+// The provider streamSimple call (`streamWith`'s extension arm,
+// provider-composer.ts:588-613 → `extension.streamSimple(model, context,
+// options)`): the host built the marshalled request — `{model, context,
+// options}` rides the session event — and the stashed handler answers with
+// an AssistantMessageEventStream (`core/extensions/types.ts:1989-2007`,
+// `packages/ai` `StreamFunction`). The glue drives the iterable inside the
+// engine: every event crosses through the `providerStreamEvent` op in
+// emission order, and the session settles once iteration finishes. A
+// handler throw — before or mid-iteration — settles as a session error
+// (upstream's lazyStream encodes setup failures as the stream's terminal
+// error event; the Rust side appends it after the events already crossed).
+globalThis.__piSessionCallProviderStream = function (id, provider) {
+  const session = globalThis.__piSessions.get(id);
+  const streamFn = globalThis.__piProviderStreams.get(provider);
+  if (streamFn === undefined || typeof streamFn !== "function") {
+    // Slot errors are JSON strings (the shape __piErrorText produces);
+    // __piSessionLast parses them back into objects.
+    globalThis.__piSessionSettle(session, {
+      error: JSON.stringify({
+        message: `Provider ${provider} is not registered with a streamSimple handler.`,
+        stack: null,
+      }),
+    });
+    return;
+  }
+  session.eventName = "providerStream";
+  Promise.resolve()
+    .then(() => streamFn(session.event.model, session.event.context, session.event.options))
+    .then(async (stream) => {
+      for await (const event of stream) {
+        globalThis.__piOps.providerStreamEvent(id, JSON.stringify(event));
+      }
+    })
+    .then(
+      () => globalThis.__piSessionSettle(session, { value: null }),
       (error) => globalThis.__piSessionSettle(session, { error: globalThis.__piErrorText(error) }),
     );
 };

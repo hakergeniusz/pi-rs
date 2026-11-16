@@ -11,15 +11,22 @@
 //! [`providers`]/[`find_by_id`] instead of the static catalog. Before the
 //! first refresh the static catalog is the answer (the engine-free shape).
 //!
-//! Deferred to slices 6c/6d: auth composition (`composeApiKeyAuth`/
-//! `composeOAuthAuth`) and `streamSimple` dispatch — the composition here is
-//! the model-list layer only.
+//! Deferred to slice 6c: auth composition (`composeApiKeyAuth`/
+//! `composeOAuthAuth`). Slice 6d added the `streamSimple` dispatch half of
+//! the composer: [`stream_with_extension`] is `streamWith`'s extension arm
+//! (`core/provider-composer.ts:588-613`) and [`ComposedStreamFn`] wraps it
+//! around the caller's base adapter, so every request under the engine
+//! streams through the composed dispatch (engine-free builds never see it).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
 
+#[cfg(feature = "ext-js")]
+use pi_agent::agent_message::AgentMessage;
+#[cfg(feature = "ext-js")]
+use pi_ai::types::StopReason;
 use pi_ai::types::Model;
 
 use crate::config::get_models_path;
@@ -200,6 +207,164 @@ pub fn errors() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The composed provider's stream dispatch (`streamWith` closure,
+/// `core/provider-composer.ts:588-613`): every request first tries the
+/// extension arm — the provider's registered `streamSimple` handler when
+/// `model.api === extension.api` — then falls through to the base/api
+/// adapter. The port's second and third upstream arms
+/// (`base.streamSimple` when the base provider supports the api, then
+/// `getApiProvider(model.api)`) share the caller-supplied fallback: the
+/// port's base adapters are the static `pi-ai` API adapters the caller
+/// already resolved.
+#[cfg(feature = "ext-js")]
+pub struct ComposedStreamFn {
+    /// The engine the stashed `streamSimple` handlers live behind.
+    pub runner: Arc<std::sync::Mutex<pi_ext_js::ExtensionRunner>>,
+    /// The base/api arm: the adapter the caller would have installed
+    /// without the engine (the selection's `ProviderStreamFn`).
+    pub fallback: Arc<dyn pi_agent::types::StreamFn>,
+}
+
+#[cfg(feature = "ext-js")]
+impl pi_agent::types::StreamFn for ComposedStreamFn {
+    fn stream(
+        &self,
+        request: pi_agent::types::StreamRequest,
+    ) -> futures::stream::BoxStream<'static, pi_agent::types::AssistantMessageEvent> {
+        if let Some(stream) = stream_with_extension(&self.runner, &request) {
+            return stream;
+        }
+        self.fallback.stream(request)
+    }
+}
+
+/// `streamWith`'s extension arm (`provider-composer.ts:588-613` →
+/// `extension.streamSimple(model, context, options)`): when the request's
+/// provider has a registered `streamSimple` handler covering `model.api`,
+/// the request marshals into the engine, the handler's event stream drains
+/// there, and the events replay as the returned stream. A handler failure
+/// — before or mid-iteration — appends the terminal error event after the
+/// events already emitted, exactly like upstream's `lazyStream` forwards
+/// until the failure and then ends with the error
+/// (`packages/ai/src/api/lazy.ts:65-105`; the setup-failure message shape
+/// is `createSetupErrorMessage`, `lazy.ts:8-36`). `None` when the provider
+/// has no matching handler — the caller falls through the remaining
+/// `streamWith` arms.
+///
+/// Deviation (mechanism only, see HANDOFF.md): upstream forwards events as
+/// the handler emits them; the port drains the whole iterable inside the
+/// engine (no incremental crossing of the QuickJS boundary) and replays
+/// them, so downstream sees the events once the handler finishes. Ordering
+/// and terminal-event semantics are unchanged.
+#[cfg(feature = "ext-js")]
+pub fn stream_with_extension(
+    runner: &Arc<std::sync::Mutex<pi_ext_js::ExtensionRunner>>,
+    request: &pi_agent::types::StreamRequest,
+) -> Option<futures::stream::BoxStream<'static, pi_agent::types::AssistantMessageEvent>> {
+    {
+        let runner = runner.lock().expect("extension runner mutex poisoned");
+        let api = runner.provider_stream_api(&request.model.provider)?;
+        if api != request.model.api {
+            return None;
+        }
+    }
+    let payload = marshal_stream_request(request);
+    let (events, mut failure) = match runner
+        .lock()
+        .expect("extension runner mutex poisoned")
+        .provider_stream(&request.model.provider, &payload)
+    {
+        Ok(outcome) => (outcome.events, outcome.error),
+        Err(err) => (Vec::new(), Some(err.to_string())),
+    };
+    let mut stream_events: Vec<pi_agent::types::AssistantMessageEvent> = Vec::new();
+    for event in events {
+        match serde_json::from_value(event) {
+            Ok(event) => stream_events.push(event),
+            Err(err) => {
+                failure = Some(format!("streamSimple event is not a protocol event: {err}"));
+                break;
+            }
+        }
+    }
+    if let Some(message) = failure {
+        stream_events.push(extension_error_event(&request.model, message));
+    }
+    Some(Box::pin(futures::stream::iter(stream_events)))
+}
+
+/// The marshalled request — `streamSimple(model, context, options)`'s three
+/// arguments (`core/extensions/types.ts:1989-2007`): the composed model,
+/// the LLM-shaped transcript context (`TranscriptContext { messages }`), and
+/// the options. Option keys mirror upstream's `SimpleStreamOptions` —
+/// `apiKey`/`accessToken` ride `ProviderRequestOptions`
+/// (`packages/ai/src/types.ts:161-183`) and only present values cross
+/// (JSON drops `undefined`); `reasoning` is the clamped thinking level, the
+/// same clamp `ProviderStreamFn` applies (`xhigh`/`max` → `high`).
+#[cfg(feature = "ext-js")]
+fn marshal_stream_request(request: &pi_agent::types::StreamRequest) -> Value {
+    use pi_agent::types::ThinkingLevel;
+
+    let mut options = serde_json::Map::new();
+    if let Some(api_key) = &request.api_key {
+        options.insert("apiKey".to_string(), Value::String(api_key.clone()));
+    }
+    if let Some(access_token) = &request.access_token {
+        options.insert(
+            "accessToken".to_string(),
+            Value::String(access_token.clone()),
+        );
+    }
+    let reasoning = match request.thinking_level {
+        ThinkingLevel::Off => "off",
+        ThinkingLevel::Minimal => "minimal",
+        ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "high",
+    };
+    options.insert("reasoning".to_string(), Value::String(reasoning.to_string()));
+    if let Some(session_id) = &request.session_id {
+        options.insert("sessionId".to_string(), Value::String(session_id.clone()));
+    }
+    serde_json::json!({
+        "model": request.model,
+        "context": {
+            "messages": request
+                .messages
+                .iter()
+                .filter_map(AgentMessage::to_llm_message)
+                .collect::<Vec<_>>(),
+        },
+        "options": Value::Object(options),
+    })
+}
+
+/// The terminal error event a failed extension stream ends with — the
+/// `lazyStream` setup-failure shape (`packages/ai/src/api/lazy.ts:8-36`):
+/// an assistant message with `stopReason: "error"` and the raw error
+/// message, pushed as `{type: "error", reason, error}`
+/// (`lazy.ts:104-108`).
+#[cfg(feature = "ext-js")]
+fn extension_error_event(
+    model: &Model,
+    message: String,
+) -> pi_agent::types::AssistantMessageEvent {
+    let error = pi_ai::types::AssistantMessage {
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        usage: pi_ai::types::Usage::default(),
+        stop_reason: StopReason::Error,
+        error_message: Some(message),
+        timestamp: pi_agent::agent_loop::now_millis(),
+        ..pi_agent::empty_assistant_message()
+    };
+    pi_agent::types::AssistantMessageEvent::Error {
+        reason: StopReason::Error,
+        error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +426,167 @@ mod tests {
             .expect("acme error");
         assert!(error.contains("must specify"), "{error}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- streamWith (slice 6d) ----
+
+    /// The message skeleton the handler's events carry — the fields the
+    /// protocol requires (`AssistantMessage` with the zero `Usage`), built
+    /// per event so the model fields can echo the marshalled request.
+    const STREAM_EXTENSION: &str = r#"
+export default function (pi) {
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  const message = (text) => ({ role: "assistant", content: [{ type: "text", text }],
+    api: "acme-api", provider: "acme", model: "acme-1", usage, stopReason: "stop", timestamp: 0 });
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    baseUrl: "https://acme.test/v1",
+    models: [{ id: "acme-1", name: "Acme One", reasoning: true, input: ["text"], contextWindow: 90000, maxTokens: 4096 }],
+    streamSimple: async function* (model, context, options) {
+      yield { type: "text_start", contentIndex: 0, partial: message("") };
+      yield { type: "text_delta", contentIndex: 0,
+              delta: `${model.id}|${context.messages[0].role}|${options.reasoning}|${options.apiKey}|${options.sessionId}`,
+              partial: message("hi") };
+      yield { type: "done", reason: "stop", message: message("done") };
+    },
+  });
+}
+"#;
+
+    /// A handler that streams one event and then throws.
+    const STREAM_EXTENSION_THROW: &str = r#"
+export default function (pi) {
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    baseUrl: "https://acme.test/v1",
+    streamSimple: async function* () {
+      yield { type: "text_delta", contentIndex: 0, delta: "first", partial: {
+        role: "assistant", content: [], api: "acme-api", provider: "acme", model: "acme-1",
+        usage, stopReason: "stop", timestamp: 0 } };
+      throw new Error("stream-boom");
+    },
+  });
+}
+"#;
+
+    #[cfg(feature = "ext-js")]
+    fn stream_runner(extension: &str) -> pi_ext_js::ExtensionRunner {
+        let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
+            cwd: "/tmp".to_string(),
+            mode: "print".to_string(),
+            settings: json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        runner.load_extension("<test>", Some(extension)).expect("load");
+        runner.bind().expect("bind");
+        runner
+    }
+
+    #[cfg(feature = "ext-js")]
+    fn stream_request(api: &str) -> pi_agent::types::StreamRequest {
+        pi_agent::types::StreamRequest {
+            model: Model {
+                provider: "acme".to_string(),
+                id: "acme-1".to_string(),
+                name: "Acme One".to_string(),
+                api: api.to_string(),
+                base_url: "https://acme.test/v1".to_string(),
+                input: vec![pi_ai::types::ModelInputModality::Text],
+                reasoning: true,
+                context_window: 90_000,
+                max_tokens: 4096,
+                ..Model::default()
+            },
+            messages: vec![pi_agent::transcript::user_message("hi", 0)],
+            thinking_level: pi_agent::types::ThinkingLevel::High,
+            session_id: Some("s1".to_string()),
+            api_key: Some("sk-acme".to_string()),
+            access_token: None,
+        }
+    }
+
+    #[cfg(feature = "ext-js")]
+    fn collect(
+        stream: futures::stream::BoxStream<'static, pi_agent::types::AssistantMessageEvent>,
+    ) -> Vec<pi_agent::types::AssistantMessageEvent> {
+        use futures::StreamExt;
+        crate::runtime::block_on(stream.collect::<Vec<_>>())
+    }
+
+    #[test]
+    #[cfg(feature = "ext-js")]
+    fn stream_with_extension_replays_the_registered_handler() {
+        let runner = Arc::new(std::sync::Mutex::new(stream_runner(STREAM_EXTENSION)));
+        let events = collect(
+            stream_with_extension(&runner, &stream_request("acme-api")).expect("extension arm"),
+        );
+        // start → delta → done, in emission order; the delta proves the
+        // marshalled model/context/options reached the handler.
+        assert_eq!(events.len(), 3);
+        let pi_agent::types::AssistantMessageEvent::TextDelta { delta, .. } = &events[1] else {
+            panic!("expected a text delta, got {:?}", events[1]);
+        };
+        assert_eq!(delta, "acme-1|user|high|sk-acme|s1");
+        let pi_agent::types::AssistantMessageEvent::Done { message, .. } = &events[2] else {
+            panic!("expected a done event, got {:?}", events[2]);
+        };
+        assert_eq!(message.model, "acme-1");
+    }
+
+    #[test]
+    #[cfg(feature = "ext-js")]
+    fn stream_with_extension_arms_decide_by_api_and_registration() {
+        let runner = Arc::new(std::sync::Mutex::new(stream_runner(STREAM_EXTENSION)));
+        // The api is the streamWith gate: `model.api === extension.api`.
+        assert!(stream_with_extension(&runner, &stream_request("other-api")).is_none());
+        // No registered handler for the provider at all.
+        let mut request = stream_request("acme-api");
+        request.model.provider = "openai-codex".to_string();
+        assert!(stream_with_extension(&runner, &request).is_none());
+        // The composed dispatch consults the arm per request: a matching
+        // api replays the handler, any other falls to the base adapter.
+        use pi_agent::types::StreamFn as _;
+        struct StubStreamFn;
+        impl pi_agent::types::StreamFn for StubStreamFn {
+            fn stream(
+                &self,
+                _request: pi_agent::types::StreamRequest,
+            ) -> futures::stream::BoxStream<'static, pi_agent::types::AssistantMessageEvent>
+            {
+                Box::pin(futures::stream::iter(Vec::new()))
+            }
+        }
+        let dispatch = ComposedStreamFn {
+            runner: Arc::clone(&runner),
+            fallback: Arc::new(StubStreamFn),
+        };
+        assert_eq!(collect(dispatch.stream(stream_request("acme-api"))).len(), 3);
+        assert_eq!(collect(dispatch.stream(stream_request("other-api"))).len(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "ext-js")]
+    fn stream_with_extension_failure_appends_the_terminal_error_event() {
+        let runner = Arc::new(std::sync::Mutex::new(stream_runner(STREAM_EXTENSION_THROW)));
+        let events = collect(
+            stream_with_extension(&runner, &stream_request("acme-api")).expect("extension arm"),
+        );
+        // The event emitted before the throw arrives, then lazyStream's
+        // setup-failure shape: an Error event carrying the raw message.
+        assert_eq!(events.len(), 2);
+        let pi_agent::types::AssistantMessageEvent::TextDelta { delta, .. } = &events[0] else {
+            panic!("expected the streamed delta, got {:?}", events[0]);
+        };
+        assert_eq!(delta, "first");
+        let pi_agent::types::AssistantMessageEvent::Error { error, .. } = &events[1] else {
+            panic!("expected the terminal error, got {:?}", events[1]);
+        };
+        assert_eq!(error.stop_reason, pi_ai::types::StopReason::Error);
+        assert_eq!(error.error_message.as_deref(), Some("stream-boom"));
+        assert_eq!(error.provider, "acme");
     }
 }

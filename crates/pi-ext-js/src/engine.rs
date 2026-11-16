@@ -15,7 +15,10 @@
 //! are `runner.ts:331-362, 577-622, 891-1041`. There is no built-in event
 //! loop (§6.3): pending jobs are drained synchronously after every engine
 //! entry, which settles async factories, async handlers, and async
-//! `pi.exec` exactly where upstream awaits them.
+//! `pi.exec` exactly where upstream awaits them. The provider-stream op
+//! extends the same pattern to a stashed `streamSimple` handler's event
+//! stream (`core/provider-composer.ts:588-613`, `packages/ai`
+//! `StreamFunction` + `AssistantMessageEventStream`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -44,6 +47,10 @@ pub enum ContextKind {
     /// The routing context: the base event context for a virtual model's
     /// `route` call (`runtime.createContext()`, loader.ts:518).
     Route,
+    /// The base event context for a provider's `streamSimple` call
+    /// (`runtime.createContext()`, loader.ts:518 — the session event is the
+    /// marshalled `{model, context, options}` request).
+    ProviderStream,
 }
 
 /// The host actions an embedder overrides; everything defaults to the
@@ -117,6 +124,12 @@ pub struct HostCore {
     /// Data `operations.exec`'s `onData` callback streamed, in order,
     /// for the current `call_bash_exec`.
     pub bash_output: Vec<String>,
+    /// Stream events a provider's `streamSimple` handler emitted through
+    /// the `providerStreamEvent` op, in emission order, tagged with the
+    /// session id of the stream call that produced them
+    /// (`__piSessionCallProviderStream`). The runner drains one id after
+    /// the session settles.
+    pub provider_stream_events: Vec<(u32, Json)>,
     /// Provider registrations that failed validation at the bind-time
     /// flush, in flush order (the bindCore `emitError` reports).
     pub provider_bind_errors: Vec<crate::events::ProviderBindError>,
@@ -445,6 +458,16 @@ impl JsHost {
                 .expect("host core mutex poisoned")
                 .bash_output
                 .push(data);
+            String::new()
+        });
+        // A provider streamSimple handler's event emission
+        // (`__piSessionCallProviderStream`'s `for await`): each protocol
+        // event lands in order, tagged with the stream session id.
+        op!("providerStreamEvent", core, |id: u32, event: String| -> String {
+            core.lock()
+                .expect("host core mutex poisoned")
+                .provider_stream_events
+                .push((id, serde_json::from_str(&event).unwrap_or(Json::Null)));
             String::new()
         });
         op!("getModel", core, || -> String {
@@ -777,6 +800,7 @@ impl JsHost {
             ContextKind::Tool => "tool",
             ContextKind::ProjectTrust => "trust",
             ContextKind::Route => "route",
+            ContextKind::ProviderStream => "providerStream",
         };
         self.ctx.with(|ctx| -> Result<u32, JsHostError> {
             let begin: Function = ctx.globals().get("__piSessionBegin")?;
@@ -859,6 +883,42 @@ impl JsHost {
                 .map_err(|err| Self::js_error(&ctx, err))?;
             Ok(())
         })
+    }
+
+    /// Calls a provider's stashed `streamSimple` inside a session
+    /// (`__piSessionCallProviderStream`); the session event is the
+    /// marshalled `{model, context, options}` request, events stream
+    /// through the `providerStreamEvent` op, and the slot settles when
+    /// iteration finishes.
+    pub fn session_call_provider_stream(
+        &self,
+        id: u32,
+        provider: &str,
+    ) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx.globals().get("__piSessionCallProviderStream")?;
+            let _: Value = call
+                .call((id, provider))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
+    /// Takes the stream events the `providerStreamEvent` op queued for one
+    /// session id, in emission order; other sessions' events are kept.
+    pub fn take_provider_stream_events(&self, id: u32) -> Vec<Json> {
+        let mut core = self.core.lock().expect("host core mutex poisoned");
+        let mut events = Vec::new();
+        let mut rest = Vec::new();
+        for (queued, event) in std::mem::take(&mut core.provider_stream_events) {
+            if queued == id {
+                events.push(event);
+            } else {
+                rest.push((queued, event));
+            }
+        }
+        core.provider_stream_events = rest;
+        events
     }
 
     /// Reads the session result slot (`__piSessionLast`): a JSON object

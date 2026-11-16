@@ -805,9 +805,12 @@ pub struct ExtensionChatModelConfig {
 }
 
 /// The model-composition subset of an extension `ProviderConfigInput`
-/// (`provider-composer.ts:93-110`). `streamSimple`/`oauth`/`images`/
-/// `classifiers`/`refreshModels` are functions or per-operation objects the
-/// JSON bridge drops or defers; they land with slices 6c/6d.
+/// (`provider-composer.ts:93-110`). The `streamSimple` *function* is
+/// stashed JS-side and crosses here only as a `streamSimple: true`
+/// presence marker (slice 6d — the dispatch reads the marker through the
+/// runner's registry); `oauth`/`images`/`classifiers`/`refreshModels` are
+/// functions or per-operation objects the JSON bridge drops or defers;
+/// they land with slice 6c.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionProviderConfig {

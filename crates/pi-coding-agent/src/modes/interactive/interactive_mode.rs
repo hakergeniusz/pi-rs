@@ -2300,6 +2300,10 @@ impl InteractiveMode {
     /// changes (`handleModelCommand` and `session.cycleModel` share the path).
     /// A virtual selection swaps in the routed-dispatch stream function: the
     /// per-request model decides the adapter (`withVirtualModels`' stream).
+    /// A physical selection binds one adapter — wrapped in the composed
+    /// dispatch when the engine exists, so a provider's registered
+    /// `streamSimple` handler wins per request (`streamWith`,
+    /// provider-composer.ts:588-613).
     fn apply_model(&mut self, model: pi_ai::types::Model) -> Result<(), String> {
         if crate::virtual_models::is_virtual_model(&model) {
             self.stream_fn = Arc::new(crate::virtual_models::RoutedStreamFn {
@@ -2307,6 +2311,8 @@ impl InteractiveMode {
                 flag_api_key: self.api_key.clone(),
                 auth_path: self.auth_path.clone(),
                 route_error: Arc::new(crate::virtual_models::RouteErrorSlot::default()),
+                #[cfg(feature = "ext-js")]
+                runner: self.extension_runner.clone(),
             });
         } else if model.api != self.model.api {
             let Some(stream_fn) = pi_ai::providers::stream_fn_for(&model.api) else {
@@ -2315,7 +2321,17 @@ impl InteractiveMode {
                     model.api, model.provider, model.id
                 ));
             };
-            self.stream_fn = Arc::new(crate::modes::print_mode::ProviderStreamFn(stream_fn));
+            let base: Arc<dyn pi_agent::types::StreamFn> =
+                Arc::new(crate::modes::print_mode::ProviderStreamFn(stream_fn));
+            #[cfg(feature = "ext-js")]
+            let base = match &self.extension_runner {
+                Some(runner) => Arc::new(crate::models_state::ComposedStreamFn {
+                    runner: Arc::clone(runner),
+                    fallback: base,
+                }) as Arc<dyn pi_agent::types::StreamFn>,
+                None => base,
+            };
+            self.stream_fn = base;
         }
         let changed = model.provider != self.model.provider || model.id != self.model.id;
         self.model = model;

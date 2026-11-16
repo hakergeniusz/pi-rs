@@ -307,7 +307,10 @@ fn build_runtime_with_ui(
 
     // Under a virtual selection the stream dispatches per routed model
     // (`withVirtualModels`' `unroutedStream` fails unrouted requests with the
-    // TS message); physical selections bind one adapter.
+    // TS message); physical selections bind one adapter — wrapped in the
+    // composed dispatch when the engine exists, so a provider's registered
+    // `streamSimple` handler wins per request (`streamWith`,
+    // provider-composer.ts:588-613).
     let stream_fn: Arc<dyn pi_agent::types::StreamFn> =
         if pi_coding_agent::virtual_models::is_virtual_model(&model) {
             Arc::new(pi_coding_agent::virtual_models::RoutedStreamFn {
@@ -315,6 +318,8 @@ fn build_runtime_with_ui(
                 flag_api_key: args.api_key.clone(),
                 auth_path: config::get_auth_path(),
                 route_error: Arc::new(pi_coding_agent::virtual_models::RouteErrorSlot::default()),
+                #[cfg(feature = "ext-js")]
+                runner: extensions.host.runner(),
             })
         } else {
             let Some(stream_fn) = providers::stream_fn_for(&model.api) else {
@@ -323,7 +328,16 @@ fn build_runtime_with_ui(
                     model.api, model.provider, model.id
                 ));
             };
-            Arc::new(ProviderStreamFn(stream_fn))
+            let base: Arc<dyn pi_agent::types::StreamFn> = Arc::new(ProviderStreamFn(stream_fn));
+            #[cfg(feature = "ext-js")]
+            let base: Arc<dyn pi_agent::types::StreamFn> = match extensions.host.runner() {
+                Some(runner) => Arc::new(pi_coding_agent::models_state::ComposedStreamFn {
+                    runner,
+                    fallback: base,
+                }),
+                None => base,
+            };
+            base
         };
 
     // Session: --no-session is ephemeral, --continue resumes the most recent

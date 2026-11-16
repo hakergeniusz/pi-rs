@@ -10,7 +10,12 @@
 //! `runner.ts:637-679`), duplicate command names get `name:occurrence`
 //! invocation names with the collision-avoidance loop
 //! (`resolveRegisteredCommands`, `runner.ts:821-855`), and handler errors
-//! fan out through error listeners (`emitError`).
+//! fan out through error listeners (`emitError`). The provider-stream
+//! surface is the host half of `streamWith`'s extension arm
+//! (`core/provider-composer.ts:588-613`): the stashed `streamSimple`
+//! handler (`core/extensions/types.ts:1989-2007`) is invoked with the
+//! marshalled request and its event stream drains through the
+//! `providerStreamEvent` op.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -76,6 +81,20 @@ pub struct ResolvedCommand {
     pub invocation_name: String,
     /// The extension that registered it.
     pub extension_path: String,
+}
+
+/// The outcome of one provider-stream call: the events the handler
+/// emitted, in emission order, plus the session error when the handler
+/// threw (before or mid-iteration). Events emitted before a throw still
+/// arrive, mirroring upstream's lazyStream — a setup/iteration failure
+/// appends the terminal error event after the events already forwarded
+/// (`packages/ai/src/api/lazy.ts:65-105`).
+#[derive(Debug, Default)]
+pub struct ProviderStreamOutcome {
+    /// The protocol events, in emission order.
+    pub events: Vec<Json>,
+    /// The handler's error message, when it threw.
+    pub error: Option<String>,
 }
 
 /// One flag registration (`ExtensionFlag`).
@@ -1546,6 +1565,81 @@ impl ExtensionRunner {
         Self::outcome_result(outcome.map_err(|err| JsHostError::Job(err.to_string()))?)
     }
 
+    /// The api a provider's registered `streamSimple` handler covers —
+    /// `streamWith`'s `model.api === extension.api` check
+    /// (`provider-composer.ts:588-613`): `Some(api)` when the provider's
+    /// merged config carries the JS-side stash marker (`streamSimple: true`
+    /// — the function itself cannot cross the engine boundary) and declares
+    /// an `api`. `None` otherwise, so the caller falls through the
+    /// remaining `streamWith` arms.
+    #[must_use]
+    pub fn provider_stream_api(&self, provider: &str) -> Option<String> {
+        let core = self.core.lock().expect("host core mutex poisoned");
+        let config = core
+            .providers
+            .providers()
+            .iter()
+            .find(|entry| entry.name == provider)?
+            .config
+            .as_object()?;
+        if !config.get("streamSimple").is_some_and(Json::as_bool) {
+            return None;
+        }
+        config
+            .get("api")
+            .and_then(Json::as_str)
+            .map(str::to_string)
+    }
+
+    /// Calls a provider's `streamSimple` with the request the host built
+    /// (`streamWith`'s extension arm, `provider-composer.ts:588-613` →
+    /// `extension.streamSimple(model, context, options)`): the marshalled
+    /// `{model, context, options}` crosses as the session event, the
+    /// handler's event stream drains inside the engine (each event through
+    /// the `providerStreamEvent` op), and the events return in emission
+    /// order. Dialog-like settling applies (promises drain through the job
+    /// queue before the slot is read). A handler throw — before or
+    /// mid-iteration — lands in [`ProviderStreamOutcome::error`] with the
+    /// events already emitted, mirroring upstream's lazyStream: a
+    /// setup/iteration failure appends the terminal error event after the
+    /// events already forwarded (`packages/ai/src/api/lazy.ts:65-105`).
+    pub fn provider_stream(
+        &mut self,
+        provider: &str,
+        request: &Json,
+    ) -> Result<ProviderStreamOutcome, JsHostError> {
+        let payload =
+            serde_json::to_string(request).map_err(|err| JsHostError::Job(err.to_string()))?;
+        let id = self
+            .host
+            .session_begin(&payload, ContextKind::ProviderStream, None)?;
+        let call = self.host.session_call_provider_stream(id, provider);
+        let outcome = match call.and_then(|()| self.settle_session(id)) {
+            Ok(()) => parse_session_outcome(&self.host.session_last(id)?),
+            Err(err) => {
+                let events = self.host.take_provider_stream_events(id);
+                let _ = self.host.session_end(id);
+                return Ok(ProviderStreamOutcome {
+                    events,
+                    error: Some(err.to_string()),
+                });
+            }
+        };
+        let events = self.host.take_provider_stream_events(id);
+        let _ = self.host.session_end(id);
+        let outcome = outcome.map_err(|err| JsHostError::Job(err.to_string()))?;
+        // A session that never settled (the handler awaited something only
+        // jobs could resolve and none came) is a failure like the route
+        // dispatch's `HandlerDidNotComplete`, not a clean end — the events
+        // already emitted still cross.
+        let error = match outcome.error {
+            Some(error) => Some(error.message),
+            None if outcome.done => None,
+            None => Some("the handler never settled while draining the job queue".to_string()),
+        };
+        Ok(ProviderStreamOutcome { events, error })
+    }
+
     /// Provider registrations that failed validation at the bind-time
     /// flush, in flush order (upstream's bindCore `emitError` reports,
     /// `runner.ts:470-521`).
@@ -2371,6 +2465,191 @@ export default function (pi) {
                 .expect_err("discard cleaned the stash"),
         );
         assert_eq!(message, "Virtual model acme/ghost is not registered.");
+    }
+
+    /// A provider whose `streamSimple` handler echoes the marshalled
+    /// request into its events: sync yields, then an async leg, then the
+    /// terminal `done` (the protocol shape an async-generator handler
+    /// produces).
+    const EXT_PROVIDER_STREAM: &str = r#"
+export default function (pi) {
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    baseUrl: "https://acme.test/v1",
+    apiKey: "$ACME_KEY",
+    models: [{ id: "acme-1", name: "Acme One", reasoning: true, input: ["text"], contextWindow: 90000, maxTokens: 4096 }],
+    streamSimple: async function* (model, context, options) {
+      yield { type: "text_start", contentIndex: 0, partial: null };
+      yield { type: "text_delta", contentIndex: 0, delta: `${model.id}|${context.messages.length}|${options.reasoning}|${options.apiKey}` };
+      await Promise.resolve();
+      yield { type: "done", reason: "stop", message: { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [] } };
+    },
+  });
+}
+"#;
+
+    /// A handler that streams one event and then throws: the events before
+    /// the throw still cross (upstream's lazyStream forwards until the
+    /// failure, then appends the terminal error event).
+    const EXT_PROVIDER_STREAM_THROW: &str = r#"
+export default function (pi) {
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    baseUrl: "https://acme.test/v1",
+    streamSimple: async function* () {
+      yield { type: "text_delta", contentIndex: 0, delta: "first" };
+      throw new Error("stream-boom");
+    },
+  });
+}
+"#;
+
+    /// A factory that registers a streamSimple provider and then dies: the
+    /// stashed handler must die with the record (the discard has to clean
+    /// it, like the route-function stash).
+    const EXT_PROVIDER_STREAM_FAIL: &str = r#"
+export default function (pi) {
+  pi.registerProvider("acme", { api: "acme-api", baseUrl: "https://x", streamSimple: () => {} });
+  throw new Error("factory died");
+}
+"#;
+
+    /// streamSimple without an api: `validateExtensionProvider` throws
+    /// into the extension before anything is stored
+    /// (provider-composer.ts:544-548). appendEntry is an action method, so
+    /// the caught message is appended post-bind.
+    const EXT_PROVIDER_STREAM_NO_API: &str = r#"
+export default function (pi) {
+  const caught = [];
+  try {
+    pi.registerProvider("acme", { streamSimple: () => {} });
+    caught.push("no-throw");
+  } catch (error) {
+    caught.push(error.message);
+  }
+  pi.on("session_start", () => pi.appendEntry("stream-errors", caught));
+}
+"#;
+
+    #[test]
+    fn provider_stream_drains_the_stashed_handler_events() {
+        let mut runner = runner_with(&[EXT_PROVIDER_STREAM]);
+        // The whole marshalled request crosses as the session event; the
+        // handler reads model/context/options off it.
+        let outcome = runner
+            .provider_stream(
+                "acme",
+                &json!({
+                    "model": { "id": "acme-1", "name": "Acme One", "api": "acme-api", "provider": "acme",
+                               "baseUrl": "https://acme.test/v1", "reasoning": true, "input": ["text"],
+                               "contextWindow": 90000, "maxTokens": 4096 },
+                    "context": { "messages": [{ "role": "user", "content": "hi" }] },
+                    "options": { "reasoning": "high", "apiKey": "sk-acme" },
+                }),
+            )
+            .expect("stream");
+        assert!(outcome.error.is_none());
+        assert_eq!(
+            outcome.events,
+            vec![
+                json!({ "type": "text_start", "contentIndex": 0, "partial": null }),
+                json!({ "type": "text_delta", "contentIndex": 0, "delta": "acme-1|1|high|sk-acme" }),
+                json!({ "type": "done", "reason": "stop", "message": { "role": "assistant", "api": "acme-api", "provider": "acme", "model": "acme-1", "content": [] } }),
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_stream_handler_throw_keeps_the_events_already_emitted() {
+        let mut runner = runner_with(&[EXT_PROVIDER_STREAM_THROW]);
+        let outcome = runner
+            .provider_stream("acme", &json!({ "model": {}, "context": {}, "options": {} }))
+            .expect("stream");
+        assert_eq!(
+            outcome.events,
+            vec![json!({ "type": "text_delta", "contentIndex": 0, "delta": "first" })]
+        );
+        assert_eq!(outcome.error.as_deref(), Some("stream-boom"));
+    }
+
+    #[test]
+    fn provider_stream_of_an_unregistered_provider_answers_the_glue_error() {
+        let runner = runner_with(&[]);
+        // No stash entry: the glue settles the session with the
+        // not-registered error (the route-glue's unregistered branch
+        // shape), which the runner reports as the outcome error.
+        let outcome = runner
+            .provider_stream("acme", &json!({}))
+            .expect("settled");
+        assert_eq!(outcome.events, Vec::<Json>::new());
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("Provider acme is not registered with a streamSimple handler.")
+        );
+    }
+
+    #[test]
+    fn provider_stream_stash_dies_with_a_failed_extension() {
+        let mut runner = ExtensionRunner::new(HostCore {
+            cwd: "/tmp".to_string(),
+            mode: "print".to_string(),
+            settings: json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        assert!(
+            runner
+                .load_extension("<test-0>", Some(EXT_PROVIDER_STREAM_FAIL))
+                .is_err()
+        );
+        runner.bind().expect("bind");
+        // The discard removed the stash entry, so the glue answers with the
+        // not-registered error even though a live registration could have
+        // survived.
+        let outcome = runner
+            .provider_stream("acme", &json!({}))
+            .expect("settled");
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("Provider acme is not registered with a streamSimple handler.")
+        );
+    }
+
+    #[test]
+    fn provider_stream_api_tracks_the_stash_marker_through_merges() {
+        let mut runner = runner_with(&[EXT_PROVIDER_STREAM]);
+        // The registered api is what `streamWith` matches model.api
+        // against (`model.api === extension.api`).
+        assert_eq!(
+            runner.provider_stream_api("acme").as_deref(),
+            Some("acme-api")
+        );
+        assert_eq!(runner.provider_stream_api("missing"), None);
+        // A re-registration without the streamSimple key keeps the
+        // previous handler, like the per-key config merge.
+        let mut runner = runner_with(&[EXT_PROVIDER_STREAM, EXT_PROVIDERS_MERGE]);
+        assert_eq!(
+            runner.provider_stream_api("acme").as_deref(),
+            Some("acme-api")
+        );
+        // Unregistering removes the whole config, marker included.
+        let mut runner = runner_with(&[EXT_PROVIDER_STREAM, EXT_PROVIDERS_UNREG]);
+        assert_eq!(runner.provider_stream_api("acme"), None);
+    }
+
+    #[test]
+    fn provider_stream_without_an_api_throws_the_upstream_validation() {
+        let mut runner = runner_with(&[EXT_PROVIDER_STREAM_NO_API]);
+        runner
+            .emit(&events::session_start("startup"))
+            .expect("emit");
+        assert_eq!(
+            entries_of(&runner),
+            vec![json!({
+                "type": "stream-errors",
+                "data": ["Provider acme: \"api\" is required when registering streamSimple."],
+            })]
+        );
     }
 
     #[test]

@@ -650,6 +650,29 @@ slice-6 units:
 Order: 6a → 6b → 6d → 6c → 6e → 6f → 6g; each unit (or pair) on its own
 topic branch behind the container gate.
 
+**6d landed** (on `feat/e2-slice6d-stream-simple`): the `streamSimple`
+handler crosses like the `route` stash — the JS side keeps the function in
+`__piProviderStreams` keyed by provider name (registration throws upstream's
+`validateExtensionProvider` api-required message before storing; the config
+JSON carries a `streamSimple: true` presence marker that merges
+over-previous like the rest of the config; discard-time cleanup checks
+ownership identity) and the host invokes it per request
+(`ExtensionRunner::provider_stream`, the `providerStreamEvent` op, a
+`providerStream` dispatch session). The composer half lives in
+`models_state.rs` (the `provider-composer` port): `stream_with_extension` is
+the extension arm and `ComposedStreamFn` the `streamWith` ladder
+(extension arm → base/api fallback), installed at the three stream-fn sites
+(print/json runtime, interactive `apply_model`, and the routed dispatch —
+`RoutedStreamFn` gained the runner for routed requests). Engine-free builds
+see none of it (everything is `#[cfg(feature = "ext-js")]`).
+Deviation (mechanism only): the handler's event iterable drains inside the
+engine and the events replay to the loop once the handler finishes — no
+incremental event crossing of the QuickJS boundary; ordering and the
+lazyStream failure shape (events already emitted + terminal error event
+with the raw message) are faithful. Options marshal as
+`apiKey`/`accessToken`/`reasoning` (clamped `xhigh`/`max` → `high`, the
+`ProviderStreamFn` clamp)/`sessionId`.
+
 - **E3 — TUI bridging**: shortcuts, message/entry/tool renderers, markdown
   transformers, widgets-as-components, `ctx.ui.custom` with overlay handles,
   editor component, autocomplete, themes; component handles crossing as
