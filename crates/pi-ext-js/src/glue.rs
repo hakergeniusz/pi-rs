@@ -13,10 +13,16 @@
 //!    in-place event mutations (`snapshotEventHandlers` +
 //!    the `emit*` loops, `runner.ts` §2), the extension event bus
 //!    (`core/event-bus.ts`), and the JS-side stashes for callables that
-//!    cannot cross as JSON — the virtual-model `route` functions and the
+//!    cannot cross as JSON — the virtual-model `route` functions, the
 //!    provider `streamSimple` handlers (`__piSessionCallRoute` /
 //!    `__piSessionCallProviderStream`; `core/provider-composer.ts:588-613`,
-//!    `core/extensions/types.ts:1989-2007`).
+//!    `core/extensions/types.ts:1989-2007`), and the provider oauth
+//!    configs (`__piSessionCallOAuthLogin` + the one-shot refresh/api-key
+//!    calls: `adaptOAuth`'s JS arm — `login` receives the adapter
+//!    callbacks whose one-way notifications cross the `oauthNotify` op
+//!    and whose prompt promises the host resolves token-verified through
+//!    `oauthResolvePrompt`; `core/provider-composer.ts:358-377, 488-511`,
+//!    `packages/ai/src/compat/extension-oauth-types.ts:39-47`).
 //! 2. [`TYPEBOX_SHIM`] — the `typebox` virtual module. Upstream serves the
 //!    real bundled `TypeBox` (`virtual-modules.ts`); the E1 shim reproduces
 //!    the exact construction semantics of the builders extensions use
@@ -84,6 +90,7 @@ globalThis.__piVirtualModels = new Map();
 // over-previous like the rest of the config, mirroring the stored
 // function).
 globalThis.__piProviderStreams = new Map();
+globalThis.__piProviderOAuth = new Map();
 globalThis.__piExtensions = [];
 globalThis.__piExtState = [];
 
@@ -137,6 +144,10 @@ globalThis.__piBeginExtension = function (path) {
     // the same discard-time cleanup (they live in __piProviderStreams
     // keyed by provider name).
     providerStreams: [],
+    // The provider oauth configs this extension registered, for the same
+    // discard-time cleanup (they live in __piProviderOAuth keyed by
+    // provider name).
+    providerOauth: [],
   });
   globalThis.__piExtState.push("loading");
   return globalThis.__piExtensions.length - 1;
@@ -238,6 +249,12 @@ globalThis.__piDiscardExtension = function (extIdx) {
   for (const entry of ext.providerStreams ?? []) {
     if (globalThis.__piProviderStreams.get(entry.name) === entry.streamSimple) {
       globalThis.__piProviderStreams.delete(entry.name);
+    }
+  }
+  // The same ownership rule for provider oauth configs.
+  for (const entry of ext.providerOauth ?? []) {
+    if (globalThis.__piProviderOAuth.get(entry.name) === entry.oauth) {
+      globalThis.__piProviderOAuth.delete(entry.name);
     }
   }
   globalThis.__piExtensions[extIdx] = { path: ext.path, events: {}, tools: {}, commands: {}, flags: {}, busSubscriptions: [] };
@@ -534,11 +551,33 @@ globalThis.__piCreateApi = function (extIdx) {
             owned.streamSimple = config.streamSimple;
           }
         }
+        // The oauth config's functions (login/refreshToken/getApiKey)
+        // cannot cross as JSON: stash the whole config object keyed by
+        // provider (the map replaces on re-registration like the
+        // streamSimple merge) and send a `true` marker; the metadata
+        // subset (name/isSubscription) rides the config as before.
+        const hasOauthFns =
+          typeof config.oauth === "object" &&
+          config.oauth !== null &&
+          typeof config.oauth.login === "function";
+        if (hasOauthFns) {
+          globalThis.__piProviderOAuth.set(providerOrName, config.oauth);
+          const owned = ext.providerOauth.find((entry) => entry.name === providerOrName);
+          if (owned === undefined) {
+            ext.providerOauth.push({ name: providerOrName, oauth: config.oauth });
+          } else {
+            owned.oauth = config.oauth;
+          }
+        }
         applyProviderChange("provider", {
           name: providerOrName,
           // The top-level `streamSimple` function crosses as a `true`
           // presence marker (a shallow copy keeps nested values verbatim —
-          // nested functions drop like JSON.stringify always did).
+          // nested functions drop like JSON.stringify always did). The
+          // oauth object crosses verbatim: JSON.stringify drops its
+          // function keys naturally, so the metadata subset (name,
+          // isSubscription) still rides to the host, and login-ability is
+          // a runner query over the stash.
           configJson: JSON.stringify({
             ...config,
             streamSimple:
@@ -555,6 +594,8 @@ globalThis.__piCreateApi = function (extIdx) {
       const provider = String(name);
       globalThis.__piProviderStreams.delete(provider);
       ext.providerStreams = ext.providerStreams.filter((entry) => entry.name !== provider);
+      globalThis.__piProviderOAuth.delete(provider);
+      ext.providerOauth = ext.providerOauth.filter((entry) => entry.name !== provider);
       applyProviderChange("unregisterProvider", { name: provider });
     },
 
@@ -1270,6 +1311,136 @@ globalThis.__piSessionCallProviderStream = function (id, provider) {
       () => globalThis.__piSessionSettle(session, { value: null }),
       (error) => globalThis.__piSessionSettle(session, { error: globalThis.__piErrorText(error) }),
     );
+};
+
+// The oauth login bridge (`adaptOAuth`, `provider-composer.ts:488-511`
+// runs on the host side; this glue is its JS arm): the stashed config's
+// `login` receives the adapter callbacks — one-way notifications cross
+// the `oauthNotify` op, and the prompt callbacks return promises the
+// host resolves through `oauthResolvePrompt` (the UI answers, the
+// capability fires, the login function continues). `signal` is a plain
+// object the host flips through `oauthAbortSignal`.
+globalThis.__piOAuthPrompts = new Map();
+globalThis.__piOAuthPromptToken = 0;
+globalThis.__piSessionCallOAuthLogin = function (id, provider) {
+  const session = globalThis.__piSessions.get(id);
+  const oauth = globalThis.__piProviderOAuth.get(provider);
+  if (oauth === undefined || typeof oauth.login !== "function") {
+    globalThis.__piSessionSettle(session, {
+      error: JSON.stringify({
+        message: `Provider ${provider} is not registered with an oauth login handler.`,
+        stack: null,
+      }),
+    });
+    return;
+  }
+  session.eventName = "oauthNotify";
+  session.oauthSignal = { aborted: false };
+  const notify = (data) => {
+    globalThis.__piOps.oauthNotify(id, JSON.stringify(data));
+  };
+  const ask = (payload) =>
+    new Promise((resolve) => {
+      const token = ++globalThis.__piOAuthPromptToken;
+      globalThis.__piOAuthPrompts.set(id, { token, resolve, payload });
+      globalThis.__piOps.oauthPrompt(id, token, JSON.stringify(payload));
+    });
+  const callbacks = {
+    onAuth: (info) => notify({ type: "auth_url", ...info }),
+    onDeviceCode: (info) => notify({ type: "device_code", ...info }),
+    onPrompt: (prompt) => ask({ type: "text", ...prompt }),
+    onProgress: (message) => notify({ type: "progress", message }),
+    onManualCodeInput: () =>
+      ask({ type: "manual_code", message: "Paste the authorization code" }),
+    onSelect: (prompt) => ask({ type: "select", ...prompt }),
+    signal: session.oauthSignal,
+  };
+  Promise.resolve()
+    .then(() => oauth.login(callbacks))
+    .then(
+      (credential) =>
+        globalThis.__piSessionSettle(session, {
+          value: JSON.stringify({ ...credential, type: "oauth" }),
+        }),
+      (error) => globalThis.__piSessionSettle(session, { error: globalThis.__piErrorText(error) }),
+    );
+};
+
+globalThis.__piResolveOAuthPrompt = function (id, token, answerJson) {
+  const pending = globalThis.__piOAuthPrompts.get(id);
+  if (pending === undefined) return "no-prompt";
+  if (pending.token !== token) return "token-mismatch";
+  globalThis.__piOAuthPrompts.delete(id);
+  // A JSON `null` answer (the UI's cancel/escape) resolves as JS
+  // `undefined` — upstream's prompt promises resolve `string | undefined`
+  // and `JSON.stringify` drops `undefined` keys (extension-oauth-types.ts:39-47).
+  let answer = undefined;
+  try {
+    answer = answerJson === null || answerJson === undefined ? undefined : JSON.parse(answerJson);
+    if (answer === null) answer = undefined;
+  } catch {
+    answer = undefined;
+  }
+  pending.resolve(answer);
+  return "ok";
+};
+
+globalThis.__piOAuthHasLogin = function (provider) {
+  const oauth = globalThis.__piProviderOAuth.get(provider);
+  return oauth !== undefined && typeof oauth.login === "function";
+};
+
+globalThis.__piAbortOAuthSignal = function (id) {
+  const session = globalThis.__piSessions.get(id);
+  if (session && session.oauthSignal) session.oauthSignal.aborted = true;
+};
+
+// The one-shot oauth calls (`adaptOAuth`'s `refresh`/`toAuth` arms): the
+// stashed `refreshToken` is async and settles through the job queue into
+// a polled slot; `getApiKey` is synchronous and answers inline. Both
+// return `{value}` or `{error}`.
+globalThis.__piOAuthCallText = null;
+globalThis.__piOAuthCallReady = function () {
+  return globalThis.__piOAuthCallText !== null;
+};
+globalThis.__piCallOAuthRefresh = function (id, provider, credentialJson) {
+  globalThis.__piOAuthCallText = null;
+  const run = async () => {
+    const oauth = globalThis.__piProviderOAuth.get(provider);
+    if (oauth === undefined || typeof oauth.refreshToken !== "function") {
+      return JSON.stringify({
+        error: `Provider ${provider} is not registered with an oauth refresh handler.`,
+      });
+    }
+    try {
+      const credential = await oauth.refreshToken(
+        JSON.parse(credentialJson || "null"),
+        { aborted: false },
+      );
+      return JSON.stringify({ value: { ...credential, type: "oauth" } });
+    } catch (error) {
+      return JSON.stringify({ error: globalThis.__piErrorText(error) });
+    }
+  };
+  Promise.resolve()
+    .then(run)
+    .then((text) => {
+      globalThis.__piOAuthCallText = text;
+    });
+};
+globalThis.__piCallOAuthApiKey = function (id, provider, credentialJson) {
+  const oauth = globalThis.__piProviderOAuth.get(provider);
+  if (oauth === undefined || typeof oauth.getApiKey !== "function") {
+    return JSON.stringify({
+      error: `Provider ${provider} is not registered with an oauth getApiKey handler.`,
+    });
+  }
+  try {
+    const credential = JSON.parse(credentialJson || "null");
+    return JSON.stringify({ value: oauth.getApiKey(credential) });
+  } catch (error) {
+    return JSON.stringify({ error: globalThis.__piErrorText(error) });
+  }
 };
 
 // The `user_bash` operations bridge (`BashOperations.exec`,

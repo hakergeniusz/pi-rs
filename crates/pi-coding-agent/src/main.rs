@@ -225,6 +225,7 @@ fn build_runtime_with_ui(
     // models (`model-runtime.ts`; consumers read `models_state`).
     #[cfg(feature = "ext-js")]
     if let Some(runner) = extensions.host.runner() {
+        pi_coding_agent::models_state::set_extension_runner(Arc::clone(&runner));
         pi_coding_agent::models_state::refresh_with_runner(
             &runner.lock().expect("extension runner mutex poisoned"),
         );

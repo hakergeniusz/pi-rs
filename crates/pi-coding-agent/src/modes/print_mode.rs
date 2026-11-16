@@ -737,11 +737,32 @@ pub fn resolve_wire_credential_composed(
                 if !has_oauth {
                     return None;
                 }
-                // The OAuth flows hand the access token to the request
-                // through `toAuth`: most providers yield `auth.apiKey` (the
-                // provider's standard key header — `x-api-key` for
-                // anthropic, `auth/oauth/anthropic.ts:304-306`); kimi-coding
-                // yields an explicit Bearer header
+                // Extension oauth providers resolve the wire key through
+                // the stashed `getApiKey(credential)` (`adaptOAuth`'s
+                // `toAuth`, `provider-composer.ts:375`) — the handler owns
+                // what reaches the request, so the built-in arm below does
+                // not apply. The full stored credential crosses (upstream
+                // passes the `OAuthCredentials` object whole).
+                #[cfg(feature = "ext-js")]
+                if extension.is_some_and(|extension| extension.oauth.is_some()) {
+                    if let Ok(credential_json) = serde_json::to_value(&credential) {
+                        if let Some(key) =
+                            crate::models_state::extension_oauth_api_key(provider, &credential_json)
+                        {
+                            return Some((WireCredential::ApiKey(key), "stored credential"));
+                        }
+                    }
+                    // The handler is gone (engine reset) or failed: the
+                    // provider reports unconfigured rather than falling
+                    // back to the raw token.
+                    return None;
+                }
+                // The built-in OAuth flows hand the access token to the
+                // request through `toAuth`: most providers yield
+                // `auth.apiKey` (the provider's standard key header —
+                // `x-api-key` for anthropic,
+                // `auth/oauth/anthropic.ts:304-306`); kimi-coding yields an
+                // explicit Bearer header
                 // (`auth/oauth/kimi-coding.ts:275-277`).
                 let wire = if provider == "kimi-coding" {
                     WireCredential::AccessToken(access.clone())
@@ -1236,6 +1257,73 @@ mod tests {
             select_tools(&args, &builtin, &extension)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// The extension-oauth ladder arm (`adaptOAuth`'s `toAuth`,
+    /// `provider-composer.ts:375`): a stored oauth credential for a
+    /// provider with extension oauth metadata resolves through the
+    /// stashed `getApiKey` — the handler owns the wire key, so the
+    /// built-in arm (the raw access token) does not apply.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_oauth_credentials_resolve_through_the_stashed_get_api_key() {
+        let source = r#"
+export default function (pi) {
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    oauth: {
+      login: async () => ({}),
+      refreshToken: async () => ({}),
+      getApiKey: (credential) => `key-${credential.access}`,
+    },
+  });
+}
+"#;
+        let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
+            cwd: "/tmp".to_string(),
+            mode: "print".to_string(),
+            settings: serde_json::json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        runner
+            .load_extension("<test-0>", Some(source))
+            .expect("load");
+        runner.bind().expect("bind");
+        crate::models_state::set_extension_runner(std::sync::Arc::new(std::sync::Mutex::new(
+            runner,
+        )));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            serde_json::to_string(&serde_json::json!({
+                "acme": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000i64},
+            }))
+            .expect("auth.json"),
+        )
+        .expect("write");
+        let extension = crate::models_config::ExtensionProviderConfig {
+            oauth: Some(crate::models_config::ExtensionOAuthMetadata {
+                name: "Acme".to_string(),
+                is_subscription: false,
+                uses_callback_server: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_wire_credential_composed("acme", None, &auth_path, None, Some(&extension)),
+            Some((
+                WireCredential::ApiKey("key-tok".to_string()),
+                "stored credential"
+            ))
+        );
+        // A provider id no engine registration covers answers nothing.
+        assert_eq!(
+            resolve_wire_credential_composed("nosuch", None, &auth_path, None, Some(&extension)),
+            None
         );
     }
 }

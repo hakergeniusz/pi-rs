@@ -15,7 +15,14 @@
 //! (`core/provider-composer.ts:588-613`): the stashed `streamSimple`
 //! handler (`core/extensions/types.ts:1989-2007`) is invoked with the
 //! marshalled request and its event stream drains through the
-//! `providerStreamEvent` op.
+//! `providerStreamEvent` op. The oauth surface is the host half of
+//! `adaptOAuth` (`core/provider-composer.ts:358-377, 488-511`):
+//! [`ExtensionRunner::oauth_login_start`] drives the stashed `login` in a
+//! dispatch session (notifications poll through the oauth slots, prompts
+//! suspend it until [`ExtensionRunner::oauth_login_answer`], the adapter
+//! `signal` flips through [`ExtensionRunner::oauth_login_abort`]), and
+//! [`ExtensionRunner::oauth_refresh`]/[`ExtensionRunner::oauth_api_key`]
+//! are the one-shot `refreshToken`/`getApiKey` calls.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -95,6 +102,18 @@ pub struct ProviderStreamOutcome {
     pub events: Vec<Json>,
     /// The handler's error message, when it threw.
     pub error: Option<String>,
+}
+
+/// One step of an oauth login flow (`oauth_login_poll`): the
+/// notifications emitted since the last poll, the prompt now awaiting a
+/// host answer, and the settled credential or error when the login
+/// function finished.
+#[derive(Debug, Default)]
+pub struct OAuthLoginPoll {
+    pub notifications: Vec<Json>,
+    pub prompt: Option<(u64, Json)>,
+    /// `Some(Ok(credential))` on success, `Some(Err(message))` on throw.
+    pub settled: Option<Result<Json, String>>,
 }
 
 /// One flag registration (`ExtensionFlag`).
@@ -1573,6 +1592,128 @@ impl ExtensionRunner {
     /// an `api`. `None` otherwise, so the caller falls through the
     /// remaining `streamWith` arms.
     #[must_use]
+    /// Whether the provider registered an oauth `login` handler (the
+    /// stash is JS-side; the config JSON only carries the metadata).
+    pub fn oauth_has_login(&self, provider: &str) -> bool {
+        self.host.oauth_has_login(provider).unwrap_or(false)
+    }
+
+    /// Starts an oauth login flow: a session whose handler is the
+    /// provider's stashed `login` (`__piSessionCallOAuthLogin`). Returns
+    /// the session id; poll it with [`Self::oauth_login_poll`], answer
+    /// prompts with [`Self::oauth_login_answer`], and end it with
+    /// [`Self::oauth_login_end`].
+    pub fn oauth_login_start(&mut self, provider: &str) -> Result<u32, JsHostError> {
+        let payload = "{}";
+        let id = self
+            .host
+            .session_begin(payload, ContextKind::OAuthLogin, None)?;
+        self.host.session_call_oauth_login(id, provider)?;
+        Ok(id)
+    }
+
+    /// One settle step of the login flow: drain jobs so the login function
+    /// progresses, then collect the notifications emitted, the prompt now
+    /// awaiting an answer, and the settled credential when the function
+    /// finished. A prompt pauses the flow until
+    /// [`Self::oauth_login_answer`].
+    pub fn oauth_login_poll(&mut self, id: u32) -> Result<OAuthLoginPoll, JsHostError> {
+        self.settle_session(id)?;
+        let notifications = self.host.take_oauth_notify_events(id);
+        let prompt = self.host.take_oauth_prompt(id);
+        let settled = if self.session_settled(id)? {
+            let raw = self.host.session_last(id)?;
+            let outcome: SessionOutcome =
+                parse_session_outcome(&raw).map_err(|err| JsHostError::Job(err.to_string()))?;
+            if let Some(error) = outcome.error {
+                Some(Err(error.message))
+            } else {
+                // The glue settles with `JSON.stringify(credential)` — a
+                // JSON string crossing as the outcome's string value.
+                let credential = outcome
+                    .value
+                    .as_ref()
+                    .and_then(Json::as_str)
+                    .and_then(|text| serde_json::from_str::<Json>(text).ok())
+                    .unwrap_or(Json::Null);
+                Some(Ok(credential))
+            }
+        } else {
+            None
+        };
+        Ok(OAuthLoginPoll {
+            notifications,
+            prompt,
+            settled,
+        })
+    }
+
+    /// Resolves the login flow's pending prompt with the host's answer
+    /// (the credential field the prompt asked for, or `null` for an
+    /// undefined select) and drains jobs so the login function continues.
+    pub fn oauth_login_answer(
+        &mut self,
+        id: u32,
+        token: u64,
+        answer: &Json,
+    ) -> Result<(), JsHostError> {
+        let resolution = self.host.oauth_resolve_prompt(id, token, answer)?;
+        if resolution != "ok" {
+            return Err(JsHostError::Job(format!(
+                "oauth prompt answer rejected: {resolution}"
+            )));
+        }
+        self.host.drive_jobs()?;
+        Ok(())
+    }
+
+    /// Flags the login flow's `signal.aborted` — the UI's interrupt during
+    /// a login flow; the login function's own logic decides how to stop.
+    pub fn oauth_login_abort(&mut self, id: u32) -> Result<(), JsHostError> {
+        self.host.oauth_abort_signal(id)?;
+        self.host.drive_jobs()?;
+        Ok(())
+    }
+
+    /// Ends a login flow session, releasing its live objects.
+    pub fn oauth_login_end(&mut self, id: u32) -> Result<(), JsHostError> {
+        self.host.session_end(id)
+    }
+
+    /// `adaptOAuth`'s `refresh` arm (`provider-composer.ts:508-510`): the
+    /// stashed `refreshToken` with the refreshed credential, `type:
+    /// "oauth"` included by the glue.
+    pub fn oauth_refresh(&mut self, provider: &str, credential: &Json) -> Result<Json, String> {
+        let outcome = self
+            .host
+            .call_oauth_refresh(provider, credential)
+            .map_err(|err| err.to_string())?;
+        if let Some(error) = outcome.get("error").and_then(Json::as_str) {
+            Err(error.to_string())
+        } else {
+            Ok(outcome.get("value").cloned().unwrap_or(Json::Null))
+        }
+    }
+
+    /// `adaptOAuth`'s `toAuth` arm (`provider-composer.ts:511`): the
+    /// stashed `getApiKey`'s key for the stored credential.
+    pub fn oauth_api_key(&mut self, provider: &str, credential: &Json) -> Result<String, String> {
+        self.host
+            .call_oauth_api_key(provider, credential)
+            .map_err(|err| err.to_string())
+            .and_then(|outcome| {
+                if let Some(error) = outcome.get("error").and_then(Json::as_str) {
+                    Err(error.to_string())
+                } else {
+                    Ok(outcome
+                        .get("value")
+                        .and_then(Json::as_str)
+                        .unwrap_or_default()
+                        .to_string())
+                }
+            })
+    }
+
     pub fn provider_stream_api(&self, provider: &str) -> Option<String> {
         let core = self.core.lock().expect("host core mutex poisoned");
         let config = core
@@ -3004,5 +3145,293 @@ export default function (pi) {
     fn runner_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<ExtensionRunner>();
+    }
+
+    // ---- OAuth bridge (E2 slice 6j: `adaptOAuth`, provider-composer.ts:488-511;
+    // callback surface `extension-oauth-types.ts:39-47`) ----
+
+    /// A provider whose `login` only notifies and settles: one-way
+    /// notifications cross the `oauthNotify` op in emission order and the
+    /// credential comes back with `type: "oauth"` appended by the glue.
+    const EXT_OAUTH_NOTIFY_ONLY: &str = r#"
+export default function (pi) {
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    baseUrl: "https://acme.test/v1",
+    oauth: {
+      login: async (cb) => {
+        cb.onProgress("starting");
+        cb.onAuth({ url: "https://auth.test/authorize", instructions: "Open and approve." });
+        cb.onDeviceCode({ userCode: "ABCD-1234", verificationUri: "https://verify.test" });
+        return { access: "tok", refresh: "r" };
+      },
+    },
+  });
+}
+"#;
+
+    /// A `login` that exercises every ask: a text prompt, a select the
+    /// host answers with `null` (resolve `undefined` — the key drops out
+    /// of the settled credential), and a manual-code prompt.
+    const EXT_OAUTH_PROMPTS: &str = r#"
+export default function (pi) {
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    oauth: {
+      login: async (cb) => {
+        const code = await cb.onPrompt({ message: "paste the code", placeholder: "code", allowEmpty: false });
+        const picked = await cb.onSelect({ message: "workspace", options: [{ id: "w1", label: "One" }, { id: "w2", label: "Two" }] });
+        const manual = await cb.onManualCodeInput();
+        return { access: code, workspace: picked, manual };
+      },
+    },
+  });
+}
+"#;
+
+    /// A `login` that checks the adapter `signal` after its prompt: the
+    /// host's abort flip must be observable to the handler.
+    const EXT_OAUTH_ABORT: &str = r#"
+export default function (pi) {
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    oauth: {
+      login: async (cb) => {
+        await cb.onPrompt({ message: "waiting for approval" });
+        if (cb.signal.aborted) throw new Error("login aborted");
+        return { access: "late" };
+      },
+    },
+  });
+}
+"#;
+
+    /// A factory that registers an oauth provider and then dies: the
+    /// stashed config must die with the record, like the route and
+    /// streamSimple stashes.
+    const EXT_OAUTH_FAIL: &str = r#"
+export default function (pi) {
+  pi.registerProvider("acme", { api: "acme-api", oauth: { login: async () => ({}) } });
+  throw new Error("factory died");
+}
+"#;
+
+    /// `refreshToken` (async, slot-settled) and `getApiKey` (sync,
+    /// inline) on one provider (`adaptOAuth`'s refresh and toAuth arms).
+    const EXT_OAUTH_CALLS: &str = r#"
+export default function (pi) {
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    oauth: {
+      login: async () => ({}),
+      refreshToken: async (credential) => ({ access: `fresh-${credential.access}`, refresh: "r2" }),
+      getApiKey: (credential) => `key-${credential.access}`,
+    },
+  });
+}
+"#;
+
+    /// Register then unregister: the discard must clear the oauth stash.
+    const EXT_OAUTH_UNREGISTER: &str = r#"
+export default function (pi) {
+  pi.registerProvider("acme", { api: "acme-api", oauth: { login: async () => ({}) } });
+  pi.unregisterProvider("acme");
+}
+"#;
+
+    #[test]
+    fn oauth_login_notifies_and_settles_the_credential() {
+        let mut runner = runner_with(&[EXT_OAUTH_NOTIFY_ONLY]);
+        assert!(runner.oauth_has_login("acme"));
+        assert!(!runner.oauth_has_login("missing"));
+        let id = runner.oauth_login_start("acme").expect("start");
+        let poll = runner.oauth_login_poll(id).expect("poll");
+        assert!(poll.prompt.is_none());
+        assert_eq!(
+            poll.notifications,
+            vec![
+                json!({ "type": "progress", "message": "starting" }),
+                json!({ "type": "auth_url", "url": "https://auth.test/authorize", "instructions": "Open and approve." }),
+                json!({ "type": "device_code", "userCode": "ABCD-1234", "verificationUri": "https://verify.test" }),
+            ]
+        );
+        assert_eq!(
+            poll.settled.expect("settled"),
+            Ok(json!({ "access": "tok", "refresh": "r", "type": "oauth" }))
+        );
+        runner.oauth_login_end(id).expect("end");
+    }
+
+    #[test]
+    fn oauth_login_prompts_round_trip_through_the_host() {
+        let mut runner = runner_with(&[EXT_OAUTH_PROMPTS]);
+        let id = runner.oauth_login_start("acme").expect("start");
+        // Text prompt: the payload rides the op; the answer crosses back
+        // through the token-verified resolve.
+        let (token, payload) = runner
+            .oauth_login_poll(id)
+            .expect("poll")
+            .prompt
+            .expect("text prompt");
+        assert_eq!(
+            payload,
+            json!({ "type": "text", "message": "paste the code", "placeholder": "code", "allowEmpty": false })
+        );
+        runner
+            .oauth_login_answer(id, token, &json!("the-code"))
+            .expect("answer");
+        // Select prompt answered `null`: the promise resolves `undefined`,
+        // so the key drops out of the settled credential.
+        let (token, payload) = runner
+            .oauth_login_poll(id)
+            .expect("poll")
+            .prompt
+            .expect("select prompt");
+        assert_eq!(
+            payload,
+            json!({ "type": "select", "message": "workspace", "options": [
+                { "id": "w1", "label": "One" }, { "id": "w2", "label": "Two" }] })
+        );
+        runner
+            .oauth_login_answer(id, token, &Json::Null)
+            .expect("answer");
+        // Manual-code prompt.
+        let (token, payload) = runner
+            .oauth_login_poll(id)
+            .expect("poll")
+            .prompt
+            .expect("manual prompt");
+        assert_eq!(
+            payload,
+            json!({ "type": "manual_code", "message": "Paste the authorization code" })
+        );
+        runner
+            .oauth_login_answer(id, token, &json!("manual-1"))
+            .expect("answer");
+        let poll = runner.oauth_login_poll(id).expect("poll");
+        assert!(poll.prompt.is_none());
+        assert_eq!(
+            poll.settled.expect("settled"),
+            Ok(json!({ "access": "the-code", "manual": "manual-1", "type": "oauth" }))
+        );
+        runner.oauth_login_end(id).expect("end");
+    }
+
+    #[test]
+    fn oauth_login_prompt_answers_are_token_verified() {
+        let mut runner = runner_with(&[EXT_OAUTH_PROMPTS]);
+        let id = runner.oauth_login_start("acme").expect("start");
+        let (token, _) = runner
+            .oauth_login_poll(id)
+            .expect("poll")
+            .prompt
+            .expect("text prompt");
+        // A stale/foreign token is rejected and leaves the ask pending.
+        let error = runner
+            .oauth_login_answer(id, token + 1, &json!("nope"))
+            .expect_err("rejected");
+        // `JsHostError::Job`'s Display wraps the glue's message.
+        assert_eq!(
+            error.to_string(),
+            "javascript job error: oauth prompt answer rejected: token-mismatch"
+        );
+        // The correct token still resolves the pending ask.
+        runner
+            .oauth_login_answer(id, token, &json!("the-code"))
+            .expect("answer");
+        runner.oauth_login_end(id).expect("end");
+    }
+
+    #[test]
+    fn oauth_login_abort_flips_the_signal_the_handler_polls() {
+        let mut runner = runner_with(&[EXT_OAUTH_ABORT]);
+        let id = runner.oauth_login_start("acme").expect("start");
+        let (token, _) = runner
+            .oauth_login_poll(id)
+            .expect("poll")
+            .prompt
+            .expect("prompt");
+        runner.oauth_login_abort(id).expect("abort");
+        // The answer still resolves the pending ask (the UI's dialog
+        // closes); the handler then observes `signal.aborted` and throws.
+        runner
+            .oauth_login_answer(id, token, &Json::Null)
+            .expect("answer");
+        let poll = runner.oauth_login_poll(id).expect("poll");
+        assert_eq!(
+            poll.settled.expect("settled"),
+            Err("login aborted".to_string())
+        );
+        runner.oauth_login_end(id).expect("end");
+    }
+
+    #[test]
+    fn oauth_login_of_an_unregistered_provider_settles_the_glue_error() {
+        let mut runner = runner_with(&[]);
+        let id = runner.oauth_login_start("acme").expect("start");
+        let poll = runner.oauth_login_poll(id).expect("poll");
+        assert_eq!(
+            poll.settled.expect("settled"),
+            Err("Provider acme is not registered with an oauth login handler.".to_string())
+        );
+        runner.oauth_login_end(id).expect("end");
+    }
+
+    #[test]
+    fn oauth_stash_dies_with_a_failed_extension() {
+        let mut runner = ExtensionRunner::new(HostCore {
+            cwd: "/tmp".to_string(),
+            mode: "print".to_string(),
+            settings: json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        assert!(
+            runner
+                .load_extension("<test-0>", Some(EXT_OAUTH_FAIL))
+                .is_err()
+        );
+        runner.bind().expect("bind");
+        assert!(!runner.oauth_has_login("acme"));
+        let id = runner.oauth_login_start("acme").expect("start");
+        let poll = runner.oauth_login_poll(id).expect("poll");
+        assert_eq!(
+            poll.settled.expect("settled"),
+            Err("Provider acme is not registered with an oauth login handler.".to_string())
+        );
+        runner.oauth_login_end(id).expect("end");
+    }
+
+    #[test]
+    fn oauth_unregister_clears_the_stash() {
+        let runner = runner_with(&[EXT_OAUTH_UNREGISTER]);
+        assert!(!runner.oauth_has_login("acme"));
+    }
+
+    #[test]
+    fn oauth_refresh_and_api_key_call_the_stashed_handlers() {
+        let mut runner = runner_with(&[EXT_OAUTH_CALLS]);
+        let credential = json!({ "access": "tok" });
+        assert_eq!(
+            runner.oauth_refresh("acme", &credential).expect("refresh"),
+            json!({ "access": "fresh-tok", "refresh": "r2", "type": "oauth" })
+        );
+        assert_eq!(
+            runner.oauth_api_key("acme", &credential).expect("api key"),
+            "key-tok"
+        );
+    }
+
+    #[test]
+    fn oauth_calls_of_unregistered_providers_answer_the_glue_error() {
+        let mut runner = runner_with(&[]);
+        assert_eq!(
+            runner.oauth_refresh("acme", &json!({})).expect_err("error"),
+            "Provider acme is not registered with an oauth refresh handler."
+        );
+        assert_eq!(
+            runner.oauth_api_key("acme", &json!({})).expect_err("error"),
+            "Provider acme is not registered with an oauth getApiKey handler."
+        );
     }
 }

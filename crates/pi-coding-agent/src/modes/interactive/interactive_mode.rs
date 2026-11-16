@@ -81,6 +81,24 @@ enum LoginBackStep {
     Provider(Option<&'static str>),
 }
 
+/// One running extension-oauth login flow (`loginProvider`'s `"oauth"` arm
+/// through the engine bridge, slice 6j): the JS `login` runs in an engine
+/// session, its notifications surface as status lines, and its asks mount
+/// the prompt/select dialogs.
+struct ExtensionLoginFlow {
+    /// The engine session driving the stashed `login`.
+    session: u32,
+    /// The provider being configured (the storage key).
+    provider_id: String,
+    /// The display name for the status/error lines.
+    provider_name: String,
+    /// The pending ask — `(token, payload)` — when a prompt suspended the
+    /// flow; the mounted dialog's answer resolves it.
+    pending_prompt: Option<(u64, serde_json::Value)>,
+    /// Where a cancelled login returns to (`onBack`).
+    back: Option<LoginBackStep>,
+}
+
 /// Options the CLI host passes in (`InteractiveModeOptions`).
 pub struct InteractiveOptions {
     pub version: String,
@@ -756,6 +774,14 @@ pub struct InteractiveMode {
     login_prompt_provider: Option<(String, String)>,
     /// Where a cancelled login returns to (`onBack`).
     login_back: Option<LoginBackStep>,
+    /// The running extension-oauth login flow (slice 6j).
+    extension_login_flow: Option<ExtensionLoginFlow>,
+    /// Events from the mounted extension-login text prompt (the
+    /// `onPrompt`/`onManualCodeInput` asks).
+    extension_login_prompt: Option<Arc<Mutex<Vec<LoginPromptEvent>>>>,
+    /// Events from the mounted extension-login option selector (the
+    /// `onSelect` ask).
+    extension_login_select: Option<Arc<Mutex<Vec<AuthSelectorEvent>>>>,
     /// The editor, parked while the selector occupies its tree slot.
     suspended_editor: Option<Box<dyn Component>>,
     /// The resolved renderer mode (`options.tuiMode`): which screen the
@@ -937,6 +963,9 @@ impl InteractiveMode {
             login_prompt_events: None,
             login_prompt_provider: None,
             login_back: None,
+            extension_login_flow: None,
+            extension_login_prompt: None,
+            extension_login_select: None,
             suspended_editor: None,
             tui_mode,
             editor_id,
@@ -2590,6 +2619,7 @@ impl InteractiveMode {
         // Registrations apply live (`model-runtime.ts`); rebuild the
         // composed snapshot when the registry moved.
         if let Some(runner) = &self.extension_runner {
+            crate::models_state::set_extension_runner(std::sync::Arc::clone(runner));
             crate::models_state::refresh_with_runner(
                 &runner.lock().expect("extension runner mutex poisoned"),
             );
@@ -4650,6 +4680,11 @@ impl InteractiveMode {
         back: Option<LoginBackStep>,
     ) {
         if provider.auth_type == "oauth" {
+            // Extension oauth providers run through the engine bridge
+            // (`adaptOAuth`'s login arm, `provider-composer.ts:363-375`).
+            if self.start_extension_oauth_login(provider, back) {
+                return;
+            }
             // The per-provider OAuth flows (PKCE/device-code/callback
             // servers, `packages/ai/src/auth/oauth/*.ts`) are not ported
             // yet; the upstream error shape reports the honest reason.
@@ -4757,6 +4792,392 @@ impl InteractiveMode {
                 }
             }
         }
+    }
+
+    // ---- Extension oauth login (slice 6j: `showLoginDialog`/`loginProvider`'s
+    // `"oauth"` arm, `interactive-mode.ts:6539-6583`, driving the engine
+    // bridge — `adaptOAuth`'s login, `provider-composer.ts:363-375`) ----
+
+    /// Starts the extension-oauth login flow when the provider registered
+    /// one: `false` leaves the caller to the built-in paths (the upstream
+    /// error for the unported per-provider flows).
+    fn start_extension_oauth_login(
+        &mut self,
+        provider: &AuthSelectorProvider,
+        back: Option<LoginBackStep>,
+    ) -> bool {
+        let started = self.extension_runner.as_ref().map(|runner| {
+            let mut runner = runner.lock().expect("extension runner mutex poisoned");
+            if !runner.oauth_has_login(&provider.id) {
+                return None;
+            }
+            Some(runner.oauth_login_start(&provider.id))
+        });
+        match started {
+            None | Some(None) => return false,
+            Some(Some(Err(error))) => {
+                self.show_error(&format!("Failed to login to {}: {error}", provider.name));
+                return true;
+            }
+            Some(Some(Ok(session))) => {
+                self.extension_login_flow = Some(ExtensionLoginFlow {
+                    session,
+                    provider_id: provider.id.clone(),
+                    provider_name: provider.name.clone(),
+                    pending_prompt: None,
+                    back,
+                });
+            }
+        }
+        self.pump_extension_oauth_login();
+        true
+    }
+
+    /// The flow's engine poll (`loginProvider` awaiting the runtime login):
+    /// drain notifications, mount the pending ask, settle the credential.
+    /// The rich `LoginDialogComponent` presentation (`login-dialog.ts`)
+    /// lands with the E3 TUI slice — the flow's notifications surface as
+    /// status lines and the asks reuse the prompt/select components
+    /// (HANDOFF deviation, presentation only).
+    fn pump_extension_oauth_login(&mut self) {
+        let Some(mut flow) = self.extension_login_flow.take() else {
+            return;
+        };
+        let poll = match self.extension_runner.as_ref().map(|runner| {
+            runner
+                .lock()
+                .expect("extension runner mutex poisoned")
+                .oauth_login_poll(flow.session)
+        }) {
+            Some(Ok(poll)) => poll,
+            Some(Err(error)) => {
+                self.finish_extension_login_error(&flow, &error.to_string());
+                return;
+            }
+            None => {
+                self.extension_login_flow = Some(flow);
+                return;
+            }
+        };
+        for notification in &poll.notifications {
+            self.show_extension_login_notification(&flow, notification);
+        }
+        if let Some((token, payload)) = poll.prompt {
+            if self.mount_extension_login_ask(&mut flow, token, &payload) {
+                self.extension_login_flow = Some(flow);
+            }
+            return;
+        }
+        if let Some(settled) = poll.settled {
+            match settled {
+                Ok(credential) => self.finish_extension_login(&flow, credential),
+                Err(message) => self.finish_extension_login_error(&flow, &message),
+            }
+            return;
+        }
+        // Still running with nothing new this tick — the pump calls again.
+        self.extension_login_flow = Some(flow);
+    }
+
+    /// `notifyAuthDialog` (`interactive-mode.ts:6507-6518`) as status lines:
+    /// the sign-in URL (with its instructions), the device code, the
+    /// progress text.
+    fn show_extension_login_notification(
+        &mut self,
+        flow: &ExtensionLoginFlow,
+        notification: &serde_json::Value,
+    ) {
+        match notification.get("type").and_then(serde_json::Value::as_str) {
+            Some("auth_url") => {
+                if let Some(instructions) = notification
+                    .get("instructions")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.show_status(instructions);
+                }
+                let url = notification
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                self.show_status(&format!("Sign in: {url}"));
+            }
+            Some("device_code") => {
+                let user_code = notification
+                    .get("userCode")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let verification_uri = notification
+                    .get("verificationUri")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                self.show_status(&format!("Enter code {user_code} at {verification_uri}"));
+                self.show_status(&format!(
+                    "Waiting for authentication... ({})",
+                    flow.provider_name
+                ));
+            }
+            // `progress` and anything else the bridge forwards.
+            _ => {
+                if let Some(message) = notification
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.show_status(message);
+                }
+            }
+        }
+    }
+
+    /// Mounts the ask's dialog (`showAuthPrompt`,
+    /// `interactive-mode.ts:6483-6505`): a select opens the option
+    /// selector, text/manual-code opens the entry dialog. Returns `false`
+    /// when the ask was unknown and the flow finished instead.
+    fn mount_extension_login_ask(
+        &mut self,
+        flow: &mut ExtensionLoginFlow,
+        token: u64,
+        payload: &serde_json::Value,
+    ) -> bool {
+        match payload.get("type").and_then(serde_json::Value::as_str) {
+            Some("select") => {
+                let message = payload
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Select an option");
+                let labels: Vec<String> = payload
+                    .get("options")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|options| {
+                        options
+                            .iter()
+                            .filter_map(|option| {
+                                option
+                                    .get("label")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let selector = AuthSelectorComponent::options(message, labels, Arc::clone(&events));
+                self.extension_login_select = Some(events);
+                flow.pending_prompt = Some((token, payload.clone()));
+                self.suspend_editor_with(Box::new(selector));
+                true
+            }
+            Some("text") | Some("manual_code") => {
+                let message = payload
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Enter value");
+                let placeholder = payload
+                    .get("placeholder")
+                    .and_then(serde_json::Value::as_str);
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let prompt = LoginPromptComponent::new(message, placeholder, Arc::clone(&events));
+                self.extension_login_prompt = Some(events);
+                flow.pending_prompt = Some((token, payload.clone()));
+                self.suspend_editor_with(Box::new(prompt));
+                true
+            }
+            _ => {
+                let kind = payload
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                self.finish_extension_login_error(
+                    flow,
+                    &format!("Login prompt type {kind:?} is not supported"),
+                );
+                false
+            }
+        }
+    }
+
+    /// Resolves the flow's pending ask and keeps polling
+    /// (`oauth_login_answer` + the next drain); errors finish the flow.
+    fn answer_extension_login_prompt(&mut self, answer: &serde_json::Value) {
+        let (session, token) = match self.extension_login_flow.as_ref() {
+            Some(flow) => match flow.pending_prompt {
+                Some((token, _)) => (flow.session, token),
+                None => return,
+            },
+            None => return,
+        };
+        let answered = self.extension_runner.as_ref().map(|runner| {
+            runner
+                .lock()
+                .expect("extension runner mutex poisoned")
+                .oauth_login_answer(session, token, answer)
+        });
+        match answered {
+            Some(Ok(())) => {
+                if let Some(flow) = self.extension_login_flow.as_mut() {
+                    flow.pending_prompt = None;
+                }
+                self.pump_extension_oauth_login();
+            }
+            Some(Err(error)) => {
+                if let Some(flow) = self.extension_login_flow.take() {
+                    self.finish_extension_login_error(&flow, &error.to_string());
+                }
+            }
+            // No engine: the flow cannot continue.
+            None => self.extension_login_flow = None,
+        }
+    }
+
+    /// Escape from a mounted ask (`Login cancelled` — the dialog's abort
+    /// signal, `interactive-mode.ts:6441-6443`): kill the engine session
+    /// and return to the `onBack` target. The abort flips the adapter
+    /// `signal` the handler polls; the session ends regardless, so the
+    /// abort is the host-side cancel rather than a cooperative stop.
+    fn cancel_extension_login_flow(&mut self) {
+        let Some(flow) = self.extension_login_flow.take() else {
+            self.tui.request_render();
+            return;
+        };
+        if let Some(runner) = self.extension_runner.as_ref() {
+            let mut runner = runner.lock().expect("extension runner mutex poisoned");
+            let _ = runner.oauth_login_abort(flow.session);
+            let _ = runner.oauth_login_end(flow.session);
+        }
+        let back = flow.back;
+        self.run_login_back(back);
+    }
+
+    /// The extension-login text prompt's drain (`showPrompt`'s resolver).
+    fn pump_extension_login_prompt(&mut self) {
+        if self.extension_login_prompt.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .extension_login_prompt
+                .as_ref()
+                .expect("extension login prompt")
+                .lock()
+                .expect("extension login prompt events"),
+        );
+        for event in events {
+            match event {
+                LoginPromptEvent::Submit(value) => {
+                    self.extension_login_prompt = None;
+                    self.restore_editor();
+                    self.answer_extension_login_prompt(&serde_json::Value::String(value));
+                }
+                LoginPromptEvent::Cancel => {
+                    self.extension_login_prompt = None;
+                    self.restore_editor();
+                    self.cancel_extension_login_flow();
+                }
+            }
+        }
+    }
+
+    /// The extension-login select's drain (`showAuthSelect`'s resolver,
+    /// `interactive-mode.ts:6450-6481`): the picked label maps back to its
+    /// option id; an unknown label or escape is `Login cancelled`.
+    fn pump_extension_login_select(&mut self) {
+        if self.extension_login_select.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .extension_login_select
+                .as_ref()
+                .expect("extension login select")
+                .lock()
+                .expect("extension login select events"),
+        );
+        for event in events {
+            match event {
+                AuthSelectorEvent::SelectOption(label) => {
+                    self.extension_login_select = None;
+                    self.restore_editor();
+                    let answer = self
+                        .extension_login_flow
+                        .as_ref()
+                        .and_then(|flow| flow.pending_prompt.as_ref().map(|(_, payload)| payload))
+                        .and_then(|payload| {
+                            payload.get("options").and_then(serde_json::Value::as_array)
+                        })
+                        .and_then(|options| {
+                            options
+                                .iter()
+                                .find(|option| {
+                                    option.get("label").and_then(serde_json::Value::as_str)
+                                        == Some(label.as_str())
+                                })
+                                .and_then(|option| option.get("id").cloned())
+                        });
+                    match answer {
+                        Some(id) => self.answer_extension_login_prompt(&id),
+                        None => self.cancel_extension_login_flow(),
+                    }
+                }
+                AuthSelectorEvent::Cancel => {
+                    self.extension_login_select = None;
+                    self.restore_editor();
+                    self.cancel_extension_login_flow();
+                }
+                // Option rows never publish `Select`.
+                AuthSelectorEvent::Select { .. } => {}
+            }
+        }
+    }
+
+    /// The settled credential (`completeProviderAuthentication`'s storage
+    /// + status, `interactive-mode.ts:6277-6331`): store the oauth
+    /// credential and report the saved path.
+    fn finish_extension_login(&mut self, flow: &ExtensionLoginFlow, credential: serde_json::Value) {
+        if let Some(runner) = self.extension_runner.as_ref() {
+            let mut runner = runner.lock().expect("extension runner mutex poisoned");
+            let _ = runner.oauth_login_end(flow.session);
+        }
+        self.extension_login_flow = None;
+        self.restore_editor();
+        let credential = match serde_json::from_value::<crate::auth::Credential>(credential) {
+            Ok(credential) => credential,
+            Err(error) => {
+                self.show_error(&format!(
+                    "Failed to save credentials for {}: {error}",
+                    flow.provider_name
+                ));
+                return;
+            }
+        };
+        let storage = crate::auth::AuthStorage::create(&self.auth_path);
+        let result = storage.modify(&flow.provider_id, |_current| Ok(Some(credential)));
+        match result {
+            Ok(_) => self.show_status(&format!(
+                "Logged in to {}. Credentials saved to {}",
+                flow.provider_name,
+                self.auth_path.display()
+            )),
+            Err(error) => self.show_error(&format!(
+                "Failed to save credentials for {}: {error}",
+                flow.provider_name
+            )),
+        }
+    }
+
+    /// A failed login (`showLoginDialog`'s catch, `:6584-6592`): report and
+    /// drop the flow. Only `Login cancelled` routes to `onBack`; errors stay.
+    fn finish_extension_login_error(&mut self, flow: &ExtensionLoginFlow, message: &str) {
+        if let Some(runner) = self.extension_runner.as_ref() {
+            let mut runner = runner.lock().expect("extension runner mutex poisoned");
+            let _ = runner.oauth_login_end(flow.session);
+        }
+        self.extension_login_flow = None;
+        self.extension_login_prompt = None;
+        self.extension_login_select = None;
+        self.restore_editor();
+        self.show_error(&format!(
+            "Failed to login to {}: {message}",
+            flow.provider_name
+        ));
     }
 
     /// The `onBack` chain (`showApiKeyLoginDialog`/`showLoginDialog`'s
@@ -4961,6 +5382,9 @@ impl InteractiveMode {
         self.pump_session_selector();
         self.pump_auth_selector();
         self.pump_login_prompt();
+        self.pump_extension_login_prompt();
+        self.pump_extension_login_select();
+        self.pump_extension_oauth_login();
 
         // The 3D easter egg (`playEasterEgg3d`): the header's logo clicks
         // replay from the queue, the animation's rows track the terminal, and
@@ -7142,6 +7566,89 @@ mod tests {
             frame.contains("OAuth login flows are not implemented"),
             "{frame}"
         );
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// The extension-oauth end-to-end (`loginProvider`'s `"oauth"` arm
+    /// through the engine bridge, slice 6j): the registration's `login`
+    /// notifies, asks, and settles; the pump mounts the ask, the answer
+    /// crosses back token-verified, and the credential lands in auth.json
+    /// with the `type: "oauth"` shape the ladder resolves through
+    /// `getApiKey`.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn login_extension_oauth_drives_the_engine_flow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        let source = r#"
+export default function (pi) {
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    oauth: {
+      name: "Acme",
+      login: async (cb) => {
+        cb.onProgress("connecting");
+        const code = await cb.onPrompt({ message: "paste the acme code", placeholder: "code" });
+        return { access: `tok-${code}`, refresh: "r", expires: 1 };
+      },
+    },
+  });
+}
+"#;
+        let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
+            cwd: "/tmp".to_string(),
+            mode: "print".to_string(),
+            settings: serde_json::json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        runner
+            .load_extension("<test-0>", Some(source))
+            .expect("load");
+        runner.bind().expect("bind");
+        mode.extension_runner = Some(Arc::new(Mutex::new(runner)));
+
+        // The selector listing rides the composed snapshot (covered by the
+        // slice 6c tests); the flow test drives `startProviderLogin`
+        // directly with the row that listing would produce.
+        let provider = AuthSelectorProvider {
+            id: "acme".to_string(),
+            name: "acme".to_string(),
+            auth_type: "oauth",
+            subscription: false,
+            method_name: Some("Acme".to_string()),
+            login_label: None,
+            status: None,
+        };
+        mode.start_provider_login(&provider, None);
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("connecting"), "progress shown: {frame}");
+        let flow = mode.extension_login_flow.as_ref().expect("flow started");
+        assert!(flow.pending_prompt.is_some(), "ask suspended the flow");
+        assert!(mode.extension_login_prompt.is_some(), "prompt mounted");
+
+        mode.extension_login_prompt
+            .as_ref()
+            .expect("prompt")
+            .lock()
+            .expect("prompt events")
+            .push(LoginPromptEvent::Submit("code-1".to_string()));
+        mode.pump();
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Logged in to acme"), "{frame}");
+        assert!(frame.contains("Credentials saved to"), "{frame}");
+        assert!(mode.extension_login_flow.is_none(), "flow settled");
+        assert!(mode.extension_login_prompt.is_none(), "prompt closed");
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+        let stored = std::fs::read_to_string(dir.path().join("auth.json")).expect("auth.json");
+        assert!(stored.contains(r#""acme""#), "{stored}");
+        assert!(stored.contains("tok-code-1"), "{stored}");
+        assert!(stored.contains(r#""oauth""#), "{stored}");
 
         mode.shutdown().expect("shutdown");
     }

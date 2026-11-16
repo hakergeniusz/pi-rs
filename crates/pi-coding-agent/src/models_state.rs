@@ -21,6 +21,10 @@
 //! (`core/provider-composer.ts:588-613`) and [`ComposedStreamFn`] wraps it
 //! around the caller's base adapter, so every request under the engine
 //! streams through the composed dispatch (engine-free builds never see it).
+//! Slice 6j added the oauth ladder reach: [`set_extension_runner`] shares
+//! the engine, and [`extension_oauth_api_key`] is `adaptOAuth`'s `toAuth`
+//! (`core/provider-composer.ts:375`) — a stored extension-oauth credential
+//! resolves its wire key through the stashed `getApiKey`.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +56,15 @@ static MODELS_JSON_PROVIDERS: RwLock<
 #[cfg(feature = "ext-js")]
 static EXTENSION_PROVIDERS: RwLock<Vec<(String, models_config::ExtensionProviderConfig)>> =
     RwLock::new(Vec::new());
+/// The engine itself, shared with the modes — the oauth credential ladder
+/// resolves stored extension credentials through the live stashed handlers
+/// (`adaptOAuth`'s `toAuth` closes over the extension's `getApiKey`;
+/// `provider-composer.ts:375`). Set at startup/refresh alongside
+/// [`refresh_with_runner`]; never locked while the runner mutex is held
+/// (the ladder clones the `Arc` under a read guard, then locks the runner).
+#[cfg(feature = "ext-js")]
+static EXTENSION_RUNNER: RwLock<Option<Arc<std::sync::Mutex<pi_ext_js::ExtensionRunner>>>> =
+    RwLock::new(None);
 #[cfg(feature = "ext-js")]
 static LAST_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -423,6 +436,29 @@ pub fn extension_provider_config(
     None
 }
 
+/// Shares the engine with the auth ladder (call at startup and whenever a
+/// fresh runner replaces the old one — extension reload).
+#[cfg(feature = "ext-js")]
+pub fn set_extension_runner(runner: Arc<std::sync::Mutex<pi_ext_js::ExtensionRunner>>) {
+    *EXTENSION_RUNNER
+        .write()
+        .expect("extension runner slot mutex poisoned") = Some(runner);
+}
+
+/// `adaptOAuth`'s `toAuth` (`provider-composer.ts:375`): a stored
+/// extension-oauth credential resolves its wire key through the stashed
+/// `getApiKey(credential)` — the handler owns what reaches the request.
+/// `None` without an engine, for a provider whose handlers are gone, or
+/// when the handler fails (upstream's `toAuth` rejection fails the
+/// request setup; the port's ladder has no error channel, so the
+/// provider reports unconfigured — HANDOFF deviation).
+#[cfg(feature = "ext-js")]
+pub fn extension_oauth_api_key(provider_id: &str, credential: &Value) -> Option<String> {
+    let runner = EXTENSION_RUNNER.read().ok()?.clone()?;
+    let mut runner = runner.lock().expect("extension runner mutex poisoned");
+    runner.oauth_api_key(provider_id, credential).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,5 +715,45 @@ export default function (pi) {
         assert_eq!(config.api_key.as_deref(), Some("$ACME_KEY"));
         assert!(models_json_provider("no-such-provider").is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The oauth ladder's engine reach (`adaptOAuth`'s `toAuth`,
+    /// `provider-composer.ts:375`): the stashed `getApiKey` resolves the
+    /// stored credential's wire key; unknown providers answer `None`.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_oauth_api_key_calls_the_stashed_handler() {
+        let source = r#"
+export default function (pi) {
+  pi.registerProvider("acme", {
+    api: "acme-api",
+    oauth: {
+      login: async () => ({}),
+      refreshToken: async () => ({}),
+      getApiKey: (credential) => `key-${credential.access}`,
+    },
+  });
+}
+"#;
+        let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
+            cwd: "/tmp".to_string(),
+            mode: "print".to_string(),
+            settings: serde_json::json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        runner
+            .load_extension("<test-0>", Some(source))
+            .expect("load");
+        runner.bind().expect("bind");
+        set_extension_runner(Arc::new(Mutex::new(runner)));
+        assert_eq!(
+            extension_oauth_api_key("acme", &serde_json::json!({ "access": "tok" })),
+            Some("key-tok".to_string())
+        );
+        assert_eq!(
+            extension_oauth_api_key("nosuch", &serde_json::json!({})),
+            None
+        );
     }
 }

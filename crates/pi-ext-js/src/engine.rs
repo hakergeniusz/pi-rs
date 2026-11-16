@@ -51,6 +51,10 @@ pub enum ContextKind {
     /// (`runtime.createContext()`, loader.ts:518 — the session event is the
     /// marshalled `{model, context, options}` request).
     ProviderStream,
+    /// The base event context for a provider's oauth `login` call — the
+    /// session event is the empty request; notifications and prompts cross
+    /// their own ops.
+    OAuthLogin,
 }
 
 /// The host actions an embedder overrides; everything defaults to the
@@ -130,6 +134,17 @@ pub struct HostCore {
     /// (`__piSessionCallProviderStream`). The runner drains one id after
     /// the session settles.
     pub provider_stream_events: Vec<(u32, Json)>,
+    /// OAuth login notifications an extension's `login` emitted through
+    /// the `oauthNotify` op, in emission order, tagged with the session id
+    /// (`__piSessionCallOAuthLogin`).
+    pub oauth_notify_events: Vec<(u32, Json)>,
+    /// OAuth login prompts awaiting host answers: (session id, token,
+    /// payload) in ask order. One prompt per session at a time — the login
+    /// function awaits its answer.
+    pub oauth_prompts: Vec<(u32, u64, Json)>,
+    /// Sessions whose oauth `signal` the host aborted
+    /// (`oauthAbortSignal`); the login function polls `signal.aborted`.
+    pub oauth_aborted: Vec<u32>,
     /// Provider registrations that failed validation at the bind-time
     /// flush, in flush order (the bindCore `emitError` reports).
     pub provider_bind_errors: Vec<crate::events::ProviderBindError>,
@@ -472,6 +487,42 @@ impl JsHost {
                 .push((id, serde_json::from_str(&event).unwrap_or(Json::Null)));
             String::new()
         });
+        // An oauth login's one-way notifications (`adaptOAuth`'s notify
+        // mapping: auth_url / device_code / progress), tagged with the
+        // login session id.
+        op!("oauthNotify", core, |id: u32, event: String| -> String {
+            core.lock()
+                .expect("host core mutex poisoned")
+                .oauth_notify_events
+                .push((id, serde_json::from_str(&event).unwrap_or(Json::Null)));
+            String::new()
+        });
+        // An oauth login's prompt ask: the login function awaits the
+        // returned promise until the host resolves it with the answer
+        // (`oauthResolvePrompt`).
+        op!("oauthPrompt", core, |id: u32,
+                                  token: u64,
+                                  payload: String|
+         -> String {
+            core.lock()
+                .expect("host core mutex poisoned")
+                .oauth_prompts
+                .push((
+                    id,
+                    token,
+                    serde_json::from_str(&payload).unwrap_or(Json::Null),
+                ));
+            String::new()
+        });
+        // Flags the login session's `signal.aborted` — the host's escape
+        // during a login flow (`session.abortRetry`'s oauth analog).
+        op!("oauthAbortSignal", core, |id: u32| -> String {
+            let mut core = core.lock().expect("host core mutex poisoned");
+            if !core.oauth_aborted.contains(&id) {
+                core.oauth_aborted.push(id);
+            }
+            String::new()
+        });
         op!("getModel", core, || -> String {
             let core = core.lock().expect("host core mutex poisoned");
             let model = (core.actions.get_model)();
@@ -803,6 +854,7 @@ impl JsHost {
             ContextKind::ProjectTrust => "trust",
             ContextKind::Route => "route",
             ContextKind::ProviderStream => "providerStream",
+            ContextKind::OAuthLogin => "oauthLogin",
         };
         self.ctx.with(|ctx| -> Result<u32, JsHostError> {
             let begin: Function = ctx.globals().get("__piSessionBegin")?;
@@ -917,6 +969,151 @@ impl JsHost {
         }
         core.provider_stream_events = rest;
         events
+    }
+
+    /// Calls the stashed oauth `login` (`__piSessionCallOAuthLogin`): the
+    /// adapter callbacks cross as described in the glue; notifications and
+    /// prompts poll through their slots, and the login's credential
+    /// settles the session slot.
+    pub fn session_call_oauth_login(&self, id: u32, provider: &str) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx.globals().get("__piSessionCallOAuthLogin")?;
+            let _: Value = call
+                .call((id, provider))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
+    /// Takes the oauth notifications queued for one session id, in
+    /// emission order; other sessions' events are kept.
+    pub fn take_oauth_notify_events(&self, id: u32) -> Vec<Json> {
+        let mut core = self.core.lock().expect("host core mutex poisoned");
+        let mut events = Vec::new();
+        let mut rest = Vec::new();
+        for (queued, event) in std::mem::take(&mut core.oauth_notify_events) {
+            if queued == id {
+                events.push(event);
+            } else {
+                rest.push((queued, event));
+            }
+        }
+        core.oauth_notify_events = rest;
+        events
+    }
+
+    /// Takes the session's pending prompt ask, if any: `(token, payload)`.
+    pub fn take_oauth_prompt(&self, id: u32) -> Option<(u64, Json)> {
+        let mut core = self.core.lock().expect("host core mutex poisoned");
+        let position = core
+            .oauth_prompts
+            .iter()
+            .position(|(queued, _, _)| *queued == id)?;
+        let (_, token, payload) = core.oauth_prompts.remove(position);
+        Some((token, payload))
+    }
+
+    /// Resolves the session's pending prompt promise with the answer,
+    /// verifying the token the ask handed out (`__piResolveOAuthPrompt`
+    /// answers `"ok"`, `"no-prompt"`, or `"token-mismatch"`); the caller
+    /// drains jobs so the login function continues.
+    pub fn oauth_resolve_prompt(
+        &self,
+        id: u32,
+        token: u64,
+        answer: &Json,
+    ) -> Result<String, JsHostError> {
+        let answer_json =
+            serde_json::to_string(answer).map_err(|err| JsHostError::Job(err.to_string()))?;
+        self.ctx.with(|ctx| -> Result<String, JsHostError> {
+            let resolve: Function = ctx.globals().get("__piResolveOAuthPrompt")?;
+            let resolution: String = resolve
+                .call((id, token, answer_json))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(resolution)
+        })
+    }
+
+    /// Whether the provider registered an oauth `login` handler
+    /// (`__piOAuthHasLogin`).
+    pub fn oauth_has_login(&self, provider: &str) -> Result<bool, JsHostError> {
+        self.ctx.with(|ctx| -> Result<bool, JsHostError> {
+            let check: Function = ctx.globals().get("__piOAuthHasLogin")?;
+            check
+                .call((provider,))
+                .map_err(|err| Self::js_error(&ctx, err))
+        })
+    }
+
+    /// Flags the session's oauth `signal.aborted`
+    /// (`__piAbortOAuthSignal`).
+    pub fn oauth_abort_signal(&self, id: u32) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let abort: Function = ctx.globals().get("__piAbortOAuthSignal")?;
+            let _: Value = abort.call((id,)).map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
+    /// Calls the stashed oauth `refreshToken` (`__piCallOAuthRefresh`) and
+    /// waits for its promise through the job queue. Returns the refreshed
+    /// credential or the error text.
+    pub fn call_oauth_refresh(
+        &self,
+        provider: &str,
+        credential: &Json,
+    ) -> Result<Json, JsHostError> {
+        let credential_json =
+            serde_json::to_string(credential).map_err(|err| JsHostError::Job(err.to_string()))?;
+        {
+            self.ctx.with(|ctx| -> Result<(), JsHostError> {
+                let call: Function = ctx.globals().get("__piCallOAuthRefresh")?;
+                let _: Value = call
+                    .call((0, provider, credential_json))
+                    .map_err(|err| Self::js_error(&ctx, err))?;
+                Ok(())
+            })?;
+        }
+        let mut probes: u32 = 0;
+        loop {
+            self.drive_jobs()?;
+            let ready: bool = self.ctx.with(|ctx| -> Result<bool, JsHostError> {
+                ctx.eval("__piOAuthCallReady()")
+                    .map_err(|err| Self::js_error(&ctx, err))
+            })?;
+            if ready {
+                break;
+            }
+            probes += 1;
+            if probes > 100_000 {
+                return Err(JsHostError::HandlerDidNotComplete(
+                    "oauth refreshToken did not settle after 100k job drains".to_string(),
+                ));
+            }
+        }
+        let text: String = self.ctx.with(|ctx| -> Result<String, JsHostError> {
+            ctx.eval("globalThis.__piOAuthCallText")
+                .map_err(|err| Self::js_error(&ctx, err))
+        })?;
+        Ok(serde_json::from_str(&text).unwrap_or(Json::Null))
+    }
+
+    /// Calls the stashed oauth `getApiKey` (`__piCallOAuthApiKey`); the
+    /// conversion is synchronous and answers inline.
+    pub fn call_oauth_api_key(
+        &self,
+        provider: &str,
+        credential: &Json,
+    ) -> Result<Json, JsHostError> {
+        let credential_json =
+            serde_json::to_string(credential).map_err(|err| JsHostError::Job(err.to_string()))?;
+        self.ctx.with(|ctx| -> Result<Json, JsHostError> {
+            let call: Function = ctx.globals().get("__piCallOAuthApiKey")?;
+            let text: String = call
+                .call((0, provider, credential_json))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(serde_json::from_str(&text).unwrap_or(Json::Null))
+        })
     }
 
     /// Reads the session result slot (`__piSessionLast`): a JSON object
