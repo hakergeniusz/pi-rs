@@ -379,11 +379,11 @@ fn session_info_text(
     let tokens = &stats.tokens;
     let mut info = format!("{}\n\n", bold_text("Session Info"));
     if let Some(session_name) = session_name {
-        let _ = write!(info, "{} {session_name}\n", dim("Name:"));
+        let _ = writeln!(info, "{} {session_name}", dim("Name:"));
     }
-    let _ = write!(
+    let _ = writeln!(
         info,
-        "{} {}\n",
+        "{} {}",
         dim("File:"),
         stats.session_file.as_deref().map_or_else(
             || "In-memory".to_string(),
@@ -391,10 +391,10 @@ fn session_info_text(
         )
     );
     let _ = write!(info, "{} {}\n\n", dim("ID:"), stats.session_id);
-    let _ = write!(info, "{}\n", bold_text("Messages"));
-    let _ = write!(info, "{} {}\n", dim("Total:"), stats.total_messages);
-    let _ = write!(info, "{} {}\n", dim("User:"), stats.user_messages);
-    let _ = write!(info, "{} {}\n", dim("Assistant:"), stats.assistant_messages);
+    let _ = writeln!(info, "{}", bold_text("Messages"));
+    let _ = writeln!(info, "{} {}", dim("Total:"), stats.total_messages);
+    let _ = writeln!(info, "{} {}", dim("User:"), stats.user_messages);
+    let _ = writeln!(info, "{} {}", dim("Assistant:"), stats.assistant_messages);
     let _ = write!(
         info,
         "{} {} calls, {} results\n\n",
@@ -402,21 +402,26 @@ fn session_info_text(
         stats.tool_calls,
         stats.tool_results
     );
-    let _ = write!(info, "{}\n", bold_text("Tokens"));
+    let _ = writeln!(info, "{}", bold_text("Tokens"));
     // "Input" is the full prompt volume. With cache activity, split it into
     // cached (served from cache) vs uncached (everything else) - the only
     // provider-independent split. Cache writes, where reported, are a detail
     // of the uncached portion.
     let prompt_tokens = tokens.input + tokens.cache_read + tokens.cache_write;
-    let _ = write!(info, "{} {}\n", dim("Input:"), to_locale_string(prompt_tokens));
+    let _ = writeln!(
+        info,
+        "{} {}",
+        dim("Input:"),
+        to_locale_string(prompt_tokens)
+    );
     if prompt_tokens > 0 && (tokens.cache_read > 0 || tokens.cache_write > 0) {
         let hit_rate = dim(&format!(
             "({:.1}%)",
             tokens.cache_read as f64 / prompt_tokens as f64 * 100.0
         ));
-        let _ = write!(
+        let _ = writeln!(
             info,
-            "  {} {} {hit_rate}\n",
+            "  {} {} {hit_rate}",
             dim("Cached:"),
             to_locale_string(tokens.cache_read)
         );
@@ -431,21 +436,35 @@ fn session_info_text(
         } else {
             String::new()
         };
-        let _ = write!(
+        let _ = writeln!(
             info,
-            "  {} {}{written}\n",
+            "  {} {}{written}",
             dim("Uncached:"),
             to_locale_string(tokens.input + tokens.cache_write)
         );
     }
-    let _ = write!(info, "{} {}\n", dim("Output:"), to_locale_string(tokens.output));
-    let _ = write!(info, "{} {}\n", dim("Total:"), to_locale_string(tokens.tokens()));
+    let _ = writeln!(
+        info,
+        "{} {}",
+        dim("Output:"),
+        to_locale_string(tokens.output)
+    );
+    let _ = writeln!(
+        info,
+        "{} {}",
+        dim("Total:"),
+        to_locale_string(tokens.tokens())
+    );
 
     let _ = write!(info, "\n{}\n", bold_text("Cache Warming"));
-    let _ = write!(info, "{} {cache_warming_mode}\n", dim("Mode:"));
+    let _ = writeln!(info, "{} {cache_warming_mode}", dim("Mode:"));
     // The formatted live status lands with the cache warmer; without one the
     // status is always the fallback (`interactive-mode.ts:6934-6935`).
-    let _ = write!(info, "{} Inactive (cache warming unavailable)\n", dim("Status:"));
+    let _ = writeln!(
+        info,
+        "{} Inactive (cache warming unavailable)",
+        dim("Status:")
+    );
 
     if stats.tokens.cost > 0.0 || cache_waste.missed_tokens > 0 {
         let _ = write!(info, "\n{}\n", bold_text("Cost"));
