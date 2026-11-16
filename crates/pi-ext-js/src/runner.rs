@@ -1582,13 +1582,10 @@ impl ExtensionRunner {
             .find(|entry| entry.name == provider)?
             .config
             .as_object()?;
-        if !config.get("streamSimple").is_some_and(Json::as_bool) {
+        if !config.get("streamSimple").is_some_and(|v| v.as_bool().unwrap_or(false)) {
             return None;
         }
-        config
-            .get("api")
-            .and_then(Json::as_str)
-            .map(str::to_string)
+        config.get("api").and_then(Json::as_str).map(str::to_string)
     }
 
     /// Calls a provider's `streamSimple` with the request the host built
@@ -2563,7 +2560,10 @@ export default function (pi) {
     fn provider_stream_handler_throw_keeps_the_events_already_emitted() {
         let mut runner = runner_with(&[EXT_PROVIDER_STREAM_THROW]);
         let outcome = runner
-            .provider_stream("acme", &json!({ "model": {}, "context": {}, "options": {} }))
+            .provider_stream(
+                "acme",
+                &json!({ "model": {}, "context": {}, "options": {} }),
+            )
             .expect("stream");
         assert_eq!(
             outcome.events,
@@ -2574,13 +2574,11 @@ export default function (pi) {
 
     #[test]
     fn provider_stream_of_an_unregistered_provider_answers_the_glue_error() {
-        let runner = runner_with(&[]);
+        let mut runner = runner_with(&[]);
         // No stash entry: the glue settles the session with the
         // not-registered error (the route-glue's unregistered branch
         // shape), which the runner reports as the outcome error.
-        let outcome = runner
-            .provider_stream("acme", &json!({}))
-            .expect("settled");
+        let outcome = runner.provider_stream("acme", &json!({})).expect("settled");
         assert_eq!(outcome.events, Vec::<Json>::new());
         assert_eq!(
             outcome.error.as_deref(),
@@ -2606,9 +2604,7 @@ export default function (pi) {
         // The discard removed the stash entry, so the glue answers with the
         // not-registered error even though a live registration could have
         // survived.
-        let outcome = runner
-            .provider_stream("acme", &json!({}))
-            .expect("settled");
+        let outcome = runner.provider_stream("acme", &json!({})).expect("settled");
         assert_eq!(
             outcome.error.as_deref(),
             Some("Provider acme is not registered with a streamSimple handler.")
@@ -2617,7 +2613,7 @@ export default function (pi) {
 
     #[test]
     fn provider_stream_api_tracks_the_stash_marker_through_merges() {
-        let mut runner = runner_with(&[EXT_PROVIDER_STREAM]);
+        let runner = runner_with(&[EXT_PROVIDER_STREAM]);
         // The registered api is what `streamWith` matches model.api
         // against (`model.api === extension.api`).
         assert_eq!(
@@ -2627,13 +2623,13 @@ export default function (pi) {
         assert_eq!(runner.provider_stream_api("missing"), None);
         // A re-registration without the streamSimple key keeps the
         // previous handler, like the per-key config merge.
-        let mut runner = runner_with(&[EXT_PROVIDER_STREAM, EXT_PROVIDERS_MERGE]);
+        let runner = runner_with(&[EXT_PROVIDER_STREAM, EXT_PROVIDERS_MERGE]);
         assert_eq!(
             runner.provider_stream_api("acme").as_deref(),
             Some("acme-api")
         );
         // Unregistering removes the whole config, marker included.
-        let mut runner = runner_with(&[EXT_PROVIDER_STREAM, EXT_PROVIDERS_UNREG]);
+        let runner = runner_with(&[EXT_PROVIDER_STREAM, EXT_PROVIDERS_UNREG]);
         assert_eq!(runner.provider_stream_api("acme"), None);
     }
 

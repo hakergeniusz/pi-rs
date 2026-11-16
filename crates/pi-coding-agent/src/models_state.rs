@@ -25,9 +25,9 @@ use serde_json::Value;
 
 #[cfg(feature = "ext-js")]
 use pi_agent::agent_message::AgentMessage;
+use pi_ai::types::Model;
 #[cfg(feature = "ext-js")]
 use pi_ai::types::StopReason;
-use pi_ai::types::Model;
 
 use crate::config::get_models_path;
 use crate::models_config::{self, ModelConfig};
@@ -322,7 +322,10 @@ fn marshal_stream_request(request: &pi_agent::types::StreamRequest) -> Value {
         ThinkingLevel::Medium => "medium",
         ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "high",
     };
-    options.insert("reasoning".to_string(), Value::String(reasoning.to_string()));
+    options.insert(
+        "reasoning".to_string(),
+        Value::String(reasoning.to_string()),
+    );
     if let Some(session_id) = &request.session_id {
         options.insert("sessionId".to_string(), Value::String(session_id.clone()));
     }
@@ -345,10 +348,7 @@ fn marshal_stream_request(request: &pi_agent::types::StreamRequest) -> Value {
 /// message, pushed as `{type: "error", reason, error}`
 /// (`lazy.ts:104-108`).
 #[cfg(feature = "ext-js")]
-fn extension_error_event(
-    model: &Model,
-    message: String,
-) -> pi_agent::types::AssistantMessageEvent {
+fn extension_error_event(model: &Model, message: String) -> pi_agent::types::AssistantMessageEvent {
     let error = pi_ai::types::AssistantMessage {
         api: model.api.clone(),
         provider: model.provider.clone(),
@@ -481,7 +481,9 @@ export default function (pi) {
             ..Default::default()
         })
         .expect("runner");
-        runner.load_extension("<test>", Some(extension)).expect("load");
+        runner
+            .load_extension("<test>", Some(extension))
+            .expect("load");
         runner.bind().expect("bind");
         runner
     }
@@ -564,8 +566,14 @@ export default function (pi) {
             runner: Arc::clone(&runner),
             fallback: Arc::new(StubStreamFn),
         };
-        assert_eq!(collect(dispatch.stream(stream_request("acme-api"))).len(), 3);
-        assert_eq!(collect(dispatch.stream(stream_request("other-api"))).len(), 0);
+        assert_eq!(
+            collect(dispatch.stream(stream_request("acme-api"))).len(),
+            3
+        );
+        assert_eq!(
+            collect(dispatch.stream(stream_request("other-api"))).len(),
+            0
+        );
     }
 
     #[test]

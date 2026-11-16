@@ -463,7 +463,9 @@ impl JsHost {
         // A provider streamSimple handler's event emission
         // (`__piSessionCallProviderStream`'s `for await`): each protocol
         // event lands in order, tagged with the stream session id.
-        op!("providerStreamEvent", core, |id: u32, event: String| -> String {
+        op!("providerStreamEvent", core, |id: u32,
+                                          event: String|
+         -> String {
             core.lock()
                 .expect("host core mutex poisoned")
                 .provider_stream_events
@@ -890,11 +892,7 @@ impl JsHost {
     /// marshalled `{model, context, options}` request, events stream
     /// through the `providerStreamEvent` op, and the slot settles when
     /// iteration finishes.
-    pub fn session_call_provider_stream(
-        &self,
-        id: u32,
-        provider: &str,
-    ) -> Result<(), JsHostError> {
+    pub fn session_call_provider_stream(&self, id: u32, provider: &str) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let call: Function = ctx.globals().get("__piSessionCallProviderStream")?;
             let _: Value = call
