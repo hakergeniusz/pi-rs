@@ -54,7 +54,8 @@ pub trait ModelPriceSource {
 
 impl ModelPriceSource for pi_ai::catalog::ModelCatalog {
     fn cache_read_cost(&self, provider: &str, model_id: &str) -> Option<f64> {
-        self.get(provider, model_id).map(|model| model.cost.cache_read)
+        self.get(provider, model_id)
+            .map(|model| model.cost.cache_read)
     }
 }
 
@@ -111,7 +112,10 @@ fn detect_miss(
     let read_per_token = if usage.cache_read > 0 {
         usage.cost.cache_read / usage.cache_read as f64
     } else {
-        models.cache_read_cost(&message.provider, &message.model).unwrap_or(0.0) / 1_000_000.0
+        models
+            .cache_read_cost(&message.provider, &message.model)
+            .unwrap_or(0.0)
+            / 1_000_000.0
     };
 
     Some(CacheMiss {
@@ -155,7 +159,8 @@ fn scan(entries: &[SessionEntry], models: &dyn ModelPriceSource) -> CacheWasteTo
                 prev = None;
             }
             SessionEntry::Usage(entry) if entry.kind == "cache_warm" => {
-                let prompt_tokens = entry.usage.input + entry.usage.cache_read + entry.usage.cache_write;
+                let prompt_tokens =
+                    entry.usage.input + entry.usage.cache_read + entry.usage.cache_write;
                 if prompt_tokens > 0 {
                     prev = Some(PreviousRequest {
                         prompt_tokens,
@@ -174,8 +179,9 @@ fn scan(entries: &[SessionEntry], models: &dyn ModelPriceSource) -> CacheWasteTo
                     totals.missed_cost += miss.missed_cost;
                     totals.miss_count += 1;
                 }
-                prev = as_previous_request(message, prev.as_ref().is_some_and(|p| p.reported_cache))
-                    .or(prev);
+                prev =
+                    as_previous_request(message, prev.as_ref().is_some_and(|p| p.reported_cache))
+                        .or(prev);
             }
             _ => {}
         }
@@ -186,7 +192,10 @@ fn scan(entries: &[SessionEntry], models: &dyn ModelPriceSource) -> CacheWasteTo
 /// `computeCacheWaste` (`cache-stats.ts:150-153`): prompt tokens that should
 /// have been cache reads (they were in the previous turn's prompt) but were
 /// re-billed.
-pub fn compute_cache_waste(entries: &[SessionEntry], models: &dyn ModelPriceSource) -> CacheWasteTotals {
+pub fn compute_cache_waste(
+    entries: &[SessionEntry],
+    models: &dyn ModelPriceSource,
+) -> CacheWasteTotals {
     scan(entries, models)
 }
 
@@ -268,7 +277,11 @@ mod tests {
         assert_eq!(totals.missed_tokens, 2_000);
         // 2k tokens at the paid input rate ($3/M) instead of the cache-read
         // rate ($0.3/M).
-        assert!((totals.missed_cost - 0.0054).abs() < 1e-9, "{}", totals.missed_cost);
+        assert!(
+            (totals.missed_cost - 0.0054).abs() < 1e-9,
+            "{}",
+            totals.missed_cost
+        );
     }
 
     /// A provider that never reports caching means nothing until some turn
@@ -279,7 +292,10 @@ mod tests {
             assistant("openai", "gpt-test", usage(10_000, 0, 0)),
             assistant("openai", "gpt-test", usage(10_000, 0, 0)),
         ];
-        assert_eq!(compute_cache_waste(&entries, &NoPrices), CacheWasteTotals::default());
+        assert_eq!(
+            compute_cache_waste(&entries, &NoPrices),
+            CacheWasteTotals::default()
+        );
     }
 
     /// Misses at or below 1024 tokens are breakpoint noise.
@@ -289,7 +305,10 @@ mod tests {
             assistant("anthropic", "claude-test", usage(2_000, 0, 0)),
             assistant("anthropic", "claude-test", usage(1_000, 1_000, 0)),
         ];
-        assert_eq!(compute_cache_waste(&entries, &NoPrices), CacheWasteTotals::default());
+        assert_eq!(
+            compute_cache_waste(&entries, &NoPrices),
+            CacheWasteTotals::default()
+        );
     }
 
     /// A compaction resets the scan: the next turn's prompt is new content.

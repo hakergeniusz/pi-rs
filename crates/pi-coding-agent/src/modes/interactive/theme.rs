@@ -479,8 +479,9 @@ pub fn key_display_text(action: &str) -> String {
         .map(|key| {
             key.split('+')
                 .map(|part| match part.chars().next() {
-                    Some(first) => first.to_uppercase().collect::<String>()
-                        + part[first.len()..],
+                    Some(first) => {
+                        first.to_uppercase().collect::<String>() + &part[first.len_utf8()..]
+                    }
                     None => String::new(),
                 })
                 .collect::<Vec<_>>()

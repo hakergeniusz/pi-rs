@@ -462,7 +462,9 @@ fn session_info_text(
         // A single entry repeats the total, unless it names a model other
         // than the selected one.
         if usage_breakdown.len() > 1
-            || usage_breakdown.first().is_some_and(|entry| entry.key != selected_model_key)
+            || usage_breakdown
+                .first()
+                .is_some_and(|entry| entry.key != selected_model_key)
         {
             for entry in usage_breakdown {
                 info += &format!(
@@ -1773,7 +1775,7 @@ impl InteractiveMode {
         }
         // `/name [name]` (`interactive-mode.ts:3377-3381`).
         if text == "/name" || text.starts_with("/name ") {
-            self.handle_name_command(text);
+            self.handle_name_command(&text);
             return;
         }
         // `/session` (`interactive-mode.ts:3382-3386`).
@@ -2811,10 +2813,8 @@ impl InteractiveMode {
         // attribution is grouped separately so the breakdown reconciles with
         // the session total (`interactive-mode.ts:6891-6894`).
         let usage_breakdown = super::components::footer::get_usage_cost_breakdown(&entries);
-        let cache_waste = crate::session::cache_stats::compute_cache_waste(
-            &entries,
-            &pi_ai::catalog::catalog(),
-        );
+        let cache_waste =
+            crate::session::cache_stats::compute_cache_waste(&entries, pi_ai::catalog::catalog());
         let cache_warming_mode = self.cache_warming_mode();
         let selected_model_key = format!("{}/{}", self.model.provider, self.model.id);
         let info = session_info_text(
@@ -2844,7 +2844,9 @@ impl InteractiveMode {
         };
         for entry in self.session.get_entries() {
             match &entry {
-                crate::session::records::SessionEntry::Usage(entry) => stats.tokens.add(&entry.usage),
+                crate::session::records::SessionEntry::Usage(entry) => {
+                    stats.tokens.add(&entry.usage)
+                }
                 crate::session::records::SessionEntry::BranchSummary(entry) => {
                     if let Some(usage) = &entry.usage {
                         stats.tokens.add(usage);
@@ -2938,7 +2940,10 @@ impl InteractiveMode {
             all_entries
                 .iter()
                 .map(|entry| {
-                    crate::changelog::normalize_changelog_links(&entry.content, &entry.version_string())
+                    crate::changelog::normalize_changelog_links(
+                        &entry.content,
+                        &entry.version_string(),
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n")
@@ -2947,8 +2952,7 @@ impl InteractiveMode {
         self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
         self.add_to_chat(Box::new(super::components::header::DynamicBorder::new()));
         self.add_to_chat(Box::new(Text::new(
-            theme::theme()
-                .fg(pi_tui::theme::ThemeColor::Accent, &bold_text("What's New")),
+            theme::theme().fg(pi_tui::theme::ThemeColor::Accent, &bold_text("What's New")),
             1,
             0,
         )));
@@ -5654,7 +5658,10 @@ mod tests {
     #[test]
     fn json_stringify_produces_a_json_string_literal() {
         assert_eq!(json_stringify("plain"), "\"plain\"");
-        assert_eq!(json_stringify("a \"quoted\" name"), "\"a \\\"quoted\\\" name\"");
+        assert_eq!(
+            json_stringify("a \"quoted\" name"),
+            "\"a \\\"quoted\\\" name\""
+        );
     }
 
     /// `/name <name>` persists the name; bare `/name` shows it; on an empty
@@ -5742,7 +5749,10 @@ mod tests {
         assert_eq!(mode.last_assistant_text(), None);
 
         mode.session
-            .append_message(assistant_reply("first reply", pi_ai::types::StopReason::Stop))
+            .append_message(assistant_reply(
+                "first reply",
+                pi_ai::types::StopReason::Stop,
+            ))
             .expect("append");
         mode.session
             .append_message(assistant_reply(
@@ -5750,10 +5760,7 @@ mod tests {
                 pi_ai::types::StopReason::Stop,
             ))
             .expect("append");
-        assert_eq!(
-            mode.last_assistant_text().as_deref(),
-            Some("second reply")
-        );
+        assert_eq!(mode.last_assistant_text().as_deref(), Some("second reply"));
 
         // An aborted turn without text is skipped, not copied.
         mode.session
@@ -5796,7 +5803,7 @@ mod tests {
     /// and the cost block with the re-billed detail.
     #[test]
     fn session_info_text_renders_the_upstream_block() {
-        use super::components::footer::{UsageCostBreakdownEntry, UsageTotals};
+        use crate::modes::interactive::components::footer::{UsageCostBreakdownEntry, UsageTotals};
         let mut stats = SessionStats::default();
         stats.session_id = "test-session".to_string();
         stats.total_messages = 4;
@@ -5842,18 +5849,24 @@ mod tests {
         assert!(plain.contains("Output: 500"), "{plain}");
         assert!(plain.contains("Total: 18,500"), "{plain}");
         assert!(plain.contains("Mode: idle"), "{plain}");
-        assert!(plain.contains("Status: Inactive (cache warming unavailable)"), "{plain}");
+        assert!(
+            plain.contains("Status: Inactive (cache warming unavailable)"),
+            "{plain}"
+        );
         // A single breakdown entry naming the selected model repeats only
         // the total; the re-billed detail rides on.
         assert!(plain.contains("Total: $0.012"), "{plain}");
-        assert!(plain.contains("Cache Re-billed: $0.009 (3,000 tokens, 2 misses)"), "{plain}");
+        assert!(
+            plain.contains("Cache Re-billed: $0.009 (3,000 tokens, 2 misses)"),
+            "{plain}"
+        );
     }
 
     /// The per-model breakdown line appears when usage names a model other
     /// than the selected one (`interactive-mode.ts:6945-6951`).
     #[test]
     fn session_info_text_breaks_out_other_models() {
-        use super::components::footer::{UsageCostBreakdownEntry, UsageTotals};
+        use crate::modes::interactive::components::footer::{UsageCostBreakdownEntry, UsageTotals};
         let mut stats = SessionStats::default();
         stats.session_id = "s".to_string();
         stats.tokens = UsageTotals {
@@ -5884,8 +5897,14 @@ mod tests {
         );
         let plain = pi_tui::ansi::strip_terminal_sequences(&info);
         assert!(plain.contains("Total: $0.020"), "{plain}");
-        assert!(plain.contains("other/virtual: $0.015 (0.7k tokens)"), "{plain}");
-        assert!(plain.contains("test/test-model: $0.005 (300 tokens)"), "{plain}");
+        assert!(
+            plain.contains("other/virtual: $0.015 (0.7k tokens)"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("test/test-model: $0.005 (300 tokens)"),
+            "{plain}"
+        );
     }
 
     /// `/session` on an in-memory session renders the block headlessly.
@@ -5910,9 +5929,15 @@ mod tests {
     /// app actions through the app table.
     #[test]
     fn key_display_text_joins_and_capitalizes() {
-        assert_eq!(theme::key_display_text("tui.editor.cursorLeft"), "Left/Ctrl+B");
+        assert_eq!(
+            theme::key_display_text("tui.editor.cursorLeft"),
+            "Left/Ctrl+B"
+        );
         assert_eq!(theme::key_display_text("tui.editor.cursorUp"), "Up");
-        assert_eq!(theme::key_display_text(theme::app_keys::MODEL_SELECT), "Ctrl+L");
+        assert_eq!(
+            theme::key_display_text(theme::app_keys::MODEL_SELECT),
+            "Ctrl+L"
+        );
         assert_eq!(
             theme::key_display_text(theme::app_keys::MODEL_CYCLE_BACKWARD),
             "Ctrl+Shift+P"
@@ -5947,7 +5972,10 @@ mod tests {
         );
         // The trailing literal rows carry no bindings.
         assert!(plain.contains("| `/` | Slash commands |"), "{plain}");
-        assert!(plain.contains("| `!!` | Run bash command (excluded from context) |"), "{plain}");
+        assert!(
+            plain.contains("| `!!` | Run bash command (excluded from context) |"),
+            "{plain}"
+        );
     }
 
     /// `/hotkeys` renders the bordered shortcut table.

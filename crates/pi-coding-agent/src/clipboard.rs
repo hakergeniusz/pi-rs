@@ -136,11 +136,7 @@ pub fn run_clipboard_command(
     if output.len() > MAX_BUFFER_BYTES {
         return None;
     }
-    if status.success() {
-        Some(output)
-    } else {
-        None
-    }
+    if status.success() { Some(output) } else { None }
 }
 
 /// `isRemoteSession` (`clipboard.ts:14-16`): SSH/MOSH clients and explicit
@@ -171,8 +167,9 @@ pub fn is_wsl() -> bool {
     if env_set("WSL_DISTRO_NAME") || env_set("WSLENV") {
         return true;
     }
-    std::fs::read_to_string("/proc/version")
-        .is_ok_and(|release| regex::Regex::new(r"(?i)microsoft|wsl").is_ok_and(|re| re.is_match(&release)))
+    std::fs::read_to_string("/proc/version").is_ok_and(|release| {
+        regex::Regex::new(r"(?i)microsoft|wsl").is_ok_and(|re| re.is_match(&release))
+    })
 }
 
 /// `copyViaWindowsClipboard` (`clipboard.ts:34-58`): WSL without WSLg writes
@@ -311,7 +308,8 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
     }
     if env_set("TERMUX_VERSION") {
         return Err(
-            "Clipboard unavailable: install the Termux:API app and `termux-api` package".to_string(),
+            "Clipboard unavailable: install the Termux:API app and `termux-api` package"
+                .to_string(),
         );
     }
     if cfg!(target_os = "linux") {

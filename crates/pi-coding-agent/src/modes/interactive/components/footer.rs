@@ -89,7 +89,9 @@ pub struct UsageCostBreakdownEntry {
 /// model-attributed usage by model and all other usage into a separate
 /// bucket, most expensive first. Usage without model attribution is grouped
 /// separately so the breakdown reconciles with the session total.
-pub fn get_usage_cost_breakdown(entries: &[crate::session::records::SessionEntry]) -> Vec<UsageCostBreakdownEntry> {
+pub fn get_usage_cost_breakdown(
+    entries: &[crate::session::records::SessionEntry],
+) -> Vec<UsageCostBreakdownEntry> {
     use crate::session::records::SessionEntry;
     use pi_agent::agent_message::AgentMessage;
 
@@ -148,7 +150,11 @@ pub fn get_usage_cost_breakdown(entries: &[crate::session::records::SessionEntry
         })
         .filter(|entry| entry.cost > 0.0 || entry.tokens > 0)
         .collect();
-    breakdown.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+    breakdown.sort_by(|a, b| {
+        b.cost
+            .partial_cmp(&a.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     breakdown
 }
 

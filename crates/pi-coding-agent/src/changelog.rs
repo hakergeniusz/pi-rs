@@ -210,9 +210,7 @@ fn normalize_changelog_link_target(target: &str, tag: &str) -> String {
     for route in ["blob", "tree"] {
         for branch in ["main", "master"] {
             let floating_ref_prefix = format!("{repo_url}/{route}/{branch}/");
-            if let Some(rest) =
-                canonical_target.strip_prefix(&floating_ref_prefix)
-            {
+            if let Some(rest) = canonical_target.strip_prefix(&floating_ref_prefix) {
                 canonical_target = format!("{repo_url}/{route}/{tag}/{rest}");
             }
         }
@@ -239,7 +237,10 @@ fn normalize_changelog_link_target(target: &str, tag: &str) -> String {
     } else {
         "blob"
     };
-    format!("{repo_url}/{route}/{tag}/{}{query}{fragment}", encode_uri(&repository_path))
+    format!(
+        "{repo_url}/{route}/{tag}/{}{query}{fragment}",
+        encode_uri(&repository_path)
+    )
 }
 
 /// `normalizeChangelogLinks` (`changelog.ts:110-118`): rewrite every inline
@@ -339,7 +340,10 @@ pub fn compare_versions(v1: &ChangelogEntry, v2: &ChangelogEntry) -> std::cmp::O
 /// `lastVersion`, or `None` when it has no leading major.minor.patch to
 /// compare against. Only the leading triple is read so a prerelease such as
 /// `0.1.5-20261020.7` counts as `0.1.5` (#11703).
-pub fn get_new_entries(entries: &[ChangelogEntry], last_version: &str) -> Option<Vec<ChangelogEntry>> {
+pub fn get_new_entries(
+    entries: &[ChangelogEntry],
+    last_version: &str,
+) -> Option<Vec<ChangelogEntry>> {
     let caps = leading_version_regex().captures(last_version.trim())?;
     let last = ChangelogEntry {
         major: caps[1].parse().unwrap_or(0),
@@ -409,15 +413,27 @@ mod tests {
     #[test]
     fn get_new_entries_compares_leading_versions() {
         let entries = vec![
-            ChangelogEntry { major: 1, minor: 2, patch: 0, content: String::new() },
-            ChangelogEntry { major: 1, minor: 1, patch: 9, content: String::new() },
+            ChangelogEntry {
+                major: 1,
+                minor: 2,
+                patch: 0,
+                content: String::new(),
+            },
+            ChangelogEntry {
+                major: 1,
+                minor: 1,
+                patch: 9,
+                content: String::new(),
+            },
         ];
         let newer = get_new_entries(&entries, "v1.1.9").expect("entries");
         assert_eq!(newer.len(), 1);
         assert_eq!(newer[0].version_string(), "1.2.0");
         // A prerelease of the same triple shows no notes again (#11703).
         assert_eq!(
-            get_new_entries(&entries, "1.1.9-20261020.7").expect("entries").len(),
+            get_new_entries(&entries, "1.1.9-20261020.7")
+                .expect("entries")
+                .len(),
             0
         );
         assert!(get_new_entries(&entries, "not a version").is_none());
