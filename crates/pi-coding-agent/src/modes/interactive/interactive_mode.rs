@@ -4315,9 +4315,11 @@ impl InteractiveMode {
             .to_string();
         let api_key_label = "Sign in with an API key";
         let available = |auth_type: &str| {
-            provider_options
-                .as_ref()
-                .is_none_or(|options| options.iter().any(|provider| provider.auth_type == auth_type))
+            provider_options.as_ref().is_none_or(|options| {
+                options
+                    .iter()
+                    .any(|provider| provider.auth_type == auth_type)
+            })
         };
         let mut options: Vec<String> = Vec::new();
         if available("oauth") {
@@ -4637,7 +4639,7 @@ impl InteractiveMode {
             && option == radius_label.as_str()
         {
             let back = pending_options.map(|options| LoginBackStep::AuthType(Some(options)));
-            self.start_provider_login(radius.clone(), back);
+            self.start_provider_login(radius, back);
             return;
         }
         let auth_type: &'static str = if option == "Sign in with an API key" {

@@ -951,11 +951,11 @@ mod tests {
         assert_eq!(find_matching_providers(&providers, "openai codex").len(), 1);
         assert_eq!(
             find_matching_providers(&providers, "openai"),
-            [] as [&oauth::AuthSelectorProvider; 0]
+            [] as [&AuthSelectorProvider; 0]
         );
         assert_eq!(
             find_matching_providers(&providers, ""),
-            [] as [&oauth::AuthSelectorProvider; 0]
+            [] as [&AuthSelectorProvider; 0]
         );
     }
 

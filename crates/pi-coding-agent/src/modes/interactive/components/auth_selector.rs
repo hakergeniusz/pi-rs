@@ -208,13 +208,10 @@ impl AuthSelectorComponent {
         let text_color = |text: &str| theme.fg(ThemeColor::Text, text);
         match row {
             AuthSelectorRow::Provider(provider) => {
-                let status_indicator = provider
-                    .status
-                    .as_ref()
-                    .map_or(
-                        theme.fg(ThemeColor::Muted, " • not configured"),
-                        |status| oauth::format_auth_selector_provider_status(provider, status),
-                    );
+                let status_indicator = provider.status.as_ref().map_or(
+                    theme.fg(ThemeColor::Muted, " • not configured"),
+                    |status| oauth::format_auth_selector_provider_status(provider, status),
+                );
                 // U+2726 is single-width in every terminal, unlike star
                 // emoji (`oauth-selector.ts:166-168`).
                 let partner_marker = if oauth::is_preferred_provider(&provider.id) {
