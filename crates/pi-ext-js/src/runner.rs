@@ -50,7 +50,9 @@ use crate::events::{
     BoundaryDispatchResult, InputResult, ProjectTrustResult, SessionBeforeResult, SessionOutcome,
     ToolCallResult, ToolResultPatch, parse_session_outcome,
 };
-use crate::mcp_registry::{create_mcp_tool_name, get_mcp_tool_exposure, mcp_namespace, to_tool_exposure};
+use crate::mcp_registry::{
+    create_mcp_tool_name, get_mcp_tool_exposure, mcp_namespace, to_tool_exposure,
+};
 use crate::transcript;
 
 /// One registered tool as the runner sees it (the E1 `ToolInfo`:
@@ -487,10 +489,9 @@ impl ExtensionRunner {
             .mcp_servers
             .iter()
             .filter(|state| {
-                registered
+                !registered
                     .iter()
                     .any(|(name, config)| name == &state.name && config == &state.registered_config)
-                    .is_none()
             })
             .map(|state| state.name.clone())
             .collect();
@@ -506,7 +507,8 @@ impl ExtensionRunner {
             }
             manager.drop_server(name);
         }
-        self.mcp_servers.retain(|state| !removed.contains(&state.name));
+        self.mcp_servers
+            .retain(|state| !removed.contains(&state.name));
 
         let mut reports = Vec::new();
         for (name, config) in &registered {
@@ -643,8 +645,10 @@ impl ExtensionRunner {
             };
             let owner = format!("{server}\0{tool_name}");
             let name = create_mcp_tool_name(server, tool_name, |candidate| {
-                owners.get(candidate).is_some_and(|existing| *existing != owner)
-                    || current.contains(candidate)
+                owners
+                    .get(candidate)
+                    .is_some_and(|existing| *existing != owner)
+                    || current.iter().any(|existing| existing == candidate)
                     || plain.iter().filter(|plain| *plain == candidate).count() > 1
             });
             current.push(name.clone());
@@ -746,7 +750,7 @@ impl ExtensionRunner {
         }
         let changes: Vec<String> = {
             let mut core = self.core.lock().expect("host core mutex poisoned");
-            core.mcp_changes.drain(..).collect()
+            std::mem::take(&mut core.mcp_changes)
         };
         if changes.is_empty() {
             return Ok(());
@@ -4332,7 +4336,10 @@ export default function (pi) {
     /// The extension source registering the fixture server; `extra` adds
     /// handlers.
     fn mcp_extension_source(server: &std::path::Path, extra: &str) -> String {
-        let command = server.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        let command = server
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
         format!(
             r#"
 export default function (pi) {{
@@ -4368,7 +4375,11 @@ export default function (pi) {{
         assert!(names.contains(&"mcp__synth__boom"), "{names:?}");
         assert!(names.contains(&"mcp__synth__odd_name"), "{names:?}");
         // Direct exposure activated them.
-        for name in ["mcp__synth__echo", "mcp__synth__boom", "mcp__synth__odd_name"] {
+        for name in [
+            "mcp__synth__echo",
+            "mcp__synth__boom",
+            "mcp__synth__odd_name",
+        ] {
             assert!(
                 runner.active_tools().iter().any(|active| active == name),
                 "{name} not active"
@@ -4445,7 +4456,10 @@ export default function (pi) {{
         let tool = runner.tool("mcp__synth__echo").expect("tool");
         assert_eq!(tool.exposure, "deferred");
         assert!(
-            !runner.active_tools().iter().any(|active| active == "mcp__synth__echo"),
+            !runner
+                .active_tools()
+                .iter()
+                .any(|active| active == "mcp__synth__echo"),
             "deferred tools stay inactive"
         );
     }
@@ -4467,14 +4481,20 @@ export default function (pi) {{
         // second server; the post-dispatch drain connects it right away
         // (runner.ts:465-466 + index.ts:1215-1248) — and the reconcile also
         // picks up `synth`, which the test never connected directly.
-        runner.emit(&json!({ "type": "session_start", "reason": "startup" })).expect("emit");
-        let tool = runner.tool("mcp__late__echo").expect("late tool registered");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        let tool = runner
+            .tool("mcp__late__echo")
+            .expect("late tool registered");
         assert_eq!(tool.exposure, "deferred", "no exposure configured");
         assert_eq!(runner.mcp_server_reports().len(), 2);
-        assert!(runner
-            .mcp_server_reports()
-            .iter()
-            .all(|report| report.state == "connected"));
+        assert!(
+            runner
+                .mcp_server_reports()
+                .iter()
+                .all(|report| report.state == "connected")
+        );
     }
 
     #[test]
@@ -4492,7 +4512,10 @@ export default function (pi) {{
         let tool = runner.tool("mcp__synth__echo").expect("tool");
         assert_eq!(tool.exposure, "hidden");
         assert!(
-            !runner.active_tools().iter().any(|active| active == "mcp__synth__echo"),
+            !runner
+                .active_tools()
+                .iter()
+                .any(|active| active == "mcp__synth__echo"),
             "hidden tools leave the active set"
         );
     }

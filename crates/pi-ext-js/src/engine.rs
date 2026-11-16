@@ -399,7 +399,7 @@ impl JsHost {
             error
         });
         op!("mcpOwnership", core, |name: String,
-                                    ext_path: String|
+                                   ext_path: String|
          -> String {
             let core = core.lock().expect("host core mutex poisoned");
             core.mcp
@@ -420,7 +420,7 @@ impl JsHost {
                 .iter()
                 .any(|server| server.name == name && server.extension_path == ext_path);
             if owned {
-                core.mcp.unregister(&name, ext_path);
+                core.mcp.unregister(&name, &ext_path);
                 core.mcp_changes.push(name);
             }
             String::new()
@@ -456,8 +456,9 @@ impl JsHost {
                 core.mcp_manager.clone()
             };
             let arguments: Json = serde_json::from_str(&args).unwrap_or(Json::Null);
-            serde_json::to_string(&manager.call_tool(&server, &tool, arguments))
-                .unwrap_or_else(|_| r#"{"error":"mcp tool result serialization failed"}"#.to_string())
+            serde_json::to_string(&manager.call_tool(&server, &tool, arguments)).unwrap_or_else(
+                |_| r#"{"error":"mcp tool result serialization failed"}"#.to_string(),
+            )
         });
         op!("cwd", core, || -> String {
             core.lock().expect("host core mutex poisoned").cwd.clone()
@@ -844,7 +845,7 @@ impl JsHost {
             let index: i64 = find
                 .call((path,))
                 .map_err(|err| Self::js_error(&ctx, err))?;
-            Ok((index >= 0).then(|| index as usize))
+            Ok((index >= 0).then_some(index as usize))
         })?;
         if let Some(index) = existing {
             return Ok(index);
@@ -861,8 +862,8 @@ impl JsHost {
     pub fn register_mcp_tools(&self, path: &str, tools: &Json) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let register: Function = ctx.globals().get("__piMcpRegisterTools")?;
-            let tools_json = serde_json::to_string(tools)
-                .map_err(|err| JsHostError::Job(err.to_string()))?;
+            let tools_json =
+                serde_json::to_string(tools).map_err(|err| JsHostError::Job(err.to_string()))?;
             register
                 .call::<(String, String), ()>((path.to_string(), tools_json))
                 .map_err(|err| Self::js_error(&ctx, err))

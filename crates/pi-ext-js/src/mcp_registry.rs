@@ -48,7 +48,13 @@ const TOOL_NAME_HASH_CHARS: usize = 8;
 pub fn create_mcp_tool_name(server: &str, tool: &str, is_taken: impl Fn(&str) -> bool) -> String {
     let name = format!("mcp__{server}__{tool}")
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>();
     if name.len() <= MAX_TOOL_NAME_LENGTH && !is_taken(&name) {
         return name;
@@ -57,7 +63,11 @@ pub fn create_mcp_tool_name(server: &str, tool: &str, is_taken: impl Fn(&str) ->
     // The truncation cap upstream's `name.slice(0, 64 - 8 - 1)` clamps at —
     // a short-but-taken name keeps its full form (JS slice never panics).
     let cap = MAX_TOOL_NAME_LENGTH - TOOL_NAME_HASH_CHARS - 1;
-    let truncated = if name.len() > cap { &name[..cap] } else { &name[..] };
+    let truncated = if name.len() > cap {
+        &name[..cap]
+    } else {
+        &name[..]
+    };
     format!("{truncated}_{hash}")
 }
 
@@ -69,11 +79,12 @@ fn tool_name_hash(server: &str, tool: &str) -> String {
     hasher.update([0]);
     hasher.update(tool.as_bytes());
     let digest = hasher.finalize();
-    digest
-        .iter()
-        .take(4)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut hex = String::new();
+    for byte in digest.iter().take(4) {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// The session-scoped MCP registry (`McpServerRegistry`).
@@ -258,7 +269,9 @@ fn check_exposures(entry: &serde_json::Map<String, Value>) -> Option<String> {
         };
         for (tool, value) in tool_exposure {
             if !is_exposure(value) {
-                return Some(format!("toolExposure \"{tool}\" must be one of {exposures}"));
+                return Some(format!(
+                    "toolExposure \"{tool}\" must be one of {exposures}"
+                ));
             }
         }
     }
@@ -273,9 +286,7 @@ const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
 /// `url` (`checkAuth`, `mcp-servers.ts:196-207`; absent is valid, an
 /// explicit `null` is present and invalid).
 fn check_auth(entry: &serde_json::Map<String, Value>, url: &str) -> Option<String> {
-    let Some(auth) = entry.get("auth") else {
-        return None;
-    };
+    let auth = entry.get("auth")?;
     let Some(auth) = auth.as_object() else {
         return Some("auth.provider must be a provider name".to_string());
     };
@@ -287,7 +298,9 @@ fn check_auth(entry: &serde_json::Map<String, Value>, url: &str) -> Option<Strin
     }
     let host = url_host(url);
     if !url.starts_with("https://") && !LOOPBACK_HOSTS.contains(&host.as_str()) {
-        return Some("auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]".to_string());
+        return Some(
+            "auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]".to_string(),
+        );
     }
     None
 }
@@ -301,21 +314,16 @@ fn url_host(url: &str) -> String {
     else {
         return String::new();
     };
-    let authority_end = rest
-        .find(['/', '?', '#'])
-        .unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     // Strip the port like URL.hostname does ([::1]:8080 → [::1]).
     if authority.starts_with('[') {
-        return authority
-            .find(']')
-            .map_or_else(|| authority.to_string(), |end| authority[..=end].to_string());
+        return authority.find(']').map_or_else(
+            || authority.to_string(),
+            |end| authority[..=end].to_string(),
+        );
     }
-    authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_string()
+    authority.split(':').next().unwrap_or_default().to_string()
 }
 
 /// Exposure of one tool of a server: its `toolExposure` entry, else the
@@ -379,10 +387,8 @@ fn tool_pattern_matches(pattern: &str, name: &str) -> bool {
 #[must_use]
 pub fn to_tool_exposure(exposure: &str) -> &'static str {
     match exposure {
-        "codemode" => "deferred",
+        "codemode" | "deferred" => "deferred",
         "direct" => "direct",
-        "deferred" => "deferred",
-        "hidden" => "hidden",
         // Configs carry only validated exposures.
         _ => "hidden",
     }
@@ -595,11 +601,13 @@ mod tests {
             .unwrap_err(),
             "server \"x\": auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]"
         );
-        assert!(validate_mcp_server_config(
-            "x",
-            &json!({"url": "http://localhost/mcp", "auth": {"provider": "p"}})
-        )
-        .is_ok());
+        assert!(
+            validate_mcp_server_config(
+                "x",
+                &json!({"url": "http://localhost/mcp", "auth": {"provider": "p"}})
+            )
+            .is_ok()
+        );
     }
 
     #[test]

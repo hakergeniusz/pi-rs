@@ -253,11 +253,7 @@ pub enum ContentBlock {
         title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
-        #[serde(
-            default,
-            rename = "mimeType",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, rename = "mimeType", skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size: Option<f64>,

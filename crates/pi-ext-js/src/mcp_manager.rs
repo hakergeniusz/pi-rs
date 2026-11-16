@@ -222,11 +222,13 @@ fn config_default_window() -> Duration {
 }
 
 /// Spawns the worker thread; returns its request channel.
-fn spawn_worker(timeouts: Arc<Mutex<HashMap<String, Duration>>>) -> std::sync::mpsc::Sender<Request> {
+fn spawn_worker(
+    timeouts: Arc<Mutex<HashMap<String, Duration>>>,
+) -> std::sync::mpsc::Sender<Request> {
     let (sender, receiver) = std::sync::mpsc::channel::<Request>();
     std::thread::Builder::new()
         .name("pi-ext-js-mcp".to_string())
-        .spawn(move || worker_loop(receiver, timeouts))
+        .spawn(move || worker_loop(&receiver, &timeouts))
         .expect("spawn MCP manager worker thread");
     sender
 }
@@ -235,8 +237,8 @@ fn spawn_worker(timeouts: Arc<Mutex<HashMap<String, Duration>>>) -> std::sync::m
 /// manager handles drop, the channel closes and remaining clients shut
 /// down (their transports kill the children).
 fn worker_loop(
-    receiver: std::sync::mpsc::Receiver<Request>,
-    timeouts: Arc<Mutex<HashMap<String, Duration>>>,
+    receiver: &std::sync::mpsc::Receiver<Request>,
+    timeouts: &Arc<Mutex<HashMap<String, Duration>>>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -253,11 +255,12 @@ fn worker_loop(
             } => {
                 let timeout = config_timeout(&config);
                 let outcome = match stdio_spawn_config(&name, &config, &cwd) {
-                    Ok(spawn) => {
-                        connect_with_spawn(&runtime, &mut servers, &name, spawn, timeout)
-                    }
+                    Ok(spawn) => connect_with_spawn(&runtime, &mut servers, &name, spawn, timeout),
                     Err(error) => {
-                        let _ = timeouts.lock().expect("mcp timeouts mutex poisoned").remove(&name);
+                        let _ = timeouts
+                            .lock()
+                            .expect("mcp timeouts mutex poisoned")
+                            .remove(&name);
                         Err(error)
                     }
                 };
@@ -369,7 +372,11 @@ fn connect_with_spawn(
 }
 
 /// Drops one entry, killing a connected process.
-fn drop_entry(runtime: &tokio::runtime::Runtime, servers: &mut HashMap<String, ServerEntry>, name: &str) {
+fn drop_entry(
+    runtime: &tokio::runtime::Runtime,
+    servers: &mut HashMap<String, ServerEntry>,
+    name: &str,
+) {
     if let Some(entry) = servers.remove(name)
         && let ServerState::Connected { client, .. } = entry.state
     {
@@ -411,14 +418,18 @@ fn call_tool_on(
             && let ServerState::Failed { error, .. } = &servers[server].state
         {
             // `connectFailed`'s error text (`runtime.ts:419`).
-            return Err(format!("MCP server \"{server}\" failed to connect: {error}"));
+            return Err(format!(
+                "MCP server \"{server}\" failed to connect: {error}"
+            ));
         }
     }
     let Some(entry) = servers.get(server) else {
         return Err(format!("MCP server \"{server}\" is disabled."));
     };
     let ServerState::Connected {
-        client, tools, timeout,
+        client,
+        tools,
+        timeout,
     } = &entry.state
     else {
         return Err(format!("MCP server \"{server}\" is disabled."));
@@ -429,7 +440,9 @@ fn call_tool_on(
         .iter()
         .any(|candidate| candidate.get("name").and_then(Json::as_str) == Some(tool));
     if !offered {
-        return Err(format!("MCP tool \"{server}/{tool}\" is no longer available."));
+        return Err(format!(
+            "MCP tool \"{server}/{tool}\" is no longer available."
+        ));
     }
     let arguments = if args.is_object() {
         Some(args)
@@ -466,7 +479,7 @@ fn stdio_spawn_config(name: &str, config: &Json, cwd: &str) -> Result<McpServerC
         .map(|args| {
             args.iter()
                 .filter_map(|arg| arg.as_str())
-                .map(|arg| expand_home(arg))
+                .map(expand_home)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -487,6 +500,7 @@ fn stdio_spawn_config(name: &str, config: &Json, cwd: &str) -> Result<McpServerC
         config.get("cwd").and_then(Json::as_str).unwrap_or("."),
     ));
     Ok(McpServerConfig {
+        name: name.to_string(),
         command: expand_home(command),
         args,
         env,
@@ -501,7 +515,10 @@ fn expand_home(value: &str) -> String {
         return home;
     }
     if let Some(rest) = value.strip_prefix("~/") {
-        return std::path::Path::new(&home).join(rest).to_string_lossy().into_owned();
+        return std::path::Path::new(&home)
+            .join(rest)
+            .to_string_lossy()
+            .into_owned();
     }
     value.to_string()
 }
@@ -530,7 +547,10 @@ fn missing_value_error(config: &str, description: &str) -> String {
     match missing.as_slice() {
         [name] => format!("Failed to resolve {description} from environment variable: {name}"),
         names if !names.is_empty() => {
-            format!("Failed to resolve {description} from environment variables: {}", names.join(", "))
+            format!(
+                "Failed to resolve {description} from environment variables: {}",
+                names.join(", ")
+            )
         }
         _ => format!("Failed to resolve {description}"),
     }
@@ -569,7 +589,7 @@ fn execute_command_value(command: &str) -> Option<String> {
         .expect("config value command cache poisoned")
         .get(command)
         .cloned();
-    if cached.is_some() {
+    if let Some(cached) = cached {
         return cached;
     }
     let mut child = std::process::Command::new("/bin/sh")
@@ -601,14 +621,13 @@ fn execute_command_value(command: &str) -> Option<String> {
             let _ = status_tx.send(status.ok().and_then(|status| status.code()));
         })
         .expect("spawn config-value waiter thread");
-    let exit_code = match status_rx.recv_timeout(COMMAND_VALUE_TIMEOUT) {
-        Ok(exit_code) => exit_code,
-        Err(_) => {
-            // The cap hit: terminate the child and reap it.
-            kill_process(pid);
-            let _ = status_rx.recv();
-            None
-        }
+    let exit_code = if let Ok(exit_code) = status_rx.recv_timeout(COMMAND_VALUE_TIMEOUT) {
+        exit_code
+    } else {
+        // The cap hit: terminate the child and reap it.
+        kill_process(pid);
+        let _ = status_rx.recv();
+        None
     };
     let text = reader
         .map(|handle| handle.join().unwrap_or_default())
@@ -665,7 +684,7 @@ fn missing_config_value_env_var_names(config: &str) -> Vec<String> {
 /// `parseConfigValueTemplate` (`resolve-config-value.ts:33-90`).
 fn parse_config_value_template(config: &str) -> Vec<Part> {
     let mut parts: Vec<Part> = Vec::new();
-    let mut append_literal = |parts: &mut Vec<Part>, value: &str| {
+    let append_literal = |parts: &mut Vec<Part>, value: &str| {
         if value.is_empty() {
             return;
         }
@@ -708,8 +727,8 @@ fn parse_config_value_template(config: &str) -> Vec<Part> {
         }
         let name = env_var_name_prefix(&config[dollar + 1..]);
         if let Some(name) = name {
-            parts.push(Part::Env(name));
             index = dollar + 1 + name.len();
+            parts.push(Part::Env(name));
             continue;
         }
         append_literal(&mut parts, "$");
@@ -850,7 +869,10 @@ fn block_to_content(_server: &str, block: &ContentBlock) -> Vec<Json> {
         }
         ContentBlock::Resource { resource } => {
             // `blockToContent`'s resource arm (`tools.ts:189-201`).
-            let uri = resource.get("uri").and_then(Json::as_str).unwrap_or_default();
+            let uri = resource
+                .get("uri")
+                .and_then(Json::as_str)
+                .unwrap_or_default();
             if let Some(text) = resource.get("text").and_then(Json::as_str) {
                 return vec![json!({ "type": "text", "text": text })];
             }
@@ -907,7 +929,12 @@ fn is_text_mime_type(mime_type: Option<&str>) -> bool {
     let Some(mime_type) = mime_type else {
         return false;
     };
-    let base = mime_type.split(';').next().unwrap_or_default().trim().to_lowercase();
+    let base = mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
     base.starts_with("text/")
         || base == "application/json"
         || base.ends_with("+json")
@@ -948,7 +975,10 @@ fn limit_mcp_content(content: Vec<Json>) -> (Vec<Json>, Option<String>) {
             format!("\n\n[Full output: {path} (read it with offset/limit)]"),
             Some(path),
         ),
-        Err(error) => (format!("\n\n[Could not save the full output: {error}]"), None),
+        Err(error) => (
+            format!("\n\n[Could not save the full output: {error}]"),
+            None,
+        ),
     };
     let tokens = truncation.total_bytes.div_ceil(4);
     let text = format!(
@@ -956,7 +986,11 @@ fn limit_mcp_content(content: Vec<Json>) -> (Vec<Json>, Option<String>) {
         truncation.total_lines, truncation.content,
     );
     let mut limited = vec![json!({ "type": "text", "text": text })];
-    limited.extend(content.into_iter().filter(|block| block.get("type").and_then(Json::as_str) == Some("image")));
+    limited.extend(
+        content
+            .into_iter()
+            .filter(|block| block.get("type").and_then(Json::as_str) == Some("image")),
+    );
     (limited, full_output_path)
 }
 
@@ -986,7 +1020,9 @@ fn truncate_middle(text: &str, max_bytes: usize) -> Option<MiddleTruncation> {
     }
     let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
     let tail = String::from_utf8_lossy(&buf[tail_start..]).into_owned();
-    let removed_chars = String::from_utf8_lossy(&buf[head_end..tail_start]).chars().count();
+    let removed_chars = String::from_utf8_lossy(&buf[head_end..tail_start])
+        .chars()
+        .count();
     // A final newline ends the last line instead of starting another.
     let total_lines = text.split('\n').count() - usize::from(text.ends_with('\n'));
     Some(MiddleTruncation {
@@ -1012,11 +1048,10 @@ fn write_output_file(extension: &str, data: &[u8]) -> Result<String, String> {
         }
         match options.open(&path) {
             Ok(mut file) => {
-                std::io::Write::write_all(&mut file, data)
-                    .map_err(|error| error.to_string())?;
+                std::io::Write::write_all(&mut file, data).map_err(|error| error.to_string())?;
                 return Ok(path.to_string_lossy().into_owned());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.to_string()),
         }
     }
@@ -1039,7 +1074,8 @@ fn unique_suffix() -> u64 {
 /// newline-delimited JSON-RPC (synthetic fixture; the client's request
 /// key order `jsonrpc,id,method,params` makes the `case` matches exact).
 #[cfg(test)]
-const FIXTURE_SERVER_SCRIPT: &str = r#"while IFS= read -r line; do
+const FIXTURE_SERVER_SCRIPT: &str = r#"#!/bin/sh
+while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*)
@@ -1080,10 +1116,7 @@ mod tests {
     #[test]
     fn config_values_resolve_env_templates_and_commands() {
         // Literal.
-        assert_eq!(
-            resolve_config_value("plain").as_deref(),
-            Some("plain")
-        );
+        assert_eq!(resolve_config_value("plain").as_deref(), Some("plain"));
         // `$$` and `$!` escape.
         assert_eq!(resolve_config_value("a$$b").as_deref(), Some("a$b"));
         assert_eq!(resolve_config_value("a!b").as_deref(), Some("a!b"));
@@ -1204,7 +1237,10 @@ mod tests {
         .expect("decode");
         let mapped = convert_mcp_result("synth", "big", &result);
         let out = mapped["content"][0]["text"].as_str().expect("text");
-        assert!(out.starts_with("Warning: truncated output (original token count: "), "{out}");
+        assert!(
+            out.starts_with("Warning: truncated output (original token count: "),
+            "{out}"
+        );
         assert!(out.contains("chars truncated…"), "{out}");
         let path = mapped["details"]["fullOutputPath"].as_str().expect("path");
         let saved = std::fs::read_to_string(path).expect("saved file");
@@ -1216,7 +1252,11 @@ mod tests {
     fn truncate_middle_keeps_half_head_and_tail() {
         let text = "abcdefghij".repeat(100);
         let truncation = truncate_middle(&text, 64).expect("truncated");
-        assert!(truncation.content.starts_with("abcdefghij"), "{}", truncation.content);
+        assert!(
+            truncation.content.starts_with("abcdefghij"),
+            "{}",
+            truncation.content
+        );
         assert!(truncation.content.contains("chars truncated…"));
         assert_eq!(truncation.total_bytes, 1000);
         assert_eq!(truncation.total_lines, 1);
@@ -1233,6 +1273,6 @@ mod tests {
     #[test]
     fn base64_decode_round_trips_ascii_and_utf8() {
         assert_eq!(base64_decode("SGVsbG8="), b"Hello".to_vec());
-        assert_eq!(base64_decode("4pyT"), "✔".as_bytes().to_vec());
+        assert_eq!(base64_decode("4pyT"), "✓".as_bytes().to_vec());
     }
 }
