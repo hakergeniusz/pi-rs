@@ -1160,9 +1160,7 @@ impl JsHost {
     pub fn provider_flip_signal(&self, id: u32) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let flip: Function = ctx.globals().get("__piFlipProviderSignal")?;
-            let _: Value = flip
-                .call((id,))
-                .map_err(|err| Self::js_error(&ctx, err))?;
+            let _: Value = flip.call((id,)).map_err(|err| Self::js_error(&ctx, err))?;
             Ok(())
         })
     }

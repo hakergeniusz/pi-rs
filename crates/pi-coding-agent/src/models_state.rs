@@ -799,9 +799,7 @@ export default function (pi) {
         let aborted = pi_agent::types::AbortSignal::default();
         aborted.abort();
         request.signal = Some(aborted);
-        let events = collect(
-            stream_with_extension(&runner, &request).expect("extension arm"),
-        );
+        let events = collect(stream_with_extension(&runner, &request).expect("extension arm"));
         assert!(
             events.iter().any(|event| match event {
                 pi_agent::types::AssistantMessageEvent::TextDelta { delta, .. } => {

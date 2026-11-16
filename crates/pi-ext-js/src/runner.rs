@@ -1781,7 +1781,8 @@ impl ExtensionRunner {
             .host
             .session_begin(&payload, ContextKind::ProviderStream, None)?;
         let call = self.host.session_call_provider_stream(id, provider);
-        let outcome = match call.and_then(|()| self.drain_stream_session(id, signal, &fallback, &model_field))
+        let outcome = match call
+            .and_then(|()| self.drain_stream_session(id, signal, &fallback, &model_field))
         {
             Ok(()) => parse_session_outcome(&self.host.session_last(id)?),
             Err(err) => {
@@ -1853,8 +1854,7 @@ impl ExtensionRunner {
                 match kind.as_str() {
                     "after_provider_response" => {
                         let status = payload.get("status").and_then(Json::as_i64).unwrap_or(0);
-                        let headers =
-                            payload.get("headers").cloned().unwrap_or(Json::Null);
+                        let headers = payload.get("headers").cloned().unwrap_or(Json::Null);
                         self.emit_after_provider_response(status, &headers)?;
                     }
                     "provider_stream_event" => {
@@ -1865,10 +1865,16 @@ impl ExtensionRunner {
                             "provider",
                             &model_field(fallback_model, "provider", "unknown"),
                         );
-                        let api =
-                            model_field(&model, "api", &model_field(fallback_model, "api", "unknown"));
-                        let model_id =
-                            model_field(&model, "id", &model_field(fallback_model, "id", "unknown"));
+                        let api = model_field(
+                            &model,
+                            "api",
+                            &model_field(fallback_model, "api", "unknown"),
+                        );
+                        let model_id = model_field(
+                            &model,
+                            "id",
+                            &model_field(fallback_model, "id", "unknown"),
+                        );
                         self.emit_provider_stream_event(&data, &provider, &api, &model_id)?;
                     }
                     _ => {}
@@ -1895,8 +1901,8 @@ impl ExtensionRunner {
         let mut current = payload.clone();
         for (index, handler) in self.handlers_for("before_provider_request") {
             let event = json!({ "type": "before_provider_request", "payload": current });
-            let event_payload = serde_json::to_string(&event)
-                .map_err(|err| JsHostError::Job(err.to_string()))?;
+            let event_payload =
+                serde_json::to_string(&event).map_err(|err| JsHostError::Job(err.to_string()))?;
             let id = self
                 .host
                 .session_begin(&event_payload, ContextKind::Event, None)?;
@@ -1904,7 +1910,8 @@ impl ExtensionRunner {
                 .session_call(id, index, "before_provider_request", handler)?;
             self.settle_session(id)?;
             let raw = self.host.session_last(id)?;
-            let outcome = parse_session_outcome(&raw).map_err(|err| JsHostError::Job(err.to_string()))?;
+            let outcome =
+                parse_session_outcome(&raw).map_err(|err| JsHostError::Job(err.to_string()))?;
             let _ = self.host.session_end(id);
             if let Some(error) = outcome.error {
                 self.report_error(index, "before_provider_request", error);
@@ -1918,7 +1925,11 @@ impl ExtensionRunner {
     /// `after_provider_response`'s notification fan-out
     /// (`sdk.ts:379-387`'s `handleProviderResponse`): `{type, status,
     /// headers}`; handler errors report, nothing returns.
-    pub fn emit_after_provider_response(&mut self, status: i64, headers: &Json) -> Result<(), JsHostError> {
+    pub fn emit_after_provider_response(
+        &mut self,
+        status: i64,
+        headers: &Json,
+    ) -> Result<(), JsHostError> {
         self.emit(&json!({
             "type": "after_provider_response",
             "status": status,
