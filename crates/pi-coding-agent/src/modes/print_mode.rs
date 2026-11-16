@@ -344,7 +344,11 @@ pub fn run_print_mode(
     // appends mid-turn; the store is not shared with the loop thread).
     #[cfg(feature = "ext-js")]
     if let Some(routing) = &routing {
-        routing.persist_state(&mut runtime.session);
+        // `entry_appended` for each router-state record
+        // (`agent-session.ts:894-897`).
+        for entry in routing.persist_state(&mut runtime.session) {
+            crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::EntryAppended { entry }));
+        }
     }
 
     // Persist the turn (`print-mode.ts` persists via MessageEnd events; the

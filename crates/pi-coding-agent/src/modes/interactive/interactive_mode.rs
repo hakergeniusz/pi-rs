@@ -1555,11 +1555,13 @@ impl InteractiveMode {
             | AgentEvent::AutoRetryStart { .. }
             | AgentEvent::AutoRetryEnd { .. }
             | AgentEvent::CompactionStart { .. }
-            | AgentEvent::CompactionEnd { .. } => {
+            | AgentEvent::CompactionEnd { .. }
+            | AgentEvent::EntryAppended { .. } => {
                 // The final tool result renders with its message end. The
-                // pump drives its runs directly; the retry and compaction
-                // status displays land with the pump's AgentRun rework
-                // (upstream shows them via agent-session events).
+                // pump drives its runs directly; the retry, compaction,
+                // and appended-entry displays land with the pump's
+                // AgentRun rework (upstream shows them via agent-session
+                // events).
             }
             AgentEvent::MessageStart { message } => match message {
                 AgentMessage::User(user) => {
@@ -2034,6 +2036,7 @@ impl InteractiveMode {
                         messages: &messages,
                         reason: crate::virtual_models::ModelRouteReason::Direct,
                         thinking_level: self.thinking_level,
+                        signal: None,
                         state: None,
                         failed: None,
                     },

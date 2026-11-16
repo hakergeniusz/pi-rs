@@ -269,6 +269,9 @@ pub struct PrepareRequestContext<'a> {
     pub context: &'a mut AgentContext,
     pub model: pi_ai::types::Model,
     pub thinking_level: ThinkingLevel,
+    /// The live run's abort signal (`prepareRequest(request, signal)`,
+    /// `agent-loop.ts:222`); hooks hand it to routing and fetches.
+    pub signal: &'a AbortSignal,
 }
 
 /// Context handed to `prepareNextTurn`.

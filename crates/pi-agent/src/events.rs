@@ -91,6 +91,15 @@ pub enum AgentEvent {
         will_retry: bool,
         error_message: Option<String>,
     },
+    // A session entry landed on the branch while the agent-session drove
+    // it (`agent-session.ts:224`): the virtual-model-state custom entries,
+    // boundary drafts, recovery omissions, and the cache warmer. Regular
+    // messages and model/thinking/compaction records surface through
+    // their own events instead.
+    EntryAppended {
+        /// The serialized entry record, pi's on-disk shape.
+        entry: serde_json::Value,
+    },
 }
 
 /// The compaction trigger (`agent-session.ts:223`): manual `/compact`, the
@@ -148,6 +157,7 @@ impl AgentEvent {
             AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
             AgentEvent::CompactionStart { .. } => "compaction_start",
             AgentEvent::CompactionEnd { .. } => "compaction_end",
+            AgentEvent::EntryAppended { .. } => "entry_appended",
         }
     }
 }

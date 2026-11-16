@@ -741,7 +741,11 @@ fn run_agent_turn(
     };
     #[cfg(feature = "ext-js")]
     if let Some(routing) = &routing {
-        routing.persist_state(&mut runtime.session);
+        // `entry_appended` for each router-state record
+        // (`agent-session.ts:894-897`).
+        for entry in routing.persist_state(&mut runtime.session) {
+            crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::EntryAppended { entry }));
+        }
     }
 
     for message in &new_messages {

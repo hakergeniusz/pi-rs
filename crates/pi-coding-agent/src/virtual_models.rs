@@ -36,7 +36,7 @@ use serde_json::{Map, Value, json};
 use pi_agent::agent_loop::PrepareRequest;
 use pi_agent::agent_message::AgentMessage;
 #[cfg(feature = "ext-js")]
-use pi_agent::types::{PrepareRequestContext, TurnUpdate, clamp_thinking_level};
+use pi_agent::types::{AbortSignal, PrepareRequestContext, TurnUpdate, clamp_thinking_level};
 use pi_agent::types::{StreamFn, StreamRequest, ThinkingLevel};
 use pi_ai::types::{Model, ModelInputModality, StopReason};
 
@@ -296,8 +296,10 @@ pub struct ModelRoute {
     pub state: Option<Value>,
 }
 
-/// The inputs of one routing decision (`ModelRouteRequest`, minus the
-/// abort signal — the runner's calls are synchronous).
+/// The inputs of one routing decision (`ModelRouteRequest`). The runner's
+/// calls are synchronous, so the abort signal is polled at the dispatch
+/// boundary (`resolve_virtual_model`), not mid-call like upstream's
+/// fetch.
 #[derive(Debug)]
 pub struct RouteRequest<'a> {
     /// The selected virtual model.
@@ -307,11 +309,13 @@ pub struct RouteRequest<'a> {
     pub messages: &'a [AgentMessage],
     pub reason: ModelRouteReason,
     pub thinking_level: ThinkingLevel,
+    /// The live request's abort signal (`request.signal`,
+    /// `agent-session.ts:888`); `None` for out-of-run resolutions.
+    pub signal: Option<&'a AbortSignal>,
     /// Router state last returned on this session branch. `None` before the
     /// first state and for `direct` requests.
     pub state: Option<Value>,
-    /// For `retry`: the failed request, which `messages` no longer contains
-    /// (unreachable until the retry subsystem lands).
+    /// For `retry`: the failed request, which `messages` no longer contains.
     pub failed: Option<&'a pi_ai::types::AssistantMessage>,
 }
 
@@ -424,6 +428,13 @@ pub fn resolve_virtual_model(
         request_json.insert("failed".to_string(), failed);
     }
     request_json.insert("messages".to_string(), Value::Array(messages));
+
+    // `request.signal` (`agent-session.ts:888`): the runner's calls are
+    // synchronous, so the abort polls at the dispatch boundary — an
+    // aborted fetch never reaches the router.
+    if request.signal.is_some_and(AbortSignal::aborted) {
+        return Err("This operation was aborted".to_string());
+    }
 
     let reply = runner
         .lock()
@@ -741,10 +752,26 @@ impl TurnRouting {
     /// Append the decided `pi.virtual-model-state` entries to the branch
     /// (`appendCustomEntry`); entries of a cancelled turn still land, like
     /// upstream's mid-turn appends.
-    pub fn persist_state(&self, session: &mut crate::session::SessionManager) {
-        for data in self.hook.take_pending_state() {
-            let _ = session.append_custom_entry(VIRTUAL_MODEL_STATE_ENTRY, Some(data));
-        }
+    /// Appends the turn's router states and returns their serialized
+    /// records for the `entry_appended` emissions (`agent-session.ts:894-897`
+    /// emits the entry after each `appendCustomEntry`).
+    pub fn persist_state(
+        &self,
+        session: &mut crate::session::SessionManager,
+    ) -> Vec<serde_json::Value> {
+        self.hook
+            .take_pending_state()
+            .into_iter()
+            .filter_map(|data| {
+                let id = session
+                    .append_custom_entry(VIRTUAL_MODEL_STATE_ENTRY, Some(data))
+                    .ok()?;
+                session.get_entry(&id).map(|entry| {
+                    // The record's ordered object is the wire shape.
+                    Value::Object(entry.to_record().object().clone())
+                })
+            })
+            .collect()
     }
 }
 
@@ -787,6 +814,7 @@ impl PrepareRequest for VirtualRouteHook {
                         ModelRouteReason::Continuation
                     },
                     thinking_level: request.thinking_level,
+                    signal: Some(request.signal),
                     state: state.clone(),
                     failed: None,
                 },
@@ -1101,12 +1129,17 @@ export default function (pi) {
     }
 
     #[cfg(feature = "ext-js")]
-    fn route_request(model: &Model, state: Option<Value>) -> RouteRequest<'_> {
+    fn route_request<'a>(
+        model: &'a Model,
+        state: Option<Value>,
+        signal: Option<&'a AbortSignal>,
+    ) -> RouteRequest<'a> {
         RouteRequest {
             model,
             messages: &[],
             reason: ModelRouteReason::User,
             thinking_level: ThinkingLevel::High,
+            signal,
             state,
             failed: None,
         }
@@ -1126,7 +1159,7 @@ export default function (pi) {
         };
         let route = resolve_virtual_model(
             &runner,
-            &route_request(&model, Some(json!({ "n": 0 }))),
+            &route_request(&model, Some(json!({ "n": 0 })), None),
             resolvers,
         )
         .expect("route");
@@ -1151,19 +1184,78 @@ export default function (pi) {
             has_credentials: &|_| false,
         };
         assert_eq!(
-            resolve_virtual_model(&runner, &route_request(&unregistered, None), no_model)
+            resolve_virtual_model(&runner, &route_request(&unregistered, None, None), no_model)
                 .expect_err("unregistered"),
             "Virtual model acme/missing is not registered."
         );
         assert_eq!(
-            resolve_virtual_model(&runner, &route_request(&model, None), no_model)
+            resolve_virtual_model(&runner, &route_request(&model, None, None), no_model)
                 .expect_err("not a physical model"),
             "Virtual model acme/router routed to acme/slow, which is not a physical model."
         );
         assert_eq!(
-            resolve_virtual_model(&runner, &route_request(&model, None), no_credentials)
+            resolve_virtual_model(&runner, &route_request(&model, None, None), no_credentials)
                 .expect_err("no credentials"),
             "Virtual model acme/router routed to acme/slow, which has no credentials."
         );
+    }
+
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn an_aborted_signal_stops_the_route_at_the_dispatch_boundary() {
+        // `request.signal` (`agent-session.ts:888`): the runner's calls are
+        // synchronous, so an aborted fetch never reaches the router.
+        let runner = std::sync::Mutex::new(route_runner());
+        let model = create_virtual_model(&json!({ "provider": "acme", "id": "router" }));
+        let signal = AbortSignal::new();
+        signal.abort();
+        let error = resolve_virtual_model(
+            &runner,
+            &route_request(&model, None, Some(&signal)),
+            RouteResolvers {
+                get_model: &|_, _| None,
+                has_credentials: &|_| true,
+            },
+        )
+        .expect_err("aborted");
+        assert_eq!(error, "This operation was aborted");
+    }
+
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn persist_state_appends_and_serializes_the_router_state_records() {
+        // `agent-session.ts:894-897`: each `appendCustomEntry` emits the
+        // appended entry; the port's persist returns the serialized records
+        // for the run tails to emit.
+        let runner = Arc::new(std::sync::Mutex::new(route_runner()));
+        let model = create_virtual_model(&json!({ "provider": "acme", "id": "router" }));
+        let auth_path = crate::config::get_auth_path();
+        let mut session = crate::session::SessionManager::in_memory(
+            std::path::Path::new("/tmp"),
+            &crate::session::store::NewSessionOptions::default(),
+            Vec::new(),
+        )
+        .expect("session");
+        let hook = VirtualRouteHook::new(Arc::clone(&runner), &model, auth_path.clone(), &[]);
+        hook.pending_state
+            .lock()
+            .expect("pending state")
+            .push(json!({ "provider": "acme", "modelId": "slow", "state": { "n": 1 } }));
+        let routing = TurnRouting {
+            hook: Arc::new(hook),
+            stream_fn: Arc::new(RoutedStreamFn {
+                selected_provider: model.provider.clone(),
+                flag_api_key: None,
+                auth_path,
+                route_error: Arc::new(RouteErrorSlot::default()),
+                runner: Some(runner),
+            }),
+        };
+        let records = routing.persist_state(&mut session);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["customType"], "pi.virtual-model-state");
+        assert_eq!(records[0]["data"]["modelId"], "slow");
+        // The queue drained: a second persist appends nothing.
+        assert!(routing.persist_state(&mut session).is_empty());
     }
 }

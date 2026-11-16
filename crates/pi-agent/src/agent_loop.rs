@@ -491,6 +491,7 @@ async fn run_loop(
                     context: &mut current_context,
                     model: model.clone(),
                     thinking_level,
+                    signal,
                 };
                 let update = prepare.call(request).await;
                 // pi: `currentContext = requestUpdate.context ?? currentContext`
