@@ -1133,12 +1133,14 @@ impl InteractiveMode {
                     );
                     let items: Vec<pi_tui::components::select_list::SelectItem> = filtered
                         .into_iter()
-                        .map(|option| pi_tui::components::select_list::SelectItem {
-                            value: option.id.clone(),
-                            label: option.id,
-                            description: Some(oauth::login_provider_completion_description(
-                                &option,
-                            )),
+                        .map(|option| {
+                            let description =
+                                oauth::login_provider_completion_description(&option);
+                            pi_tui::components::select_list::SelectItem {
+                                value: option.id.clone(),
+                                label: option.id,
+                                description: Some(description),
+                            }
                         })
                         .collect();
                     if items.is_empty() { None } else { Some(items) }
@@ -4231,9 +4233,7 @@ impl InteractiveMode {
             return;
         }
         if matches.len() > 1 {
-            let same_id = matches
-                .iter()
-                .all(|provider| provider.id == matches[0].id);
+            let same_id = matches.iter().all(|provider| provider.id == matches[0].id);
             if same_id {
                 let provider_options = matches.into_iter().cloned().collect();
                 self.show_login_auth_type_selector(Some(provider_options));
@@ -4278,7 +4278,10 @@ impl InteractiveMode {
     /// subscription/API-key options for one provider, or the top-level menu
     /// with the Radius option last. `provider_options` carries the one
     /// provider's entries when `/login <ref>` matched several auth types.
-    fn show_login_auth_type_selector(&mut self, provider_options: Option<Vec<AuthSelectorProvider>>) {
+    fn show_login_auth_type_selector(
+        &mut self,
+        provider_options: Option<Vec<AuthSelectorProvider>>,
+    ) {
         let all_options = oauth::login_provider_options(&self.auth_path);
         // The top-level selector offers Radius directly, as its last option
         // (`interactive-mode.ts:6090-6093`).
@@ -4287,24 +4290,39 @@ impl InteractiveMode {
         } else {
             all_options
                 .iter()
-                .find(|provider| provider.id == oauth::RADIUS_PROVIDER_ID && provider.auth_type == "oauth")
+                .find(|provider| {
+                    provider.id == oauth::RADIUS_PROVIDER_ID && provider.auth_type == "oauth"
+                })
                 .cloned()
         };
-        let radius_label = radius_option
-            .as_ref()
-            .map(|provider| format!("Sign in with {}{}", provider.name, Self::auth_selector_status_suffix(provider)));
+        let radius_label = radius_option.as_ref().map(|provider| {
+            format!(
+                "Sign in with {}{}",
+                provider.name,
+                Self::auth_selector_status_suffix(provider)
+            )
+        });
         // `oauthLoginLabel` (`:6094-6098`): the OAuth method's selector label.
         let oauth_login_label = provider_options
             .as_ref()
-            .and_then(|options| options.iter().find(|provider| provider.auth_type == "oauth"))
+            .and_then(|options| {
+                options
+                    .iter()
+                    .find(|provider| provider.auth_type == "oauth")
+            })
             .and_then(|provider| provider.login_label);
-        let subscription_label =
-            oauth_login_label.unwrap_or("Sign in with an account").to_string();
+        let subscription_label = oauth_login_label
+            .unwrap_or("Sign in with an account")
+            .to_string();
         let api_key_label = "Sign in with an API key";
         let available = |auth_type: &str| {
             provider_options
                 .as_ref()
-                .map(|options| options.iter().any(|provider| provider.auth_type == auth_type))
+                .map(|options| {
+                    options
+                        .iter()
+                        .any(|provider| provider.auth_type == auth_type)
+                })
                 .unwrap_or(true)
         };
         let mut options: Vec<String> = Vec::new();
@@ -4324,7 +4342,10 @@ impl InteractiveMode {
         if provider_options.is_some() && options.len() == 1 {
             // The single auth type starts directly, without a back target
             // (`interactive-mode.ts:6130-6138`).
-            if let Some(provider) = provider_options.as_ref().and_then(|options| options.first()) {
+            if let Some(provider) = provider_options
+                .as_ref()
+                .and_then(|options| options.first())
+            {
                 let provider = provider.clone();
                 self.start_provider_login(provider, None);
             }
@@ -4348,7 +4369,11 @@ impl InteractiveMode {
 
     /// `showLoginProviderSelector` (`interactive-mode.ts:6156-6187`): the
     /// provider rows for one auth type, or all of them.
-    fn show_login_provider_selector(&mut self, auth_type: Option<&'static str>, initial_search: Option<&str>) {
+    fn show_login_provider_selector(
+        &mut self,
+        auth_type: Option<&'static str>,
+        initial_search: Option<&str>,
+    ) {
         let all_options = oauth::login_provider_options(&self.auth_path);
         let provider_options: Vec<AuthSelectorProvider> = all_options
             .into_iter()
@@ -4367,7 +4392,8 @@ impl InteractiveMode {
             return;
         }
         let events = Arc::new(Mutex::new(Vec::new()));
-        let selector = AuthSelectorComponent::login(provider_options, initial_search, Arc::clone(&events));
+        let selector =
+            AuthSelectorComponent::login(provider_options, initial_search, Arc::clone(&events));
         self.auth_selector_events = Some(events);
         self.auth_selector_mode = Some("login");
         self.pending_auth_type = auth_type;
@@ -4376,7 +4402,11 @@ impl InteractiveMode {
 
     /// `startProviderLogin` (`interactive-mode.ts:6077-6085`): the oauth
     /// flow, the API-key prompt, or the ambient notice.
-    fn start_provider_login(&mut self, provider: AuthSelectorProvider, back: Option<LoginBackStep>) {
+    fn start_provider_login(
+        &mut self,
+        provider: AuthSelectorProvider,
+        back: Option<LoginBackStep>,
+    ) {
         match provider.auth_type {
             "oauth" => {
                 // The per-provider OAuth flows (PKCE/device-code/callback
@@ -4396,10 +4426,7 @@ impl InteractiveMode {
                 if crate::oauth::AMBIENT_LOGIN_PROVIDERS.contains(&provider.id.as_str()) {
                     self.show_status(&format!(
                         "{} is configured outside {}.",
-                        provider
-                            .method_name
-                            .as_deref()
-                            .unwrap_or("Authentication"),
+                        provider.method_name.as_deref().unwrap_or("Authentication"),
                         crate::config::APP_NAME
                     ));
                     return;
@@ -4428,11 +4455,8 @@ impl InteractiveMode {
             return;
         }
         let events = Arc::new(Mutex::new(Vec::new()));
-        let prompt = LoginPromptComponent::new(
-            &format!("Enter {auth_name}"),
-            None,
-            Arc::clone(&events),
-        );
+        let prompt =
+            LoginPromptComponent::new(&format!("Enter {auth_name}"), None, Arc::clone(&events));
         self.login_prompt_events = Some(events);
         self.login_prompt_provider = Some((provider_id.to_string(), provider_name.to_string()));
         self.login_back = back;
@@ -4455,7 +4479,8 @@ impl InteractiveMode {
         for event in events {
             match event {
                 LoginPromptEvent::Submit(value) => {
-                    let Some((provider_id, provider_name)) = self.login_prompt_provider.take() else {
+                    let Some((provider_id, provider_name)) = self.login_prompt_provider.take()
+                    else {
                         continue;
                     };
                     self.restore_editor();
@@ -4524,7 +4549,10 @@ impl InteractiveMode {
         );
         for event in events {
             match event {
-                AuthSelectorEvent::Select { provider_id, auth_type } => {
+                AuthSelectorEvent::Select {
+                    provider_id,
+                    auth_type,
+                } => {
                     // The pending-selector state feeds the `onBack` chains;
                     // it is captured before `close_auth_selector` clears it.
                     let mode = self.auth_selector_mode;
@@ -4585,7 +4613,7 @@ impl InteractiveMode {
         };
         let back = match pending_type {
             Some(auth_type) => Some(LoginBackStep::Provider(Some(auth_type))),
-            None => pending_options.map(LoginBackStep::AuthType),
+            None => pending_options.map(|options| LoginBackStep::AuthType(Some(options))),
         };
         self.start_provider_login(provider, back);
     }
@@ -4602,15 +4630,21 @@ impl InteractiveMode {
         let all_options = oauth::login_provider_options(&self.auth_path);
         let radius = all_options
             .iter()
-            .find(|provider| provider.id == oauth::RADIUS_PROVIDER_ID && provider.auth_type == "oauth")
+            .find(|provider| {
+                provider.id == oauth::RADIUS_PROVIDER_ID && provider.auth_type == "oauth"
+            })
             .cloned();
-        let radius_label = radius
-            .as_ref()
-            .map(|provider| format!("Sign in with {}{}", provider.name, Self::auth_selector_status_suffix(provider)));
+        let radius_label = radius.as_ref().map(|provider| {
+            format!(
+                "Sign in with {}{}",
+                provider.name,
+                Self::auth_selector_status_suffix(provider)
+            )
+        });
         if let (Some(radius), Some(radius_label)) = (&radius, &radius_label)
             && option == radius_label.as_str()
         {
-            let back = pending_options.map(LoginBackStep::AuthType);
+            let back = pending_options.map(|options| LoginBackStep::AuthType(Some(options)));
             self.start_provider_login(radius.clone(), back);
             return;
         }
@@ -4650,7 +4684,9 @@ impl InteractiveMode {
                 let message = if auth_type == "oauth" {
                     format!("Logged out of {name}")
                 } else {
-                    format!("Removed stored API key for {name}. Environment variables and models.json config are unchanged.")
+                    format!(
+                        "Removed stored API key for {name}. Environment variables and models.json config are unchanged."
+                    )
                 };
                 self.show_status(&message);
             }
@@ -6671,10 +6707,7 @@ mod tests {
         mode.pump();
         mode.tui.render_now(false);
         let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
-        assert!(
-            frame.contains("Removed stored API key for groq"),
-            "{frame}"
-        );
+        assert!(frame.contains("Removed stored API key for groq"), "{frame}");
         assert!(
             frame.contains("Environment variables and models.json config are unchanged"),
             "{frame}"
@@ -6791,7 +6824,10 @@ mod tests {
         mode.tui.render_now(false);
         let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
         assert!(frame.contains("Failed to login to"), "{frame}");
-        assert!(frame.contains("OAuth login flows are not implemented"), "{frame}");
+        assert!(
+            frame.contains("OAuth login flows are not implemented"),
+            "{frame}"
+        );
 
         mode.shutdown().expect("shutdown");
     }

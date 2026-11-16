@@ -156,10 +156,7 @@ impl AuthSelectorComponent {
         options: Vec<String>,
         events: Arc<Mutex<Vec<AuthSelectorEvent>>>,
     ) -> Self {
-        let rows: Vec<AuthSelectorRow> = options
-            .into_iter()
-            .map(AuthSelectorRow::Option)
-            .collect();
+        let rows: Vec<AuthSelectorRow> = options.into_iter().map(AuthSelectorRow::Option).collect();
         Self::new("login", title, rows, false, None, events)
     }
 
@@ -214,9 +211,7 @@ impl AuthSelectorComponent {
                 let status_indicator = provider
                     .status
                     .as_ref()
-                    .map(|status| {
-                        oauth::format_auth_selector_provider_status(provider, status)
-                    })
+                    .map(|status| oauth::format_auth_selector_provider_status(provider, status))
                     .unwrap_or_else(|| theme.fg(ThemeColor::Muted, " • not configured"));
                 // U+2726 is single-width in every terminal, unlike star
                 // emoji (`oauth-selector.ts:166-168`).
@@ -242,7 +237,11 @@ impl AuthSelectorComponent {
                 } else {
                     format!("  {}", text_color(&provider.name))
                 };
-                let prefix = if is_selected { accent("→ ") } else { String::new() };
+                let prefix = if is_selected {
+                    accent("→ ")
+                } else {
+                    String::new()
+                };
                 format!("{prefix}{name}{partner_marker}{auth_type_label}{status_indicator}")
             }
             AuthSelectorRow::Option(option) => {
@@ -277,10 +276,11 @@ impl Component for AuthSelectorComponent {
 
         // The `MAX_VISIBLE` window centered on the selection
         // (`updateList`, `oauth-selector.ts:162-169`).
-        let start_index = self
-            .selected_index
-            .saturating_sub(MAX_VISIBLE / 2)
-            .min(self.filtered.len().saturating_sub(MAX_VISIBLE.min(self.filtered.len())));
+        let start_index = self.selected_index.saturating_sub(MAX_VISIBLE / 2).min(
+            self.filtered
+                .len()
+                .saturating_sub(MAX_VISIBLE.min(self.filtered.len())),
+        );
         let end_index = (start_index + MAX_VISIBLE).min(self.filtered.len());
         for index in start_index..end_index {
             let line = self.row_line(&self.filtered[index], index == self.selected_index);
@@ -325,7 +325,11 @@ impl Component for AuthSelectorComponent {
         let confirm = |selector: &mut Self| {
             if let Some(row) = selector.filtered.get(selector.selected_index) {
                 let event = row.select_event();
-                selector.events.lock().expect("auth selector events").push(event);
+                selector
+                    .events
+                    .lock()
+                    .expect("auth selector events")
+                    .push(event);
             }
         };
         if keybindings::matches(data, action::SELECT_UP) {
@@ -476,7 +480,12 @@ mod tests {
     use super::*;
     use pi_tui::ansi::strip_terminal_sequences;
 
-    fn provider(id: &str, name: &str, auth_type: &'static str, configured: bool) -> AuthSelectorProvider {
+    fn provider(
+        id: &str,
+        name: &str,
+        auth_type: &'static str,
+        configured: bool,
+    ) -> AuthSelectorProvider {
         AuthSelectorProvider {
             id: id.to_string(),
             name: name.to_string(),
@@ -564,8 +573,10 @@ mod tests {
     #[test]
     fn logout_uses_the_upstream_title() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let selector =
-            AuthSelectorComponent::logout(vec![provider("radius", "Radius", "oauth", true)], events);
+        let selector = AuthSelectorComponent::logout(
+            vec![provider("radius", "Radius", "oauth", true)],
+            events,
+        );
         let plain = strip_terminal_sequences(&selector.render(100).join("\n"));
         assert!(plain.contains("Select provider to logout:"), "{plain}");
     }
@@ -573,8 +584,11 @@ mod tests {
     #[test]
     fn the_prompt_submits_and_cancels() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let mut prompt =
-            LoginPromptComponent::new("Enter Anthropic API key", Some("sk-ant-..."), Arc::clone(&events));
+        let mut prompt = LoginPromptComponent::new(
+            "Enter Anthropic API key",
+            Some("sk-ant-..."),
+            Arc::clone(&events),
+        );
         let plain = strip_terminal_sequences(&prompt.render(100).join("\n"));
         assert!(plain.contains("Enter Anthropic API key"), "{plain}");
         assert!(plain.contains("e.g., sk-ant-..."), "{plain}");
@@ -619,6 +633,9 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let selector = AuthSelectorComponent::logout(Vec::new(), events);
         let plain = strip_terminal_sequences(&selector.render(100).join("\n"));
-        assert!(plain.contains("No providers logged in. Use /login first."), "{plain}");
+        assert!(
+            plain.contains("No providers logged in. Use /login first."),
+            "{plain}"
+        );
     }
 }

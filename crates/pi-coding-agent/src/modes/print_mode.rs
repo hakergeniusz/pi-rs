@@ -905,18 +905,27 @@ mod tests {
         // provider's standard key header (`toAuth`).
         assert_eq!(
             resolve_wire_credential("anthropic", None, &auth_path),
-            Some((WireCredential::ApiKey("tok".to_string()), "stored credential"))
+            Some((
+                WireCredential::ApiKey("tok".to_string()),
+                "stored credential"
+            ))
         );
         // kimi-coding yields an explicit Bearer header.
         assert_eq!(
             resolve_wire_credential("kimi-coding", None, &auth_path),
-            Some((WireCredential::AccessToken("tok".to_string()), "stored credential"))
+            Some((
+                WireCredential::AccessToken("tok".to_string()),
+                "stored credential"
+            ))
         );
         // A stored OAuth credential for a provider without OAuth auth
         // resolves to nothing — no env fallback (`resolve.ts:82-86`).
         assert_eq!(resolve_wire_credential("groq", None, &auth_path), None);
         // A stored API key for an OAuth-only provider resolves to nothing.
-        assert_eq!(resolve_wire_credential("openai-codex", None, &auth_path), None);
+        assert_eq!(
+            resolve_wire_credential("openai-codex", None, &auth_path),
+            None
+        );
     }
 
     /// The composed config layers (`composeApiKeyAuth.resolve`,
@@ -937,14 +946,20 @@ mod tests {
         let literal = config(serde_json::json!("acme-key"));
         assert_eq!(
             resolve_wire_credential_composed("acme", None, &auth_path, Some(&literal), None),
-            Some((WireCredential::ApiKey("acme-key".to_string()), "configured API key"))
+            Some((
+                WireCredential::ApiKey("acme-key".to_string()),
+                "configured API key"
+            ))
         );
         // The configured key on a provider with an inherited auth resolves
         // as a stored credential (`helpers.ts:21-23`).
         let literal = config(serde_json::json!("openai-key"));
         assert_eq!(
             resolve_wire_credential_composed("openai", None, &auth_path, Some(&literal), None),
-            Some((WireCredential::ApiKey("openai-key".to_string()), "stored credential"))
+            Some((
+                WireCredential::ApiKey("openai-key".to_string()),
+                "stored credential"
+            ))
         );
         // An unresolvable `$VAR` template resolves to nothing — no env
         // fallback after the configured-key branch.

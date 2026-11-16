@@ -118,9 +118,8 @@ fn rebuild(
     }
     // The auth layer's config snapshots (`model-runtime.ts`'s `this.config`
     // and `extensionProviders`).
-    let snapshot: BTreeMap<String, models_config::ModelsJsonProvider> = models_config
-        .providers()
-        .clone();
+    let snapshot: BTreeMap<String, models_config::ModelsJsonProvider> =
+        models_config.providers().clone();
     if let Ok(mut slot) = MODELS_JSON_PROVIDERS.write() {
         *slot = Some(Arc::new(snapshot));
     }
@@ -396,30 +395,31 @@ fn extension_error_event(model: &Model, message: String) -> pi_agent::types::Ass
 /// composition's `config` layer (`model-runtime.ts`'s `this.config`).
 /// `None` before the first refresh.
 pub fn models_json_provider(provider_id: &str) -> Option<models_config::ModelsJsonProvider> {
-    MODELS_JSON_PROVIDERS
-        .read()
-        .ok()
-        .and_then(|slot| slot.as_ref().and_then(|providers| providers.get(provider_id).cloned()))
+    MODELS_JSON_PROVIDERS.read().ok().and_then(|slot| {
+        slot.as_ref()
+            .and_then(|providers| providers.get(provider_id).cloned())
+    })
 }
 
 /// One provider's extension-registered config — the auth composition's
 /// `extension` layer (`model-runtime.ts`'s `extensionProviders`). `None`
 /// before a refresh with the engine.
 #[cfg(feature = "ext-js")]
-pub fn extension_provider_config(provider_id: &str) -> Option<models_config::ExtensionProviderConfig> {
-    EXTENSION_PROVIDERS
-        .read()
-        .ok()
-        .and_then(|slot| {
-            slot.iter()
-                .find(|(name, _)| name == provider_id)
-                .map(|(_, config)| config.clone())
-        })
+pub fn extension_provider_config(
+    provider_id: &str,
+) -> Option<models_config::ExtensionProviderConfig> {
+    EXTENSION_PROVIDERS.read().ok().and_then(|slot| {
+        slot.iter()
+            .find(|(name, _)| name == provider_id)
+            .map(|(_, config)| config.clone())
+    })
 }
 
 /// Engine-free builds have no extension providers.
 #[cfg(not(feature = "ext-js"))]
-pub fn extension_provider_config(_provider_id: &str) -> Option<models_config::ExtensionProviderConfig> {
+pub fn extension_provider_config(
+    _provider_id: &str,
+) -> Option<models_config::ExtensionProviderConfig> {
     None
 }
 
@@ -658,7 +658,7 @@ export default function (pi) {
         assert_eq!(error.stop_reason, pi_ai::types::StopReason::Error);
         assert_eq!(error.error_message.as_deref(), Some("stream-boom"));
         assert_eq!(error.provider, "acme");
-}
+    }
 
     /// The slice 6c config snapshot: the auth layer reads one provider's
     /// models.json entry from the last loaded config

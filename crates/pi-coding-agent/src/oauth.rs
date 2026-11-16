@@ -154,32 +154,32 @@ pub fn api_key_auth_name(provider_id: &str) -> Option<&'static str> {
         "qwen-token-plan-cn" => Some("Qwen Token Plan Team CN API key"), // qwen-token-plan-cn.ts:12
         "qwen-token-plan-individual" => Some("Qwen Token Plan Individual API key"), // qwen-token-plan-individual.ts:12
         "qwen-token-plan-individual-cn" => Some("Qwen Token Plan Individual CN API key"), // qwen-token-plan-individual-cn.ts:12
-        "cerebras" => Some("Cerebras API key"),   // cerebras.ts:11
-        "google" => Some("Gemini API key"),       // google.ts:11
+        "cerebras" => Some("Cerebras API key"), // cerebras.ts:11
+        "google" => Some("Gemini API key"),     // google.ts:11
         "huggingface" => Some("Hugging Face token"), // huggingface.ts:11
         "github-copilot" => Some("GitHub Copilot token"), // github-copilot.ts:30
-        "xai" => Some("xAI API key"),             // xai.ts:13
+        "xai" => Some("xAI API key"),           // xai.ts:13
         "vercel-ai-gateway" => Some("Vercel AI Gateway API key"), // vercel-ai-gateway.ts:12
-        "kimi-coding" => Some("Kimi API key"),    // kimi-coding.ts:13
+        "kimi-coding" => Some("Kimi API key"),  // kimi-coding.ts:13
         "moonshotai" | "moonshotai-cn" => Some("Moonshot AI API key"), // moonshotai.ts:11
-        "ant-ling" => Some("Ant Ling API key"),   // ant-ling.ts:11
-        "xiaomi" => Some("Xiaomi API key"),       // xiaomi.ts:11
-        "meta" => Some("Meta Model API key"),     // meta.ts:13
+        "ant-ling" => Some("Ant Ling API key"), // ant-ling.ts:11
+        "xiaomi" => Some("Xiaomi API key"),     // xiaomi.ts:11
+        "meta" => Some("Meta Model API key"),   // meta.ts:13
         "fireworks" => Some("Fireworks API key"), // fireworks.ts:12
-        "mistral" => Some("Mistral API key"),     // mistral.ts:11
+        "mistral" => Some("Mistral API key"),   // mistral.ts:11
         "opencode" | "opencode-go" => Some("OpenCode API key"), // opencode.ts:17
-        "openai" => Some("OpenAI API key"),       // openai.ts:15
-        "azure" => Some("Azure OpenAI API key"),  // azure.ts:48
-        "minimax" => Some("MiniMax API key"),     // minimax.ts:11
+        "openai" => Some("OpenAI API key"),     // openai.ts:15
+        "azure" => Some("Azure OpenAI API key"), // azure.ts:48
+        "minimax" => Some("MiniMax API key"),   // minimax.ts:11
         "minimax-cn" => Some("MiniMax CN API key"), // minimax-cn.ts:11
-        "baseten" => Some("Baseten API key"),     // baseten.ts:11
-        "together" => Some("Together API key"),   // together.ts:11
-        "nvidia" => Some("NVIDIA API key"),       // nvidia.ts:11
-        "typesafe" => Some("TypeSafe API key"),   // typesafe.ts:11
-        "zai" => Some("Z.AI API key"),            // zai.ts:11
+        "baseten" => Some("Baseten API key"),   // baseten.ts:11
+        "together" => Some("Together API key"), // together.ts:11
+        "nvidia" => Some("NVIDIA API key"),     // nvidia.ts:11
+        "typesafe" => Some("TypeSafe API key"), // typesafe.ts:11
+        "zai" => Some("Z.AI API key"),          // zai.ts:11
         "zai-coding-cn" => Some("Z.AI Coding CN API key"), // zai-coding-cn.ts:11
         "openrouter" => Some("OpenRouter API key"), // openrouter.ts:68
-        "radius" => Some("Radius API key"),       // radius.ts:39
+        "radius" => Some("Radius API key"),     // radius.ts:39
         _ => None,
     }
 }
@@ -301,7 +301,7 @@ pub fn provider_auth_methods(
         methods.push(AuthMethod::OAuth(oauth));
     }
     if let Some(api_key) = api_key {
-        methods.push(AuthMethod::ApiKey(api_key));
+        methods.push(api_key);
     }
     methods
 }
@@ -444,10 +444,11 @@ pub fn login_provider_options(auth_path: &Path) -> Vec<AuthSelectorProvider> {
         let extension = crate::models_state::extension_provider_config(&provider_id);
         let name = provider_display_name(&provider_id, config.as_ref(), extension.as_ref());
         let methods = provider_auth_methods(&provider_id, config.as_ref(), extension.as_ref());
-        let subscription = methods.first().is_some_and(|method| {
-            matches!(method, AuthMethod::OAuth(oauth) if oauth.is_subscription)
-        });
-        let status = provider_auth_status(&provider_id, config.as_ref(), extension.as_ref(), auth_path);
+        let subscription = methods.first().is_some_and(
+            |method| matches!(method, AuthMethod::OAuth(oauth) if oauth.is_subscription),
+        );
+        let status =
+            provider_auth_status(&provider_id, config.as_ref(), extension.as_ref(), auth_path);
         for method in &methods {
             let (method_name, login_label) = match method {
                 AuthMethod::OAuth(oauth) => (oauth.name.clone(), oauth.login_label),
@@ -481,14 +482,17 @@ pub fn logout_provider_options(
         .map(|info| {
             let config = crate::models_state::models_json_provider(&info.provider_id);
             let extension = crate::models_state::extension_provider_config(&info.provider_id);
-            let name = provider_display_name(&info.provider_id, config.as_ref(), extension.as_ref());
+            let name =
+                provider_display_name(&info.provider_id, config.as_ref(), extension.as_ref());
             let subscription = provider_auth_methods(
                 &info.provider_id,
                 config.as_ref(),
                 extension.as_ref(),
             )
             .first()
-            .is_some_and(|method| matches!(method, AuthMethod::OAuth(oauth) if oauth.is_subscription));
+            .is_some_and(
+                |method| matches!(method, AuthMethod::OAuth(oauth) if oauth.is_subscription),
+            );
             AuthSelectorProvider {
                 id: info.provider_id.clone(),
                 name,
@@ -563,9 +567,12 @@ pub fn format_auth_selector_provider_status(
         return muted(" • not configured");
     }
     if status.auth_type != provider.auth_type {
-        let label =
-            format_auth_selector_provider_type(status.auth_type, provider.subscription);
-        return format!("{}{}", muted(" • "), warning(&format!("{label} configured")));
+        let label = format_auth_selector_provider_type(status.auth_type, provider.subscription);
+        return format!(
+            "{}{}",
+            muted(" • "),
+            warning(&format!("{label} configured"))
+        );
     }
     let source = status
         .label
@@ -792,7 +799,10 @@ mod tests {
             provider_display_name("acme", Some(&config), Some(&extension)),
             "Extension Name"
         );
-        assert_eq!(provider_display_name("acme", Some(&config), None), "Configured Name");
+        assert_eq!(
+            provider_display_name("acme", Some(&config), None),
+            "Configured Name"
+        );
         assert_eq!(provider_display_name("acme", None, None), "acme");
     }
 
@@ -895,7 +905,10 @@ mod tests {
             label: None,
         };
         assert_eq!(
-            plain(&format_auth_selector_provider_status(&provider, &none_status)),
+            plain(&format_auth_selector_provider_status(
+                &provider,
+                &none_status
+            )),
             " • not configured"
         );
         // An all-caps source renders as env names.
@@ -935,10 +948,7 @@ mod tests {
             vec!["openai-codex"]
         );
         // Display names match too; partial references do not.
-        assert_eq!(
-            find_matching_providers(&providers, "openai codex").len(),
-            1
-        );
+        assert_eq!(find_matching_providers(&providers, "openai codex").len(), 1);
         assert!(find_matching_providers(&providers, "openai").is_empty());
         assert!(find_matching_providers(&providers, "").is_empty());
     }
@@ -982,13 +992,13 @@ mod tests {
                 .iter()
                 .map(|option| (option.id.as_str(), option.auth_types.clone()))
                 .collect::<Vec<_>>(),
-            vec![
-                ("acme", vec!["oauth", "api_key"]),
-                ("other", vec!["oauth"]),
-            ]
+            vec![("acme", vec!["oauth", "api_key"]), ("other", vec!["oauth"]),]
         );
         let option = &completions[0];
-        assert_eq!(login_provider_completion_description(option), "account/API key");
+        assert_eq!(
+            login_provider_completion_description(option),
+            "account/API key"
+        );
         // A name distinct from the id is prefixed (`interactive-mode.ts:431-433`).
         let option = &completions[1];
         assert_eq!(
