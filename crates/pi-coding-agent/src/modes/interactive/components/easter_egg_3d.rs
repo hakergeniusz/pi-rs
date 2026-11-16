@@ -2207,7 +2207,7 @@ mod tests {
     /// (`exitProgress`, `easter-egg-3d.ts:1114-1118`, finishing at >= 1).
     #[test]
     fn the_exit_reassembles_the_screen() {
-        let (animation, done) = test_animation(Some((0, 0)));
+        let (mut animation, done) = test_animation(Some((0, 0)));
         // Age the intro past the dissolve (`DISSOLVE_END`) so the exit starts
         // from a fully dissolved screen.
         animation.start = Instant::now()
