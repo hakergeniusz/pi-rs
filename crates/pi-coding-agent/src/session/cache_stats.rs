@@ -81,9 +81,7 @@ fn detect_miss(
     message: &pi_ai::types::AssistantMessage,
     models: &dyn ModelPriceSource,
 ) -> Option<CacheMiss> {
-    let Some(prev) = prev else {
-        return None;
-    };
+    let prev = prev?;
     let usage = &message.usage;
     let prompt_tokens = usage.input + usage.cache_read + usage.cache_write;
     // A zero-cache turn only counts when cache activity was reported before:
@@ -202,7 +200,7 @@ pub fn compute_cache_waste(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::records::{SessionEntry, SessionMessageEntry};
+    use crate::session::records::{EntryBase, SessionEntry, SessionMessageEntry};
     use pi_ai::types::{AssistantContent, AssistantMessage, TextContent, Usage, UsageCost};
 
     /// The pricing source used by the tests: no catalog entry, so the
@@ -258,8 +256,8 @@ mod tests {
                 timestamp: 1_730_000_000_000,
                 duration_ms: None,
             }),
-            base: Default::default(),
-            unknown: Default::default(),
+            base: EntryBase::default(),
+            unknown: serde_json::Map::default(),
         })
     }
 
@@ -315,7 +313,7 @@ mod tests {
     #[test]
     fn compaction_resets_the_scan() {
         let compaction = crate::session::records::CompactionEntry {
-            base: Default::default(),
+            base: EntryBase::default(),
             summary: "summary".to_string(),
             first_kept_entry_id: String::new(),
             tokens_before: 0.0,
@@ -323,7 +321,7 @@ mod tests {
             usage: None,
             from_hook: None,
             system_message: None,
-            unknown: Default::default(),
+            unknown: serde_json::Map::default(),
         };
         let entries = vec![
             assistant("anthropic", "claude-test", usage(10_000, 0, 0)),

@@ -7,6 +7,7 @@
 //! convention, `config.ts:494-496`) — pi-rs ships no `CHANGELOG.md` yet, so
 //! the typical result is no entries.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -179,7 +180,7 @@ fn encode_uri(value: &str) -> String {
         if unreserved {
             encoded.push(byte as char);
         } else {
-            encoded.push_str(&format!("%{byte:02X}"));
+            let _ = write!(encoded, "%{byte:02X}");
         }
     }
     encoded
@@ -196,8 +197,7 @@ fn normalize_changelog_link_target(target: &str, tag: &str) -> String {
     let repo_url = format!("https://github.com/{GITHUB_REPO}");
     let mut canonical_target = target.to_string();
     for prefix in [LEGACY_BADLOGIC, LEGACY_EARENDIL] {
-        if target.starts_with(prefix) {
-            let rest = &target[prefix.len()..];
+        if let Some(rest) = target.strip_prefix(prefix) {
             if rest.is_empty() || rest.starts_with('/') {
                 canonical_target = format!("{repo_url}{rest}");
             }
@@ -293,19 +293,16 @@ pub fn parse_changelog(changelog_path: &Path) -> Vec<ChangelogEntry> {
             }
 
             // Try to parse version from this line; reset if it has none.
-            match version_header_regex().captures(line) {
-                Some(caps) => {
-                    current_version = Some((
-                        caps[1].parse().unwrap_or(0),
-                        caps[2].parse().unwrap_or(0),
-                        caps[3].parse().unwrap_or(0),
-                    ));
-                    current_lines = vec![line];
-                }
-                None => {
-                    current_version = None;
-                    current_lines.clear();
-                }
+            if let Some(caps) = version_header_regex().captures(line) {
+                current_version = Some((
+                    caps[1].parse().unwrap_or(0),
+                    caps[2].parse().unwrap_or(0),
+                    caps[3].parse().unwrap_or(0),
+                ));
+                current_lines = vec![line];
+            } else {
+                current_version = None;
+                current_lines.clear();
             }
         } else if current_version.is_some() {
             // Collect lines for current version
@@ -405,7 +402,7 @@ mod tests {
         assert_eq!(entries[1].version_string(), "0.9.0");
 
         // A missing file parses as no entries.
-        assert!(parse_changelog(&dir.path().join("missing.md")).is_empty());
+        assert_eq!(parse_changelog(&dir.path().join("missing.md")), Vec::new());
     }
 
     /// `getNewEntries` (`changelog.ts:193-205`): strict newer-than on the

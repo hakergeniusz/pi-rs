@@ -21,6 +21,7 @@ const MAX_OSC52_ENCODED_LENGTH: usize = 100_000;
 const MAX_BUFFER_BYTES: usize = 50 * 1024 * 1024;
 
 /// Options for [`run_clipboard_command`] (`RunClipboardCommandOptions`).
+#[derive(Clone, Copy)]
 pub struct RunOptions<'a> {
     /// Text to write to the child's stdin; `None` reads stdout instead
     /// (upstream swaps the stdio pipes on `input === undefined`).
@@ -172,10 +173,10 @@ pub fn is_wsl() -> bool {
     })
 }
 
-/// `copyViaWindowsClipboard` (`clipboard.ts:34-58`): WSL without WSLg writes
-/// the Windows clipboard through interop. PowerShell reads the text from a
-/// file because piped bytes are decoded with the console code page, which
-/// mangles non-ASCII UTF-8.
+/// `copyViaWindowsClipboard` (`clipboard.ts:34-58`): WSL without `WSLg`
+/// writes the Windows clipboard through interop. PowerShell reads the text
+/// from a file because piped bytes are decoded with the console code page,
+/// which mangles non-ASCII UTF-8.
 fn copy_via_windows_clipboard(text: &str) -> bool {
     let tmp_file = std::env::temp_dir().join(format!("pi-wsl-clip-{}.txt", uuid::Uuid::new_v4()));
     let copied = (|| {
@@ -195,9 +196,8 @@ fn copy_via_windows_clipboard(text: &str) -> bool {
             .create(true)
             .truncate(true)
             .open(&tmp_file);
-        let mut file = match file {
-            Ok(file) => file,
-            Err(_) => return false,
+        let Ok(mut file) = file else {
+            return false;
         };
         if file.write_all(text.as_bytes()).is_err() {
             return false;

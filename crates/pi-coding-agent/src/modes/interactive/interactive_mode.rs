@@ -12,6 +12,7 @@
 //! swaps, and the extension host is deferred.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -336,6 +337,7 @@ fn json_stringify(value: &str) -> String {
 
 /// The `/session` numbers (`SessionStats`, `agent-session.ts:357-375`,
 /// reduced to the fields the command renders; `contextUsage` is footer work).
+#[derive(Default)]
 struct SessionStats {
     session_file: Option<std::path::PathBuf>,
     session_id: String,
@@ -347,21 +349,6 @@ struct SessionStats {
     tokens: super::components::footer::UsageTotals,
 }
 
-impl Default for SessionStats {
-    fn default() -> Self {
-        SessionStats {
-            session_file: None,
-            session_id: String::new(),
-            total_messages: 0,
-            user_messages: 0,
-            assistant_messages: 0,
-            tool_calls: 0,
-            tool_results: 0,
-            tokens: super::components::footer::UsageTotals::default(),
-        }
-    }
-}
-
 /// `toLocaleString()`'s digit grouping for the token counts
 /// (`interactive-mode.ts:6925` and friends). Upstream formats in the host
 /// locale; the port always groups with commas (the en-US default).
@@ -369,7 +356,7 @@ fn to_locale_string(value: u64) -> String {
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.char_indices() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(ch);
@@ -392,9 +379,10 @@ fn session_info_text(
     let tokens = &stats.tokens;
     let mut info = format!("{}\n\n", bold_text("Session Info"));
     if let Some(session_name) = session_name {
-        info += &format!("{} {session_name}\n", dim("Name:"));
+        let _ = write!(info, "{} {session_name}\n", dim("Name:"));
     }
-    info += &format!(
+    let _ = write!(
+        info,
         "{} {}\n",
         dim("File:"),
         stats.session_file.as_deref().map_or_else(
@@ -402,30 +390,32 @@ fn session_info_text(
             |file| file.to_string_lossy().into_owned()
         )
     );
-    info += &format!("{} {}\n\n", dim("ID:"), stats.session_id);
-    info += &format!("{}\n", bold_text("Messages"));
-    info += &format!("{} {}\n", dim("Total:"), stats.total_messages);
-    info += &format!("{} {}\n", dim("User:"), stats.user_messages);
-    info += &format!("{} {}\n", dim("Assistant:"), stats.assistant_messages);
-    info += &format!(
+    let _ = write!(info, "{} {}\n\n", dim("ID:"), stats.session_id);
+    let _ = write!(info, "{}\n", bold_text("Messages"));
+    let _ = write!(info, "{} {}\n", dim("Total:"), stats.total_messages);
+    let _ = write!(info, "{} {}\n", dim("User:"), stats.user_messages);
+    let _ = write!(info, "{} {}\n", dim("Assistant:"), stats.assistant_messages);
+    let _ = write!(
+        info,
         "{} {} calls, {} results\n\n",
         dim("Tools:"),
         stats.tool_calls,
         stats.tool_results
     );
-    info += &format!("{}\n", bold_text("Tokens"));
+    let _ = write!(info, "{}\n", bold_text("Tokens"));
     // "Input" is the full prompt volume. With cache activity, split it into
     // cached (served from cache) vs uncached (everything else) - the only
     // provider-independent split. Cache writes, where reported, are a detail
     // of the uncached portion.
     let prompt_tokens = tokens.input + tokens.cache_read + tokens.cache_write;
-    info += &format!("{} {}\n", dim("Input:"), to_locale_string(prompt_tokens));
+    let _ = write!(info, "{} {}\n", dim("Input:"), to_locale_string(prompt_tokens));
     if prompt_tokens > 0 && (tokens.cache_read > 0 || tokens.cache_write > 0) {
         let hit_rate = dim(&format!(
             "({:.1}%)",
             tokens.cache_read as f64 / prompt_tokens as f64 * 100.0
         ));
-        info += &format!(
+        let _ = write!(
+            info,
             "  {} {} {hit_rate}\n",
             dim("Cached:"),
             to_locale_string(tokens.cache_read)
@@ -441,24 +431,25 @@ fn session_info_text(
         } else {
             String::new()
         };
-        info += &format!(
+        let _ = write!(
+            info,
             "  {} {}{written}\n",
             dim("Uncached:"),
             to_locale_string(tokens.input + tokens.cache_write)
         );
     }
-    info += &format!("{} {}\n", dim("Output:"), to_locale_string(tokens.output));
-    info += &format!("{} {}\n", dim("Total:"), to_locale_string(tokens.tokens()));
+    let _ = write!(info, "{} {}\n", dim("Output:"), to_locale_string(tokens.output));
+    let _ = write!(info, "{} {}\n", dim("Total:"), to_locale_string(tokens.tokens()));
 
-    info += &format!("\n{}\n", bold_text("Cache Warming"));
-    info += &format!("{} {cache_warming_mode}\n", dim("Mode:"));
+    let _ = write!(info, "\n{}\n", bold_text("Cache Warming"));
+    let _ = write!(info, "{} {cache_warming_mode}\n", dim("Mode:"));
     // The formatted live status lands with the cache warmer; without one the
     // status is always the fallback (`interactive-mode.ts:6934-6935`).
-    info += &format!("{} Inactive (cache warming unavailable)\n", dim("Status:"));
+    let _ = write!(info, "{} Inactive (cache warming unavailable)\n", dim("Status:"));
 
     if stats.tokens.cost > 0.0 || cache_waste.missed_tokens > 0 {
-        info += &format!("\n{}\n", bold_text("Cost"));
-        info += &format!("{} ${:.3}", dim("Total:"), stats.tokens.cost);
+        let _ = write!(info, "\n{}\n", bold_text("Cost"));
+        let _ = write!(info, "{} ${:.3}", dim("Total:"), stats.tokens.cost);
         // A single entry repeats the total, unless it names a model other
         // than the selected one.
         if usage_breakdown.len() > 1
@@ -467,7 +458,8 @@ fn session_info_text(
                 .is_some_and(|entry| entry.key != selected_model_key)
         {
             for entry in usage_breakdown {
-                info += &format!(
+                let _ = write!(
+                    info,
                     "\n  {} ${:.3} {}",
                     dim(&format!("{}:", entry.key)),
                     entry.cost,
@@ -488,16 +480,17 @@ fn session_info_text(
                 "{} tokens, {miss_label}",
                 to_locale_string(cache_waste.missed_tokens)
             );
-            info += &if cache_waste.missed_cost >= 0.0001 {
-                format!(
+            if cache_waste.missed_cost >= 0.0001 {
+                let _ = write!(
+                    info,
                     "\n{} ${:.3} {}",
                     dim("Cache Re-billed:"),
                     cache_waste.missed_cost,
                     dim(&format!("({detail})"))
-                )
+                );
             } else {
-                format!("\n{} {detail}", dim("Cache Re-billed:"))
-            };
+                let _ = write!(info, "\n{} {detail}", dim("Cache Re-billed:"));
+            }
         }
     }
     info
@@ -2845,7 +2838,7 @@ impl InteractiveMode {
         for entry in self.session.get_entries() {
             match &entry {
                 crate::session::records::SessionEntry::Usage(entry) => {
-                    stats.tokens.add(&entry.usage)
+                    stats.tokens.add(&entry.usage);
                 }
                 crate::session::records::SessionEntry::BranchSummary(entry) => {
                     if let Some(usage) = &entry.usage {
@@ -5804,19 +5797,21 @@ mod tests {
     #[test]
     fn session_info_text_renders_the_upstream_block() {
         use crate::modes::interactive::components::footer::{UsageCostBreakdownEntry, UsageTotals};
-        let mut stats = SessionStats::default();
-        stats.session_id = "test-session".to_string();
-        stats.total_messages = 4;
-        stats.user_messages = 2;
-        stats.assistant_messages = 2;
-        stats.tool_calls = 1;
-        stats.tool_results = 1;
-        stats.tokens = UsageTotals {
-            input: 10_000,
-            output: 500,
-            cache_read: 8_000,
-            cache_write: 0,
-            cost: 0.012,
+        let stats = SessionStats {
+            session_id: "test-session".to_string(),
+            total_messages: 4,
+            user_messages: 2,
+            assistant_messages: 2,
+            tool_calls: 1,
+            tool_results: 1,
+            tokens: UsageTotals {
+                input: 10_000,
+                output: 500,
+                cache_read: 8_000,
+                cache_write: 0,
+                cost: 0.012,
+            },
+            ..SessionStats::default()
         };
         let cache_waste = crate::session::cache_stats::CacheWasteTotals {
             missed_tokens: 3_000,
@@ -5867,14 +5862,16 @@ mod tests {
     #[test]
     fn session_info_text_breaks_out_other_models() {
         use crate::modes::interactive::components::footer::{UsageCostBreakdownEntry, UsageTotals};
-        let mut stats = SessionStats::default();
-        stats.session_id = "s".to_string();
-        stats.tokens = UsageTotals {
-            input: 1_000,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
-            cost: 0.02,
+        let stats = SessionStats {
+            session_id: "s".to_string(),
+            tokens: UsageTotals {
+                input: 1_000,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                cost: 0.02,
+            },
+            ..SessionStats::default()
         };
         let info = session_info_text(
             &stats,
