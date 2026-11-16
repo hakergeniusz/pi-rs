@@ -4222,7 +4222,7 @@ impl InteractiveMode {
     /// else opens the provider selector seeded with the reference.
     fn handle_login_command(&mut self, provider_ref: Option<&str>) {
         let Some(provider_ref) = provider_ref else {
-            self.show_login_auth_type_selector(&None);
+            self.show_login_auth_type_selector(None);
             return;
         };
         let options = oauth::login_provider_options(&self.auth_path);
@@ -4235,7 +4235,7 @@ impl InteractiveMode {
             let same_id = matches.iter().all(|provider| provider.id == matches[0].id);
             if same_id {
                 let provider_options = matches.into_iter().cloned().collect();
-                self.show_login_auth_type_selector(&Some(provider_options));
+                self.show_login_auth_type_selector(Some(provider_options.as_slice()));
                 return;
             }
         }
@@ -4247,7 +4247,7 @@ impl InteractiveMode {
     /// the auth-type menu (`:6210-6213`).
     fn show_oauth_selector(&mut self, mode: &str) {
         if mode == "login" {
-            self.show_login_auth_type_selector(&None);
+            self.show_login_auth_type_selector(None);
             return;
         }
         let options = match oauth::logout_provider_options(&self.auth_path) {
@@ -4279,7 +4279,7 @@ impl InteractiveMode {
     /// provider's entries when `/login <ref>` matched several auth types.
     fn show_login_auth_type_selector(
         &mut self,
-        provider_options: &Option<Vec<AuthSelectorProvider>>,
+        provider_options: Option<&[AuthSelectorProvider]>,
     ) {
         let all_options = oauth::login_provider_options(&self.auth_path);
         // The top-level selector offers Radius directly, as its last option
@@ -4315,7 +4315,7 @@ impl InteractiveMode {
             .to_string();
         let api_key_label = "Sign in with an API key";
         let available = |auth_type: &str| {
-            provider_options.as_ref().is_none_or(|options| {
+            provider_options.is_none_or(|options| {
                 options
                     .iter()
                     .any(|provider| provider.auth_type == auth_type)
@@ -4338,16 +4338,12 @@ impl InteractiveMode {
         if provider_options.is_some() && options.len() == 1 {
             // The single auth type starts directly, without a back target
             // (`interactive-mode.ts:6130-6138`).
-            if let Some(provider) = provider_options
-                .as_ref()
-                .and_then(|options| options.first())
-            {
+            if let Some(provider) = provider_options.and_then(|options| options.first()) {
                 self.start_provider_login(provider, None);
             }
             return;
         }
         let title = provider_options
-            .as_ref()
             .and_then(|options| options.first())
             .map_or_else(
                 || "Select authentication method:".to_string(),
@@ -4360,7 +4356,7 @@ impl InteractiveMode {
         let selector = AuthSelectorComponent::options(&title, options, Arc::clone(&events));
         self.auth_selector_events = Some(events);
         self.auth_selector_mode = Some("login");
-        self.pending_auth_type_options.clone_from(provider_options);
+        self.pending_auth_type_options = provider_options.map(|options| options.to_vec());
         self.suspend_editor_with(Box::new(selector));
     }
 
@@ -4518,7 +4514,7 @@ impl InteractiveMode {
     /// `errorMsg === "Login cancelled"` branch).
     fn run_login_back(&mut self, back: Option<LoginBackStep>) {
         match back {
-            Some(LoginBackStep::AuthType(options)) => self.show_login_auth_type_selector(&options),
+            Some(LoginBackStep::AuthType(options)) => self.show_login_auth_type_selector(options.as_deref()),
             Some(LoginBackStep::Provider(auth_type)) => {
                 self.show_login_provider_selector(auth_type, None);
             }
@@ -6656,7 +6652,9 @@ mod tests {
         let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
         assert!(frame.contains("No stored credentials to remove"), "{frame}");
         assert!(
-            frame.contains("environment variables and models.json config are unchanged"),
+            // The upstream status line wraps at terminal width; match the
+            // second line's fragment.
+            frame.contains("variables and models.json config are unchanged"),
             "{frame}"
         );
         assert!(mode.suspended_editor.is_none(), "no selector mounted");
