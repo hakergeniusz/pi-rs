@@ -316,6 +316,14 @@ fn build_runtime_with_ui(
         &virtual_models,
     )?;
 
+    // `--api-key` registers the session provider's non-persistent runtime key
+    // (`main.ts:898-906`): the login/logout selectors report it
+    // (`getProviderAuthStatus`, `model-runtime.ts:656`) and /logout merges it
+    // into the credential list (`runtime-credentials.ts:36-41`).
+    if let Some(api_key) = args.api_key.as_deref() {
+        pi_coding_agent::oauth::set_runtime_api_key(&model.provider, api_key);
+    }
+
     // Credential ladder: flag > auth.json > models.json/extension `apiKey` >
     // provider env vars, gated on the provider's composed auth methods
     // (slice 6c). OAuth tokens resolve as bearer credentials, distinct from

@@ -15,6 +15,10 @@
 //!   providers (`radiusProvider({id, name: config.name ?? providerId,
 //!   gateway})`, so they inherit the Radius auth pair); `getProviderAuthStatus`
 //!   (`:655-665`) and `isUsingOAuth` (`:544-546`).
+//! - `core/runtime-credentials.ts` — the `RuntimeCredentials` overlay
+//!   (`:8-49`): the `--api-key` flag's non-persistent key rides
+//!   `getProviderAuthStatus` (`model-runtime.ts:656`) and the logout
+//!   credential list (`:36-41`).
 //! - `auth/resolve.ts` — `resolveProviderAuth` (`:33-93`): a stored
 //!   credential owns the provider; a credential whose type the provider does
 //!   not support resolves to nothing with **no** env fallback, and ambient
@@ -43,23 +47,62 @@
 //! wire ladder applies
 //! ([`crate::modes::print_mode::resolve_wire_credential`]).
 //!
-//! Deviations: provider display names are `extension name ?? models.json
-//! name ?? provider id` — the port's embedded catalog carries no built-in
-//! provider names, so the `base?.name` layer is the provider id. The login
-//! option list derives its providers from the composed model catalog
-//! ([`crate::models_state::providers`]), which is model-derived — a
-//! models.json provider that only configures `apiKey` (zero models) does not
-//! appear, where upstream's `getProviders()` lists it. Upstream's RPC mode
-//! has no auth dialogs at all (`modes/rpc/rpc-mode.ts` exposes only
-//! `extension_ui_request` select/input methods and no login/logout commands),
-//! so nothing rides the RPC dialog subprotocol here.
+//! The login option list enumerates the composed provider registry
+//! ([`crate::models_state::providers`] — upstream's `getProviders()`,
+//! `model-runtime.ts:442-444`, fed by `providerIds()` `:288-295`): every
+//! provider contributes an OAuth row when its composed auth has OAuth and an
+//! API-key row when it has API-key auth, regardless of whether it carries
+//! models. Upstream's RPC mode has no auth dialogs at all
+//! (`modes/rpc/rpc-mode.ts` exposes only `extension_ui_request`
+//! select/input methods and no login/logout commands), so nothing rides the
+//! RPC dialog subprotocol here.
+//!
+//! Deviations: the built-in `envApiKeyAuth`/custom-resolver auth metadata and
+//! the built-in provider display names are static tables here
+//! ([`api_key_auth_name`]/[`custom_api_key_auth_name`]/[`builtin_provider_name`]),
+//! ported verbatim from the `providers/*.ts` factories — the port's embedded
+//! model catalog carries provider ids only. `configureRadiusProviders`'
+//! gateway rebuild is mirrored in metadata
+//! ([`is_radius_oauth`]/[`provider_auth_methods`]) rather than as a real
+//! provider object. Upstream's RPC mode has no auth dialogs (see above).
 
 use crate::auth::read_stored_credential;
 use crate::models_config::{ExtensionProviderConfig, ModelsJsonProvider};
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::RwLock;
 
 /// `RADIUS_PROVIDER_ID` (`core/radius.ts:3`).
 pub const RADIUS_PROVIDER_ID: &str = "radius";
+
+/// The runtime API-key overlay (`core/runtime-credentials.ts:8-32`): the
+/// `--api-key` flag registers the session provider's non-persistent key
+/// (`main.ts:898-906`), which the auth surfaces report
+/// (`getProviderAuthStatus`, `model-runtime.ts:656`) and the logout list
+/// merges over the stored credentials (`RuntimeCredentials.list`,
+/// `runtime-credentials.ts:36-41`).
+static RUNTIME_API_KEYS: RwLock<BTreeMap<String, String>> = RwLock::new(BTreeMap::new());
+
+/// `RuntimeCredentials.setRuntimeApiKey` (`runtime-credentials.ts:14-16`).
+pub fn set_runtime_api_key(provider_id: &str, api_key: &str) {
+    if let Ok(mut keys) = RUNTIME_API_KEYS.write() {
+        keys.insert(provider_id.to_string(), api_key.to_string());
+    }
+}
+
+/// `RuntimeCredentials.removeRuntimeApiKey` (`runtime-credentials.ts:18-20`).
+pub fn remove_runtime_api_key(provider_id: &str) {
+    if let Ok(mut keys) = RUNTIME_API_KEYS.write() {
+        keys.remove(provider_id);
+    }
+}
+
+/// `RuntimeCredentials.hasRuntimeApiKey` (`runtime-credentials.ts:22-24`).
+fn has_runtime_api_key(provider_id: &str) -> bool {
+    RUNTIME_API_KEYS
+        .read()
+        .is_ok_and(|keys| keys.contains_key(provider_id))
+}
 
 /// Providers whose API-key auth is configured outside the app — their custom
 /// login flows (the AWS auth-method chooser `amazon-bedrock.ts:13`, the
@@ -191,6 +234,74 @@ pub fn api_key_auth_name(provider_id: &str) -> Option<&'static str> {
     }
 }
 
+/// The API-key auth display names of the built-in providers whose `auth.apiKey`
+/// is a custom resolver rather than the standard `envApiKeyAuth`
+/// (`auth/helpers.ts`): the AWS auth-method chooser, the Google Cloud method
+/// select, and the Cloudflare account config. Their `login` flows prompt
+/// beyond a single secret, so `/login` reports the ambient-auth message
+/// ([`AMBIENT_LOGIN_PROVIDERS`]) — but the rows themselves carry these
+/// verbatim names (`method.name`, `oauth-selector.ts:142`).
+fn custom_api_key_auth_name(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        "amazon-bedrock" => Some("AWS credentials or bearer token"), // amazon-bedrock.ts:16
+        "google-vertex" => Some("Google Cloud credentials"),         // google-vertex.ts:18
+        "cloudflare-workers-ai" | "cloudflare-ai-gateway" => Some("Cloudflare API key"), // cloudflare-auth.ts:50,73
+        _ => None,
+    }
+}
+
+/// The built-in provider display names — the `base?.name` layer of
+/// `provider_display_name` (`provider-composer.ts:598-600`), the verbatim
+/// `createProvider({name})` values (`providers/*.ts`, `radius.ts:24`).
+pub fn builtin_provider_name(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        "amazon-bedrock" => Some("Amazon Bedrock"), // amazon-bedrock.ts:85
+        "ant-ling" => Some("Ant Ling"),             // ant-ling.ts:9
+        "anthropic" => Some("Anthropic"),           // anthropic.ts:77
+        "azure" => Some("Azure"),                   // azure.ts:47
+        "baseten" => Some("Baseten"),               // baseten.ts:9
+        "cerebras" => Some("Cerebras"),             // cerebras.ts:9
+        "cloudflare-ai-gateway" => Some("Cloudflare AI Gateway"), // cloudflare-ai-gateway.ts:18
+        "cloudflare-workers-ai" => Some("Cloudflare Workers AI"), // cloudflare-workers-ai.ts:14
+        "deepseek" => Some("DeepSeek"),             // deepseek.ts:9
+        "fireworks" => Some("Fireworks"),           // fireworks.ts:10
+        "github-copilot" => Some("GitHub Copilot"), // github-copilot.ts:27
+        "google" => Some("Google"),                 // google.ts:9
+        "google-vertex" => Some("Google Vertex AI"), // google-vertex.ts:95
+        "groq" => Some("Groq"),                     // groq.ts:9
+        "huggingface" => Some("Hugging Face"),      // huggingface.ts:9
+        "kimi-coding" => Some("Kimi For Coding"),   // kimi-coding.ts:10
+        "meta" => Some("Meta"),                     // meta.ts:10
+        "minimax" => Some("MiniMax"),               // minimax.ts:9
+        "minimax-cn" => Some("MiniMax CN"),         // minimax-cn.ts:9
+        "mistral" => Some("Mistral"),               // mistral.ts:9
+        "moonshotai" => Some("Moonshot AI"),        // moonshotai.ts:9
+        "moonshotai-cn" => Some("Moonshot AI CN"),  // moonshotai-cn.ts:9
+        "nvidia" => Some("NVIDIA"),                 // nvidia.ts:9
+        "openai" => Some("OpenAI"),                 // openai.ts:12
+        "openai-codex" => Some("OpenAI Codex"),     // openai-codex.ts:10
+        "opencode" => Some("OpenCode Zen"),         // opencode.ts:16
+        "opencode-go" => Some("OpenCode Go"),       // opencode-go.ts:15
+        "openrouter" => Some("OpenRouter"),         // openrouter.ts:65
+        "qwen-token-plan" => Some("Qwen Token Plan Team"), // qwen-token-plan.ts:9
+        "qwen-token-plan-cn" => Some("Qwen Token Plan Team CN"), // qwen-token-plan-cn.ts:9
+        "qwen-token-plan-individual" => Some("Qwen Token Plan Individual"), // qwen-token-plan-individual.ts:9
+        "qwen-token-plan-individual-cn" => Some("Qwen Token Plan Individual CN"), // qwen-token-plan-individual-cn.ts:9
+        "radius" => Some("Radius"),                 // radius.ts:24
+        "together" => Some("Together"),             // together.ts:9
+        "typesafe" => Some("TypeSafe"),             // typesafe.ts:9
+        "vercel-ai-gateway" => Some("Vercel AI Gateway"), // vercel-ai-gateway.ts:10
+        "xai" => Some("xAI"),                       // xai.ts:10
+        "xiaomi" => Some("Xiaomi"),                 // xiaomi.ts:9
+        "xiaomi-token-plan-ams" => Some("Xiaomi Token Plan AMS"), // xiaomi-token-plan-ams.ts:9
+        "xiaomi-token-plan-cn" => Some("Xiaomi Token Plan CN"), // xiaomi-token-plan-cn.ts:9
+        "xiaomi-token-plan-sgp" => Some("Xiaomi Token Plan SGP"), // xiaomi-token-plan-sgp.ts:9
+        "zai" => Some("Z.AI"),                      // zai.ts:9
+        "zai-coding-cn" => Some("Z.AI Coding CN"),  // zai-coding-cn.ts:9
+        _ => None,
+    }
+}
+
 /// The built-in providers advertising OAuth (`lazyOAuth` carriers;
 /// `providers/*.ts`), with the verbatim `OAuthAuth` metadata. `radius`'s
 /// OAuth comes from the radius-style branch of [`provider_auth_methods`] —
@@ -224,24 +335,35 @@ fn builtin_oauth(provider_id: &str) -> Option<OAuthAuthInfo> {
 }
 
 /// The composed provider name (`provider-composer.ts:598-600`):
-/// `extension?.name ?? config?.name ?? base?.name ?? providerId`. The port's
-/// embedded catalog has no built-in provider names, so the base layer falls
-/// to the id (module doc, deviations).
+/// `extension?.name ?? config?.name ?? base?.name ?? providerId`, where the
+/// base layer is the built-in provider's verbatim display name
+/// ([`builtin_provider_name`]) — except for models.json Radius-gateway
+/// providers, whose base is rebuilt with `name: config.name ?? providerId`
+/// (`model-runtime.ts:277-284`), so their base layer never contributes.
 pub fn provider_display_name(
     provider_id: &str,
     config: Option<&ModelsJsonProvider>,
     extension: Option<&ExtensionProviderConfig>,
 ) -> String {
+    let base_name = if config.is_some_and(is_radius_oauth) {
+        None
+    } else {
+        builtin_provider_name(provider_id)
+    };
     extension
         .and_then(|extension| extension.name.clone())
         .or_else(|| config.and_then(|config| config.name.clone()))
+        .or_else(|| base_name.map(str::to_string))
         .unwrap_or_else(|| provider_id.to_string())
 }
 
-/// A models.json provider entry with `oauth: "radius"` (the only accepted
-/// value; `model-config.ts:108`).
+/// A models.json provider entry `configureRadiusProviders` turns into a
+/// Radius-gateway provider: `oauth: "radius"` (the only accepted value;
+/// `model-config.ts:108`) with the `baseUrl` it requires
+/// (`model-runtime.ts:276` skips entries without one; `provider-composer.ts:309`
+/// rejects `oauth` without `baseUrl` outright).
 fn is_radius_oauth(config: &ModelsJsonProvider) -> bool {
-    config.oauth.as_deref() == Some("radius")
+    config.oauth.as_deref() == Some("radius") && config.base_url.is_some()
 }
 
 /// The composed auth methods of one provider — the outcome of
@@ -251,10 +373,12 @@ fn is_radius_oauth(config: &ModelsJsonProvider) -> bool {
 /// OAuth: an extension oauth config (`adaptOAuth`, `:358-377`) wins, then the
 /// built-in provider's OAuth, then a models.json `oauth: "radius"` entry,
 /// which `configureRadiusProviders` (`model-runtime.ts:274-287`) turns into a
-/// Radius-gateway provider inheriting the Radius auth pair. API key: the
-/// built-in `envApiKeyAuth` (inherited), else the configured `apiKey`
-/// (`extension?.apiKey ?? config?.apiKey`); an OAuth-only provider gets no
-/// fabricated API-key method (`:432`). The order matches
+/// Radius-gateway provider inheriting the Radius auth pair — its OAuth name
+/// is `config.name ?? providerId` (the rebuilt `radiusProvider({name})`'s
+/// `lazyOAuth({name})`, `radius.ts:39-40`). API key: the built-in
+/// `envApiKeyAuth` or the custom-resolver auth (inherited), else the
+/// configured `apiKey` (`extension?.apiKey ?? config?.apiKey`); an OAuth-only
+/// provider gets no fabricated API-key method (`:432`). The order matches
 /// `getLoginProviderOptions` (`interactive-mode.ts:6002-6036`): the OAuth
 /// entry before the API-key entry.
 pub fn provider_auth_methods(
@@ -262,7 +386,6 @@ pub fn provider_auth_methods(
     config: Option<&ModelsJsonProvider>,
     extension: Option<&ExtensionProviderConfig>,
 ) -> Vec<AuthMethod> {
-    let provider_name = provider_display_name(provider_id, config, extension);
     let radius_style = provider_id == RADIUS_PROVIDER_ID || config.is_some_and(is_radius_oauth);
     let oauth = match extension.and_then(|extension| extension.oauth.as_ref()) {
         // `adaptOAuth` (`:358-377`): the extension's oauth metadata rides as
@@ -275,10 +398,23 @@ pub fn provider_auth_methods(
         }),
         None if radius_style => {
             // A models.json `oauth: "radius"` entry becomes a Radius-gateway
-            // provider (`model-runtime.ts:274-287`); the OAuth name is the
-            // provider's display name and `isSubscription` stays unset.
+            // provider (`model-runtime.ts:274-287`): the rebuilt
+            // `radiusProvider({name: config.name ?? providerId})`'s
+            // `lazyOAuth({name})` carries that name (`radius.ts:39-40`).
+            // Otherwise this is the default `radiusProvider()` builtin, whose
+            // OAuth name is its default display name (`radius.ts:24`).
+            // `isSubscription` stays unset either way.
+            let name = if config.is_some_and(is_radius_oauth) {
+                config
+                    .and_then(|config| config.name.clone())
+                    .unwrap_or_else(|| provider_id.to_string())
+            } else {
+                builtin_provider_name(provider_id)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| provider_id.to_string())
+            };
             Some(OAuthAuthInfo {
-                name: provider_name,
+                name,
                 is_subscription: false,
                 login_label: None,
             })
@@ -291,13 +427,13 @@ pub fn provider_auth_methods(
         .and_then(|extension| extension.api_key.as_deref())
         .or_else(|| config.and_then(|config| config.api_key.as_deref()));
     // `composeApiKeyAuth` (`:428-432`): the inherited method (the built-in
-    // envApiKeyAuth; a models.json radius provider inherits the Radius one)
-    // or a configured key; OAuth-only providers get no fabricated method
-    // (`:432`).
+    // envApiKeyAuth or the custom-resolver auth; a models.json radius
+    // provider inherits the Radius one) or a configured key; OAuth-only
+    // providers get no fabricated method (`:432`).
     let inherited = if radius_style {
         api_key_auth_name(RADIUS_PROVIDER_ID)
     } else {
-        api_key_auth_name(provider_id)
+        api_key_auth_name(provider_id).or_else(|| custom_api_key_auth_name(provider_id))
     };
     let api_key = inherited
         .or_else(|| raw_key.map(|_| "API key"))
@@ -332,16 +468,27 @@ pub struct AuthStatus {
 }
 
 /// `getProviderAuthStatus` (`model-runtime.ts:655-665`) +
-/// `configuredRequestAuthStatus` (`provider-composer.ts:707-721`): a stored
-/// credential wins, then the configured models.json/extension key, then the
-/// provider environment variables (`envApiKeyAuth.resolve`'s loop). `None`
-/// renders as "not configured".
+/// `configuredRequestAuthStatus` (`provider-composer.ts:707-721`): the
+/// runtime `--api-key` overlay wins, then a stored credential, then the
+/// configured models.json/extension key, then the provider environment
+/// variables (`envApiKeyAuth.resolve`'s loop). `None` renders as
+/// "not configured".
 pub fn provider_auth_status(
     provider_id: &str,
     config: Option<&ModelsJsonProvider>,
     extension: Option<&ExtensionProviderConfig>,
     auth_path: &Path,
 ) -> Option<AuthStatus> {
+    // The runtime `--api-key` key wins (`model-runtime.ts:656`: `{ configured:
+    // true, source: "runtime" }`).
+    if has_runtime_api_key(provider_id) {
+        return Some(AuthStatus {
+            configured: true,
+            auth_type: "api_key",
+            source: Some("runtime"),
+            label: None,
+        });
+    }
     // The stored credential owns the provider (`resolve.ts:70-87`); the
     // status reports its type (`isUsingOAuth`, `model-runtime.ts:544-546`).
     if let Some(credential) = read_stored_credential(provider_id, auth_path) {
@@ -476,14 +623,29 @@ pub fn login_provider_options(auth_path: &Path) -> Vec<AuthSelectorProvider> {
     options
 }
 
-/// `getLogoutProviderOptions` (`interactive-mode.ts:6038-6040`): the stored
-/// credentials, one row each, `compareProviders`-sorted. Storage failures
-/// propagate (`showOAuthSelector` reports them).
+/// `getLogoutProviderOptions` (`interactive-mode.ts:6038-6050`): the stored
+/// credentials — plus the runtime `--api-key` overrides
+/// ([`RUNTIME_API_KEYS`]) — one row each, `compareProviders`-sorted. The
+/// status rides the verbatim `"stored credential"` source (`:6046`), which
+/// renders as " ✓ configured" (`formatAuthSelectorProviderStatus`'s special
+/// case). Storage failures propagate (`showOAuthSelector` reports them).
 pub fn logout_provider_options(
     auth_path: &Path,
 ) -> Result<Vec<AuthSelectorProvider>, crate::auth::AuthError> {
     let storage = crate::auth::AuthStorage::create(auth_path);
     let listed = storage.list()?;
+    // `RuntimeCredentials.list` (`runtime-credentials.ts:36-41`): the runtime
+    // `--api-key` overrides ride the list, replacing same-provider entries.
+    let mut listed = listed;
+    if let Ok(keys) = RUNTIME_API_KEYS.read() {
+        for provider_id in keys.keys() {
+            listed.retain(|info| info.provider_id != *provider_id);
+            listed.push(crate::auth::CredentialInfo {
+                provider_id: provider_id.clone(),
+                credential_type: "api_key".to_string(),
+            });
+        }
+    }
     let mut options: Vec<AuthSelectorProvider> = listed
         .into_iter()
         .map(|info| {
@@ -518,7 +680,9 @@ pub fn logout_provider_options(
                     } else {
                         "api_key"
                     },
-                    source: Some("stored"),
+                    // The verbatim `getLogoutProviderOptions` status source
+                    // (`interactive-mode.ts:6046`) — renders " ✓ configured".
+                    source: Some("stored credential"),
                     label: None,
                 }),
             }
@@ -690,6 +854,16 @@ mod tests {
         (dir, path)
     }
 
+    /// A synthetic models.json the composing tests refresh the global
+    /// snapshot from ([`crate::models_state::refresh_with_config`]).
+    fn temp_models_json(name: &str, content: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("pi-rs-oauth-tests");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(format!("{}-{name}.json", std::process::id()));
+        std::fs::write(&path, content).expect("write temp models.json");
+        path
+    }
+
     /// `composeApiKeyAuth`/`composeOAuthAuth` outcomes
     /// (`provider-composer.ts:422-511`).
     #[test]
@@ -825,6 +999,7 @@ mod tests {
     /// (`model-runtime.ts:655-665`, `provider-composer.ts:707-721`).
     #[test]
     fn stored_credentials_own_the_status() {
+        let _guard = crate::models_state::REBUILD_LOCK.lock().expect("lock");
         let (dir, path) = auth_path(&json!({
             "acme": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000i64},
             "other": {"type": "api_key", "key": "sk-test"},
@@ -841,6 +1016,7 @@ mod tests {
 
     #[test]
     fn configured_keys_report_the_models_json_sources() {
+        let _guard = crate::models_state::REBUILD_LOCK.lock().expect("lock");
         let config = models_json_provider(json!({"apiKey": "literal-key"}));
         let status = provider_auth_status("acme", Some(&config), None, Path::new("/nowhere"))
             .expect("configured");
@@ -1022,5 +1198,208 @@ mod tests {
             login_provider_search_text(option),
             "other Other Corp oauth subscription"
         );
+    }
+
+    /// The built-in provider display names (`createProvider({name})`,
+    /// `providers/*.ts`) — the `base?.name` layer of
+    /// `provider_display_name` (`provider-composer.ts:598-600`).
+    #[test]
+    fn builtin_provider_names_are_verbatim() {
+        assert_eq!(builtin_provider_name("anthropic"), Some("Anthropic"));
+        assert_eq!(builtin_provider_name("amazon-bedrock"), Some("Amazon Bedrock"));
+        assert_eq!(builtin_provider_name("kimi-coding"), Some("Kimi For Coding"));
+        assert_eq!(builtin_provider_name("opencode"), Some("OpenCode Zen"));
+        assert_eq!(builtin_provider_name("radius"), Some("Radius"));
+        assert_eq!(builtin_provider_name("acme"), None);
+    }
+
+    /// The custom-resolver API-key auth names (`providers/*.ts`) — rows the
+    /// standard `envApiKeyAuth` table does not carry.
+    #[test]
+    fn custom_api_key_names_cover_the_ambient_providers() {
+        assert_eq!(
+            custom_api_key_auth_name("amazon-bedrock"),
+            Some("AWS credentials or bearer token")
+        );
+        assert_eq!(
+            custom_api_key_auth_name("google-vertex"),
+            Some("Google Cloud credentials")
+        );
+        assert_eq!(
+            custom_api_key_auth_name("cloudflare-ai-gateway"),
+            Some("Cloudflare API key")
+        );
+        assert_eq!(custom_api_key_auth_name("openai"), None);
+    }
+
+    /// A models.json provider with `oauth: "radius"` but no `baseUrl` is not
+    /// a Radius gateway (`model-runtime.ts:276` skips it;
+    /// `provider-composer.ts:309` rejects it) — no fabricated Radius pair.
+    #[test]
+    fn radius_oauth_without_base_url_is_not_a_gateway() {
+        let config = models_json_provider(json!({"oauth": "radius"}));
+        assert_eq!(provider_auth_methods("acme", Some(&config), None), vec![]);
+        // An explicit `apiKey` still composes the plain API-key method
+        // (`composeApiKeyAuth`'s rawKey arm, `:438-441`).
+        let config = models_json_provider(json!({"oauth": "radius", "apiKey": "sk-acme"}));
+        assert_eq!(
+            provider_auth_methods("acme", Some(&config), None),
+            vec![AuthMethod::ApiKey(ApiKeyAuthInfo { name: "API key" })]
+        );
+    }
+
+    /// `getLoginProviderOptions` over the whole composed registry
+    /// (`interactive-mode.ts:6002-6036`): the built-in catalog rows carry
+    /// their verbatim display names and auth pairs, an api-key-only
+    /// models.json provider lists despite having no models
+    /// (`getProviders()`, `model-runtime.ts:442-444`), and a provider with
+    /// no auth method contributes nothing (`composeModelProvider` throws and
+    /// the runtime drops it, `:309-325` / `:585`).
+    #[test]
+    fn login_rows_enumerate_the_whole_provider_registry() {
+        let _guard = crate::models_state::REBUILD_LOCK.lock().expect("lock");
+        let path = temp_models_json(
+            "login-rows",
+            r#"{"providers": {"acme-key": {"apiKey": "sk-acme"}, "bare": {}}}"#,
+        );
+        crate::models_state::refresh_with_config(&crate::models_config::ModelConfig::load(&path));
+
+        let options = login_provider_options(Path::new("/nonexistent/auth.json"));
+        let plain_name = |id: &str, auth_type: &str| {
+            options
+                .iter()
+                .find(|provider| provider.id == id && provider.auth_type == auth_type)
+        };
+
+        // Preferred partners first, in `PREFERRED_PROVIDER_IDS` order
+        // (`core/preferred-providers.ts:12`); a provider's account row stays
+        // above its API-key row (the stable sort, `:6035`).
+        assert_eq!(options[0].id, "radius");
+        assert_eq!(options[0].auth_type, "oauth");
+        assert_eq!(options[0].name, "Radius");
+        assert_eq!(options[1].id, "radius");
+        assert_eq!(options[1].auth_type, "api_key");
+        assert_eq!(options[2].id, "openrouter");
+        assert_eq!(options[2].auth_type, "oauth");
+        assert_eq!(options[3].id, "openrouter");
+        assert_eq!(options[3].auth_type, "api_key");
+        // Then the catalog alphabetically by display name.
+        assert_eq!(options[4].id, "acme-key");
+        assert_eq!(options[4].name, "acme-key");
+        assert_eq!(options[5].id, "amazon-bedrock");
+        assert_eq!(options[5].name, "Amazon Bedrock");
+
+        // An api-key-only models.json provider lists without models, with
+        // the composed "API key" method (`provider-composer.ts:438-441`) and
+        // the literal-key status (`configuredRequestAuthStatus`, `:719-721`).
+        let acme = plain_name("acme-key", "api_key").expect("acme-key row");
+        assert_eq!(acme.method_name.as_deref(), Some("API key"));
+        let status = acme.status.as_ref().expect("configured");
+        assert_eq!(status.source, Some("models_json_key"));
+        assert!(options.iter().all(|provider| provider.id != "bare"));
+
+        // A subscription OAuth provider carries both rows with the verbatim
+        // metadata (`anthropic.ts:79-85`).
+        let oauth = plain_name("anthropic", "oauth").expect("oauth row");
+        assert_eq!(oauth.name, "Anthropic");
+        assert_eq!(oauth.method_name.as_deref(), Some("Anthropic (Claude Pro/Max)"));
+        assert!(oauth.subscription);
+        let api_key = plain_name("anthropic", "api_key").expect("api key row");
+        assert_eq!(api_key.method_name.as_deref(), Some("Anthropic API key"));
+        assert_eq!(
+            options
+                .iter()
+                .filter(|provider| provider.id == "anthropic")
+                .count(),
+            2
+        );
+
+        // An OAuth-only provider has no fabricated API-key row
+        // (`openai-codex.ts:12-17`, `provider-composer.ts:432`).
+        let codex = plain_name("openai-codex", "oauth").expect("codex oauth row");
+        assert_eq!(codex.name, "OpenAI Codex");
+        assert!(plain_name("openai-codex", "api_key").is_none());
+        // OpenRouter's OAuth is not subscription-backed, so the row labels
+        // as an account and carries the `loginLabel` (`openrouter.ts:69-73`).
+        let openrouter = plain_name("openrouter", "oauth").expect("openrouter row");
+        assert!(!openrouter.subscription);
+        assert_eq!(openrouter.login_label, Some("Sign in with OpenRouter"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `getLogoutProviderOptions` (`interactive-mode.ts:6038-6050`): one row
+    /// per stored credential — including providers the registry does not
+    /// know (the name falls back to the id) — with the verbatim
+    /// `"stored credential"` status source that renders " ✓ configured".
+    #[test]
+    fn logout_rows_list_the_stored_credentials() {
+        let _guard = crate::models_state::REBUILD_LOCK.lock().expect("lock");
+        let (dir, path) = auth_path(&json!({
+            "acme": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000i64},
+            "other": {"type": "api_key", "key": "sk-test"},
+            "ghost": {"type": "api_key", "key": "sk-ghost"},
+        }));
+
+        let options = logout_provider_options(&path).expect("listed");
+        assert_eq!(
+            options
+                .iter()
+                .map(|provider| (provider.id.as_str(), provider.auth_type))
+                .collect::<Vec<_>>(),
+            [("acme", "oauth"), ("ghost", "api_key"), ("other", "api_key")]
+        );
+        // Unknown providers keep the id as the name (`:6044`).
+        let ghost = &options[1];
+        assert_eq!(ghost.name, "ghost");
+        // The verbatim status source renders " ✓ configured"
+        // (`oauth-selector.ts:44-46`).
+        let status = ghost.status.as_ref().expect("status");
+        assert_eq!(status.source, Some("stored credential"));
+        let plain = pi_tui::ansi::strip_terminal_sequences(&format_auth_selector_provider_status(
+            ghost,
+            status,
+        ));
+        assert_eq!(plain, " ✓ configured");
+
+        drop(dir);
+    }
+
+    /// The runtime `--api-key` overlay (`main.ts:898-906`): the status
+    /// reports `runtime` before any stored credential
+    /// (`getProviderAuthStatus`, `model-runtime.ts:656`), and the logout list
+    /// merges the override over the same provider's stored entry
+    /// (`RuntimeCredentials.list`, `runtime-credentials.ts:36-41`).
+    #[test]
+    fn runtime_api_key_overrides_status_and_logout_rows() {
+        let _guard = crate::models_state::REBUILD_LOCK.lock().expect("lock");
+        let (dir, path) = auth_path(&json!({
+            "acme": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000i64},
+            "other": {"type": "api_key", "key": "sk-test"},
+        }));
+        set_runtime_api_key("acme", "sk-flag");
+        set_runtime_api_key("flagged", "sk-flagged");
+
+        // The status rides `runtime` ahead of the stored credential.
+        let status = provider_auth_status("acme", None, None, &path).expect("status");
+        assert_eq!(status.source, Some("runtime"));
+        assert_eq!(status.auth_type, "api_key");
+
+        // The logout list carries the override rows, and the override
+        // replaces the same provider's stored entry.
+        let options = logout_provider_options(&path).expect("listed");
+        assert_eq!(
+            options
+                .iter()
+                .map(|provider| (provider.id.as_str(), provider.auth_type))
+                .collect::<Vec<_>>(),
+            [("acme", "api_key"), ("flagged", "api_key"), ("other", "api_key")]
+        );
+
+        remove_runtime_api_key("acme");
+        remove_runtime_api_key("flagged");
+        let status = provider_auth_status("acme", None, None, &path).expect("status");
+        assert_eq!(status.source, Some("stored"));
+        drop(dir);
     }
 }

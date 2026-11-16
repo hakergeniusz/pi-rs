@@ -24,7 +24,11 @@
 //! Slice 6j added the oauth ladder reach: [`set_extension_runner`] shares
 //! the engine, and [`extension_oauth_api_key`] is `adaptOAuth`'s `toAuth`
 //! (`core/provider-composer.ts:375`) — a stored extension-oauth credential
-//! resolves its wire key through the stashed `getApiKey`.
+//! resolves its wire key through the stashed `getApiKey`. The provider
+//! registry itself is kept alongside the model list
+//! ([`providers`], `providerIds()` at `model-runtime.ts:288-295`), so the
+//! auth surfaces enumerate every composed provider even when it has no
+//! models.
 
 use std::collections::BTreeMap;
 #[cfg(feature = "ext-js")]
@@ -43,10 +47,23 @@ use crate::config::get_models_path;
 use crate::models_config::{self, ModelConfig};
 
 static COMPOSED: RwLock<Option<Arc<Vec<Model>>>> = RwLock::new(None);
+/// The composed provider registry, last rebuild only: every provider id the
+/// composition knows, whether or not it has models — `providerIds()`
+/// (`model-runtime.ts:288-295`): builtins, native extension providers, the
+/// models.json config providers, extension-registered providers, and
+/// virtual-model providers. `getProviders()` answers from this registry
+/// (`model-runtime.ts:442-444`), so a provider that only configures auth
+/// (an api-key without models) still lists.
+static PROVIDER_IDS: RwLock<Option<Arc<Vec<String>>>> = RwLock::new(None);
 /// Composition errors (models.json / extension config problems), last
 /// rebuild only. Upstream surfaces these through the registry's error state
 /// (`ModelRegistry::getError`).
 static ERRORS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+/// Serializes rebuild-touching tests: the snapshot is process-global, so
+/// composing tests (here and in [`crate::oauth`]) take this lock while they
+/// refresh and assert.
+#[cfg(test)]
+pub(crate) static REBUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// The models.json provider entries of the last loaded config — the auth
 /// composition reads them (`model-runtime.ts`'s `this.config`).
 static MODELS_JSON_PROVIDERS: RwLock<
@@ -171,6 +188,11 @@ fn rebuild(
     }
     // Virtual models are selectable catalog entries (`model-runtime.ts`).
     for model in crate::virtual_models::virtual_models_from_defs(virtual_defs) {
+        // Their providers join the registry even when nothing else defines
+        // them (`providerIds()`'s `...this.virtualModels.keys()`).
+        if !provider_ids.iter().any(|existing| existing == &model.provider) {
+            provider_ids.push(model.provider.clone());
+        }
         if !models
             .iter()
             .any(|existing| existing.provider == model.provider && existing.id == model.id)
@@ -179,6 +201,9 @@ fn rebuild(
         }
     }
 
+    if let Ok(mut slot) = PROVIDER_IDS.write() {
+        *slot = Some(Arc::new(provider_ids));
+    }
     if let Ok(mut slot) = COMPOSED.write() {
         *slot = Some(Arc::new(models));
     }
@@ -222,15 +247,28 @@ pub fn models_for(provider: &str) -> Vec<Model> {
         .collect()
 }
 
-/// Every provider id in the composition, in base-catalog-first order.
+/// Every provider id in the composition, in base-catalog-first order —
+/// `providerIds()`'s sources (`model-runtime.ts:288-295`): the built-in
+/// catalog, the models.json config providers, the extension-registered
+/// providers, and the virtual-model providers. Unlike the model list, this
+/// registry includes providers without models (an api-key-only models.json
+/// entry), matching `getProviders()` (`model-runtime.ts:442-444`); a
+/// composed provider with no auth method at all still lists here but
+/// contributes nothing (upstream's `composeModelProvider` throws and the
+/// runtime drops it — `model-runtime.ts:309-325` — leaving the same
+/// user-visible surface). Before the first refresh the static catalog is the
+/// answer.
 pub fn providers() -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    for model in all() {
-        if !ids.iter().any(|existing| existing == &model.provider) {
-            ids.push(model.provider.clone());
+    if let Ok(ids) = PROVIDER_IDS.read() {
+        if let Some(ids) = ids.as_ref() {
+            return ids.as_ref().clone();
         }
     }
-    ids
+    pi_ai::catalog::catalog()
+        .providers()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 /// `ModelRegistry`'s id-only lookup over every provider
@@ -486,9 +524,10 @@ mod tests {
         path
     }
 
-    /// The composing tests share the process-global snapshot; the test
-    /// harness runs them on parallel threads.
-    static REBUILD_LOCK: Mutex<()> = Mutex::new(());
+    // The composing tests share the process-global snapshot; the test
+    // harness runs them on parallel threads. `REBUILD_LOCK` lives on the
+    // module (imported through `use super::*`) so `crate::oauth`'s composing
+    // tests take the same one.
 
     #[test]
     fn fallback_without_refresh_is_the_static_catalog() {
@@ -532,6 +571,23 @@ mod tests {
             .find(|error| error.contains("acme"))
             .expect("acme error");
         assert!(error.contains("must specify"), "{error}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The provider registry answers from `providerIds()`'s sources
+    /// (`model-runtime.ts:288-295`), not from the model list: an
+    /// api-key-only models.json provider lists even though it has no models
+    /// (`getProviders()`, `:442-444`).
+    #[test]
+    fn registry_keeps_providers_without_models() {
+        let _guard = REBUILD_LOCK.lock().expect("lock");
+        let path = temp_models_json(
+            "registry",
+            r#"{"providers": {"acme-key": {"apiKey": "sk-acme"}}}"#,
+        );
+        refresh_with_config(&ModelConfig::load(&path));
+        assert!(providers().iter().any(|provider| provider == "acme-key"));
+        assert!(!all().iter().any(|model| model.provider == "acme-key"));
         let _ = std::fs::remove_file(&path);
     }
 

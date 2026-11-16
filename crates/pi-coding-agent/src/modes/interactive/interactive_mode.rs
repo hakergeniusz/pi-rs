@@ -7666,8 +7666,9 @@ mod tests {
         assert!(frame.contains("Select authentication method:"), "{frame}");
         assert!(frame.contains("Sign in with an account"), "{frame}");
         assert!(frame.contains("Sign in with an API key"), "{frame}");
-        // The Radius option rides last (`interactive-mode.ts:6090-6093`).
-        assert!(frame.contains("Sign in with radius"), "{frame}");
+        // The Radius option rides last (`interactive-mode.ts:6090-6093`),
+        // labeled with the provider's display name (`radius.ts:23`).
+        assert!(frame.contains("Sign in with Radius"), "{frame}");
 
         mode.shutdown().expect("shutdown");
     }
