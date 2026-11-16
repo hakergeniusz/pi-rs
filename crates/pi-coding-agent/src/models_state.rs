@@ -11,13 +11,18 @@
 //! [`providers`]/[`find_by_id`] instead of the static catalog. Before the
 //! first refresh the static catalog is the answer (the engine-free shape).
 //!
-//! Deferred to slice 6c: auth composition (`composeApiKeyAuth`/
-//! `composeOAuthAuth`). Slice 6d added the `streamSimple` dispatch half of
-//! the composer: [`stream_with_extension`] is `streamWith`'s extension arm
+//! Slice 6c added the config snapshots the auth layer reads
+//! ([`models_json_provider`]/[`extension_provider_config`]) — upstream keeps
+//! the loaded `ModelConfig` and the extension `ProviderConfigInput`s on the
+//! runtime and consults them per auth resolution (`model-runtime.ts`
+//! `composeProvider`/`getAuth`); the port mirrors them as the last rebuild's
+//! maps. Slice 6d added the `streamSimple` dispatch half of the composer:
+//! [`stream_with_extension`] is `streamWith`'s extension arm
 //! (`core/provider-composer.ts:588-613`) and [`ComposedStreamFn`] wraps it
 //! around the caller's base adapter, so every request under the engine
 //! streams through the composed dispatch (engine-free builds never see it).
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -37,6 +42,16 @@ static COMPOSED: RwLock<Option<Arc<Vec<Model>>>> = RwLock::new(None);
 /// rebuild only. Upstream surfaces these through the registry's error state
 /// (`ModelRegistry::getError`).
 static ERRORS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+/// The models.json provider entries of the last loaded config — the auth
+/// composition reads them (`model-runtime.ts`'s `this.config`).
+static MODELS_JSON_PROVIDERS: RwLock<
+    Option<Arc<BTreeMap<String, models_config::ModelsJsonProvider>>>,
+> = RwLock::new(None);
+/// The extension-registered provider configs of the last rebuild
+/// (`model-runtime.ts`'s `extensionProviders` map).
+#[cfg(feature = "ext-js")]
+static EXTENSION_PROVIDERS: RwLock<Vec<(String, models_config::ExtensionProviderConfig)>> =
+    RwLock::new(Vec::new());
 #[cfg(feature = "ext-js")]
 static LAST_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -100,6 +115,18 @@ fn rebuild(
             Ok(config) => registered_providers.push((name.clone(), config)),
             Err(error) => errors.push(error),
         }
+    }
+    // The auth layer's config snapshots (`model-runtime.ts`'s `this.config`
+    // and `extensionProviders`).
+    let snapshot: BTreeMap<String, models_config::ModelsJsonProvider> = models_config
+        .providers()
+        .clone();
+    if let Ok(mut slot) = MODELS_JSON_PROVIDERS.write() {
+        *slot = Some(Arc::new(snapshot));
+    }
+    #[cfg(feature = "ext-js")]
+    if let Ok(mut slot) = EXTENSION_PROVIDERS.write() {
+        *slot = registered_providers.clone();
     }
 
     let mut models: Vec<Model> = Vec::new();
@@ -365,6 +392,37 @@ fn extension_error_event(model: &Model, message: String) -> pi_agent::types::Ass
     }
 }
 
+/// One provider's models.json entry from the last loaded config — the auth
+/// composition's `config` layer (`model-runtime.ts`'s `this.config`).
+/// `None` before the first refresh.
+pub fn models_json_provider(provider_id: &str) -> Option<models_config::ModelsJsonProvider> {
+    MODELS_JSON_PROVIDERS
+        .read()
+        .ok()
+        .and_then(|slot| slot.as_ref().and_then(|providers| providers.get(provider_id).cloned()))
+}
+
+/// One provider's extension-registered config — the auth composition's
+/// `extension` layer (`model-runtime.ts`'s `extensionProviders`). `None`
+/// before a refresh with the engine.
+#[cfg(feature = "ext-js")]
+pub fn extension_provider_config(provider_id: &str) -> Option<models_config::ExtensionProviderConfig> {
+    EXTENSION_PROVIDERS
+        .read()
+        .ok()
+        .and_then(|slot| {
+            slot.iter()
+                .find(|(name, _)| name == provider_id)
+                .map(|(_, config)| config.clone())
+        })
+}
+
+/// Engine-free builds have no extension providers.
+#[cfg(not(feature = "ext-js"))]
+pub fn extension_provider_config(_provider_id: &str) -> Option<models_config::ExtensionProviderConfig> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +658,26 @@ export default function (pi) {
         assert_eq!(error.stop_reason, pi_ai::types::StopReason::Error);
         assert_eq!(error.error_message.as_deref(), Some("stream-boom"));
         assert_eq!(error.provider, "acme");
+}
+
+    /// The slice 6c config snapshot: the auth layer reads one provider's
+    /// models.json entry from the last loaded config
+    /// (`model-runtime.ts`'s `this.config`).
+    #[test]
+    fn provider_configs_snapshot_after_refresh() {
+        let _guard = REBUILD_LOCK.lock().expect("lock");
+        let path = temp_models_json(
+            "snap",
+            r#"{"providers": {"acme": {"name": "Acme", "apiKey": "$ACME_KEY",
+                "baseUrl": "https://acme.local/v1", "api": "openai-completions",
+                "models": [{"id": "acme-1", "name": "Acme One", "reasoning": true, "input": ["text"],
+                            "contextWindow": 90000, "maxTokens": 4096}]}}}"#,
+        );
+        refresh_with_config(&ModelConfig::load(&path));
+        let config = models_json_provider("acme").expect("snapshot");
+        assert_eq!(config.name.as_deref(), Some("Acme"));
+        assert_eq!(config.api_key.as_deref(), Some("$ACME_KEY"));
+        assert!(models_json_provider("no-such-provider").is_none());
+        let _ = std::fs::remove_file(&path);
     }
 }

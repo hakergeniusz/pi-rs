@@ -479,7 +479,7 @@ pub fn resolve_model_with(
 /// `ANTHROPIC_AUTH_TOKEN` participates in discovery but rides the wire as a
 /// Bearer header (see [`resolve_wire_credential`]); `amazon-bedrock` and
 /// `google-vertex` ADC paths stay out of this table.
-fn env_key_candidates(provider: &str) -> &'static [&'static str] {
+pub(crate) fn env_key_candidates(provider: &str) -> &'static [&'static str] {
     match provider {
         "anthropic" => &[
             "ANTHROPIC_AUTH_TOKEN",
@@ -548,29 +548,81 @@ pub enum WireCredential {
 }
 
 /// The auth ladder for one request (`providers/anthropic.ts:30-45` and
-/// friends): `--api-key` flag, then the stored credential from `auth.json`,
-/// then provider environment variables. Returns the credential and its
-/// source, keeping bearer tokens distinct from API keys so the adapters can
-/// pick the right header.
+/// friends, composed through `auth/resolve.ts:33-93` and
+/// `provider-composer.ts:422-511`): the `--api-key` flag (the port's runtime
+/// credential; it wins for any provider id — see
+/// [`resolve_wire_credential_composed`]), then the stored credential from
+/// `auth.json` — which owns the provider: a stored credential whose type the
+/// provider does not support resolves to nothing with no env fallback — then
+/// the configured models.json/extension `apiKey`, then provider environment
+/// variables. Returns the credential and its source, keeping bearer tokens
+/// distinct from API keys so the adapters can pick the right header.
 pub fn resolve_wire_credential(
     provider: &str,
     flag_key: Option<&str>,
     auth_path: &Path,
 ) -> Option<(WireCredential, &'static str)> {
+    // The composed config layers (`model-runtime.ts`'s `this.config` and
+    // `extensionProviders`); `None` before a refresh — the engine-free shape.
+    let config = crate::models_state::models_json_provider(provider);
+    let extension = crate::models_state::extension_provider_config(provider);
+    resolve_wire_credential_composed(
+        provider,
+        flag_key,
+        auth_path,
+        config.as_ref(),
+        extension.as_ref(),
+    )
+}
+
+/// [`resolve_wire_credential`] over explicit config layers (the tests' seam;
+/// the production path reads the composed snapshots).
+pub fn resolve_wire_credential_composed(
+    provider: &str,
+    flag_key: Option<&str>,
+    auth_path: &Path,
+    config: Option<&crate::models_config::ModelsJsonProvider>,
+    extension: Option<&crate::models_config::ExtensionProviderConfig>,
+) -> Option<(WireCredential, &'static str)> {
+    let methods = crate::oauth::provider_auth_methods(provider, config, extension);
+    let has_api_key = methods
+        .iter()
+        .any(|method| matches!(method, crate::oauth::AuthMethod::ApiKey(_)));
+    let has_oauth = methods
+        .iter()
+        .any(|method| matches!(method, crate::oauth::AuthMethod::OAuth(_)));
+    // The `--api-key` flag is the port's runtime credential
+    // (`credentials.setRuntimeApiKey`, `model-runtime.ts:655-665` reports it
+    // configured first): it wins over every layer, for any provider id.
+    // Upstream's `overrides.apiKey` requires `provider.auth.apiKey`
+    // (`resolve.ts:56-68`); the port keeps the unconditional P4 behavior
+    // because the flag is the runtime layer here, not a request override.
     if let Some(key) = flag_key {
         return Some((WireCredential::ApiKey(key.to_string()), "--api-key"));
     }
     if let Some(credential) = auth::read_stored_credential(provider, auth_path) {
         match &credential {
             Credential::ApiKey { key, env, .. } => {
+                // A stored API key for an OAuth-only provider resolves to
+                // nothing — no env fallback (`resolve.ts:82-86`).
+                if !has_api_key {
+                    return None;
+                }
                 if let Some(resolved) = key
                     .as_deref()
                     .and_then(|key| auth::resolve_config_value(key, env.as_ref()))
                 {
                     return Some((WireCredential::ApiKey(resolved), "stored credential"));
                 }
+                // An unresolvable stored template falls through to the env
+                // loop inside `envApiKeyAuth.resolve` (`helpers.ts:21-29`).
             }
             Credential::Oauth { access, .. } => {
+                // A stored OAuth credential for a provider without OAuth
+                // auth resolves to nothing (`resolve.ts:72-86`).
+                if !has_oauth {
+                    return None;
+                }
                 // The OAuth flows hand the access token to the request
                 // through `toAuth`: most providers yield `auth.apiKey` (the
                 // provider's standard key header — `x-api-key` for
@@ -585,6 +637,27 @@ pub fn resolve_wire_credential(
                 return Some((wire, "stored credential"));
             }
         }
+    }
+    // The configured models.json/extension key (`composeApiKeyAuth.resolve`,
+    // `provider-composer.ts:470-475`): resolved through
+    // `resolveConfigValueOrThrow`, wrapped into the inherited resolve when
+    // the provider has one — no env-var fallback after this branch.
+    let raw_key = extension
+        .and_then(|extension| extension.api_key.as_deref())
+        .or_else(|| config.and_then(|config| config.api_key.as_deref()));
+    if let Some(raw_key) = raw_key {
+        let resolved = auth::resolve_config_value(raw_key, None)?;
+        let source = if crate::oauth::api_key_auth_name(provider).is_some() {
+            // The inherited `envApiKeyAuth.resolve` sees the configured key
+            // as a stored credential (`helpers.ts:21-23`).
+            "stored credential"
+        } else {
+            "configured API key"
+        };
+        return Some((WireCredential::ApiKey(resolved), source));
+    }
+    if !has_api_key {
+        return None;
     }
     for variable in env_key_candidates(provider) {
         if let Ok(value) = std::env::var(variable) {
@@ -801,11 +874,84 @@ mod tests {
         // provider id -> None (env vars like OPENAI_API_KEY may exist in the
         // ambient environment, so use an id with no env candidates).
         assert!(resolve_api_key("bogus-provider", None, &auth_path).is_none());
-        // The flag always wins.
+        // The flag wins unconditionally (the runtime credential;
+        // `resolve_wire_credential`'s doc comment).
         assert_eq!(
             resolve_api_key("bogus-provider", Some("sk-test"), &auth_path)
                 .map(|(key, source)| (key, source == "--api-key")),
             Some(("sk-test".to_string(), true))
+        );
+    }
+
+    /// The auth-kind gate (`auth/resolve.ts:70-87`): a stored credential
+    /// resolves only through a matching auth method, with no env fallback
+    /// for a mismatched type.
+    #[test]
+    fn stored_credentials_gate_on_the_provider_auth_methods() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            serde_json::to_string(&serde_json::json!({
+                "anthropic": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000},
+                "kimi-coding": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000},
+                "groq": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9_000_000_000_000},
+                "openai-codex": {"type": "api_key", "key": "sk-test"},
+            }))
+            .expect("auth.json"),
+        )
+        .expect("write");
+        // OAuth for a provider with OAuth auth: the access token rides the
+        // provider's standard key header (`toAuth`).
+        assert_eq!(
+            resolve_wire_credential("anthropic", None, &auth_path),
+            Some((WireCredential::ApiKey("tok".to_string()), "stored credential"))
+        );
+        // kimi-coding yields an explicit Bearer header.
+        assert_eq!(
+            resolve_wire_credential("kimi-coding", None, &auth_path),
+            Some((WireCredential::AccessToken("tok".to_string()), "stored credential"))
+        );
+        // A stored OAuth credential for a provider without OAuth auth
+        // resolves to nothing — no env fallback (`resolve.ts:82-86`).
+        assert_eq!(resolve_wire_credential("groq", None, &auth_path), None);
+        // A stored API key for an OAuth-only provider resolves to nothing.
+        assert_eq!(resolve_wire_credential("openai-codex", None, &auth_path), None);
+    }
+
+    /// The composed config layers (`composeApiKeyAuth.resolve`,
+    /// `provider-composer.ts:470-475`): the models.json/extension key
+    /// resolves through `resolveConfigValue`, without an env fallback, and
+    /// the inherited `envApiKeyAuth` labels it a stored credential.
+    #[test]
+    fn configured_keys_resolve_through_the_composition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        let config = |value: serde_json::Value| {
+            serde_json::from_value::<crate::models_config::ModelsJsonProvider>(serde_json::json!({
+                "apiKey": value,
+            }))
+            .expect("models.json provider")
+        };
+        // A literal key on a models.json-only provider: "configured API key".
+        let literal = config(serde_json::json!("acme-key"));
+        assert_eq!(
+            resolve_wire_credential_composed("acme", None, &auth_path, Some(&literal), None),
+            Some((WireCredential::ApiKey("acme-key".to_string()), "configured API key"))
+        );
+        // The configured key on a provider with an inherited auth resolves
+        // as a stored credential (`helpers.ts:21-23`).
+        let literal = config(serde_json::json!("openai-key"));
+        assert_eq!(
+            resolve_wire_credential_composed("openai", None, &auth_path, Some(&literal), None),
+            Some((WireCredential::ApiKey("openai-key".to_string()), "stored credential"))
+        );
+        // An unresolvable `$VAR` template resolves to nothing — no env
+        // fallback after the configured-key branch.
+        let template = config(serde_json::json!("$PI_RS_SLICE6C_TEST_UNSET_VAR"));
+        assert_eq!(
+            resolve_wire_credential_composed("openai", None, &auth_path, Some(&template), None),
+            None
         );
     }
 

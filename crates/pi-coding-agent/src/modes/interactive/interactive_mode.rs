@@ -53,6 +53,9 @@ use super::autocomplete;
 use super::chat_viewport::{self, ChatViewport, HostSlot};
 use super::components::armin::ArminComponent;
 use super::components::assistant_message::AssistantMessageComponent;
+use super::components::auth_selector::{
+    AuthSelectorComponent, AuthSelectorEvent, LoginPromptComponent, LoginPromptEvent,
+};
 use super::components::easter_egg_3d::{EasterEgg3d, EasterEggHandle, play_easter_egg_3d};
 use super::components::footer::{FooterComponent, FooterData, UsageTotals};
 use super::components::header::{BuiltInHeader, pi_logo_lines};
@@ -66,6 +69,17 @@ use super::components::tool_execution::{ToolExecutionComponent, ToolResultView};
 use super::components::trust_selector::{TrustSelectorComponent, TrustSelectorEvent};
 use super::components::user_message::UserMessageComponent;
 use super::theme;
+use crate::oauth::{self, AuthSelectorProvider};
+
+/// Where a cancelled login returns to (`startProviderLogin`'s `onBack`,
+/// `interactive-mode.ts:6077-6085`).
+#[derive(Debug, Clone)]
+enum LoginBackStep {
+    /// `showLoginAuthTypeSelector(providerOptions)` again.
+    AuthType(Option<Vec<AuthSelectorProvider>>),
+    /// `showLoginProviderSelector(authType)` again.
+    Provider(Option<&'static str>),
+}
 
 /// Options the CLI host passes in (`InteractiveModeOptions`).
 pub struct InteractiveOptions {
@@ -692,6 +706,27 @@ pub struct InteractiveMode {
     /// Events from the mounted `/settings` dialog, same queue pattern.
     settings_selector_events: Option<Arc<Mutex<Vec<SettingsSelectorEvent>>>>,
     session_selector_events: Option<Arc<Mutex<Vec<SessionSelectorEvent>>>>,
+    /// Events from the mounted `/login`//`/logout` selector
+    /// (`OAuthSelectorComponent`'s onSelect/onCancel).
+    auth_selector_events: Option<Arc<Mutex<Vec<AuthSelectorEvent>>>>,
+    /// Which flow the mounted auth selector serves ("login"/"logout") —
+    /// upstream binds the behavior per instance; the port's single event
+    /// queue needs the tag.
+    auth_selector_mode: Option<&'static str>,
+    /// The auth-type filter the open provider selector was seeded with
+    /// (`showLoginProviderSelector`'s `authType`).
+    pending_auth_type: Option<&'static str>,
+    /// The one-provider entries behind an open auth-type menu
+    /// (`showLoginAuthTypeSelector`'s `providerOptions`).
+    pending_auth_type_options: Option<Vec<AuthSelectorProvider>>,
+    /// Events from the mounted login prompt (`LoginDialogComponent`'s
+    /// input resolver/rejecter), while an API-key login runs.
+    login_prompt_events: Option<Arc<Mutex<Vec<LoginPromptEvent>>>>,
+    /// The provider the open login prompt configures
+    /// (`loginProvider`'s closure state).
+    login_prompt_provider: Option<(String, String)>,
+    /// Where a cancelled login returns to (`onBack`).
+    login_back: Option<LoginBackStep>,
     /// The editor, parked while the selector occupies its tree slot.
     suspended_editor: Option<Box<dyn Component>>,
     /// The resolved renderer mode (`options.tuiMode`): which screen the
@@ -866,6 +901,13 @@ impl InteractiveMode {
             trust_selector_events: None,
             settings_selector_events: None,
             session_selector_events: None,
+            auth_selector_events: None,
+            auth_selector_mode: None,
+            pending_auth_type: None,
+            pending_auth_type_options: None,
+            login_prompt_events: None,
+            login_prompt_provider: None,
+            login_back: None,
             suspended_editor: None,
             tui_mode,
             editor_id,
@@ -1075,6 +1117,33 @@ impl InteractiveMode {
             autocomplete::SlashCommand::new("session", "Show session info and stats"),
             autocomplete::SlashCommand::new("changelog", "Show changelog entries"),
             autocomplete::SlashCommand::new("hotkeys", "Show all keyboard shortcuts"),
+            // `BUILTIN_SLASH_COMMANDS` (`slash-commands.ts:37-38`); the
+            // `/login` argument completions ride
+            // `loginCommand.getArgumentCompletions`
+            // (`interactive-mode.ts:801-812`).
+            autocomplete::SlashCommand::new("login", "Configure provider authentication")
+                .with_argument_hint("<provider>")
+                .with_argument_completions(Arc::new(|prefix: &str| {
+                    let options = oauth::login_provider_options(&crate::config::get_auth_path());
+                    let completions = oauth::login_provider_completion_options(&options);
+                    let filtered = pi_tui::fuzzy::fuzzy_filter(
+                        &completions,
+                        prefix,
+                        oauth::login_provider_search_text,
+                    );
+                    let items: Vec<pi_tui::components::select_list::SelectItem> = filtered
+                        .into_iter()
+                        .map(|option| pi_tui::components::select_list::SelectItem {
+                            value: option.id.clone(),
+                            label: option.id,
+                            description: Some(oauth::login_provider_completion_description(
+                                &option,
+                            )),
+                        })
+                        .collect();
+                    if items.is_empty() { None } else { Some(items) }
+                })),
+            autocomplete::SlashCommand::new("logout", "Remove provider authentication"),
             autocomplete::SlashCommand::new("thinking", "Set thinking level")
                 .with_argument_hint("<level>")
                 .with_argument_completions(Arc::new(|prefix: &str| {
@@ -1804,6 +1873,20 @@ impl InteractiveMode {
         // `/hotkeys` (`interactive-mode.ts:3392-3396`).
         if text == "/hotkeys" {
             self.handle_hotkeys_command();
+            return;
+        }
+        // `/login [provider]` (`interactive-mode.ts:3418-3423`): an empty
+        // reference rides as `""`, which matches nothing and opens the
+        // provider selector (`findMatchingProviders`'s normalized-empty
+        // guard, `provider-matching.ts:8-10`).
+        if text == "/login" || text.starts_with("/login ") {
+            let provider_ref = text.strip_prefix("/login ").map(str::trim);
+            self.handle_login_command(provider_ref);
+            return;
+        }
+        // `/logout` (`interactive-mode.ts:3424-3426`).
+        if text == "/logout" {
+            self.show_oauth_selector("logout");
             return;
         }
         if let Some(rest) = text.strip_prefix("/thinking") {
@@ -4041,6 +4124,9 @@ impl InteractiveMode {
         self.trust_selector_events = None;
         self.settings_selector_events = None;
         self.session_selector_events = None;
+        self.auth_selector_events = None;
+        self.login_prompt_events = None;
+        self.login_prompt_provider = None;
         self.tui.set_focus(Some(FocusTarget::Id(self.editor_id)));
     }
 
@@ -4114,6 +4200,464 @@ impl InteractiveMode {
         }
     }
 
+    // --------------------------------------------------------------
+    // /login and /logout (`handleLoginCommand`, `interactive-mode.ts:6053-6075`,
+    // `showOAuthSelector` `:6209-6251`, the auth-type menu `:6087-6155`,
+    // `startProviderLogin` `:6077-6085`, the login dialogs `:6367-6616`,
+    // and `completeProviderAuthentication`'s status lines `:6303-6359`)
+    // --------------------------------------------------------------
+
+    /// `formatAuthSelectorProviderStatus` with the undefined-status fallback
+    /// (`oauth-selector.ts:31-33`): " • not configured" rides the muted color.
+    fn auth_selector_status_suffix(provider: &AuthSelectorProvider) -> String {
+        match &provider.status {
+            Some(status) => oauth::format_auth_selector_provider_status(provider, status),
+            None => theme::theme().fg(pi_tui::theme::ThemeColor::Muted, " • not configured"),
+        }
+    }
+
+    /// `/login [provider]` (`handleLoginCommand`): one match starts its
+    /// login, matches sharing one id open the auth-type selector, anything
+    /// else opens the provider selector seeded with the reference.
+    fn handle_login_command(&mut self, provider_ref: Option<&str>) {
+        let Some(provider_ref) = provider_ref else {
+            self.show_login_auth_type_selector(None);
+            return;
+        };
+        let options = oauth::login_provider_options(&self.auth_path);
+        let matches = oauth::find_matching_providers(&options, provider_ref);
+        if let [option] = matches.as_slice() {
+            self.start_provider_login((*option).clone(), None);
+            return;
+        }
+        if matches.len() > 1 {
+            let same_id = matches
+                .iter()
+                .all(|provider| provider.id == matches[0].id);
+            if same_id {
+                let provider_options = matches.into_iter().cloned().collect();
+                self.show_login_auth_type_selector(Some(provider_options));
+                return;
+            }
+        }
+        self.show_login_provider_selector(None, Some(provider_ref));
+    }
+
+    /// `showOAuthSelector("logout")` (`interactive-mode.ts:6209-6251`): the
+    /// stored credentials, or the verbatim empty state. `"login"` routes to
+    /// the auth-type menu (`:6210-6213`).
+    fn show_oauth_selector(&mut self, mode: &str) {
+        if mode == "login" {
+            self.show_login_auth_type_selector(None);
+            return;
+        }
+        let options = match oauth::logout_provider_options(&self.auth_path) {
+            Ok(options) => options,
+            Err(error) => {
+                self.show_error(&format!("Could not read stored credentials: {error}"));
+                return;
+            }
+        };
+        if options.is_empty() {
+            self.show_status(
+                "No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.",
+            );
+            return;
+        }
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let selector = AuthSelectorComponent::logout(options, Arc::clone(&events));
+        self.auth_selector_events = Some(events);
+        self.auth_selector_mode = Some("logout");
+        self.suspend_editor_with(Box::new(selector));
+    }
+
+    /// `showLoginAuthTypeSelector` (`interactive-mode.ts:6087-6155`): the
+    /// subscription/API-key options for one provider, or the top-level menu
+    /// with the Radius option last. `provider_options` carries the one
+    /// provider's entries when `/login <ref>` matched several auth types.
+    fn show_login_auth_type_selector(&mut self, provider_options: Option<Vec<AuthSelectorProvider>>) {
+        let all_options = oauth::login_provider_options(&self.auth_path);
+        // The top-level selector offers Radius directly, as its last option
+        // (`interactive-mode.ts:6090-6093`).
+        let radius_option = if provider_options.is_some() {
+            None
+        } else {
+            all_options
+                .iter()
+                .find(|provider| provider.id == oauth::RADIUS_PROVIDER_ID && provider.auth_type == "oauth")
+                .cloned()
+        };
+        let radius_label = radius_option
+            .as_ref()
+            .map(|provider| format!("Sign in with {}{}", provider.name, Self::auth_selector_status_suffix(provider)));
+        // `oauthLoginLabel` (`:6094-6098`): the OAuth method's selector label.
+        let oauth_login_label = provider_options
+            .as_ref()
+            .and_then(|options| options.iter().find(|provider| provider.auth_type == "oauth"))
+            .and_then(|provider| provider.login_label);
+        let subscription_label =
+            oauth_login_label.unwrap_or("Sign in with an account").to_string();
+        let api_key_label = "Sign in with an API key";
+        let available = |auth_type: &str| {
+            provider_options
+                .as_ref()
+                .map(|options| options.iter().any(|provider| provider.auth_type == auth_type))
+                .unwrap_or(true)
+        };
+        let mut options: Vec<String> = Vec::new();
+        if available("oauth") {
+            options.push(subscription_label.clone());
+        }
+        if available("api_key") {
+            options.push(api_key_label.to_string());
+        }
+        if let Some(radius_label) = &radius_label {
+            options.push(radius_label.clone());
+        }
+        if options.is_empty() {
+            self.show_status("No login methods available.");
+            return;
+        }
+        if provider_options.is_some() && options.len() == 1 {
+            // The single auth type starts directly, without a back target
+            // (`interactive-mode.ts:6130-6138`).
+            if let Some(provider) = provider_options.as_ref().and_then(|options| options.first()) {
+                let provider = provider.clone();
+                self.start_provider_login(provider, None);
+            }
+            return;
+        }
+        let title = provider_options
+            .as_ref()
+            .and_then(|options| options.first())
+            .map(|provider| format!("Select authentication method for {}:", provider.name))
+            .unwrap_or_else(|| "Select authentication method:".to_string());
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let selector = AuthSelectorComponent::options(&title, options, Arc::clone(&events));
+        self.auth_selector_events = Some(events);
+        self.auth_selector_mode = Some("login");
+        self.pending_auth_type_options = provider_options.clone();
+        self.suspend_editor_with(Box::new(selector));
+    }
+
+    /// `showLoginProviderSelector` (`interactive-mode.ts:6156-6187`): the
+    /// provider rows for one auth type, or all of them.
+    fn show_login_provider_selector(&mut self, auth_type: Option<&'static str>, initial_search: Option<&str>) {
+        let all_options = oauth::login_provider_options(&self.auth_path);
+        let provider_options: Vec<AuthSelectorProvider> = all_options
+            .into_iter()
+            .filter(|provider| auth_type.is_none_or(|filter| provider.auth_type == filter))
+            .collect();
+        if provider_options.is_empty() {
+            let message = match auth_type {
+                Some("oauth") => "No account providers available.",
+                Some("api_key") => "No API key providers available.",
+                _ => "No login providers available.",
+            };
+            self.show_status(message);
+            return;
+        }
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let selector = AuthSelectorComponent::login(provider_options, initial_search, Arc::clone(&events));
+        self.auth_selector_events = Some(events);
+        self.auth_selector_mode = Some("login");
+        self.pending_auth_type = auth_type;
+        self.suspend_editor_with(Box::new(selector));
+    }
+
+    /// `startProviderLogin` (`interactive-mode.ts:6077-6085`): the oauth
+    /// flow, the API-key prompt, or the ambient notice.
+    fn start_provider_login(&mut self, provider: AuthSelectorProvider, back: Option<LoginBackStep>) {
+        match provider.auth_type {
+            "oauth" => {
+                // The per-provider OAuth flows (PKCE/device-code/callback
+                // servers, `packages/ai/src/auth/oauth/*.ts`) are not ported
+                // yet; the upstream error shape reports the honest reason.
+                self.show_error(&format!(
+                    "Failed to login to {}: OAuth login flows are not implemented in pi-rs yet",
+                    provider.name
+                ));
+            }
+            _ => {
+                // Custom select-based API-key flows (`amazon-bedrock.ts:13`,
+                // `google-vertex.ts:15`) and the ambient-only auths resolve
+                // outside the app; the standard `envApiKeyAuth` login and
+                // the composed default (`provider-composer.ts:438-441`)
+                // prompt for the key.
+                if crate::oauth::AMBIENT_LOGIN_PROVIDERS.contains(&provider.id.as_str()) {
+                    self.show_status(&format!(
+                        "{} is configured outside {}.",
+                        provider
+                            .method_name
+                            .as_deref()
+                            .unwrap_or("Authentication"),
+                        crate::config::APP_NAME
+                    ));
+                    return;
+                }
+                let auth_name = provider
+                    .method_name
+                    .as_deref()
+                    .unwrap_or("API key")
+                    .to_string();
+                self.open_login_prompt(&provider.id, &provider.name, &auth_name, back);
+            }
+        }
+    }
+
+    /// `showApiKeyLoginDialog` + `loginProvider`'s prompt wiring
+    /// (`interactive-mode.ts:6397-6447`, `showAuthPrompt` `:6483-6505`):
+    /// mount the entry dialog over the editor slot.
+    fn open_login_prompt(
+        &mut self,
+        provider_id: &str,
+        provider_name: &str,
+        auth_name: &str,
+        back: Option<LoginBackStep>,
+    ) {
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let prompt = LoginPromptComponent::new(
+            &format!("Enter {auth_name}"),
+            None,
+            Arc::clone(&events),
+        );
+        self.login_prompt_events = Some(events);
+        self.login_prompt_provider = Some((provider_id.to_string(), provider_name.to_string()));
+        self.login_back = back;
+        self.suspend_editor_with(Box::new(prompt));
+    }
+
+    /// The login prompt's drain (`showPrompt`'s resolver/rejecter).
+    fn pump_login_prompt(&mut self) {
+        if self.login_prompt_events.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .login_prompt_events
+                .as_ref()
+                .expect("login prompt")
+                .lock()
+                .expect("login prompt events"),
+        );
+        for event in events {
+            match event {
+                LoginPromptEvent::Submit(value) => {
+                    let Some((provider_id, provider_name)) = self.login_prompt_provider.take() else {
+                        continue;
+                    };
+                    self.restore_editor();
+                    self.login_prompt_events = None;
+                    self.login_back = None;
+                    // Persist the credential (`AuthStorage.modify`, the
+                    // `api_key` shape; the secret prompt resolves upstream in
+                    // `envApiKeyAuth.login`, `helpers.ts:10-15`).
+                    let storage = crate::auth::AuthStorage::create(&self.auth_path);
+                    let result = storage.modify(&provider_id, |_current| {
+                        Ok(Some(crate::auth::Credential::ApiKey {
+                            key: Some(value.clone()),
+                            env: None,
+                            unknown: serde_json::Map::new(),
+                        }))
+                    });
+                    match result {
+                        Ok(_) => self.show_status(&format!(
+                            "Saved API key for {provider_name}. Credentials saved to {}",
+                            self.auth_path.display()
+                        )),
+                        Err(error) => self.show_error(&format!(
+                            "Failed to save API key for {provider_name}: {error}"
+                        )),
+                    }
+                }
+                LoginPromptEvent::Cancel => {
+                    // Upstream rejects with `Login cancelled`, which reopens
+                    // the selector the login started from (`:6441-6443`).
+                    self.restore_editor();
+                    self.login_prompt_events = None;
+                    self.login_prompt_provider = None;
+                    let back = self.login_back.take();
+                    self.run_login_back(back);
+                }
+            }
+        }
+    }
+
+    /// The `onBack` chain (`showApiKeyLoginDialog`/`showLoginDialog`'s
+    /// `errorMsg === "Login cancelled"` branch).
+    fn run_login_back(&mut self, back: Option<LoginBackStep>) {
+        match back {
+            Some(LoginBackStep::AuthType(options)) => self.show_login_auth_type_selector(options),
+            Some(LoginBackStep::Provider(auth_type)) => {
+                self.show_login_provider_selector(auth_type, None);
+            }
+            None => self.tui.request_render(),
+        }
+    }
+
+    /// The mounted auth selector's drain (`showSelector`'s onSelect/onCancel
+    /// callbacks): login rows start their flow, logout rows delete the
+    /// stored credential, plain options drive the auth-type menu.
+    fn pump_auth_selector(&mut self) {
+        if self.auth_selector_events.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .auth_selector_events
+                .as_ref()
+                .expect("auth selector")
+                .lock()
+                .expect("auth selector events"),
+        );
+        for event in events {
+            match event {
+                AuthSelectorEvent::Select { provider_id, auth_type } => {
+                    // The pending-selector state feeds the `onBack` chains;
+                    // it is captured before `close_auth_selector` clears it.
+                    let mode = self.auth_selector_mode;
+                    let pending_type = self.pending_auth_type;
+                    let pending_options = self.pending_auth_type_options.clone();
+                    self.close_auth_selector();
+                    match mode {
+                        Some("logout") => self.logout_provider(&provider_id, auth_type),
+                        _ => self.start_selected_login(
+                            &provider_id,
+                            auth_type,
+                            pending_type,
+                            pending_options,
+                        ),
+                    }
+                }
+                AuthSelectorEvent::SelectOption(option) => {
+                    let pending_options = self.pending_auth_type_options.clone();
+                    self.close_auth_selector();
+                    self.handle_auth_type_option(&option, pending_options);
+                }
+                AuthSelectorEvent::Cancel => {
+                    self.close_auth_selector();
+                    self.tui.request_render();
+                }
+            }
+        }
+    }
+
+    /// Put the editor back after the auth selector closes.
+    fn close_auth_selector(&mut self) {
+        if self.auth_selector_events.is_some() {
+            self.auth_selector_events = None;
+            self.auth_selector_mode = None;
+            self.pending_auth_type = None;
+            self.pending_auth_type_options = None;
+            self.restore_editor();
+        }
+    }
+
+    /// A login row confirmed from the provider selector
+    /// (`OAuthSelectorComponent`'s login `onSelect`,
+    /// `interactive-mode.ts:6165-6184`): the pending state carries the
+    /// `onBack` target.
+    fn start_selected_login(
+        &mut self,
+        provider_id: &str,
+        auth_type: &'static str,
+        pending_type: Option<&'static str>,
+        pending_options: Option<Vec<AuthSelectorProvider>>,
+    ) {
+        let options = oauth::login_provider_options(&self.auth_path);
+        let Some(provider) = options
+            .into_iter()
+            .find(|provider| provider.id == provider_id && provider.auth_type == auth_type)
+        else {
+            return;
+        };
+        let back = match pending_type {
+            Some(auth_type) => Some(LoginBackStep::Provider(Some(auth_type))),
+            None => pending_options.map(LoginBackStep::AuthType),
+        };
+        self.start_provider_login(provider, back);
+    }
+
+    /// A plain option confirmed from the auth-type menu
+    /// (`showLoginAuthTypeSelector`'s `onSelect`,
+    /// `interactive-mode.ts:6122-6148`); `pending_options` is the one-provider
+    /// entry list when the menu was scoped to a single provider.
+    fn handle_auth_type_option(
+        &mut self,
+        option: &str,
+        pending_options: Option<Vec<AuthSelectorProvider>>,
+    ) {
+        let all_options = oauth::login_provider_options(&self.auth_path);
+        let radius = all_options
+            .iter()
+            .find(|provider| provider.id == oauth::RADIUS_PROVIDER_ID && provider.auth_type == "oauth")
+            .cloned();
+        let radius_label = radius
+            .as_ref()
+            .map(|provider| format!("Sign in with {}{}", provider.name, Self::auth_selector_status_suffix(provider)));
+        if let (Some(radius), Some(radius_label)) = (&radius, &radius_label)
+            && option == radius_label.as_str()
+        {
+            let back = pending_options.map(LoginBackStep::AuthType);
+            self.start_provider_login(radius.clone(), back);
+            return;
+        }
+        let auth_type: &'static str = if option == "Sign in with an API key" {
+            "api_key"
+        } else {
+            "oauth"
+        };
+        if let Some(provider_options) = &pending_options
+            && let Some(provider) = provider_options
+                .iter()
+                .find(|provider| provider.auth_type == auth_type)
+        {
+            let provider = provider.clone();
+            let back = Some(LoginBackStep::AuthType(pending_options));
+            self.start_provider_login(provider, back);
+            return;
+        }
+        self.show_login_provider_selector(Some(auth_type), None);
+    }
+
+    /// A logout row confirmed (`showOAuthSelector`'s onSelect,
+    /// `interactive-mode.ts:6220-6246`): delete the credential and report.
+    fn logout_provider(&mut self, provider_id: &str, auth_type: &'static str) {
+        let name = oauth::logout_provider_options(&self.auth_path)
+            .ok()
+            .and_then(|options| {
+                options
+                    .into_iter()
+                    .find(|provider| provider.id == provider_id)
+                    .map(|provider| provider.name)
+            })
+            .unwrap_or_else(|| provider_id.to_string());
+        let storage = crate::auth::AuthStorage::create(&self.auth_path);
+        match storage.delete(provider_id) {
+            Ok(()) => {
+                let message = if auth_type == "oauth" {
+                    format!("Logged out of {name}")
+                } else {
+                    format!("Removed stored API key for {name}. Environment variables and models.json config are unchanged.")
+                };
+                self.show_status(&message);
+            }
+            Err(error) => self.show_error(&format!("Logout failed: {error}")),
+        }
+    }
+
     /// One loop iteration without terminal input: editor events, agent
     /// events, spinner frames. `run` calls this between input polls; the
     /// scripted tests drive it directly with a capture terminal.
@@ -4138,6 +4682,8 @@ impl InteractiveMode {
         self.pump_trust_selector();
         self.pump_settings_selector();
         self.pump_session_selector();
+        self.pump_auth_selector();
+        self.pump_login_prompt();
 
         // The 3D easter egg (`playEasterEgg3d`): the header's logo clicks
         // replay from the queue, the animation's rows track the terminal, and
@@ -6059,6 +6605,193 @@ mod tests {
         let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
         assert!(frame.contains("What's New"), "{frame}");
         assert!(frame.contains("No changelog entries found."), "{frame}");
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    // --------------------------------------------------------------
+    // /login and /logout (slice 6c)
+    // --------------------------------------------------------------
+
+    /// `/logout` without stored credentials shows the verbatim empty state
+    /// (`interactive-mode.ts:6219-6221`).
+    #[test]
+    fn logout_without_credentials_shows_the_empty_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/logout");
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("No stored credentials to remove"), "{frame}");
+        assert!(
+            frame.contains("environment variables and models.json config are unchanged"),
+            "{frame}"
+        );
+        assert!(mode.suspended_editor.is_none(), "no selector mounted");
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `/logout` with stored credentials lists them; confirming a row deletes
+    /// that entry only, with the upstream status
+    /// (`interactive-mode.ts:6222-6246`).
+    #[test]
+    fn logout_deletes_the_selected_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        // Synthetic credentials only (never a real auth.json).
+        std::fs::write(
+            &auth_path,
+            r#"{"groq": {"type": "api_key", "key": "sk-test"}, "acme": {"type": "oauth", "access": "tok", "refresh": "r", "expires": 9000000000000}}"#,
+        )
+        .expect("write auth.json");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/logout");
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Select provider to logout:"), "{frame}");
+        assert!(frame.contains("groq"), "{frame}");
+        assert!(frame.contains("acme"), "{frame}");
+
+        // Confirming the api_key row (escape is the other exit; the pump
+        // drains the selector queue like `showSelector`'s callbacks).
+        mode.auth_selector_events
+            .as_ref()
+            .expect("selector")
+            .lock()
+            .expect("selector events")
+            .push(AuthSelectorEvent::Select {
+                provider_id: "groq".to_string(),
+                auth_type: "api_key",
+            });
+        mode.pump();
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(
+            frame.contains("Removed stored API key for groq"),
+            "{frame}"
+        );
+        assert!(
+            frame.contains("Environment variables and models.json config are unchanged"),
+            "{frame}"
+        );
+        let stored = std::fs::read_to_string(&auth_path).expect("auth.json");
+        assert!(stored.contains("acme"), "{stored}");
+        assert!(!stored.contains("groq"), "{stored}");
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `/login <provider>` for an API-key provider opens the entry prompt,
+    /// and the submitted key lands in auth.json with the upstream status
+    /// (`interactive-mode.ts:6397-6447` + `completeProviderAuthentication`).
+    #[test]
+    fn login_saves_the_submitted_api_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/login groq");
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Enter Groq API key"), "{frame}");
+        assert!(mode.login_prompt_events.is_some(), "prompt mounted");
+        assert!(
+            mode.login_prompt_provider.as_ref().expect("provider").0 == "groq",
+            "prompt targets groq"
+        );
+
+        mode.login_prompt_events
+            .as_ref()
+            .expect("prompt")
+            .lock()
+            .expect("prompt events")
+            .push(LoginPromptEvent::Submit("sk-test-123".to_string()));
+        mode.pump();
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Saved API key for groq"), "{frame}");
+        assert!(frame.contains("Credentials saved to"), "{frame}");
+        let stored = std::fs::read_to_string(dir.path().join("auth.json")).expect("auth.json");
+        assert!(stored.contains("\"groq\""), "{stored}");
+        assert!(stored.contains("sk-test-123"), "{stored}");
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// A cancelled login prompt reopens nothing and restores the editor
+    /// (upstream rejects with `Login cancelled`; the port has no back target
+    /// from a direct `/login <ref>`).
+    #[test]
+    fn login_prompt_cancel_restores_the_editor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/login groq");
+        assert!(mode.login_prompt_events.is_some(), "prompt mounted");
+        mode.login_prompt_events
+            .as_ref()
+            .expect("prompt")
+            .lock()
+            .expect("prompt events")
+            .push(LoginPromptEvent::Cancel);
+        mode.pump();
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+        assert!(mode.login_prompt_events.is_none(), "prompt closed");
+        assert!(
+            !dir.path().join("auth.json").exists() || {
+                let stored =
+                    std::fs::read_to_string(dir.path().join("auth.json")).expect("auth.json");
+                stored.trim() == "{}" || !stored.contains("groq")
+            },
+            "no credential written"
+        );
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `/login` without a reference opens the upstream auth-type menu
+    /// (`interactive-mode.ts:6087-6155`).
+    #[test]
+    fn login_without_reference_opens_the_auth_type_menu() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/login");
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Select authentication method:"), "{frame}");
+        assert!(frame.contains("Sign in with an account"), "{frame}");
+        assert!(frame.contains("Sign in with an API key"), "{frame}");
+        // The Radius option rides last (`interactive-mode.ts:6090-6093`).
+        assert!(frame.contains("Sign in with radius"), "{frame}");
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `/login` for an OAuth provider reports the unimplemented flow through
+    /// the upstream error shape (the slice 6c deviation: the per-provider
+    /// OAuth protocol machines in `packages/ai/src/auth/oauth/` are not
+    /// ported).
+    #[test]
+    fn login_oauth_reports_the_unimplemented_flow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/login openai-codex");
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Failed to login to"), "{frame}");
+        assert!(frame.contains("OAuth login flows are not implemented"), "{frame}");
 
         mode.shutdown().expect("shutdown");
     }

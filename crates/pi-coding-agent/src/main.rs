@@ -271,10 +271,11 @@ fn build_runtime_with_ui(
         &virtual_models,
     )?;
 
-    // Credential ladder: flag > auth.json > provider env vars. OAuth tokens
-    // resolve as bearer credentials, distinct from API keys. A virtual
-    // selection defers the check to routing (the routed provider's
-    // credentials decide).
+    // Credential ladder: flag > auth.json > models.json/extension `apiKey` >
+    // provider env vars, gated on the provider's composed auth methods
+    // (slice 6c). OAuth tokens resolve as bearer credentials, distinct from
+    // API keys. A virtual selection defers the check to routing (the routed
+    // provider's credentials decide).
     let wire: (Option<String>, Option<String>) =
         if pi_coding_agent::virtual_models::is_virtual_model(&model) {
             (None, None)

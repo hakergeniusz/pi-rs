@@ -4,9 +4,10 @@
 //! errors-as-values) and the models.json halves of `core/provider-composer.ts`
 //! (`modelFromJson` `:212-251`, the merge helpers `:124-210`,
 //! `applyModelOverride` `:179-210`, `applyModelsJson` `:302-344`). The
-//! extension-composition and auth halves of the composer land with slice 6b
-//! (see docs/EXTENSIONS.md §8.1); `configuredRequestAuthStatus` lands with
-//! the runtime wiring that consumes it.
+//! extension-composition half of the composer landed with slice 6b (see
+//! docs/EXTENSIONS.md §8.1); slice 6c adds the `ExtensionOAuthConfig`
+//! metadata subset ([`ExtensionOAuthMetadata`]) and
+//! `configuredRequestAuthStatus` (ported in [`crate::oauth`]).
 //!
 //! Deviations (recorded per the fidelity rule):
 //! - Upstream validates with TypeBox and surfaces TypeBox's message strings;
@@ -366,6 +367,12 @@ impl ModelConfig {
 
     pub fn get_provider_ids(&self) -> Vec<&str> {
         self.providers.keys().map(String::as_str).collect()
+    }
+
+    /// The whole provider map (the compose/auth layers read individual
+    /// entries; slice 6c keeps a snapshot for the credential ladder).
+    pub fn providers(&self) -> &BTreeMap<String, ModelsJsonProvider> {
+        &self.providers
     }
 
     pub fn get_error(&self) -> Option<&str> {
@@ -804,13 +811,31 @@ pub struct ExtensionChatModelConfig {
     pub compat: Option<JsonObject>,
 }
 
+/// The metadata subset of an extension `ExtensionOAuthConfig`
+/// (`provider-composer.ts:41-51`). The `login`/`refreshToken`/`getApiKey`/
+/// `modifyModels` members are JS functions the JSON bridge drops — only the
+/// data rides the registry (`ExtensionOAuthAuthInfo`, slice 6c).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionOAuthMetadata {
+    /// Display name (`ExtensionOAuthConfig.name`, required upstream).
+    pub name: String,
+    /// Whether access through this auth method is subscription-backed.
+    #[serde(default)]
+    pub is_subscription: bool,
+    /// Retained upstream for extension source compatibility; ignored by the
+    /// canonical auth flows (`provider-composer.ts:45-46`).
+    #[serde(default)]
+    pub uses_callback_server: Option<bool>,
+}
+
 /// The model-composition subset of an extension `ProviderConfigInput`
 /// (`provider-composer.ts:93-110`). The `streamSimple` *function* is
 /// stashed JS-side and crosses here only as a `streamSimple: true`
 /// presence marker (slice 6d — the dispatch reads the marker through the
-/// runner's registry); `oauth`/`images`/`classifiers`/`refreshModels` are
-/// functions or per-operation objects the JSON bridge drops or defers;
-/// they land with slice 6c.
+/// runner's registry). The `oauth` member carries its metadata subset
+/// only (slice 6c); `images`/`classifiers`/`refreshModels` remain
+/// functions or per-operation objects the JSON bridge drops or defers.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionProviderConfig {
@@ -826,6 +851,9 @@ pub struct ExtensionProviderConfig {
     pub headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub auth_header: Option<bool>,
+    /// The `ExtensionOAuthConfig` metadata subset (`provider-composer.ts:41-51`).
+    #[serde(default)]
+    pub oauth: Option<ExtensionOAuthMetadata>,
     #[serde(default)]
     pub models: Option<Vec<ExtensionChatModelConfig>>,
 }

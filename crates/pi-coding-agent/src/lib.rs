@@ -42,6 +42,10 @@ pub mod models_config;
 /// The composed model catalog: base catalog ⊕ models.json ⊕ extension
 /// providers ⊕ virtual models (`core/model-runtime.ts`, slice 6b).
 pub mod models_state;
+/// OAuth and provider-auth composition (E2 slice 6c): auth methods per
+/// provider, login/logout option surfaces (`core/provider-composer.ts` +
+/// `auth/resolve.ts` halves).
+pub mod oauth;
 /// Print, JSON-event, RPC, and interactive modes.
 pub mod modes;
 /// System prompt assembly (`core/system-prompt.ts`).
