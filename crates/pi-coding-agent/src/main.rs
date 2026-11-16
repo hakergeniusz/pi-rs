@@ -28,6 +28,13 @@ use pi_coding_agent::tools::index::ToolRegistry;
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+
+    // Package subcommands route before mode startup (`main.ts:648` —
+    // `pi install|remove|uninstall|list|update`), like `runAuthCommand`.
+    if let Some(code) = pi_coding_agent::cli::package_command::handle_package_command(&raw) {
+        std::process::exit(code);
+    }
+
     let args = parse_args(&raw);
 
     let errors: Vec<&_> = args

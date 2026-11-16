@@ -875,7 +875,7 @@ fn load_with_engine(
 
 /// `isLocalPath` (`utils/paths.ts:94-109`): the known non-local prefixes
 /// are package-manager sources (P5); everything else is a filesystem path.
-fn is_local_path(value: &str) -> bool {
+pub(crate) fn is_local_path(value: &str) -> bool {
     let trimmed = value.trim();
     !trimmed.starts_with("npm:")
         && !trimmed.starts_with("git:")

@@ -48,6 +48,8 @@ pub mod modes;
 /// provider, login/logout option surfaces (`core/provider-composer.ts` +
 /// `auth/resolve.ts` halves).
 pub mod oauth;
+
+pub mod package_manager;
 /// System prompt assembly (`core/system-prompt.ts`).
 pub mod prompt;
 /// Command prompt templates (`core/prompt-templates.ts`).
