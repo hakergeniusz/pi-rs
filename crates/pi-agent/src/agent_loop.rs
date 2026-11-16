@@ -541,6 +541,7 @@ async fn run_loop(
                 .await;
                 emit.emit(AgentEvent::AgentEnd {
                     messages: new_messages.clone(),
+                    will_retry: false,
                 })
                 .await;
                 return;
@@ -583,6 +584,7 @@ async fn run_loop(
             if decision == Some(TurnDecision::End) {
                 emit.emit(AgentEvent::AgentEnd {
                     messages: new_messages.clone(),
+                    will_retry: false,
                 })
                 .await;
                 return;
@@ -616,6 +618,7 @@ async fn run_loop(
 
     emit.emit(AgentEvent::AgentEnd {
         messages: new_messages.clone(),
+        will_retry: false,
     })
     .await;
 }

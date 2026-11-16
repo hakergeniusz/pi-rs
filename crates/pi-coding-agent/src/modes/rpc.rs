@@ -636,16 +636,25 @@ fn run_agent_turn(
                 &mut sink,
             );
         }
-        let messages = crate::runtime::block_on(pi_agent::run_agent_loop(
-            user_prompts.clone(),
-            context.clone(),
-            executor.as_ref(),
-            &config,
-            &mut queues,
-            &mut sink,
-            &signal,
-            loop_stream_fn.as_ref(),
-        ));
+        let messages = {
+            // `agent_end` carries the merged `willRetry`
+            // (`agent-session.ts:1211`).
+            let mut aware = crate::modes::retry::RetryAwareSink {
+                inner: &mut sink,
+                retry: &retry,
+                signal: &signal,
+            };
+            crate::runtime::block_on(pi_agent::run_agent_loop(
+                user_prompts.clone(),
+                context.clone(),
+                executor.as_ref(),
+                &config,
+                &mut queues,
+                &mut aware,
+                &signal,
+                loop_stream_fn.as_ref(),
+            ))
+        };
         let aborted = signal.aborted();
         if retry.will_retry(aborted, &messages) {
             let (attempt, max_attempts, delay_ms, error_message) = retry.schedule(&messages);

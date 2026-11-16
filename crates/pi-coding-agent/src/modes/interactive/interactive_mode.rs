@@ -688,6 +688,8 @@ pub struct InteractiveMode {
     agent_run: Option<AgentRun>,
     /// The compaction attempt in flight, if any (`session.isCompacting`).
     compaction_run: Option<CompactionRun>,
+    /// The `agent_end` verdict, consumed by the post-run machine.
+    last_agent_end_will_retry: bool,
     /// Messages queued while compaction runs
     /// (`compactionQueuedMessages`), `(text, follow_up)`.
     compaction_queued: Vec<(String, bool)>,
@@ -924,6 +926,7 @@ impl InteractiveMode {
             queues,
             queued_deliveries: Vec::new(),
             compaction_run: None,
+            last_agent_end_will_retry: false,
             compaction_queued: Vec::new(),
             active_prompt: None,
             stdin_buffer: StdinBuffer::new(StdinBufferOptions::default()),
@@ -1728,7 +1731,9 @@ impl InteractiveMode {
                 }
                 self.tui.request_render();
             }
-            AgentEvent::AgentEnd { .. } => {
+            AgentEvent::AgentEnd { will_retry, .. } => {
+                // The pump's post-run machine (part b) consumes the verdict.
+                self.last_agent_end_will_retry = *will_retry;
                 self.refresh_footer();
                 self.tui.request_render();
             }

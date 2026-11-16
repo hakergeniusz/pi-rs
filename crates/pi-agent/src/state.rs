@@ -442,6 +442,7 @@ mod tests {
 
         state.apply_event(&AgentEvent::AgentEnd {
             messages: Vec::new(),
+            will_retry: false,
         });
         assert_eq!(state.streaming_message(), None);
     }

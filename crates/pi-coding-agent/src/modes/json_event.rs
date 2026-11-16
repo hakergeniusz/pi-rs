@@ -36,11 +36,15 @@ pub fn event_to_json(event: &AgentEvent) -> JsonObject {
     object.insert("type".to_string(), serde_json::json!(event.kind()));
     match event {
         AgentEvent::AgentStart | AgentEvent::TurnStart => {}
-        AgentEvent::AgentEnd { messages } => {
+        AgentEvent::AgentEnd {
+            messages,
+            will_retry,
+        } => {
             object.insert(
                 "messages".to_string(),
                 serde_json::to_value(messages).unwrap_or_default(),
             );
+            object.insert("willRetry".to_string(), serde_json::json!(will_retry));
         }
         AgentEvent::TurnEnd {
             message,
@@ -404,16 +408,25 @@ pub fn run_json_mode(
                 &mut sink,
             );
         }
-        let messages = crate::runtime::block_on(pi_agent::run_agent_loop(
-            prompts.clone(),
-            context.clone(),
-            executor.as_ref(),
-            &config,
-            &mut queues,
-            &mut sink,
-            &signal,
-            loop_stream_fn.as_ref(),
-        ));
+        let messages = {
+            // `agent_end` carries the merged `willRetry`
+            // (`agent-session.ts:1211`).
+            let mut aware = crate::modes::retry::RetryAwareSink {
+                inner: &mut sink,
+                retry: &retry,
+                signal: &signal,
+            };
+            crate::runtime::block_on(pi_agent::run_agent_loop(
+                prompts.clone(),
+                context.clone(),
+                executor.as_ref(),
+                &config,
+                &mut queues,
+                &mut aware,
+                &signal,
+                loop_stream_fn.as_ref(),
+            ))
+        };
         let aborted = signal.aborted();
         if retry.will_retry(aborted, &messages) {
             let (attempt, max_attempts, delay_ms, error_message) = retry.schedule(&messages);

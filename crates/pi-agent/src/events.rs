@@ -20,6 +20,11 @@ pub enum AgentEvent {
     AgentStart,
     AgentEnd {
         messages: Vec<AgentMessage>,
+        /// Whether a retry will re-run after this end (`agent-session.ts`
+        /// :212-216 merges `_willRetryAfterAgentEnd` into the event; the
+        /// core loop emits `false` and the run-tail sinks merge the
+        /// machine's verdict).
+        will_retry: bool,
     },
     // Turn lifecycle — one assistant response plus its tool calls and results
     TurnStart,

@@ -667,6 +667,7 @@ impl Agent {
             },
             AgentEvent::AgentEnd {
                 messages: vec![message],
+                will_retry: false,
             },
         ]
     }

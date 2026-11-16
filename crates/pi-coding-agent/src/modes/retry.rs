@@ -18,6 +18,7 @@ use pi_ai::types::StopReason;
 
 use crate::config::settings::RetrySettings;
 use crate::session::records::ContextReplacement;
+use pi_agent::events::{AgentEvent, AgentEventSink};
 
 /// One retry budget over a run (attempts reset when a run succeeds).
 pub struct AgentRetry {
@@ -110,6 +111,30 @@ pub fn last_error_text(messages: &[AgentMessage]) -> String {
     last_assistant(messages)
         .and_then(|assistant| assistant.error_message.clone())
         .unwrap_or_else(|| "Unknown error".to_string())
+}
+
+/// Merges `willRetry` into the streamed `agent_end` (`agent-session.ts`
+/// :1211 wraps the emit; the sink does it at the stream boundary). The
+/// verdict reads the machine's current budget — the same inputs upstream's
+/// `_willRetryAfterAgentEnd` (:1267-1281) uses. The core loop emits
+/// `false`; without this wrapper the wire would never see a retry.
+pub struct RetryAwareSink<'a, S: AgentEventSink> {
+    pub inner: &'a mut S,
+    pub retry: &'a AgentRetry,
+    pub signal: &'a AbortSignal,
+}
+
+impl<S: AgentEventSink> AgentEventSink for RetryAwareSink<'_, S> {
+    fn emit(&mut self, event: AgentEvent) -> pi_agent::types::BoxFuture<'_, ()> {
+        let event = match event {
+            AgentEvent::AgentEnd { messages, .. } => AgentEvent::AgentEnd {
+                will_retry: self.retry.will_retry(self.signal.aborted(), &messages),
+                messages,
+            },
+            event => event,
+        };
+        self.inner.emit(event)
+    }
 }
 
 /// `_omitRecoveryAttempt` (`agent-session.ts:1311-1336`): the failed
