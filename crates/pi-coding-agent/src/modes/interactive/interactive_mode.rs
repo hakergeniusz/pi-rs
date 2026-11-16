@@ -1627,12 +1627,16 @@ impl InteractiveMode {
             | AgentEvent::AutoRetryEnd { .. }
             | AgentEvent::CompactionStart { .. }
             | AgentEvent::CompactionEnd { .. }
-            | AgentEvent::EntryAppended { .. } => {
+            | AgentEvent::EntryAppended { .. }
+            | AgentEvent::AgentSettled { .. }
+            | AgentEvent::QueueUpdate { .. }
+            | AgentEvent::ThinkingLevelChanged { .. }
+            | AgentEvent::SessionInfoChanged { .. } => {
                 // The final tool result renders with its message end. The
                 // pump drives its runs directly; the retry, compaction,
-                // and appended-entry displays land with the pump's
-                // AgentRun rework (upstream shows them via agent-session
-                // events).
+                // appended-entry, settled, and queue/level/name-change
+                // displays land with the pump's AgentRun rework (upstream
+                // shows them via agent-session events).
             }
             AgentEvent::MessageStart { message } => match message {
                 AgentMessage::User(user) => {

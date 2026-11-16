@@ -524,7 +524,7 @@ fn run_rpc(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, 
     // `extension_ui_response` lines to pending dialogs while the loop is
     // inside a command (upstream routes both through the same stdin
     // handler, `rpc-mode.ts:759-824`).
-    let bridge = pi_coding_agent::modes::rpc::create_bridge(
+    let mut bridge = pi_coding_agent::modes::rpc::create_bridge(
         Box::new(BufReader::new(std::io::stdin())),
         Box::new(pi_coding_agent::modes::rpc::RpcStdout::new()),
     );
@@ -533,5 +533,5 @@ fn run_rpc(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, 
         build_runtime_with_ui(args, cwd, cwd_string, "rpc", Some(Arc::clone(&bridge.sink)))?;
     #[cfg(not(feature = "ext-js"))]
     let mut runtime = build_runtime(args, cwd, cwd_string, "rpc")?;
-    run_rpc_mode(&mut runtime, &bridge)
+    run_rpc_mode(&mut runtime, &mut bridge)
 }

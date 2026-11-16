@@ -338,6 +338,113 @@ impl AutoCompaction {
         }));
         false
     }
+
+    /// `session.compact(customInstructions)` (`agent-session.ts:2936-3072`):
+    /// the manual compaction behind the RPC `compact` command. `compaction_start`
+    /// goes out before the gate, so even a refused compaction produces the
+    /// start/end pair; the `compaction_end` failure line carries the manual
+    /// `Compaction failed: ` prefix (:3060) while the returned error carries
+    /// the verbatim refusal, which is what the RPC error response echoes.
+    /// The port's `session_before_compact` handlers and the entry abort are
+    /// not wired yet, so `fromExtension` is always `false` and the run is
+    /// never aborted.
+    #[allow(clippy::too_many_lines)] // mirrors session.compact; split when extending
+    pub fn run_manual(
+        &mut self,
+        custom_instructions: Option<&str>,
+        session: &mut SessionManager,
+        model: &Model,
+        api_key: Option<&str>,
+        access_token: Option<&str>,
+        thinking_level: ThinkingLevel,
+        stream_fn: &dyn StreamFn,
+        sink: &mut dyn AgentEventSink,
+    ) -> Result<CompactionResultEvent, String> {
+        crate::runtime::block_on(sink.emit(AgentEvent::CompactionStart {
+            reason: CompactionReason::Manual,
+        }));
+        let fail = |sink: &mut dyn AgentEventSink, message: &str| {
+            crate::runtime::block_on(sink.emit(AgentEvent::CompactionEnd {
+                reason: CompactionReason::Manual,
+                result: None,
+                aborted: false,
+                will_retry: false,
+                error_message: Some(format!("Compaction failed: {message}")),
+            }));
+            message.to_string()
+        };
+        let branch = match session.get_branch(None) {
+            Ok(branch) => branch,
+            Err(err) => return Err(fail(sink, &err.to_string())),
+        };
+        let Some(preparation) = compaction::prepare_compaction(&branch, self.settings) else {
+            // The two refusals (`agent-session.ts:2952-2960`).
+            let message = match branch.last() {
+                Some(crate::session::records::SessionEntry::Compaction(..)) => "Already compacted",
+                _ => "Nothing to compact (session too small)",
+            };
+            return Err(fail(sink, message));
+        };
+        let signal = AbortSignal::new();
+        match crate::runtime::block_on(compaction::compact(
+            &preparation,
+            model,
+            api_key,
+            access_token,
+            custom_instructions,
+            &signal,
+            thinking_level,
+            stream_fn,
+        )) {
+            Ok(result) => {
+                let details = compaction::details_json(&result);
+                let summary = result.summary.clone();
+                let first_kept_entry_id = result.first_kept_entry_id.clone();
+                let tokens_before = result.tokens_before;
+                let usage = result.usage;
+                match session.append_compaction(
+                    &summary,
+                    Some(&first_kept_entry_id),
+                    tokens_before,
+                    Some(details.clone()),
+                    // fromExtension=false — the shared default generator.
+                    Some(false),
+                    usage,
+                ) {
+                    Ok(_entry) => {
+                        let estimated_tokens_after = session.get_branch(None).ok().map(|branch| {
+                            let projection =
+                                crate::session::store::build_session_projection_from(&branch, None);
+                            compaction::estimate_context_tokens(&projection.messages).tokens
+                        });
+                        let event = CompactionResultEvent {
+                            summary,
+                            first_kept_entry_id,
+                            tokens_before,
+                            estimated_tokens_after,
+                            usage,
+                            details,
+                        };
+                        crate::runtime::block_on(sink.emit(AgentEvent::CompactionEnd {
+                            reason: CompactionReason::Manual,
+                            result: Some(event.clone()),
+                            aborted: false,
+                            will_retry: false,
+                            error_message: None,
+                        }));
+                        Ok(event)
+                    }
+                    Err(err) => Err(fail(sink, &err.to_string())),
+                }
+            }
+            // The local signal is never aborted here; a cancelled compaction
+            // or a model failure both surface through `Failed`.
+            Err(err) => match err {
+                CompactionError::Cancelled => Err(fail(sink, "Compaction cancelled")),
+                CompactionError::Failed(message) => Err(fail(sink, &message)),
+            },
+        }
+    }
 }
 
 /// The last assistant message of a run (`agent-session.ts:1270-1277`

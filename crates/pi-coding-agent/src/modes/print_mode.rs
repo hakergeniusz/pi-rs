@@ -367,6 +367,11 @@ pub fn run_print_mode(
             }
         }
     };
+    // `agent_settled` closes the run (`agent-session.ts:1141-1152`): the
+    // run's abort request decides `aborted`.
+    crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AgentSettled {
+        aborted: signal.aborted(),
+    }));
     // Router state decided this turn lands on the branch now (upstream
     // appends mid-turn; the store is not shared with the loop thread).
     #[cfg(feature = "ext-js")]

@@ -1,16 +1,15 @@
 //! JSON mode: run the agent loop and emit every event as a JSON line on
 //! stdout.
 //!
-//! Port of `modes/json-event.ts` (61 lines) on top of the same runtime
-//! resolution as print mode. Each line is one event serialized with pi's
-//! wire shape (`snake_case` `type` discriminant, `camelCase` payload; the
+//! Port of `modes/json-event.ts` (61 lines) plus print-mode.ts's JSON
+//! prelude (`:129-134`) on top of the same runtime resolution as print
+//! mode. Each line is one event serialized with pi's wire shape
+//! (`snake_case` `type` discriminant, `camelCase` payload; the
 //! `message_update` line carries `usage` plus the `partial`-less assistant
-//! event, exactly `json-event.ts`). Remaining deviations:
-//! - upstream emits the coding-agent's extended `agent_end` (with
-//!   `willRetry`); the port emits the loop's plain event.
-//! - upstream subscribes mid-loop (events stream as they happen); the port
-//!   emits through a sink that writes synchronously, which is the same
-//!   visible byte stream for a non-aborted run.
+//! event, exactly `json-event.ts`). Remaining deviation: upstream
+//! subscribes mid-loop (events stream as they happen); the port emits
+//! through a sink that writes synchronously, which is the same visible
+//! byte stream for a non-aborted run.
 
 use std::io::{self, BufWriter, Write};
 use std::sync::Arc;
@@ -122,23 +121,23 @@ pub fn event_to_json(event: &AgentEvent) -> JsonObject {
             tool_name,
             result,
             is_error,
+            duration_ms,
             parent_tool_call_id,
         } => {
-            insert_tool_identity(
-                &mut object,
-                tool_call_id,
-                tool_name,
-                &serde_json::json!({})
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default(),
-                parent_tool_call_id.as_deref(),
-            );
+            // `tool_execution_end` carries no `args` (`types.ts:543-551`).
+            object.insert("toolCallId".to_string(), serde_json::json!(tool_call_id));
+            object.insert("toolName".to_string(), serde_json::json!(tool_name));
             object.insert(
                 "result".to_string(),
                 serde_json::to_value(result).unwrap_or_default(),
             );
             object.insert("isError".to_string(), serde_json::json!(is_error));
+            if let Some(duration_ms) = duration_ms {
+                object.insert("durationMs".to_string(), serde_json::json!(duration_ms));
+            }
+            if let Some(id) = parent_tool_call_id.as_deref() {
+                object.insert("parentToolCallId".to_string(), serde_json::json!(id));
+            }
         }
         AgentEvent::AutoRetryStart {
             attempt,
@@ -187,6 +186,24 @@ pub fn event_to_json(event: &AgentEvent) -> JsonObject {
         }
         AgentEvent::EntryAppended { entry } => {
             object.insert("entry".to_string(), entry.clone());
+        }
+        AgentEvent::AgentSettled { aborted } => {
+            object.insert("aborted".to_string(), serde_json::json!(aborted));
+        }
+        AgentEvent::QueueUpdate {
+            steering,
+            follow_up,
+        } => {
+            object.insert("steering".to_string(), serde_json::json!(steering));
+            object.insert("followUp".to_string(), serde_json::json!(follow_up));
+        }
+        AgentEvent::ThinkingLevelChanged { level } => {
+            object.insert("level".to_string(), serde_json::json!(level));
+        }
+        AgentEvent::SessionInfoChanged { name } => {
+            if let Some(name) = name {
+                object.insert("name".to_string(), serde_json::json!(name));
+            }
         }
     }
     object
@@ -257,6 +274,16 @@ impl<W: Write> JsonEventSink<W> {
 
     fn write_event(&mut self, event: &AgentEvent) {
         let line = serde_json::Value::Object(event_to_json(event)).to_string();
+        if writeln!(self.writer, "{line}").is_err() {
+            // stdout closed: upstream's output guard (P7) aborts the run; the
+            // port's signal handling lands with it.
+        }
+    }
+
+    /// Writes one pre-serialized value as a JSON line. JSON mode's prelude is
+    /// the session header (`print-mode.ts:129-134`).
+    fn write_value(&mut self, value: &serde_json::Value) {
+        let line = value.to_string();
         if writeln!(self.writer, "{line}").is_err() {
             // stdout closed: upstream's output guard (P7) aborts the run; the
             // port's signal handling lands with it.
@@ -341,6 +368,12 @@ pub fn run_json_mode(
 
     let mut queues = Queues::new();
     let mut sink = JsonEventSink::new(io::stdout().lock());
+    // The session header prelude, before any event (`print-mode.ts:129-134`).
+    if let Some(header) = runtime.session.get_header()
+        && let Ok(header) = serde_json::to_value(&header)
+    {
+        sink.write_value(&header);
+    }
     let signal = Arc::new(AbortSignal::new());
     // Under a virtual selection every request routes first
     // (`_installAgentRequestProjection`).
@@ -538,6 +571,11 @@ pub fn run_json_mode(
             }
         }
     };
+    // `agent_settled` closes the run (`agent-session.ts:1141-1152`): the
+    // run's abort request decides `aborted`.
+    crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AgentSettled {
+        aborted: signal.aborted(),
+    }));
     sink.flush();
     #[cfg(feature = "ext-js")]
     if let Some(routing) = &routing {
