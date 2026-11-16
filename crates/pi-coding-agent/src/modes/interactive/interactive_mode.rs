@@ -4234,7 +4234,8 @@ impl InteractiveMode {
         if matches.len() > 1 {
             let same_id = matches.iter().all(|provider| provider.id == matches[0].id);
             if same_id {
-                let provider_options = matches.into_iter().cloned().collect();
+                let provider_options: Vec<AuthSelectorProvider> =
+                    matches.into_iter().cloned().collect();
                 self.show_login_auth_type_selector(Some(provider_options.as_slice()));
                 return;
             }
@@ -4277,10 +4278,7 @@ impl InteractiveMode {
     /// subscription/API-key options for one provider, or the top-level menu
     /// with the Radius option last. `provider_options` carries the one
     /// provider's entries when `/login <ref>` matched several auth types.
-    fn show_login_auth_type_selector(
-        &mut self,
-        provider_options: Option<&[AuthSelectorProvider]>,
-    ) {
+    fn show_login_auth_type_selector(&mut self, provider_options: Option<&[AuthSelectorProvider]>) {
         let all_options = oauth::login_provider_options(&self.auth_path);
         // The top-level selector offers Radius directly, as its last option
         // (`interactive-mode.ts:6090-6093`).
@@ -4514,7 +4512,9 @@ impl InteractiveMode {
     /// `errorMsg === "Login cancelled"` branch).
     fn run_login_back(&mut self, back: Option<LoginBackStep>) {
         match back {
-            Some(LoginBackStep::AuthType(options)) => self.show_login_auth_type_selector(options.as_deref()),
+            Some(LoginBackStep::AuthType(options)) => {
+                self.show_login_auth_type_selector(options.as_deref())
+            }
             Some(LoginBackStep::Provider(auth_type)) => {
                 self.show_login_provider_selector(auth_type, None);
             }
