@@ -567,7 +567,8 @@ mod tests {
         let plain = strip_terminal_sequences(&selector.render(100).join("\n"));
         assert!(plain.contains("Groq"), "{plain}");
         assert!(!plain.contains("OpenAI"), "{plain}");
-        selector.handle_input("zzz").expect("typed");
+        // Typed keys filter without consuming (`InputAction::None`).
+        let _ = selector.handle_input("zzz");
         let plain = strip_terminal_sequences(&selector.render(100).join("\n"));
         assert!(plain.contains("No matching providers"), "{plain}");
     }
