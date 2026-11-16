@@ -312,10 +312,6 @@ struct CompactionRun {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Whether the automatic compaction re-runs the turn on completion
-/// (`_runAutoCompaction`'s `willRetry` → `agent.continue()`).
-struct AutoContinueAfterCompaction;
-
 /// `QueueSource` over a mutex-shared [`Queues`]: the loop borrows it for the
 /// whole run while the UI keeps enqueueing (`agent.steer`/`followUp`).
 struct SharedQueues(Arc<Mutex<Queues>>);
@@ -1767,7 +1763,10 @@ impl InteractiveMode {
                 }
                 self.tui.request_render();
             }
-            AgentEvent::AgentEnd { messages, will_retry } => {
+            AgentEvent::AgentEnd {
+                messages,
+                will_retry,
+            } => {
                 // The pump's post-run machine consumes the verdict and the
                 // run's messages (`_handlePostAgentRun`, `agent-session.ts`
                 // :2062-2098).
@@ -2135,9 +2134,7 @@ impl InteractiveMode {
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        pi_ai::types::AssistantContent::ToolCall(call) => {
-                            Some(call.id.clone())
-                        }
+                        pi_ai::types::AssistantContent::ToolCall(call) => Some(call.id.clone()),
                         _ => None,
                     })
                     .collect(),
@@ -2368,7 +2365,9 @@ impl InteractiveMode {
         if self.retry_attempt > 0 {
             let attempt = self.retry_attempt;
             self.retry_attempt = 0;
-            self.show_error(&format!("Retry failed after {attempt} attempts: Retry cancelled"));
+            self.show_error(&format!(
+                "Retry failed after {attempt} attempts: Retry cancelled"
+            ));
         }
         self.last_run_turn = None;
         self.set_working_status(None);
@@ -5042,11 +5041,10 @@ impl InteractiveMode {
                         .as_ref()
                         .is_some_and(|messages| !crate::modes::retry::run_succeeded(messages));
                     if failed {
-                        let error = self
-                            .last_agent_end_messages
-                            .as_deref()
-                            .map(crate::modes::retry::last_error_text)
-                            .unwrap_or_else(|| "Unknown error".to_string());
+                        let error = self.last_agent_end_messages.as_deref().map_or_else(
+                            || "Unknown error".to_string(),
+                            crate::modes::retry::last_error_text,
+                        );
                         self.show_error(&format!(
                             "Retry failed after {} attempts: {error}",
                             self.retry_attempt
