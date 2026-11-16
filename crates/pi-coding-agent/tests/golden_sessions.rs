@@ -115,7 +115,7 @@ fn golden_headers_decode_as_v3_with_synthetic_cwds() {
         "01a1e4e8-da35-7789-82da-852d30b04c0f",
         "01a1e4e9-05a2-7018-8622-e30713cef684",
     ];
-    for ((name, cwd), id) in FIXTURES.iter().zip(ids) {
+    for ((name, cwd), id) in FIXTURES.iter().copied().zip(ids) {
         let header = read_session_header(&fixtures_dir().join(name))
             .unwrap()
             .unwrap();
@@ -496,7 +496,8 @@ fn golden_fixtures_open_in_the_manager_without_a_rewrite() {
         // The branch's raw records (everything but the header, on a linear
         // fixture) re-serialize to the file's remainder byte for byte.
         let branch_records = manager.get_branch_records(None);
-        let (_, body) = fixture_text(name).split_once('\n').unwrap();
+        let text = fixture_text(name);
+        let (_, body) = text.split_once('\n').unwrap();
         assert_eq!(serialize_entries(&branch_records), body, "{name}");
 
         // Opening a current-version session must not touch the file.
