@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use pi_agent::agent_loop::{AgentLoopConfig, DefaultConvertToLlm};
 use pi_agent::agent_message::AgentMessage;
-use pi_agent::events::CollectingSink;
+use pi_agent::events::{AgentEventSink, CollectingSink};
 use pi_agent::queues::Queues;
 use pi_agent::transcript::tool_declaration;
 use pi_agent::types::{
@@ -22,6 +22,7 @@ use pi_ai::types::{ImageContent, Model, StopReason};
 
 use crate::auth::{self, Credential};
 use crate::cli::args::{Args, Mode};
+use crate::config::settings::RetrySettings;
 use crate::session::store::{SessionManager, build_session_context_from};
 use crate::tools::index::{ToolDefinition, ToolRegistry};
 
@@ -56,6 +57,8 @@ pub struct PrintRuntime {
     /// The resolved trust decision, shared with the interactive host
     /// (extensions may decide through the `project_trust` hook).
     pub project_trusted: bool,
+    /// The auto-retry budget (`settings.retry`), driving the run tails.
+    pub retry_settings: RetrySettings,
     /// The extension runner the mode-level surfaces share (E2 slice 4):
     /// the RPC dialog bridge, the `user_bash` interception, the session
     /// gates, and the context transform. `None` without the engine.
@@ -205,16 +208,57 @@ pub fn run_print_mode(
     };
     #[cfg(not(feature = "ext-js"))]
     let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = Arc::clone(&runtime.stream_fn);
-    let new_messages = crate::runtime::block_on(pi_agent::run_agent_loop(
-        prompts,
-        context,
-        executor.as_ref(),
-        &config,
-        &mut queues,
-        &mut sink,
-        &signal,
-        loop_stream_fn.as_ref(),
-    ));
+    // The auto-retry machine (`agent-session.ts` `_handlePostAgentRun`): a
+    // retryable error within budget re-runs the same prompt after a backoff;
+    // the failed response is never persisted.
+    let mut retry = crate::modes::retry::AgentRetry::new(runtime.retry_settings);
+    let new_messages = loop {
+        let messages = crate::runtime::block_on(pi_agent::run_agent_loop(
+            prompts.clone(),
+            context.clone(),
+            executor.as_ref(),
+            &config,
+            &mut queues,
+            &mut sink,
+            &signal,
+            loop_stream_fn.as_ref(),
+        ));
+        let aborted = signal.aborted();
+        if retry.will_retry(aborted, &messages) {
+            let (attempt, max_attempts, delay_ms, error_message) = retry.schedule(&messages);
+            crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message: error_message.clone(),
+            }));
+            if retry.sleep(delay_ms, &signal) {
+                continue;
+            }
+            crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt,
+                final_error: Some(error_message),
+            }));
+            break messages;
+        }
+        if retry.attempt() > 0 {
+            let success = crate::modes::retry::run_succeeded(&messages);
+            crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AutoRetryEnd {
+                success,
+                attempt: retry.attempt(),
+                final_error: if success {
+                    None
+                } else {
+                    Some(crate::modes::retry::last_error_text(&messages))
+                },
+            }));
+            if success {
+                retry.reset();
+            }
+        }
+        break messages;
+    };
     // Router state decided this turn lands on the branch now (upstream
     // appends mid-turn; the store is not shared with the loop thread).
     #[cfg(feature = "ext-js")]

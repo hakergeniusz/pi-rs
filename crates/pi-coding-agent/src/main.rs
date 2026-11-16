@@ -391,6 +391,7 @@ fn build_runtime_with_ui(
         system_prompt,
         session,
         project_trusted,
+        retry_settings: settings.get_retry_settings(),
         #[cfg(feature = "ext-js")]
         extension_runner: extensions.host.runner(),
     })

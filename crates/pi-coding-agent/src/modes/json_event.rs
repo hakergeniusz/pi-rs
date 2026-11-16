@@ -135,6 +135,28 @@ pub fn event_to_json(event: &AgentEvent) -> JsonObject {
             );
             object.insert("isError".to_string(), serde_json::json!(is_error));
         }
+        AgentEvent::AutoRetryStart {
+            attempt,
+            max_attempts,
+            delay_ms,
+            error_message,
+        } => {
+            object.insert("attempt".to_string(), serde_json::json!(attempt));
+            object.insert("maxAttempts".to_string(), serde_json::json!(max_attempts));
+            object.insert("delayMs".to_string(), serde_json::json!(delay_ms));
+            object.insert("errorMessage".to_string(), serde_json::json!(error_message));
+        }
+        AgentEvent::AutoRetryEnd {
+            success,
+            attempt,
+            final_error,
+        } => {
+            object.insert("success".to_string(), serde_json::json!(success));
+            object.insert("attempt".to_string(), serde_json::json!(attempt));
+            if let Some(final_error) = final_error {
+                object.insert("finalError".to_string(), serde_json::json!(final_error));
+            }
+        }
     }
     object
 }
@@ -329,16 +351,57 @@ pub fn run_json_mode(
     };
     #[cfg(not(feature = "ext-js"))]
     let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = Arc::clone(&runtime.stream_fn);
-    let new_messages = crate::runtime::block_on(pi_agent::run_agent_loop(
-        prompts,
-        context,
-        executor.as_ref(),
-        &config,
-        &mut queues,
-        &mut sink,
-        &signal,
-        loop_stream_fn.as_ref(),
-    ));
+    // The auto-retry machine (`agent-session.ts` `_handlePostAgentRun`),
+    // emitting `auto_retry_start`/`auto_retry_end` lines like upstream's
+    // event stream (`agent-session.ts:235-237`).
+    let mut retry = crate::modes::retry::AgentRetry::new(runtime.retry_settings);
+    let new_messages = loop {
+        let messages = crate::runtime::block_on(pi_agent::run_agent_loop(
+            prompts.clone(),
+            context.clone(),
+            executor.as_ref(),
+            &config,
+            &mut queues,
+            &mut sink,
+            &signal,
+            loop_stream_fn.as_ref(),
+        ));
+        let aborted = signal.aborted();
+        if retry.will_retry(aborted, &messages) {
+            let (attempt, max_attempts, delay_ms, error_message) = retry.schedule(&messages);
+            crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message: error_message.clone(),
+            }));
+            if retry.sleep(delay_ms, &signal) {
+                continue;
+            }
+            crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt,
+                final_error: Some(error_message),
+            }));
+            break messages;
+        }
+        if retry.attempt() > 0 {
+            let success = crate::modes::retry::run_succeeded(&messages);
+            crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AutoRetryEnd {
+                success,
+                attempt: retry.attempt(),
+                final_error: if success {
+                    None
+                } else {
+                    Some(crate::modes::retry::last_error_text(&messages))
+                },
+            }));
+            if success {
+                retry.reset();
+            }
+        }
+        break messages;
+    };
     sink.flush();
     #[cfg(feature = "ext-js")]
     if let Some(routing) = &routing {

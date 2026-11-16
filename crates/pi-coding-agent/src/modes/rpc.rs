@@ -610,16 +610,56 @@ fn run_agent_turn(
     };
     #[cfg(not(feature = "ext-js"))]
     let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = Arc::clone(&runtime.stream_fn);
-    let new_messages = crate::runtime::block_on(pi_agent::run_agent_loop(
-        user_prompts,
-        context,
-        executor.as_ref(),
-        &config,
-        &mut queues,
-        &mut sink,
-        &signal,
-        loop_stream_fn.as_ref(),
-    ));
+    // The auto-retry machine (`agent-session.ts` `_handlePostAgentRun`); the
+    // RPC sink forwards the events like any other.
+    let mut retry = crate::modes::retry::AgentRetry::new(runtime.retry_settings);
+    let new_messages = loop {
+        let messages = crate::runtime::block_on(pi_agent::run_agent_loop(
+            user_prompts.clone(),
+            context.clone(),
+            executor.as_ref(),
+            &config,
+            &mut queues,
+            &mut sink,
+            &signal,
+            loop_stream_fn.as_ref(),
+        ));
+        let aborted = signal.aborted();
+        if retry.will_retry(aborted, &messages) {
+            let (attempt, max_attempts, delay_ms, error_message) = retry.schedule(&messages);
+            crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AutoRetryStart {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error_message: error_message.clone(),
+            }));
+            if retry.sleep(delay_ms, &signal) {
+                continue;
+            }
+            crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt,
+                final_error: Some(error_message),
+            }));
+            break messages;
+        }
+        if retry.attempt() > 0 {
+            let success = crate::modes::retry::run_succeeded(&messages);
+            crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AutoRetryEnd {
+                success,
+                attempt: retry.attempt(),
+                final_error: if success {
+                    None
+                } else {
+                    Some(crate::modes::retry::last_error_text(&messages))
+                },
+            }));
+            if success {
+                retry.reset();
+            }
+        }
+        break messages;
+    };
     #[cfg(feature = "ext-js")]
     if let Some(routing) = &routing {
         routing.persist_state(&mut runtime.session);

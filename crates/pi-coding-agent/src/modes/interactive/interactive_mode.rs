@@ -1484,6 +1484,10 @@ impl InteractiveMode {
             | AgentEvent::ToolExecutionEnd { .. } => {
                 // The final tool result renders with its message end.
             }
+            // The pump drives its runs directly; the retry status display
+            // lands with the pump's AgentRun rework (upstream shows it via
+            // agent-session events).
+            AgentEvent::AutoRetryStart { .. } | AgentEvent::AutoRetryEnd { .. } => {}
             AgentEvent::MessageStart { message } => match message {
                 AgentMessage::User(user) => {
                     let text = match &user.content {
@@ -4616,6 +4620,12 @@ mod tests {
             session: SessionManager::in_memory(dir, &NewSessionOptions::default(), Vec::new())
                 .expect("session"),
             project_trusted: false,
+            retry_settings: crate::config::settings::RetrySettings {
+                enabled: true,
+                max_retries: 3,
+                base_delay_ms: 2000,
+                max_agent_delay_ms: 60_000,
+            },
             #[cfg(feature = "ext-js")]
             extension_runner: None,
         }

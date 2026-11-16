@@ -4,4 +4,5 @@
 pub mod interactive;
 pub mod json_event;
 pub mod print_mode;
+pub mod retry;
 pub mod rpc;

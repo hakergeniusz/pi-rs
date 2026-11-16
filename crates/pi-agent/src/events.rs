@@ -65,6 +65,19 @@ pub enum AgentEvent {
         is_error: bool,
         parent_tool_call_id: Option<String>,
     },
+    // Auto-retry lifecycle (`agent-session.ts:235-237`): the retry machine
+    // schedules a re-run around a transient provider error.
+    AutoRetryStart {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        error_message: String,
+    },
+    AutoRetryEnd {
+        success: bool,
+        attempt: u32,
+        final_error: Option<String>,
+    },
 }
 
 impl AgentEvent {
@@ -81,6 +94,8 @@ impl AgentEvent {
             AgentEvent::ToolExecutionStart { .. } => "tool_execution_start",
             AgentEvent::ToolExecutionUpdate { .. } => "tool_execution_update",
             AgentEvent::ToolExecutionEnd { .. } => "tool_execution_end",
+            AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
+            AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
         }
     }
 }
