@@ -21,8 +21,8 @@
 use pi_agent::agent_message::AgentMessage;
 use pi_agent::events::{AgentEvent, AgentEventSink, CompactionReason, CompactionResultEvent};
 use pi_agent::types::AbortSignal;
-use pi_ai::types::Model;
 use pi_agent::types::{StreamFn, ThinkingLevel};
+use pi_ai::types::Model;
 
 use crate::session::compaction::{
     self, CompactionError, CompactionSettings, DEFAULT_COMPACTION_SETTINGS,
@@ -81,9 +81,8 @@ impl AutoCompaction {
         if model.context_window == 0 {
             return false;
         }
-        let branch = match session.get_branch(None) {
-            Ok(branch) => branch,
-            Err(_) => return false,
+        let Ok(branch) = session.get_branch(None) else {
+            return false;
         };
         let projection = crate::session::store::build_session_projection_from(&branch, None);
         let tokens = compaction::estimate_projected_context_tokens(&projection, &branch).tokens;
@@ -121,15 +120,13 @@ impl AutoCompaction {
         // the latest compaction boundary (:3138-3143) — a stale
         // pre-compaction usage/error must not retrigger compaction on the
         // first prompt after compaction.
-        let branch = match session.get_branch(None) {
-            Ok(branch) => branch,
-            Err(_) => return Decision::None,
+        let Ok(branch) = session.get_branch(None) else {
+            return Decision::None;
         };
-        if let Some(compaction_entry) =
-            crate::session::store::get_latest_compaction_entry(&branch)
+        if let Some(compaction_entry) = crate::session::store::get_latest_compaction_entry(&branch)
         {
             let boundary_ms = crate::session::store::iso_to_ms(&compaction_entry.base.timestamp);
-            if (assistant.timestamp as i64) <= boundary_ms {
+            if assistant.timestamp <= boundary_ms {
                 return Decision::None;
             }
         }
@@ -139,16 +136,15 @@ impl AutoCompaction {
         // otherwise the selection must match the message's provider/model.
         let message_model = message_model(assistant, model);
         let same_model = message_model.is_some();
-        let context_window = message_model.as_ref().map_or(model.context_window, |m| {
-            m.context_window
-        });
+        let context_window = message_model
+            .as_ref()
+            .map_or(model.context_window, |m| m.context_window);
 
         // Automatic cases 1 and 2: context overflow (:3145-3215). The port's
         // failed response is unpersisted at decision time, so it is always
         // projected and retained for recovery (see the module docs).
-        let explicit_overflow =
-            assistant.stop_reason == pi_ai::types::StopReason::Error
-                && pi_ai::overflow::is_context_overflow(assistant, None);
+        let explicit_overflow = assistant.stop_reason == pi_ai::types::StopReason::Error
+            && pi_ai::overflow::is_context_overflow(assistant, None);
         let context_overflow = same_model
             && (explicit_overflow
                 || pi_ai::overflow::is_context_overflow(assistant, Some(context_window)));
@@ -186,10 +182,12 @@ impl AutoCompaction {
         // valid response; with context edits the projection estimate wins.
         let projection = crate::session::store::build_session_projection_from(&branch, None);
         let direct_context_tokens = compaction::calculate_context_tokens(&assistant.usage);
-        let has_context_edits = projection
-            .entries
-            .iter()
-            .any(|entry| matches!(entry.source_entry, crate::session::records::SessionEntry::ContextEdit(_)));
+        let has_context_edits = projection.entries.iter().any(|entry| {
+            matches!(
+                entry.source_entry,
+                crate::session::records::SessionEntry::ContextEdit(_)
+            )
+        });
         let context_tokens = if has_context_edits {
             compaction::estimate_projected_context_tokens(&projection, &branch).tokens
         } else if assistant.stop_reason == pi_ai::types::StopReason::Error
@@ -205,8 +203,7 @@ impl AutoCompaction {
                 // (`usageMsg.role === "assistant"`, :3237-3240).
                 let stale = match (compaction_entry_in(&branch), usage_message) {
                     (Some(entry), AgentMessage::Assistant(a)) => {
-                        (a.timestamp as i64)
-                            <= crate::session::store::iso_to_ms(&entry.base.timestamp)
+                        a.timestamp <= crate::session::store::iso_to_ms(&entry.base.timestamp)
                     }
                     _ => false,
                 };
@@ -230,6 +227,7 @@ impl AutoCompaction {
     /// Upstream's `session_before_compact`/`session_compact`/
     /// `session_compact_failed` extension events ride the E3 bridge.
     #[allow(clippy::too_many_lines)] // mirrors the TS run loop; split when extending
+    #[allow(clippy::too_many_arguments)] // mirrors _runAutoCompaction's inputs
     pub fn run(
         &mut self,
         reason: CompactionReason,
@@ -242,9 +240,8 @@ impl AutoCompaction {
         stream_fn: &dyn StreamFn,
         sink: &mut dyn AgentEventSink,
     ) -> bool {
-        let branch = match session.get_branch(None) {
-            Ok(branch) => branch,
-            Err(_) => return false,
+        let Ok(branch) = session.get_branch(None) else {
+            return false;
         };
         let Some(preparation) = compaction::prepare_compaction(&branch, self.settings) else {
             return false;
@@ -279,13 +276,11 @@ impl AutoCompaction {
                     Ok(_entry) => {
                         // `estimatedTokensAfter` over the post-compaction
                         // projection (:3348).
-                        let estimated_tokens_after = session
-                            .get_branch(None)
-                            .ok()
-                            .map(|branch| {
-                                let projection = crate::session::store::build_session_projection_from(&branch, None);
-                                compaction::estimate_context_tokens(&projection.messages).tokens
-                            });
+                        let estimated_tokens_after = session.get_branch(None).ok().map(|branch| {
+                            let projection =
+                                crate::session::store::build_session_projection_from(&branch, None);
+                            compaction::estimate_context_tokens(&projection.messages).tokens
+                        });
                         crate::runtime::block_on(sink.emit(AgentEvent::CompactionEnd {
                             reason,
                             result: Some(CompactionResultEvent {
@@ -302,7 +297,7 @@ impl AutoCompaction {
                         }));
                         will_retry
                     }
-                    Err(err) => Self::emit_failure(reason, sink, err.to_string()),
+                    Err(err) => Self::emit_failure(reason, sink, &err.to_string()),
                 }
             }
             Err(err) => match err {
@@ -317,7 +312,7 @@ impl AutoCompaction {
                     }));
                     false
                 }
-                CompactionError::Failed(message) => Self::emit_failure(reason, sink, message),
+                CompactionError::Failed(message) => Self::emit_failure(reason, sink, &message),
             },
         }
     }
@@ -327,7 +322,7 @@ impl AutoCompaction {
     fn emit_failure(
         reason: CompactionReason,
         sink: &mut dyn AgentEventSink,
-        message: String,
+        message: &str,
     ) -> bool {
         let error_message = if reason == CompactionReason::Overflow {
             format!("Context overflow recovery failed: {message}")
@@ -372,7 +367,9 @@ fn message_model(assistant: &pi_ai::types::AssistantMessage, model: &Model) -> O
 }
 
 /// The latest compaction entry of a branch, shared by the two stale checks.
-fn compaction_entry_in(branch: &[crate::session::records::SessionEntry]) -> Option<&CompactionEntry> {
+fn compaction_entry_in(
+    branch: &[crate::session::records::SessionEntry],
+) -> Option<&CompactionEntry> {
     crate::session::store::get_latest_compaction_entry(branch)
 }
 
@@ -525,7 +522,10 @@ mod tests {
         );
         match machine.post_run_decision(false, &messages, &messages, &no_session(), &model()) {
             Decision::RecoveryFailed { message } => {
-                assert!(message.contains("one compact-and-retry attempt"), "{message}");
+                assert!(
+                    message.contains("one compact-and-retry attempt"),
+                    "{message}"
+                );
             }
             decision => panic!("expected recovery failure, got {decision:?}"),
         }

@@ -615,8 +615,7 @@ fn run_agent_turn(
     // RPC sink forwards the events like any other.
     let mut retry = crate::modes::retry::AgentRetry::new(runtime.retry_settings);
 
-    let mut compaction =
-        crate::modes::compaction::AutoCompaction::new(runtime.compaction_settings);
+    let mut compaction = crate::modes::compaction::AutoCompaction::new(runtime.compaction_settings);
     let new_messages = loop {
         // `_compactBeforeNextAssistantResponse` (`agent-session.ts:839-848`):
         // the threshold gate keys on the model about to answer; under a
