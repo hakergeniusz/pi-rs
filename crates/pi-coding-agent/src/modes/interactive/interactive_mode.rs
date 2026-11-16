@@ -4966,7 +4966,7 @@ impl InteractiveMode {
                 self.suspend_editor_with(Box::new(selector));
                 true
             }
-            Some("text") | Some("manual_code") => {
+            Some("text" | "manual_code") => {
                 let message = payload
                     .get("message")
                     .and_then(serde_json::Value::as_str)
@@ -5129,7 +5129,7 @@ impl InteractiveMode {
     }
 
     /// The settled credential (`completeProviderAuthentication`'s storage
-    /// + status, `interactive-mode.ts:6277-6331`): store the oauth
+    /// and status, `interactive-mode.ts:6277-6331`): store the oauth
     /// credential and report the saved path.
     fn finish_extension_login(&mut self, flow: &ExtensionLoginFlow, credential: serde_json::Value) {
         if let Some(runner) = self.extension_runner.as_ref() {
