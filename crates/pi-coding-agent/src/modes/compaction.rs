@@ -349,6 +349,7 @@ impl AutoCompaction {
     /// not wired yet, so `fromExtension` is always `false` and the run is
     /// never aborted.
     #[allow(clippy::too_many_lines)] // mirrors session.compact; split when extending
+    #[allow(clippy::too_many_arguments)] // mirrors session.compact's parameter list; split when extending
     pub fn run_manual(
         &mut self,
         custom_instructions: Option<&str>,

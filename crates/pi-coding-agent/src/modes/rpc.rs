@@ -1442,7 +1442,8 @@ mod tests {
     /// A process pipe pair drives the bridge deterministically: the test
     /// writes lines on the writer side while the reader thread consumes.
     struct BridgeFixture {
-        bridge: RpcBridge,
+        /// `None` once `take_bridge` moved it into the mode thread.
+        bridge: Option<RpcBridge>,
         writer: std::io::PipeWriter,
         out: SharedBuf,
     }
@@ -1453,10 +1454,21 @@ mod tests {
             let out = SharedBuf::default();
             let bridge = create_bridge(Box::new(BufReader::new(reader)), Box::new(out.clone()));
             Self {
-                bridge,
+                bridge: Some(bridge),
                 writer,
                 out,
             }
+        }
+
+        /// The bridge for drains that leave it in place.
+        fn bridge(&self) -> &RpcBridge {
+            self.bridge.as_ref().expect("bridge still in the fixture")
+        }
+
+        /// Moves the bridge into the mode thread; the fixture keeps the
+        /// pipe writer and the shared output.
+        fn take_bridge(&mut self) -> RpcBridge {
+            self.bridge.take().expect("bridge still in the fixture")
         }
 
         fn write_line(&self, line: &str) {
@@ -1481,8 +1493,7 @@ mod tests {
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "timed out waiting for {count} lines: {:?}",
-                    lines
+                    "timed out waiting for {count} lines: {lines:?}"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
@@ -1745,30 +1756,31 @@ mod tests {
 
     #[test]
     fn bridge_routes_commands_and_ignores_unknown_ui_responses() {
-        let fixture = BridgeFixture::new();
+        let mut fixture = BridgeFixture::new();
         fixture.write_line(r#"{"type":"get_state","id":1}"#);
         // No dialog is pending; the response drops on the floor.
         fixture.write_line(r#"{"type":"extension_ui_response","id":"ui-9","value":"x"}"#);
         fixture.write_line(r#"{"type":"get_state","id":2}"#);
-        let first = fixture.bridge.commands.recv().expect("command");
+        let bridge = fixture.take_bridge();
+        let first = bridge.commands.recv().expect("command");
         assert!(first.contains(r#""type":"get_state""#));
-        let second = fixture.bridge.commands.recv().expect("command");
+        let second = bridge.commands.recv().expect("command");
         assert!(second.contains(r#""id":2"#));
         drop(fixture.writer);
         assert!(
-            fixture.bridge.commands.recv().is_err(),
+            bridge.commands.recv().is_err(),
             "stdin close ends the command stream"
         );
     }
 
     #[test]
     fn rpc_mode_answers_state_text_and_unknown_frames() {
-        let fixture = BridgeFixture::new();
+        let mut fixture = BridgeFixture::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
         let session_id = runtime.session.get_session_id().to_string();
         // Moved out of the fixture: the mode thread owns the bridge now.
-        let bridge = fixture.bridge;
+        let bridge = fixture.take_bridge();
         let mode = ModeThread::start(runtime, bridge);
 
         fixture.write_line(r#"{"type":"get_state","id":"s1"}"#);
@@ -1854,15 +1866,15 @@ mod tests {
 
     #[test]
     fn rpc_mode_queues_steering_and_streams_the_run() {
-        let fixture = BridgeFixture::new();
+        let mut fixture = BridgeFixture::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut runtime = test_runtime(
+        let runtime = test_runtime(
             dir.path(),
             Arc::new(TextScript {
                 calls: AtomicUsize::new(0),
             }),
         );
-        let bridge = fixture.bridge;
+        let bridge = fixture.take_bridge();
         let mode = ModeThread::start(runtime, bridge);
 
         // Steering while idle queues, emits the queue update, and answers
@@ -1896,8 +1908,7 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "run did not settle: {:?}",
-                lines
+                "run did not settle: {lines:?}",
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         };
@@ -1940,10 +1951,10 @@ mod tests {
 
     #[test]
     fn rpc_mode_sets_thinking_level_with_the_clamp_and_the_event() {
-        let fixture = BridgeFixture::new();
+        let mut fixture = BridgeFixture::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut runtime = test_runtime(dir.path(), Arc::new(NeverStream));
-        let bridge = fixture.bridge;
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        let bridge = fixture.take_bridge();
         let mode = ModeThread::start(runtime, bridge);
 
         fixture.write_line(r#"{"type":"set_thinking_level","id":"h1","level":"high"}"#);
@@ -1973,10 +1984,10 @@ mod tests {
 
     #[test]
     fn rpc_mode_clears_the_queue_and_reports_the_texts() {
-        let fixture = BridgeFixture::new();
+        let mut fixture = BridgeFixture::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut runtime = test_runtime(dir.path(), Arc::new(NeverStream));
-        let bridge = fixture.bridge;
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        let bridge = fixture.take_bridge();
         let mode = ModeThread::start(runtime, bridge);
 
         fixture.write_line(r#"{"type":"steer","message":"one"}"#);
@@ -2010,10 +2021,10 @@ mod tests {
 
     #[test]
     fn rpc_mode_names_the_session_and_refuses_empty_verbatim() {
-        let fixture = BridgeFixture::new();
+        let mut fixture = BridgeFixture::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut runtime = test_runtime(dir.path(), Arc::new(NeverStream));
-        let bridge = fixture.bridge;
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        let bridge = fixture.take_bridge();
         let mode = ModeThread::start(runtime, bridge);
 
         fixture.write_line(r#"{"type":"set_session_name","id":"n1","name":"  My Session  "}"#);
@@ -2048,7 +2059,7 @@ mod tests {
     #[test]
     fn sink_request_writes_wire_shape_and_response_resolves() {
         let fixture = BridgeFixture::new();
-        fixture.bridge.sink.request(&json!({
+        fixture.bridge().sink.request(&json!({
             "id": "ui-1",
             "method": "select",
             "title": "Pick",
@@ -2062,7 +2073,7 @@ mod tests {
             lines[0]
         );
         fixture.write_line(r#"{"type":"extension_ui_response","id":"ui-1","value":"a"}"#);
-        let response = fixture.bridge.sink.wait_response("ui-1", "select");
+        let response = fixture.bridge().sink.wait_response("ui-1", "select");
         // The sink is transport-level: the whole frame crosses; the JS
         // glue's per-method parseResponse extracts the payload.
         assert_eq!(
@@ -2075,14 +2086,14 @@ mod tests {
     #[test]
     fn sink_timeout_resolves_to_the_method_default() {
         let fixture = BridgeFixture::new();
-        fixture.bridge.sink.request(&json!({
+        fixture.bridge().sink.request(&json!({
             "id": "ui-2",
             "method": "confirm",
             "title": "Proceed",
             "timeout": 40,
         }));
         let started = std::time::Instant::now();
-        let response = fixture.bridge.sink.wait_response("ui-2", "confirm");
+        let response = fixture.bridge().sink.wait_response("ui-2", "confirm");
         assert_eq!(
             response,
             Value::Null,
@@ -2098,7 +2109,7 @@ mod tests {
     #[test]
     fn sink_fire_and_forget_requests_only_write() {
         let fixture = BridgeFixture::new();
-        fixture.bridge.sink.request(&json!({
+        fixture.bridge().sink.request(&json!({
             "id": "ui-3",
             "method": "notify",
             "message": "hello",
@@ -2106,7 +2117,7 @@ mod tests {
         }));
         assert_eq!(fixture.output_lines().len(), 1, "the notify crossed");
         // No waiter was registered: the wait returns the default at once.
-        let response = fixture.bridge.sink.wait_response("ui-3", "notify");
+        let response = fixture.bridge().sink.wait_response("ui-3", "notify");
         assert_eq!(response, Value::Null);
     }
 }
