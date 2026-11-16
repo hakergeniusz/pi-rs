@@ -536,6 +536,7 @@ fn tool_name(spec: &ToolSpec) -> String {
 }
 
 /// One full agent run, events streamed to `output` as they happen.
+#[allow(clippy::too_many_lines)] // mirrors the TS run loop; split when extending
 fn run_agent_turn(
     runtime: &mut PrintRuntime,
     prompts: Vec<String>,

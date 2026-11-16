@@ -1481,13 +1481,14 @@ impl InteractiveMode {
             AgentEvent::AgentStart
             | AgentEvent::TurnStart
             | AgentEvent::TurnEnd { .. }
-            | AgentEvent::ToolExecutionEnd { .. } => {
-                // The final tool result renders with its message end.
+            | AgentEvent::ToolExecutionEnd { .. }
+            | AgentEvent::AutoRetryStart { .. }
+            | AgentEvent::AutoRetryEnd { .. } => {
+                // The final tool result renders with its message end. The
+                // pump drives its runs directly; the retry status display
+                // lands with the pump's AgentRun rework (upstream shows it
+                // via agent-session events).
             }
-            // The pump drives its runs directly; the retry status display
-            // lands with the pump's AgentRun rework (upstream shows it via
-            // agent-session events).
-            AgentEvent::AutoRetryStart { .. } | AgentEvent::AutoRetryEnd { .. } => {}
             AgentEvent::MessageStart { message } => match message {
                 AgentMessage::User(user) => {
                     let text = match &user.content {

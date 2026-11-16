@@ -30,6 +30,7 @@ use crate::session::store::build_session_context_from;
 /// payload fields, `camelCase` like pi's JSON protocol.
 // Upstream `json-event.ts` serializes the same union; this is the explicit
 // shape-by-shape port of it.
+#[allow(clippy::too_many_lines)] // mirrors the TS union; split when extending
 pub fn event_to_json(event: &AgentEvent) -> JsonObject {
     let mut object = JsonObject::new();
     object.insert("type".to_string(), serde_json::json!(event.kind()));

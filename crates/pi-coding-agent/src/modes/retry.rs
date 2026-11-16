@@ -41,9 +41,7 @@ impl AgentRetry {
         if !self.settings.enabled || self.attempt >= self.max_attempts() {
             return false;
         }
-        last_assistant(messages)
-            .map(|assistant| pi_ai::retry::is_retryable_assistant_error(assistant))
-            .unwrap_or(false)
+        last_assistant(messages).is_some_and(pi_ai::retry::is_retryable_assistant_error)
     }
 
     /// Advance the attempt and compute the backoff. Returns
@@ -182,7 +180,7 @@ mod tests {
 
     #[test]
     fn quota_exhaustion_and_disabled_and_budget_end_the_machine() {
-        let mut disabled = AgentRetry::new(settings(false));
+        let disabled = AgentRetry::new(settings(false));
         let messages = vec![assistant_message(StopReason::Error, Some("HTTP 503"))];
         assert!(!disabled.will_retry(false, &messages));
 
@@ -196,7 +194,7 @@ mod tests {
             StopReason::Error,
             Some("insufficient_quota"),
         )];
-        let mut fresh = AgentRetry::new(settings(true));
+        let fresh = AgentRetry::new(settings(true));
         assert!(!fresh.will_retry(false, &quota));
     }
 
