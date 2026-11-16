@@ -7552,7 +7552,9 @@ mod tests {
         mode.tui.render_now(false);
         let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
         assert!(frame.contains("Select provider to logout:"), "{frame}");
-        assert!(frame.contains("groq"), "{frame}");
+        // Builtin providers render their upstream display name; unknown ones
+        // fall back to the id (`oauth-selector.ts:30-49`).
+        assert!(frame.contains("Groq [API key]"), "{frame}");
         assert!(frame.contains("acme"), "{frame}");
 
         // Confirming the api_key row (escape is the other exit; the pump
@@ -7569,7 +7571,7 @@ mod tests {
         mode.pump();
         mode.tui.render_now(false);
         let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
-        assert!(frame.contains("Removed stored API key for groq"), "{frame}");
+        assert!(frame.contains("Removed stored API key for Groq"), "{frame}");
         assert!(
             frame.contains("Environment variables and models.json config are unchanged"),
             "{frame}"
@@ -7610,7 +7612,7 @@ mod tests {
         mode.pump();
         mode.tui.render_now(false);
         let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
-        assert!(frame.contains("Saved API key for groq"), "{frame}");
+        assert!(frame.contains("Saved API key for Groq"), "{frame}");
         assert!(frame.contains("Credentials saved to"), "{frame}");
         let stored = std::fs::read_to_string(dir.path().join("auth.json")).expect("auth.json");
         assert!(stored.contains("\"groq\""), "{stored}");

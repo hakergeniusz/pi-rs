@@ -190,7 +190,10 @@ fn rebuild(
     for model in crate::virtual_models::virtual_models_from_defs(virtual_defs) {
         // Their providers join the registry even when nothing else defines
         // them (`providerIds()`'s `...this.virtualModels.keys()`).
-        if !provider_ids.iter().any(|existing| existing == &model.provider) {
+        if !provider_ids
+            .iter()
+            .any(|existing| existing == &model.provider)
+        {
             provider_ids.push(model.provider.clone());
         }
         if !models

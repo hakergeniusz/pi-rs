@@ -287,17 +287,17 @@ pub fn builtin_provider_name(provider_id: &str) -> Option<&'static str> {
         "qwen-token-plan-cn" => Some("Qwen Token Plan Team CN"), // qwen-token-plan-cn.ts:9
         "qwen-token-plan-individual" => Some("Qwen Token Plan Individual"), // qwen-token-plan-individual.ts:9
         "qwen-token-plan-individual-cn" => Some("Qwen Token Plan Individual CN"), // qwen-token-plan-individual-cn.ts:9
-        "radius" => Some("Radius"),                 // radius.ts:24
-        "together" => Some("Together"),             // together.ts:9
-        "typesafe" => Some("TypeSafe"),             // typesafe.ts:9
+        "radius" => Some("Radius"),                                               // radius.ts:24
+        "together" => Some("Together"),                                           // together.ts:9
+        "typesafe" => Some("TypeSafe"),                                           // typesafe.ts:9
         "vercel-ai-gateway" => Some("Vercel AI Gateway"), // vercel-ai-gateway.ts:10
-        "xai" => Some("xAI"),                       // xai.ts:10
-        "xiaomi" => Some("Xiaomi"),                 // xiaomi.ts:9
+        "xai" => Some("xAI"),                             // xai.ts:10
+        "xiaomi" => Some("Xiaomi"),                       // xiaomi.ts:9
         "xiaomi-token-plan-ams" => Some("Xiaomi Token Plan AMS"), // xiaomi-token-plan-ams.ts:9
         "xiaomi-token-plan-cn" => Some("Xiaomi Token Plan CN"), // xiaomi-token-plan-cn.ts:9
         "xiaomi-token-plan-sgp" => Some("Xiaomi Token Plan SGP"), // xiaomi-token-plan-sgp.ts:9
-        "zai" => Some("Z.AI"),                      // zai.ts:9
-        "zai-coding-cn" => Some("Z.AI Coding CN"),  // zai-coding-cn.ts:9
+        "zai" => Some("Z.AI"),                            // zai.ts:9
+        "zai-coding-cn" => Some("Z.AI Coding CN"),        // zai-coding-cn.ts:9
         _ => None,
     }
 }
@@ -410,8 +410,7 @@ pub fn provider_auth_methods(
                     .unwrap_or_else(|| provider_id.to_string())
             } else {
                 builtin_provider_name(provider_id)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| provider_id.to_string())
+                    .map_or_else(|| provider_id.to_string(), str::to_string)
             };
             Some(OAuthAuthInfo {
                 name,
@@ -1206,8 +1205,14 @@ mod tests {
     #[test]
     fn builtin_provider_names_are_verbatim() {
         assert_eq!(builtin_provider_name("anthropic"), Some("Anthropic"));
-        assert_eq!(builtin_provider_name("amazon-bedrock"), Some("Amazon Bedrock"));
-        assert_eq!(builtin_provider_name("kimi-coding"), Some("Kimi For Coding"));
+        assert_eq!(
+            builtin_provider_name("amazon-bedrock"),
+            Some("Amazon Bedrock")
+        );
+        assert_eq!(
+            builtin_provider_name("kimi-coding"),
+            Some("Kimi For Coding")
+        );
         assert_eq!(builtin_provider_name("opencode"), Some("OpenCode Zen"));
         assert_eq!(builtin_provider_name("radius"), Some("Radius"));
         assert_eq!(builtin_provider_name("acme"), None);
@@ -1302,7 +1307,10 @@ mod tests {
         // metadata (`anthropic.ts:79-85`).
         let oauth = plain_name("anthropic", "oauth").expect("oauth row");
         assert_eq!(oauth.name, "Anthropic");
-        assert_eq!(oauth.method_name.as_deref(), Some("Anthropic (Claude Pro/Max)"));
+        assert_eq!(
+            oauth.method_name.as_deref(),
+            Some("Anthropic (Claude Pro/Max)")
+        );
         assert!(oauth.subscription);
         let api_key = plain_name("anthropic", "api_key").expect("api key row");
         assert_eq!(api_key.method_name.as_deref(), Some("Anthropic API key"));
@@ -1347,7 +1355,11 @@ mod tests {
                 .iter()
                 .map(|provider| (provider.id.as_str(), provider.auth_type))
                 .collect::<Vec<_>>(),
-            [("acme", "oauth"), ("ghost", "api_key"), ("other", "api_key")]
+            [
+                ("acme", "oauth"),
+                ("ghost", "api_key"),
+                ("other", "api_key")
+            ]
         );
         // Unknown providers keep the id as the name (`:6044`).
         let ghost = &options[1];
@@ -1357,8 +1369,7 @@ mod tests {
         let status = ghost.status.as_ref().expect("status");
         assert_eq!(status.source, Some("stored credential"));
         let plain = pi_tui::ansi::strip_terminal_sequences(&format_auth_selector_provider_status(
-            ghost,
-            status,
+            ghost, status,
         ));
         assert_eq!(plain, " ✓ configured");
 
@@ -1393,7 +1404,11 @@ mod tests {
                 .iter()
                 .map(|provider| (provider.id.as_str(), provider.auth_type))
                 .collect::<Vec<_>>(),
-            [("acme", "api_key"), ("flagged", "api_key"), ("other", "api_key")]
+            [
+                ("acme", "api_key"),
+                ("flagged", "api_key"),
+                ("other", "api_key")
+            ]
         );
 
         remove_runtime_api_key("acme");
