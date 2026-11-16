@@ -35,8 +35,9 @@ use serde_json::{Map, Value, json};
 #[cfg(feature = "ext-js")]
 use pi_agent::agent_loop::PrepareRequest;
 use pi_agent::agent_message::AgentMessage;
+use pi_agent::types::AbortSignal;
 #[cfg(feature = "ext-js")]
-use pi_agent::types::{AbortSignal, PrepareRequestContext, TurnUpdate, clamp_thinking_level};
+use pi_agent::types::{PrepareRequestContext, TurnUpdate, clamp_thinking_level};
 use pi_agent::types::{StreamFn, StreamRequest, ThinkingLevel};
 use pi_ai::types::{Model, ModelInputModality, StopReason};
 
@@ -1256,6 +1257,9 @@ export default function (pi) {
         assert_eq!(records[0]["customType"], "pi.virtual-model-state");
         assert_eq!(records[0]["data"]["modelId"], "slow");
         // The queue drained: a second persist appends nothing.
-        assert!(routing.persist_state(&mut session).is_empty());
+        assert_eq!(
+            routing.persist_state(&mut session),
+            Vec::<serde_json::Value>::new()
+        );
     }
 }

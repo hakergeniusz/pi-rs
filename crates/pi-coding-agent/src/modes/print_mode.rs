@@ -347,7 +347,9 @@ pub fn run_print_mode(
         // `entry_appended` for each router-state record
         // (`agent-session.ts:894-897`).
         for entry in routing.persist_state(&mut runtime.session) {
-            crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::EntryAppended { entry }));
+            crate::runtime::block_on(
+                sink.emit(pi_agent::events::AgentEvent::EntryAppended { entry }),
+            );
         }
     }
 
