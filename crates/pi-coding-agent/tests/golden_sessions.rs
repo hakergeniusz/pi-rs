@@ -217,7 +217,7 @@ fn golden_plain_exchange_round_trips_byte_exactly() {
     let AssistantContent::Thinking(thinking) = &assistant.content[0] else {
         panic!("expected a thinking block");
     };
-    assert!(!thinking.thinking.is_empty());
+    assert_ne!(thinking.thinking, "");
     assert_eq!(
         thinking.thinking_signature.as_deref(),
         Some("reasoning_content")
