@@ -696,8 +696,7 @@ fn level_step(state: &Arc<Mutex<SelectorState>>, thinking_level: &str) -> Submen
             let Some((provider, id)) = provider.zip(id) else {
                 return Vec::new();
             };
-            let Some(model) = pi_ai::catalog::catalog()
-                .models(&provider)
+            let Some(model) = crate::models_state::models_for(&provider)
                 .into_iter()
                 .find(|model| model.id == id)
             else {
@@ -705,7 +704,7 @@ fn level_step(state: &Arc<Mutex<SelectorState>>, thinking_level: &str) -> Submen
             };
             let state = level_state.lock().expect("selector state");
             let active_level = state.model_thinking_levels.get(&key);
-            let mut items: Vec<SelectItem> = pi_ai::types::get_supported_thinking_levels(model)
+            let mut items: Vec<SelectItem> = pi_ai::types::get_supported_thinking_levels(&model)
                 .into_iter()
                 .map(|level| {
                     let marker = if Some(level) == active_level.map(String::as_str) {

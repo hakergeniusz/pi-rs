@@ -1467,6 +1467,17 @@ impl ExtensionRunner {
         Ok(current)
     }
 
+    /// Monotonic mutation counter of the provider registry, for host-side
+    /// composed-catalog rebuilds.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.core
+            .lock()
+            .expect("host core mutex poisoned")
+            .providers
+            .generation()
+    }
+
     /// The provider registrations the host applies to its model catalog.
     #[must_use]
     pub fn providers(&self) -> Vec<(String, String, Json)> {

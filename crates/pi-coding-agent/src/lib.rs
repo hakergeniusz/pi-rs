@@ -35,6 +35,9 @@ pub mod extensions;
 /// (`core/model-config.ts` plus the models.json halves of
 /// `core/provider-composer.ts`).
 pub mod models_config;
+/// The composed model catalog: base catalog ⊕ models.json ⊕ extension
+/// providers ⊕ virtual models (`core/model-runtime.ts`, slice 6b).
+pub mod models_state;
 /// Print, JSON-event, RPC, and interactive modes.
 pub mod modes;
 /// System prompt assembly (`core/system-prompt.ts`).

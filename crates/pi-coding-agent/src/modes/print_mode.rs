@@ -18,7 +18,6 @@ use pi_agent::transcript::tool_declaration;
 use pi_agent::types::{
     AbortSignal, AgentContext, StreamFn, ThinkingLevel, ToolExecutionMode, ToolExecutor, ToolSpec,
 };
-use pi_ai::catalog;
 use pi_ai::types::{ImageContent, Model, StopReason};
 
 use crate::auth::{self, Credential};
@@ -384,7 +383,7 @@ pub fn resolve_model_with(
             .iter()
             .find(|model| model.provider == provider && model.id == id)
             .cloned()
-            .or_else(|| catalog::catalog().get(provider, id).cloned())
+            .or_else(|| crate::models_state::lookup(provider, id))
     };
     let Some(pattern) = pattern else {
         // Fall back to the settings default; otherwise ask for a model.
@@ -404,15 +403,13 @@ pub fn resolve_model_with(
             .cloned()
             .collect();
         matches.extend(
-            catalog::catalog()
-                .find(&pattern.id)
+            crate::models_state::find_by_id(&pattern.id)
                 .into_iter()
                 .filter(|model| {
                     !virtual_models.iter().any(|virtual_model| {
                         virtual_model.provider == model.provider && virtual_model.id == model.id
                     })
-                })
-                .cloned(),
+                }),
         );
         match matches.len() {
             0 => return Err(format!("Model not found: {}", pattern.id)),

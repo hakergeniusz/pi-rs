@@ -720,10 +720,10 @@ impl InteractiveMode {
             autocomplete::SlashCommand::new("model", "Select model (opens selector UI)")
                 .with_argument_hint("<provider/model>")
                 .with_argument_completions(Arc::new(move |prefix: &str| {
-                    let catalog = pi_ai::catalog::catalog();
+                    let composed = crate::models_state::all();
                     let mut models: Vec<(String, String, String)> = Vec::new(); // (id, provider, name)
-                    for provider in catalog.providers() {
-                        for model in catalog.models(provider) {
+                    for provider in crate::models_state::providers() {
+                        for model in composed.iter().filter(|model| model.provider == provider) {
                             // A virtual registration hides the same-id
                             // physical entry (`withVirtualModels`).
                             if virtual_models.iter().any(|virtual_model| {
@@ -731,11 +731,7 @@ impl InteractiveMode {
                             }) {
                                 continue;
                             }
-                            models.push((
-                                model.id.clone(),
-                                provider.to_string(),
-                                model.name.clone(),
-                            ));
+                            models.push((model.id.clone(), provider.clone(), model.name.clone()));
                         }
                     }
                     for model in &virtual_models {
@@ -1613,9 +1609,7 @@ impl InteractiveMode {
                         failed: None,
                     },
                     crate::virtual_models::RouteResolvers {
-                        get_model: &|provider, id| {
-                            pi_ai::catalog::catalog().get(provider, id).cloned()
-                        },
+                        get_model: &|provider, id| crate::models_state::lookup(provider, id),
                         has_credentials: &|provider| {
                             crate::modes::print_mode::resolve_wire_credential(
                                 provider,
@@ -1933,6 +1927,13 @@ impl InteractiveMode {
     /// (`withVirtualModels`' additions to a provider's models).
     #[cfg(feature = "ext-js")]
     fn virtual_catalog_models(&self) -> Vec<pi_ai::types::Model> {
+        // Registrations apply live (`model-runtime.ts`); rebuild the
+        // composed snapshot when the registry moved.
+        if let Some(runner) = &self.extension_runner {
+            crate::models_state::refresh_with_runner(
+                &runner.lock().expect("extension runner mutex poisoned"),
+            );
+        }
         self.extension_runner
             .as_ref()
             .map(|runner| {
@@ -1995,23 +1996,28 @@ impl InteractiveMode {
     /// same-id physical model.
     fn available_models(&self) -> Vec<pi_ai::types::Model> {
         let auth_path = &self.auth_path;
-        let catalog = pi_ai::catalog::catalog();
+        let composed = crate::models_state::all();
         let virtual_models = self.virtual_catalog_models();
         let mut models = Vec::new();
-        for provider in catalog.providers() {
+        for provider in crate::models_state::providers() {
             let flag_key = if provider == self.model.provider {
                 self.api_key.clone()
             } else {
                 None
             };
             if crate::modes::print_mode::resolve_wire_credential(
-                provider,
+                &provider,
                 flag_key.as_deref(),
                 auth_path,
             )
             .is_some()
             {
-                models.extend(catalog.models(provider).into_iter().cloned());
+                models.extend(
+                    composed
+                        .iter()
+                        .filter(|model| model.provider == provider)
+                        .cloned(),
+                );
             }
         }
         crate::virtual_models::with_virtual_model_listing(models, &virtual_models)

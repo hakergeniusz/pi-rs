@@ -53,9 +53,18 @@ pub struct ProviderRegistry {
     providers: Vec<RegisteredProvider>,
     native_providers: Vec<RegisteredNativeProvider>,
     virtual_models: Vec<RegisteredVirtualModel>,
+    /// Bumped on every mutation so the host can rebuild its composed model
+    /// catalog lazily (`model-runtime.ts` applies registrations live).
+    generation: u64,
 }
 
 impl ProviderRegistry {
+    /// Monotonic mutation counter for host-side catalog rebuilds.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// `runtime.registerProvider` (`model-runtime.ts:965-986`): validate
     /// standalone, then merge the config over any previous registration.
     pub fn register(
@@ -91,6 +100,7 @@ impl ProviderRegistry {
                 config: Value::Object(merged),
             }),
         }
+        self.generation += 1;
         Ok(())
     }
 
@@ -111,15 +121,24 @@ impl ProviderRegistry {
             provider,
             extension_path: extension_path.to_string(),
         });
+        self.generation += 1;
         Ok(())
     }
 
     /// `runtime.unregisterProvider` (`model-runtime.ts:988-994`): removes
     /// both registration kinds; no-op when absent.
     pub fn unregister(&mut self, name: &str) {
+        let had = self.providers.iter().any(|provider| provider.name == name)
+            || self
+                .native_providers
+                .iter()
+                .any(|existing| existing.provider.get("id").and_then(Value::as_str) == Some(name));
         self.providers.retain(|provider| provider.name != name);
         self.native_providers
             .retain(|existing| existing.provider.get("id").and_then(Value::as_str) != Some(name));
+        if had {
+            self.generation += 1;
+        }
     }
 
     /// `runtime.registerVirtualModel` (`model-runtime.ts:1001-1021`):
@@ -148,13 +167,21 @@ impl ProviderRegistry {
             definition,
             extension_path: extension_path.to_string(),
         });
+        self.generation += 1;
         Ok(())
     }
 
     /// `runtime.unregisterVirtualModel` (`model-runtime.ts:1022-1029`).
     pub fn unregister_virtual_model(&mut self, provider: &str, id: &str) {
+        let had = self
+            .virtual_models
+            .iter()
+            .any(|existing| Self::same_key(existing, provider, id));
         self.virtual_models
             .retain(|existing| !Self::same_key(existing, provider, id));
+        if had {
+            self.generation += 1;
+        }
     }
 
     fn same_key(existing: &RegisteredVirtualModel, provider: &str, id: &str) -> bool {

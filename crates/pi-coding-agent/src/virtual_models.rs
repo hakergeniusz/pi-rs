@@ -640,9 +640,7 @@ impl VirtualRouteHook {
             state.insert((model.provider.clone(), model.id.clone()), value);
         }
         Self {
-            get_model: Box::new(|provider, id| {
-                pi_ai::catalog::catalog().get(provider, id).cloned()
-            }),
+            get_model: Box::new(crate::models_state::lookup),
             has_credentials: Box::new(move |provider| {
                 crate::modes::print_mode::resolve_wire_credential(provider, None, &auth_path)
                     .is_some()

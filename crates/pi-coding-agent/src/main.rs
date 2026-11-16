@@ -7,7 +7,6 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pi_ai::catalog;
 use pi_ai::providers;
 
 use pi_ai::types::ImageContent;
@@ -98,8 +97,8 @@ fn main() {
 /// search of upstream `cli/list-models.ts` lands in P5.
 fn list_models(search: Option<&str>) {
     let search = search.unwrap_or("");
-    for provider in catalog::catalog().providers() {
-        for model in catalog::catalog().models(provider) {
+    for provider in pi_coding_agent::models_state::providers() {
+        for model in pi_coding_agent::models_state::models_for(&provider) {
             let full = format!("{provider}/{}", model.id);
             if search.is_empty() || full.contains(search) || model.id.contains(search) {
                 println!("{full}\t{}", model.name);
@@ -222,6 +221,16 @@ fn build_runtime_with_ui(
         }
         return Err(message);
     }
+    // Composed model catalog: models.json ⊕ extension providers ⊕ virtual
+    // models (`model-runtime.ts`; consumers read `models_state`).
+    #[cfg(feature = "ext-js")]
+    if let Some(runner) = extensions.host.runner() {
+        pi_coding_agent::models_state::refresh_with_runner(
+            &runner.lock().expect("extension runner mutex poisoned"),
+        );
+    }
+    #[cfg(not(feature = "ext-js"))]
+    pi_coding_agent::models_state::refresh();
     let project_trusted = extensions.project_trusted;
 
     // `resolveProjectTrusted` (`project-trust.ts:47-97`): the `--approve`
