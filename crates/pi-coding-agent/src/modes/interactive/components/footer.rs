@@ -67,6 +67,89 @@ impl UsageTotals {
         self.cache_write += usage.cache_write;
         self.cost += usage.cost.total;
     }
+
+    /// `tokens` (`core/usage-totals.ts:88`): the four token buckets.
+    pub fn tokens(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+}
+
+/// One `getUsageCostBreakdown` row (`UsageCostBreakdownEntry`,
+/// `core/usage-totals.ts:67-72`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageCostBreakdownEntry {
+    /// `provider/model` for model-attributed usage, `Tools/summaries` for
+    /// tool-result / branch-summary / compaction usage.
+    pub key: String,
+    pub cost: f64,
+    pub tokens: u64,
+}
+
+/// `getUsageCostBreakdown` (`core/usage-totals.ts:78-99`): group
+/// model-attributed usage by model and all other usage into a separate
+/// bucket, most expensive first. Usage without model attribution is grouped
+/// separately so the breakdown reconciles with the session total.
+pub fn get_usage_cost_breakdown(entries: &[crate::session::records::SessionEntry]) -> Vec<UsageCostBreakdownEntry> {
+    use crate::session::records::SessionEntry;
+    use pi_agent::agent_message::AgentMessage;
+
+    let mut totals_by_key: Vec<(String, UsageTotals)> = Vec::new();
+    let mut add = |key: String, usage: &pi_ai::types::Usage| {
+        if let Some((_, totals)) = totals_by_key.iter_mut().find(|(k, _)| *k == key) {
+            totals.add(usage);
+        } else {
+            let mut totals = UsageTotals::default();
+            totals.add(usage);
+            totals_by_key.push((key, totals));
+        }
+    };
+
+    for entry in entries {
+        match entry {
+            SessionEntry::Message(entry) => match &entry.message {
+                AgentMessage::Assistant(message) => {
+                    let key = format!(
+                        "{}/{}",
+                        message.provider,
+                        message.response_model.as_deref().unwrap_or(&message.model)
+                    );
+                    add(key, &message.usage);
+                }
+                AgentMessage::ToolResult(message) => {
+                    if let Some(usage) = &message.usage {
+                        add("Tools/summaries".to_string(), usage);
+                    }
+                }
+                _ => {}
+            },
+            SessionEntry::Usage(entry) => {
+                add(format!("{}/{}", entry.provider, entry.model), &entry.usage);
+            }
+            SessionEntry::BranchSummary(entry) => {
+                if let Some(usage) = &entry.usage {
+                    add("Tools/summaries".to_string(), usage);
+                }
+            }
+            SessionEntry::Compaction(entry) => {
+                if let Some(usage) = &entry.usage {
+                    add("Tools/summaries".to_string(), usage);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut breakdown: Vec<UsageCostBreakdownEntry> = totals_by_key
+        .into_iter()
+        .map(|(key, totals)| UsageCostBreakdownEntry {
+            key,
+            cost: totals.cost,
+            tokens: totals.tokens(),
+        })
+        .filter(|entry| entry.cost > 0.0 || entry.tokens > 0)
+        .collect();
+    breakdown.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+    breakdown
 }
 
 /// The data the footer renders, gathered by the interactive loop.

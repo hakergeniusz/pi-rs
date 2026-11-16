@@ -26,6 +26,7 @@
 
 use std::path::PathBuf;
 
+pub mod cache_stats;
 pub mod compaction;
 pub mod json;
 pub mod migrate;

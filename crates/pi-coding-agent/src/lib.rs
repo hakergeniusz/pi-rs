@@ -25,8 +25,12 @@
 
 /// Credential storage for provider auth (`core/auth-storage.ts`).
 pub mod auth;
+/// Changelog parsing and link normalization (`utils/changelog.ts`).
+pub mod changelog;
 /// Argument parsing, `@file` processing, project trust.
 pub mod cli;
+/// Clipboard writes for `/copy` (`utils/clipboard-command.ts` + `utils/clipboard.ts`).
+pub mod clipboard;
 /// Global + project config loading (`config.ts`).
 pub mod config;
 /// Runtime-agnostic extension host seam (runtime decision pending at the P5 gate).

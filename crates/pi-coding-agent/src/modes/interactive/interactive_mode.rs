@@ -322,6 +322,297 @@ fn queue_mode_as_setting(mode: QueueMode) -> &'static str {
     }
 }
 
+/// `/name`'s argument: the text after the command word, trimmed
+/// (`handleNameCommand`, `interactive-mode.ts:6860`, `/^\/name\s*/` + trim).
+fn name_argument(text: &str) -> &str {
+    text.strip_prefix("/name").unwrap_or("").trim()
+}
+
+/// `JSON.stringify` of a string (`interactive-mode.ts:6875`): a JSON string
+/// literal, used for the name-normalization warning.
+fn json_stringify(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
+}
+
+/// The `/session` numbers (`SessionStats`, `agent-session.ts:357-375`,
+/// reduced to the fields the command renders; `contextUsage` is footer work).
+struct SessionStats {
+    session_file: Option<std::path::PathBuf>,
+    session_id: String,
+    total_messages: u64,
+    user_messages: u64,
+    assistant_messages: u64,
+    tool_calls: u64,
+    tool_results: u64,
+    tokens: super::components::footer::UsageTotals,
+}
+
+impl Default for SessionStats {
+    fn default() -> Self {
+        SessionStats {
+            session_file: None,
+            session_id: String::new(),
+            total_messages: 0,
+            user_messages: 0,
+            assistant_messages: 0,
+            tool_calls: 0,
+            tool_results: 0,
+            tokens: super::components::footer::UsageTotals::default(),
+        }
+    }
+}
+
+/// `toLocaleString()`'s digit grouping for the token counts
+/// (`interactive-mode.ts:6925` and friends). Upstream formats in the host
+/// locale; the port always groups with commas (the en-US default).
+fn to_locale_string(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.char_indices() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    grouped
+}
+
+/// `renderInfo` (`interactive-mode.ts:6900-6960`): the `/session` block.
+#[allow(clippy::too_many_lines)] // mirrors the TS renderInfo; split when extending
+fn session_info_text(
+    stats: &SessionStats,
+    session_name: Option<&str>,
+    cache_warming_mode: &str,
+    cache_waste: &crate::session::cache_stats::CacheWasteTotals,
+    usage_breakdown: &[super::components::footer::UsageCostBreakdownEntry],
+    selected_model_key: &str,
+) -> String {
+    let theme = theme::theme();
+    let dim = |text: &str| theme.fg(pi_tui::theme::ThemeColor::Dim, text);
+    let tokens = &stats.tokens;
+    let mut info = format!("{}\n\n", bold_text("Session Info"));
+    if let Some(session_name) = session_name {
+        info += &format!("{} {session_name}\n", dim("Name:"));
+    }
+    info += &format!(
+        "{} {}\n",
+        dim("File:"),
+        stats.session_file.as_deref().map_or_else(
+            || "In-memory".to_string(),
+            |file| file.to_string_lossy().into_owned()
+        )
+    );
+    info += &format!("{} {}\n\n", dim("ID:"), stats.session_id);
+    info += &format!("{}\n", bold_text("Messages"));
+    info += &format!("{} {}\n", dim("Total:"), stats.total_messages);
+    info += &format!("{} {}\n", dim("User:"), stats.user_messages);
+    info += &format!("{} {}\n", dim("Assistant:"), stats.assistant_messages);
+    info += &format!(
+        "{} {} calls, {} results\n\n",
+        dim("Tools:"),
+        stats.tool_calls,
+        stats.tool_results
+    );
+    info += &format!("{}\n", bold_text("Tokens"));
+    // "Input" is the full prompt volume. With cache activity, split it into
+    // cached (served from cache) vs uncached (everything else) - the only
+    // provider-independent split. Cache writes, where reported, are a detail
+    // of the uncached portion.
+    let prompt_tokens = tokens.input + tokens.cache_read + tokens.cache_write;
+    info += &format!("{} {}\n", dim("Input:"), to_locale_string(prompt_tokens));
+    if prompt_tokens > 0 && (tokens.cache_read > 0 || tokens.cache_write > 0) {
+        let hit_rate = dim(&format!(
+            "({:.1}%)",
+            tokens.cache_read as f64 / prompt_tokens as f64 * 100.0
+        ));
+        info += &format!(
+            "  {} {} {hit_rate}\n",
+            dim("Cached:"),
+            to_locale_string(tokens.cache_read)
+        );
+        let written = if tokens.cache_write > 0 {
+            format!(
+                " {}",
+                dim(&format!(
+                    "({} written to cache)",
+                    to_locale_string(tokens.cache_write)
+                ))
+            )
+        } else {
+            String::new()
+        };
+        info += &format!(
+            "  {} {}{written}\n",
+            dim("Uncached:"),
+            to_locale_string(tokens.input + tokens.cache_write)
+        );
+    }
+    info += &format!("{} {}\n", dim("Output:"), to_locale_string(tokens.output));
+    info += &format!("{} {}\n", dim("Total:"), to_locale_string(tokens.tokens()));
+
+    info += &format!("\n{}\n", bold_text("Cache Warming"));
+    info += &format!("{} {cache_warming_mode}\n", dim("Mode:"));
+    // The formatted live status lands with the cache warmer; without one the
+    // status is always the fallback (`interactive-mode.ts:6934-6935`).
+    info += &format!("{} Inactive (cache warming unavailable)\n", dim("Status:"));
+
+    if stats.tokens.cost > 0.0 || cache_waste.missed_tokens > 0 {
+        info += &format!("\n{}\n", bold_text("Cost"));
+        info += &format!("{} ${:.3}", dim("Total:"), stats.tokens.cost);
+        // A single entry repeats the total, unless it names a model other
+        // than the selected one.
+        if usage_breakdown.len() > 1
+            || usage_breakdown.first().is_some_and(|entry| entry.key != selected_model_key)
+        {
+            for entry in usage_breakdown {
+                info += &format!(
+                    "\n  {} ${:.3} {}",
+                    dim(&format!("{}:", entry.key)),
+                    entry.cost,
+                    dim(&format!(
+                        "({} tokens)",
+                        super::components::footer::format_tokens(entry.tokens)
+                    ))
+                );
+            }
+        }
+        if cache_waste.missed_tokens > 0 {
+            let miss_label = if cache_waste.miss_count == 1 {
+                "1 miss".to_string()
+            } else {
+                format!("{} misses", cache_waste.miss_count)
+            };
+            let detail = format!(
+                "{} tokens, {miss_label}",
+                to_locale_string(cache_waste.missed_tokens)
+            );
+            info += &if cache_waste.missed_cost >= 0.0001 {
+                format!(
+                    "\n{} ${:.3} {}",
+                    dim("Cache Re-billed:"),
+                    cache_waste.missed_cost,
+                    dim(&format!("({detail})"))
+                )
+            } else {
+                format!("\n{} {detail}", dim("Cache Re-billed:"))
+            };
+        }
+    }
+    info
+}
+
+/// `theme.bold` (`theme.ts`): the port's chat lines embed the bold SGR
+/// directly (see `compaction_summary.rs`).
+fn bold_text(text: &str) -> String {
+    format!("\x1b[1m{text}\x1b[22m")
+}
+
+/// `handleHotkeysCommand`'s table (`interactive-mode.ts:6999-7099`): the
+/// Navigation/Editing/Other sections with the effective keybindings filled
+/// in. The extension-registered-shortcuts section (`interactive-mode.ts:7101-7112`)
+/// renders only when the runner reports shortcuts; it lands with the
+/// extension UI (E3).
+#[allow(clippy::too_many_lines)] // mirrors the TS template literal; split when extending
+fn hotkeys_markdown() -> String {
+    // Navigation keybindings
+    let cursor_up = theme::key_display_text("tui.editor.cursorUp");
+    let cursor_down = theme::key_display_text("tui.editor.cursorDown");
+    let cursor_left = theme::key_display_text("tui.editor.cursorLeft");
+    let cursor_right = theme::key_display_text("tui.editor.cursorRight");
+    let cursor_word_left = theme::key_display_text("tui.editor.cursorWordLeft");
+    let cursor_word_right = theme::key_display_text("tui.editor.cursorWordRight");
+    let cursor_line_start = theme::key_display_text("tui.editor.cursorLineStart");
+    let cursor_line_end = theme::key_display_text("tui.editor.cursorLineEnd");
+    let jump_forward = theme::key_display_text("tui.editor.jumpForward");
+    let jump_backward = theme::key_display_text("tui.editor.jumpBackward");
+    let page_up = theme::key_display_text("tui.editor.pageUp");
+    let page_down = theme::key_display_text("tui.editor.pageDown");
+
+    // Editing keybindings
+    let submit = theme::key_display_text("tui.input.submit");
+    let new_line = theme::key_display_text("tui.input.newLine");
+    let delete_word_backward = theme::key_display_text("tui.editor.deleteWordBackward");
+    let delete_word_forward = theme::key_display_text("tui.editor.deleteWordForward");
+    let delete_to_line_start = theme::key_display_text("tui.editor.deleteToLineStart");
+    let delete_to_line_end = theme::key_display_text("tui.editor.deleteToLineEnd");
+    let yank = theme::key_display_text("tui.editor.yank");
+    let yank_pop = theme::key_display_text("tui.editor.yankPop");
+    let undo = theme::key_display_text("tui.editor.undo");
+    let tab = theme::key_display_text("tui.input.tab");
+
+    // App keybindings
+    let interrupt = theme::key_display_text(theme::app_keys::INTERRUPT);
+    let clear = theme::key_display_text(theme::app_keys::CLEAR);
+    let exit = theme::key_display_text(theme::app_keys::EXIT);
+    let suspend = theme::key_display_text(theme::app_keys::SUSPEND);
+    let cycle_thinking_level = theme::key_display_text(theme::app_keys::THINKING_CYCLE);
+    let cycle_model_forward = theme::key_display_text(theme::app_keys::MODEL_CYCLE_FORWARD);
+    let select_model = theme::key_display_text(theme::app_keys::MODEL_SELECT);
+    let expand_tools = theme::key_display_text(theme::app_keys::TOOLS_EXPAND);
+    let toggle_thinking = theme::key_display_text(theme::app_keys::THINKING_TOGGLE);
+    let external_editor = theme::key_display_text(theme::app_keys::EDITOR_EXTERNAL);
+    let cycle_model_backward = theme::key_display_text(theme::app_keys::MODEL_CYCLE_BACKWARD);
+    let copy_message = theme::key_display_text(theme::app_keys::MESSAGE_COPY);
+    let follow_up = theme::key_display_text(theme::app_keys::MESSAGE_FOLLOW_UP);
+    let dequeue = theme::key_display_text(theme::app_keys::MESSAGE_DEQUEUE);
+    let paste_image = theme::key_display_text(theme::app_keys::CLIPBOARD_PASTE_IMAGE);
+
+    let windows_new_line_note = if cfg!(windows) {
+        " (Ctrl+Enter on Windows Terminal)"
+    } else {
+        ""
+    };
+    format!(
+        "
+**Navigation**
+| Key | Action |
+|-----|--------|
+| `{cursor_up}` / `{cursor_down}` / `{cursor_left}` / `{cursor_right}` | Move cursor / browse history |
+| `{cursor_word_left}` / `{cursor_word_right}` | Move by word |
+| `{cursor_line_start}` | Start of line |
+| `{cursor_line_end}` | End of line |
+| `{jump_forward}` | Jump forward to character |
+| `{jump_backward}` | Jump backward to character |
+| `{page_up}` / `{page_down}` | Scroll by page |
+
+**Editing**
+| Key | Action |
+|-----|--------|
+| `{submit}` | Send message |
+| `{new_line}` | New line{windows_new_line_note} |
+| `{delete_word_backward}` | Delete word backwards |
+| `{delete_word_forward}` | Delete word forwards |
+| `{delete_to_line_start}` | Delete to start of line |
+| `{delete_to_line_end}` | Delete to end of line |
+| `{yank}` | Paste the most-recently-deleted text |
+| `{yank_pop}` | Cycle through the deleted text after pasting |
+| `{undo}` | Undo |
+
+**Other**
+| Key | Action |
+|-----|--------|
+| `{tab}` | Path completion / accept autocomplete |
+| `{interrupt}` | Cancel autocomplete / abort streaming |
+| `{clear}` | Clear editor (first) / exit (second) |
+| `{exit}` | Exit (when editor is empty) |
+| `{suspend}` | Suspend to background |
+| `{cycle_thinking_level}` | Cycle thinking level |
+| `{cycle_model_forward}` / `{cycle_model_backward}` | Cycle models |
+| `{select_model}` | Open model selector |
+| `{expand_tools}` | Toggle tool output expansion |
+| `{toggle_thinking}` | Toggle thinking block visibility |
+| `{external_editor}` | Edit message in external editor |
+| `{copy_message}` | Copy selection or last assistant message |
+| `{follow_up}` | Queue follow-up message |
+| `{dequeue}` | Restore queued messages |
+| `{paste_image}` | Paste files on macOS, images, or text from clipboard |
+| `/` | Slash commands |
+| `!` | Run bash command |
+| `!!` | Run bash command (excluded from context) |
+"
+    )
+}
+
 /// The `modelThinkingLevels` map: `provider/id` → level.
 fn model_thinking_levels(settings: &SettingsManager) -> BTreeMap<String, String> {
     settings
@@ -766,6 +1057,14 @@ impl InteractiveMode {
             autocomplete::SlashCommand::new("trust", "Show the project trust options"),
             autocomplete::SlashCommand::new("settings", "Open settings menu"),
             autocomplete::SlashCommand::new("resume", "Resume another session"),
+            // `BUILTIN_SLASH_COMMANDS` (`slash-commands.ts:20-43`) descriptions
+            // and hints, verbatim. `/bug` stays unadvertised: its flow needs
+            // the bug-report bundle, upload, and archive infrastructure.
+            autocomplete::SlashCommand::new("copy", "Copy last agent message to clipboard"),
+            autocomplete::SlashCommand::new("name", "Set session display name"),
+            autocomplete::SlashCommand::new("session", "Show session info and stats"),
+            autocomplete::SlashCommand::new("changelog", "Show changelog entries"),
+            autocomplete::SlashCommand::new("hotkeys", "Show all keyboard shortcuts"),
             autocomplete::SlashCommand::new("thinking", "Set thinking level")
                 .with_argument_hint("<level>")
                 .with_argument_completions(Arc::new(|prefix: &str| {
@@ -1465,6 +1764,31 @@ impl InteractiveMode {
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
             self.handle_compact_command(custom);
+            return;
+        }
+        // `/copy` (`interactive-mode.ts:3372-3376`).
+        if text == "/copy" {
+            self.handle_copy_command();
+            return;
+        }
+        // `/name [name]` (`interactive-mode.ts:3377-3381`).
+        if text == "/name" || text.starts_with("/name ") {
+            self.handle_name_command(text);
+            return;
+        }
+        // `/session` (`interactive-mode.ts:3382-3386`).
+        if text == "/session" {
+            self.handle_session_command();
+            return;
+        }
+        // `/changelog` (`interactive-mode.ts:3387-3391`).
+        if text == "/changelog" {
+            self.handle_changelog_command();
+            return;
+        }
+        // `/hotkeys` (`interactive-mode.ts:3392-3396`).
+        if text == "/hotkeys" {
+            self.handle_hotkeys_command();
             return;
         }
         if let Some(rest) = text.strip_prefix("/thinking") {
@@ -2404,6 +2728,289 @@ impl InteractiveMode {
         self.theme_setting = Some(name.to_string());
         if let Ok(()) = self.theme_apply_from_settings(true) {
             self.show_status(&format!("Theme: {name}"));
+        }
+    }
+
+    // --------------------------------------------------------------
+    // Session info commands (`handleNameCommand`, `interactive-mode.ts:6859`)
+    // --------------------------------------------------------------
+
+    /// `/name [name]` (`handleNameCommand`, `interactive-mode.ts:6859-6883`):
+    /// with a name, persist it as a `session_info` entry and confirm; without
+    /// one, show the current name or the usage. The `session_info_changed`
+    /// extension event lands with the extension UI wiring.
+    fn handle_name_command(&mut self, text: &str) {
+        let name = name_argument(text);
+        if name.is_empty() {
+            match self.session.get_session_name() {
+                Some(current_name) => {
+                    self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+                    self.add_to_chat(Box::new(Text::new(
+                        theme::theme().fg(
+                            pi_tui::theme::ThemeColor::Dim,
+                            &format!("Session name: {current_name}"),
+                        ),
+                        1,
+                        0,
+                    )));
+                }
+                None => self.show_warning("Usage: /name <name>"),
+            }
+            self.tui.request_render();
+            return;
+        }
+
+        // `setSessionName` (`agent-session.ts:4118-4123`) appends the
+        // `session_info` entry.
+        let _ = self.session.append_session_info(name);
+        let session_name = self.session.get_session_name();
+        if session_name.as_deref() != Some(name) {
+            let normalized = session_name.clone().unwrap_or_default();
+            self.show_warning(&format!(
+                "Session name was normalized from {} to {}",
+                json_stringify(name),
+                json_stringify(&normalized),
+            ));
+        }
+        self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        let display_name = session_name.unwrap_or_else(|| name.to_string());
+        self.add_to_chat(Box::new(Text::new(
+            theme::theme().fg(
+                pi_tui::theme::ThemeColor::Dim,
+                &format!("Session name set: {display_name}"),
+            ),
+            1,
+            0,
+        )));
+        self.tui.request_render();
+    }
+
+    /// `showWarning` (`interactive-mode.ts:4815-4819`): a warning-colored
+    /// line in the chat.
+    fn show_warning(&mut self, message: &str) {
+        self.add_to_chat(Box::new(Text::new(
+            theme::theme().fg(pi_tui::theme::ThemeColor::Warning, message),
+            1,
+            0,
+        )));
+        self.tui.request_render();
+    }
+
+    /// `/session` (`handleSessionCommand`, `interactive-mode.ts:6884-6963`):
+    /// the session info block. Upstream builds the text lazily in a
+    /// `ThemedText` so it follows theme changes; the port's `Text` is static
+    /// like its other chat lines.
+    fn handle_session_command(&mut self) {
+        // Snapshot the stats; the text is built on demand so it follows
+        // theme changes (upstream, `interactive-mode.ts:6897-6899`).
+        let stats = self.session_stats();
+        let session_name = self.session.get_session_name();
+        let entries = self.session.get_entries();
+        // Cost/token totals per provider/model actually used (e.g. OpenRouter
+        // `auto` resolves to a concrete responseModel). Usage without model
+        // attribution is grouped separately so the breakdown reconciles with
+        // the session total (`interactive-mode.ts:6891-6894`).
+        let usage_breakdown = super::components::footer::get_usage_cost_breakdown(&entries);
+        let cache_waste = crate::session::cache_stats::compute_cache_waste(
+            &entries,
+            &pi_ai::catalog::catalog(),
+        );
+        let cache_warming_mode = self.cache_warming_mode();
+        let selected_model_key = format!("{}/{}", self.model.provider, self.model.id);
+        let info = session_info_text(
+            &stats,
+            session_name.as_deref(),
+            &cache_warming_mode,
+            &cache_waste,
+            &usage_breakdown,
+            &selected_model_key,
+        );
+        self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        self.add_to_chat(Box::new(Text::new(info, 1, 0)));
+        self.tui.request_render();
+    }
+
+    /// `getSessionStats` (`agent-session.ts:4364-4425`): counts over the
+    /// session entries plus the usage totals (usage entries, summaries, and
+    /// tool results all contribute).
+    fn session_stats(&self) -> SessionStats {
+        let mut stats = SessionStats {
+            session_file: self
+                .session
+                .get_session_file()
+                .map(std::path::Path::to_path_buf),
+            session_id: self.session.get_session_id().to_string(),
+            ..SessionStats::default()
+        };
+        for entry in self.session.get_entries() {
+            match &entry {
+                crate::session::records::SessionEntry::Usage(entry) => stats.tokens.add(&entry.usage),
+                crate::session::records::SessionEntry::BranchSummary(entry) => {
+                    if let Some(usage) = &entry.usage {
+                        stats.tokens.add(usage);
+                    }
+                }
+                crate::session::records::SessionEntry::Compaction(entry) => {
+                    if let Some(usage) = &entry.usage {
+                        stats.tokens.add(usage);
+                    }
+                }
+                crate::session::records::SessionEntry::Message(entry) => {
+                    stats.total_messages += 1;
+                    match &entry.message {
+                        AgentMessage::User(_) => stats.user_messages += 1,
+                        AgentMessage::ToolResult(message) => {
+                            stats.tool_results += 1;
+                            if let Some(usage) = &message.usage {
+                                stats.tokens.add(usage);
+                            }
+                        }
+                        AgentMessage::Assistant(message) => {
+                            stats.assistant_messages += 1;
+                            stats.tool_calls += message
+                                .content
+                                .iter()
+                                .filter(|block| {
+                                    matches!(block, pi_ai::types::AssistantContent::ToolCall(_))
+                                })
+                                .count() as u64;
+                            stats.tokens.add(&message.usage);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        stats
+    }
+
+    /// `getCacheWarmingMode` (`settings-manager.ts:942-945`): the global
+    /// `cacheWarming` setting when valid, else the default (`idle`).
+    fn cache_warming_mode(&self) -> String {
+        const MODES: [&str; 3] = ["off", "streaming", "idle"];
+        self.settings
+            .get_global_settings()
+            .get("cacheWarming")
+            .and_then(|value| value.as_str())
+            .filter(|mode| MODES.contains(mode))
+            .unwrap_or("idle")
+            .to_string()
+    }
+
+    /// `/hotkeys` (`handleHotkeysCommand`, `interactive-mode.ts:6999-7112`):
+    /// every keyboard shortcut, bordered, as markdown.
+    fn handle_hotkeys_command(&mut self) {
+        let hotkeys = hotkeys_markdown();
+        self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        self.add_to_chat(Box::new(super::components::header::DynamicBorder::new()));
+        self.add_to_chat(Box::new(Text::new(
+            theme::theme().fg(
+                pi_tui::theme::ThemeColor::Accent,
+                &bold_text("Keyboard Shortcuts"),
+            ),
+            1,
+            0,
+        )));
+        self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        self.add_to_chat(Box::new(pi_tui::components::markdown::Markdown::new(
+            hotkeys.trim().to_string(),
+            1,
+            1,
+            theme::markdown_theme(),
+            None,
+            pi_tui::components::markdown::MarkdownOptions::default(),
+        )));
+        self.add_to_chat(Box::new(super::components::header::DynamicBorder::new()));
+        self.tui.request_render();
+    }
+
+    /// `/changelog` (`handleChangelogCommand`, `interactive-mode.ts:6965-6984`):
+    /// the changelog entries, newest first, bordered, as markdown.
+    fn handle_changelog_command(&mut self) {
+        let changelog_path = crate::changelog::get_changelog_path();
+        let mut all_entries = crate::changelog::parse_changelog(&changelog_path);
+
+        let changelog_markdown = if all_entries.is_empty() {
+            "No changelog entries found.".to_string()
+        } else {
+            all_entries.reverse();
+            all_entries
+                .iter()
+                .map(|entry| {
+                    crate::changelog::normalize_changelog_links(&entry.content, &entry.version_string())
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+
+        self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        self.add_to_chat(Box::new(super::components::header::DynamicBorder::new()));
+        self.add_to_chat(Box::new(Text::new(
+            theme::theme()
+                .fg(pi_tui::theme::ThemeColor::Accent, &bold_text("What's New")),
+            1,
+            0,
+        )));
+        self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        self.add_to_chat(Box::new(pi_tui::components::markdown::Markdown::new(
+            changelog_markdown,
+            1,
+            1,
+            theme::markdown_theme(),
+            None,
+            pi_tui::components::markdown::MarkdownOptions::default(),
+        )));
+        self.add_to_chat(Box::new(super::components::header::DynamicBorder::new()));
+        self.tui.request_render();
+    }
+
+    /// `/copy` (`handleCopyCommand`, `interactive-mode.ts:6828-6857`): copy
+    /// the last agent message to the clipboard. The `flashConfirmation` /
+    /// `preferSelection` options belong to the `app.message.copy` keybinding,
+    /// whose alt-screen selection branch lands with that keybinding.
+    fn handle_copy_command(&mut self) {
+        let Some(text) = self.last_assistant_text() else {
+            self.show_error("No agent messages to copy yet.");
+            return;
+        };
+        match crate::clipboard::copy_to_clipboard(&text) {
+            Ok(()) => self.show_status("Copied last agent message to clipboard"),
+            Err(error) => self.show_error(&error),
+        }
+    }
+
+    /// `getLastAssistantText` (`agent-session.ts:4528-4554`): the last
+    /// assistant message's concatenated text blocks. A turn that did not end
+    /// normally (aborted, failed, only tool calls) is skipped unless it still
+    /// has text (#12119).
+    fn last_assistant_text(&self) -> Option<String> {
+        let mut text = String::new();
+        for entry in self.session.get_entries().iter().rev() {
+            let crate::session::records::SessionEntry::Message(entry) = entry else {
+                continue;
+            };
+            let AgentMessage::Assistant(assistant) = &entry.message else {
+                continue;
+            };
+            let has_text = assistant.content.iter().any(|block| {
+                matches!(block, pi_ai::types::AssistantContent::Text(block) if !block.text.trim().is_empty())
+            });
+            if assistant.stop_reason != pi_ai::types::StopReason::Stop && !has_text {
+                continue;
+            }
+            for block in &assistant.content {
+                if let pi_ai::types::AssistantContent::Text(block) = block {
+                    text.push_str(&block.text);
+                }
+            }
+            break;
+        }
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
         }
     }
 
@@ -5028,6 +5635,350 @@ mod tests {
         mode.tui.render_now(false);
         assert!(mode.easter_egg.is_some(), "the logo lifts off");
         assert!(mode.tui.has_overlay());
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `/name`'s argument parsing: everything after the command word,
+    /// trimmed (`interactive-mode.ts:6860`).
+    #[test]
+    fn name_argument_strips_the_command_word_and_trims() {
+        assert_eq!(name_argument("/name"), "");
+        assert_eq!(name_argument("/name "), "");
+        assert_eq!(name_argument("/name My Session"), "My Session");
+        assert_eq!(name_argument("/name   spaced   "), "spaced");
+        assert_eq!(name_argument("/other"), "");
+    }
+
+    /// `JSON.stringify` for the normalization warning: a JSON string literal.
+    #[test]
+    fn json_stringify_produces_a_json_string_literal() {
+        assert_eq!(json_stringify("plain"), "\"plain\"");
+        assert_eq!(json_stringify("a \"quoted\" name"), "\"a \\\"quoted\\\" name\"");
+    }
+
+    /// `/name <name>` persists the name; bare `/name` shows it; on an empty
+    /// session it warns with the usage (`interactive-mode.ts:6859-6883`).
+    #[test]
+    fn name_command_sets_shows_and_warns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        // No name yet: the usage warning.
+        mode.submit("/name");
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Warning: Usage: /name <name>"), "{frame}");
+
+        // Set one.
+        mode.submit("/name Renamed session");
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(
+            frame.contains("Session name set: Renamed session"),
+            "{frame}"
+        );
+        assert_eq!(
+            mode.session.get_session_name().as_deref(),
+            Some("Renamed session")
+        );
+
+        // Bare `/name` shows the persisted name.
+        mode.submit("/name");
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Session name: Renamed session"), "{frame}");
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// A synthetic assistant reply (`store.rs`'s test helper shape; no real
+    /// data).
+    fn assistant_reply(text: &str, stop_reason: pi_ai::types::StopReason) -> AgentMessage {
+        use pi_ai::types::{AssistantContent, AssistantMessage, TextContent, Usage, UsageCost};
+        AgentMessage::Assistant(AssistantMessage {
+            content: vec![AssistantContent::Text(TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            })],
+            api: "test".into(),
+            provider: "test".into(),
+            model: "test-model".into(),
+            response_model: None,
+            response_id: None,
+            provider_thinking_level: None,
+            thinking_level: None,
+            diagnostics: Vec::new(),
+            usage: Usage {
+                input: 0,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                cache_write_1h: None,
+                reasoning: None,
+                total_tokens: 0,
+                cost: UsageCost::default(),
+            },
+            stop_reason,
+            deferred: None,
+            error_message: None,
+            raw_stop_reason: None,
+            end_turn: None,
+            timestamp: 1,
+            duration_ms: None,
+        })
+    }
+
+    /// `getLastAssistantText` (`agent-session.ts:4528-4554`): the newest
+    /// assistant reply's text; a turn that did not end normally with no text
+    /// is skipped (#12119).
+    #[test]
+    fn last_assistant_text_extracts_the_newest_reply() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        assert_eq!(mode.last_assistant_text(), None);
+
+        mode.session
+            .append_message(assistant_reply("first reply", pi_ai::types::StopReason::Stop))
+            .expect("append");
+        mode.session
+            .append_message(assistant_reply(
+                "second reply",
+                pi_ai::types::StopReason::Stop,
+            ))
+            .expect("append");
+        assert_eq!(
+            mode.last_assistant_text().as_deref(),
+            Some("second reply")
+        );
+
+        // An aborted turn without text is skipped, not copied.
+        mode.session
+            .append_message(assistant_reply("", pi_ai::types::StopReason::Aborted))
+            .expect("append");
+        assert_eq!(mode.last_assistant_text().as_deref(), Some("second reply"));
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `/copy` on an empty session shows the upstream error; the clipboard
+    /// outcome itself is environment-dependent (OSC 52 headless, `xclip`, …),
+    /// covered by the [`crate::clipboard`] tests.
+    #[test]
+    fn copy_command_on_an_empty_session_reports_no_messages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/copy");
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("No agent messages to copy yet."), "{frame}");
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `toLocaleString()`'s en-US grouping.
+    #[test]
+    fn to_locale_string_groups_thousands() {
+        assert_eq!(to_locale_string(0), "0");
+        assert_eq!(to_locale_string(999), "999");
+        assert_eq!(to_locale_string(1_000), "1,000");
+        assert_eq!(to_locale_string(1_234_567), "1,234,567");
+        assert_eq!(to_locale_string(18_500), "18,500");
+    }
+
+    /// `renderInfo` (`interactive-mode.ts:6900-6960`) on a synthetic stats
+    /// snapshot: identity, counts, the cached/uncached split, cache warming,
+    /// and the cost block with the re-billed detail.
+    #[test]
+    fn session_info_text_renders_the_upstream_block() {
+        use super::components::footer::{UsageCostBreakdownEntry, UsageTotals};
+        let mut stats = SessionStats::default();
+        stats.session_id = "test-session".to_string();
+        stats.total_messages = 4;
+        stats.user_messages = 2;
+        stats.assistant_messages = 2;
+        stats.tool_calls = 1;
+        stats.tool_results = 1;
+        stats.tokens = UsageTotals {
+            input: 10_000,
+            output: 500,
+            cache_read: 8_000,
+            cache_write: 0,
+            cost: 0.012,
+        };
+        let cache_waste = crate::session::cache_stats::CacheWasteTotals {
+            missed_tokens: 3_000,
+            missed_cost: 0.009,
+            miss_count: 2,
+        };
+        let info = session_info_text(
+            &stats,
+            Some("Named session"),
+            "idle",
+            &cache_waste,
+            &[UsageCostBreakdownEntry {
+                key: "test/test-model".to_string(),
+                cost: 0.012,
+                tokens: 18_500,
+            }],
+            "test/test-model",
+        );
+        let plain = pi_tui::ansi::strip_terminal_sequences(&info);
+        assert!(plain.contains("Session Info"), "{plain}");
+        assert!(plain.contains("Name: Named session"), "{plain}");
+        assert!(plain.contains("File: In-memory"), "{plain}");
+        assert!(plain.contains("ID: test-session"), "{plain}");
+        assert!(plain.contains("Total: 4"), "{plain}");
+        assert!(plain.contains("Tools: 1 calls, 1 results"), "{plain}");
+        // prompt = 18,000; 8,000 served from cache (44.4%).
+        assert!(plain.contains("Input: 18,000"), "{plain}");
+        assert!(plain.contains("Cached: 8,000 (44.4%)"), "{plain}");
+        assert!(plain.contains("Uncached: 10,000"), "{plain}");
+        assert!(plain.contains("Output: 500"), "{plain}");
+        assert!(plain.contains("Total: 18,500"), "{plain}");
+        assert!(plain.contains("Mode: idle"), "{plain}");
+        assert!(plain.contains("Status: Inactive (cache warming unavailable)"), "{plain}");
+        // A single breakdown entry naming the selected model repeats only
+        // the total; the re-billed detail rides on.
+        assert!(plain.contains("Total: $0.012"), "{plain}");
+        assert!(plain.contains("Cache Re-billed: $0.009 (3,000 tokens, 2 misses)"), "{plain}");
+    }
+
+    /// The per-model breakdown line appears when usage names a model other
+    /// than the selected one (`interactive-mode.ts:6945-6951`).
+    #[test]
+    fn session_info_text_breaks_out_other_models() {
+        use super::components::footer::{UsageCostBreakdownEntry, UsageTotals};
+        let mut stats = SessionStats::default();
+        stats.session_id = "s".to_string();
+        stats.tokens = UsageTotals {
+            input: 1_000,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cost: 0.02,
+        };
+        let info = session_info_text(
+            &stats,
+            None,
+            "idle",
+            &crate::session::cache_stats::CacheWasteTotals::default(),
+            &[
+                UsageCostBreakdownEntry {
+                    key: "other/virtual".to_string(),
+                    cost: 0.015,
+                    tokens: 700,
+                },
+                UsageCostBreakdownEntry {
+                    key: "test/test-model".to_string(),
+                    cost: 0.005,
+                    tokens: 300,
+                },
+            ],
+            "test/test-model",
+        );
+        let plain = pi_tui::ansi::strip_terminal_sequences(&info);
+        assert!(plain.contains("Total: $0.020"), "{plain}");
+        assert!(plain.contains("other/virtual: $0.015 (0.7k tokens)"), "{plain}");
+        assert!(plain.contains("test/test-model: $0.005 (300 tokens)"), "{plain}");
+    }
+
+    /// `/session` on an in-memory session renders the block headlessly.
+    #[test]
+    fn session_command_renders_the_info_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/session");
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Session Info"), "{frame}");
+        assert!(frame.contains("File: In-memory"), "{frame}");
+        assert!(frame.contains("Cache Warming"), "{frame}");
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `keyDisplayText` (`keybinding-hints.ts:38-40`): all bound keys joined
+    /// with `/`, parts capitalized; editor actions resolve through pi-tui,
+    /// app actions through the app table.
+    #[test]
+    fn key_display_text_joins_and_capitalizes() {
+        assert_eq!(theme::key_display_text("tui.editor.cursorLeft"), "Left/Ctrl+B");
+        assert_eq!(theme::key_display_text("tui.editor.cursorUp"), "Up");
+        assert_eq!(theme::key_display_text(theme::app_keys::MODEL_SELECT), "Ctrl+L");
+        assert_eq!(
+            theme::key_display_text(theme::app_keys::MODEL_CYCLE_BACKWARD),
+            "Ctrl+Shift+P"
+        );
+    }
+
+    /// `handleHotkeysCommand`'s table (`interactive-mode.ts:6999-7099`): the
+    /// three sections with live bindings filled in.
+    #[test]
+    fn hotkeys_markdown_lists_the_upstream_sections() {
+        let markdown = hotkeys_markdown();
+        let plain = pi_tui::ansi::strip_terminal_sequences(&markdown);
+        assert!(plain.contains("**Navigation**"), "{plain}");
+        assert!(plain.contains("**Editing**"), "{plain}");
+        assert!(plain.contains("**Other**"), "{plain}");
+        assert!(plain.contains("| `Enter` | Send message |"), "{plain}");
+        assert!(
+            plain.contains("| `Left/Ctrl+B` | Move cursor / browse history"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("| `Escape` | Cancel autocomplete / abort streaming |"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("| `Ctrl+L` | Open model selector |"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("| `Ctrl+X` | Copy selection or last assistant message |"),
+            "{plain}"
+        );
+        // The trailing literal rows carry no bindings.
+        assert!(plain.contains("| `/` | Slash commands |"), "{plain}");
+        assert!(plain.contains("| `!!` | Run bash command (excluded from context) |"), "{plain}");
+    }
+
+    /// `/hotkeys` renders the bordered shortcut table.
+    #[test]
+    fn hotkeys_command_renders_the_shortcuts_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/hotkeys");
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Keyboard Shortcuts"), "{frame}");
+        assert!(frame.contains("Send message"), "{frame}");
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `/changelog` without a shipped changelog shows the empty state
+    /// (`interactive-mode.ts:6968-6973`).
+    #[test]
+    fn changelog_command_without_entries_shows_the_empty_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/changelog");
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("What's New"), "{frame}");
+        assert!(frame.contains("No changelog entries found."), "{frame}");
 
         mode.shutdown().expect("shutdown");
     }
