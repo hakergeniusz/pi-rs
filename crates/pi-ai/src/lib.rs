@@ -25,6 +25,8 @@ pub mod cost;
 pub mod event_stream;
 /// Provider-API adapters, dispatched per `Model.api`.
 pub mod providers;
+/// Context-overflow classifiers (`packages/ai/src/utils/overflow.ts`).
+pub mod overflow;
 /// Retry classification and policy (`packages/ai/src/utils/retry.ts`).
 pub mod retry;
 /// Server-Sent Events parsing over a reqwest byte stream.

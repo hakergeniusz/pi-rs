@@ -158,6 +158,29 @@ pub fn event_to_json(event: &AgentEvent) -> JsonObject {
                 object.insert("finalError".to_string(), serde_json::json!(final_error));
             }
         }
+        AgentEvent::CompactionStart { reason } => {
+            object.insert("reason".to_string(), serde_json::json!(reason.as_str()));
+        }
+        AgentEvent::CompactionEnd {
+            reason,
+            result,
+            aborted,
+            will_retry,
+            error_message,
+        } => {
+            object.insert("reason".to_string(), serde_json::json!(reason.as_str()));
+            if let Some(result) = result {
+                object.insert(
+                    "result".to_string(),
+                    serde_json::to_value(result).unwrap_or_default(),
+                );
+            }
+            object.insert("aborted".to_string(), serde_json::json!(aborted));
+            object.insert("willRetry".to_string(), serde_json::json!(will_retry));
+            if let Some(error_message) = error_message {
+                object.insert("errorMessage".to_string(), serde_json::json!(error_message));
+            }
+        }
     }
     object
 }
@@ -356,7 +379,29 @@ pub fn run_json_mode(
     // emitting `auto_retry_start`/`auto_retry_end` lines like upstream's
     // event stream (`agent-session.ts:235-237`).
     let mut retry = crate::modes::retry::AgentRetry::new(runtime.retry_settings);
+
+    let mut compaction =
+        crate::modes::compaction::AutoCompaction::new(runtime.compaction_settings);
     let new_messages = loop {
+        // `_compactBeforeNextAssistantResponse` (`agent-session.ts:839-848`):
+        // the threshold gate keys on the model about to answer; under a
+        // virtual selection upstream re-checks the ROUTED model after the
+        // resolve (:901-904) — deferred with the prepare-hook rework.
+        if !crate::virtual_models::is_virtual_model(&runtime.model)
+            && compaction.exceeds_threshold_for_session(&runtime.session, &runtime.model)
+        {
+            compaction.run(
+                pi_agent::events::CompactionReason::Threshold,
+                false,
+                &mut runtime.session,
+                &runtime.model,
+                runtime.api_key.as_deref(),
+                runtime.access_token.as_deref(),
+                runtime.thinking_level,
+                runtime.stream_fn.as_ref(),
+                &mut sink,
+            );
+        }
         let messages = crate::runtime::block_on(pi_agent::run_agent_loop(
             prompts.clone(),
             context.clone(),
@@ -401,7 +446,64 @@ pub fn run_json_mode(
                 retry.reset();
             }
         }
-        break messages;
+        // Upstream `_handlePostAgentRun` (`agent-session.ts:2062-2098`)
+        // decides the retry first — compaction only runs when no retry was
+        // scheduled.
+        let mut full_messages = context.messages.clone();
+        full_messages.extend(messages.iter().cloned());
+        match compaction.post_run_decision(
+            aborted,
+            &messages,
+            &full_messages,
+            &runtime.session,
+            &runtime.model,
+        ) {
+            crate::modes::compaction::Decision::None => break messages,
+            crate::modes::compaction::Decision::Threshold => {
+                compaction.run(
+                    pi_agent::events::CompactionReason::Threshold,
+                    false,
+                    &mut runtime.session,
+                    &runtime.model,
+                    runtime.api_key.as_deref(),
+                    runtime.access_token.as_deref(),
+                    runtime.thinking_level,
+                    runtime.stream_fn.as_ref(),
+                    &mut sink,
+                );
+                break messages;
+            }
+            crate::modes::compaction::Decision::Overflow { will_retry } => {
+                // The overflow compact-and-retry drops the failed attempt
+                // (unpersisted) and re-runs once (`agent.continue()`).
+                let continued = compaction.run(
+                    pi_agent::events::CompactionReason::Overflow,
+                    will_retry,
+                    &mut runtime.session,
+                    &runtime.model,
+                    runtime.api_key.as_deref(),
+                    runtime.access_token.as_deref(),
+                    runtime.thinking_level,
+                    runtime.stream_fn.as_ref(),
+                    &mut sink,
+                );
+                if will_retry && continued {
+                    continue;
+                }
+                break messages;
+            }
+            crate::modes::compaction::Decision::RecoveryFailed { message } => {
+                // The verbatim one-shot failure (`agent-session.ts:3187-3206`).
+                crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::CompactionEnd {
+                    reason: pi_agent::events::CompactionReason::Overflow,
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(message),
+                }));
+                break messages;
+            }
+        }
     };
     sink.flush();
     #[cfg(feature = "ext-js")]

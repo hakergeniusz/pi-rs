@@ -396,6 +396,9 @@ fn build_runtime_with_ui(
         thinking_level_from_str(&level).unwrap_or_default()
     };
 
+    let compaction_settings = settings
+        .get_compaction_settings(Some((model.provider.as_str(), model.id.as_str())))
+        .unwrap_or(pi_coding_agent::session::compaction::DEFAULT_COMPACTION_SETTINGS);
     Ok(PrintRuntime {
         model,
         thinking_level,
@@ -407,6 +410,7 @@ fn build_runtime_with_ui(
         session,
         project_trusted,
         retry_settings: settings.get_retry_settings(),
+        compaction_settings,
         #[cfg(feature = "ext-js")]
         extension_runner: extensions.host.runner(),
     })

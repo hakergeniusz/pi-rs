@@ -59,6 +59,9 @@ pub struct PrintRuntime {
     pub project_trusted: bool,
     /// The auto-retry budget (`settings.retry`), driving the run tails.
     pub retry_settings: RetrySettings,
+    /// The automatic-compaction settings (`settings.compaction`), driving
+    /// the run tails' threshold/overflow machine.
+    pub compaction_settings: crate::session::compaction::CompactionSettings,
     /// The extension runner the mode-level surfaces share (E2 slice 4):
     /// the RPC dialog bridge, the `user_bash` interception, the session
     /// gates, and the context transform. `None` without the engine.
@@ -212,7 +215,29 @@ pub fn run_print_mode(
     // retryable error within budget re-runs the same prompt after a backoff;
     // the failed response is never persisted.
     let mut retry = crate::modes::retry::AgentRetry::new(runtime.retry_settings);
+
+    let mut compaction =
+        crate::modes::compaction::AutoCompaction::new(runtime.compaction_settings);
     let new_messages = loop {
+        // `_compactBeforeNextAssistantResponse` (`agent-session.ts:839-848`):
+        // the threshold gate keys on the model about to answer; under a
+        // virtual selection upstream re-checks the ROUTED model after the
+        // resolve (:901-904) — deferred with the prepare-hook rework.
+        if !crate::virtual_models::is_virtual_model(&runtime.model)
+            && compaction.exceeds_threshold_for_session(&runtime.session, &runtime.model)
+        {
+            compaction.run(
+                pi_agent::events::CompactionReason::Threshold,
+                false,
+                &mut runtime.session,
+                &runtime.model,
+                runtime.api_key.as_deref(),
+                runtime.access_token.as_deref(),
+                runtime.thinking_level,
+                runtime.stream_fn.as_ref(),
+                &mut sink,
+            );
+        }
         let messages = crate::runtime::block_on(pi_agent::run_agent_loop(
             prompts.clone(),
             context.clone(),
@@ -257,7 +282,64 @@ pub fn run_print_mode(
                 retry.reset();
             }
         }
-        break messages;
+        // Upstream `_handlePostAgentRun` (`agent-session.ts:2062-2098`)
+        // decides the retry first — compaction only runs when no retry was
+        // scheduled.
+        let mut full_messages = context.messages.clone();
+        full_messages.extend(messages.iter().cloned());
+        match compaction.post_run_decision(
+            aborted,
+            &messages,
+            &full_messages,
+            &runtime.session,
+            &runtime.model,
+        ) {
+            crate::modes::compaction::Decision::None => break messages,
+            crate::modes::compaction::Decision::Threshold => {
+                compaction.run(
+                    pi_agent::events::CompactionReason::Threshold,
+                    false,
+                    &mut runtime.session,
+                    &runtime.model,
+                    runtime.api_key.as_deref(),
+                    runtime.access_token.as_deref(),
+                    runtime.thinking_level,
+                    runtime.stream_fn.as_ref(),
+                    &mut sink,
+                );
+                break messages;
+            }
+            crate::modes::compaction::Decision::Overflow { will_retry } => {
+                // The overflow compact-and-retry drops the failed attempt
+                // (unpersisted) and re-runs once (`agent.continue()`).
+                let continued = compaction.run(
+                    pi_agent::events::CompactionReason::Overflow,
+                    will_retry,
+                    &mut runtime.session,
+                    &runtime.model,
+                    runtime.api_key.as_deref(),
+                    runtime.access_token.as_deref(),
+                    runtime.thinking_level,
+                    runtime.stream_fn.as_ref(),
+                    &mut sink,
+                );
+                if will_retry && continued {
+                    continue;
+                }
+                break messages;
+            }
+            crate::modes::compaction::Decision::RecoveryFailed { message } => {
+                // The verbatim one-shot failure (`agent-session.ts:3187-3206`).
+                crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::CompactionEnd {
+                    reason: pi_agent::events::CompactionReason::Overflow,
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(message),
+                }));
+                break messages;
+            }
+        }
     };
     // Router state decided this turn lands on the branch now (upstream
     // appends mid-turn; the store is not shared with the loop thread).

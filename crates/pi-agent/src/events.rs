@@ -78,6 +78,56 @@ pub enum AgentEvent {
         attempt: u32,
         final_error: Option<String>,
     },
+    // Compaction lifecycle (`agent-session.ts:223-248`): manual `/compact`
+    // and the automatic threshold/overflow machine share the reason enum;
+    // `result` is absent on failure or abortion.
+    CompactionStart {
+        reason: CompactionReason,
+    },
+    CompactionEnd {
+        reason: CompactionReason,
+        result: Option<CompactionResultEvent>,
+        aborted: bool,
+        will_retry: bool,
+        error_message: Option<String>,
+    },
+}
+
+/// The compaction trigger (`agent-session.ts:223`): manual `/compact`, the
+/// automatic threshold, or overflow recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionReason {
+    Manual,
+    Threshold,
+    Overflow,
+}
+
+impl CompactionReason {
+    /// The wire discriminant, identical to pi's reason strings.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CompactionReason::Manual => "manual",
+            CompactionReason::Threshold => "threshold",
+            CompactionReason::Overflow => "overflow",
+        }
+    }
+}
+
+/// The successful `compaction_end` result payload (`agent-session.ts`
+/// `CompactionResult`): summary, the retained range's first entry, the
+/// token estimate before, the post-compaction estimate, the summarization
+/// usage, and the extension details object.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CompactionResultEvent {
+    pub summary: String,
+    #[serde(rename = "firstKeptEntryId")]
+    pub first_kept_entry_id: String,
+    #[serde(rename = "tokensBefore")]
+    pub tokens_before: u64,
+    #[serde(rename = "estimatedTokensAfter")]
+    pub estimated_tokens_after: Option<u64>,
+    pub usage: Option<pi_ai::types::Usage>,
+    pub details: serde_json::Value,
 }
 
 impl AgentEvent {
@@ -96,6 +146,8 @@ impl AgentEvent {
             AgentEvent::ToolExecutionEnd { .. } => "tool_execution_end",
             AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
             AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
+            AgentEvent::CompactionStart { .. } => "compaction_start",
+            AgentEvent::CompactionEnd { .. } => "compaction_end",
         }
     }
 }

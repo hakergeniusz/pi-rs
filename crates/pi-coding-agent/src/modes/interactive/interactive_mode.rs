@@ -1553,11 +1553,13 @@ impl InteractiveMode {
             | AgentEvent::TurnEnd { .. }
             | AgentEvent::ToolExecutionEnd { .. }
             | AgentEvent::AutoRetryStart { .. }
-            | AgentEvent::AutoRetryEnd { .. } => {
+            | AgentEvent::AutoRetryEnd { .. }
+            | AgentEvent::CompactionStart { .. }
+            | AgentEvent::CompactionEnd { .. } => {
                 // The final tool result renders with its message end. The
-                // pump drives its runs directly; the retry status display
-                // lands with the pump's AgentRun rework (upstream shows it
-                // via agent-session events).
+                // pump drives its runs directly; the retry and compaction
+                // status displays land with the pump's AgentRun rework
+                // (upstream shows them via agent-session events).
             }
             AgentEvent::MessageStart { message } => match message {
                 AgentMessage::User(user) => {
@@ -5215,6 +5217,7 @@ mod tests {
                 base_delay_ms: 2000,
                 max_agent_delay_ms: 60_000,
             },
+            compaction_settings: crate::session::compaction::DEFAULT_COMPACTION_SETTINGS,
             #[cfg(feature = "ext-js")]
             extension_runner: None,
         }
