@@ -87,6 +87,50 @@ enum LoginBackStep {
     Provider(Option<&'static str>),
 }
 
+/// The pending `/import` dialog: which question the mounted selector is
+/// asking and what to do with the answer (`handleImportCommand`,
+/// `interactive-mode.ts:6755-6803`).
+#[derive(Debug, Clone)]
+enum ImportDialog {
+    /// `showExtensionConfirm("Import session", …)` — the Yes/No gate.
+    Confirm { input_path: String },
+    /// `promptForMissingSessionCwd` — continue/fork/cancel on the copied
+    /// session's stale stored cwd.
+    MissingSessionCwd {
+        input_path: String,
+        issue: crate::session::cwd::SessionCwdIssue,
+    },
+}
+
+/// What `importFromJsonl` reports (`agent-session-runtime.ts:356-357`'s
+/// throws): the file-not-found error, the stale-cwd gate, and everything
+/// else that rides `handleFatalRuntimeError`.
+enum ImportFromJsonlError {
+    /// `SessionImportFileNotFoundError` — carries its full message.
+    FileNotFound(String),
+    /// `MissingSessionCwdError` — the issue drives the continue/fork prompt.
+    MissingSessionCwd(crate::session::cwd::SessionCwdIssue),
+    /// Any other failure, rendered through the fatal-error message.
+    Other(String),
+}
+
+/// `copyFileSync(source, destination, COPYFILE_EXCL)` (`node:fs`): copy
+/// contents and mode bits, failing when the destination already exists.
+fn copy_file_exclusive(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    let mut reader = std::fs::File::open(source)?;
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    std::io::copy(&mut reader, &mut writer)?;
+    let permissions = std::fs::metadata(source)?.permissions();
+    std::fs::set_permissions(destination, permissions)?;
+    Ok(())
+}
+
 /// One running extension-oauth login flow (`loginProvider`'s `"oauth"` arm
 /// through the engine bridge, slice 6j): the JS `login` runs in an engine
 /// session, its notifications surface as status lines, and its asks mount
