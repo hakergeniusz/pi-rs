@@ -1862,7 +1862,7 @@ impl TreeSelectorComponent {
         let max_visible_lines = (terminal_height / 2).max(5);
         Self {
             tree_list: TreeList::new(
-                &tree,
+                tree,
                 current_leaf_id,
                 max_visible_lines,
                 initial_selected_id,
@@ -2166,9 +2166,9 @@ mod tests {
     }
 
     /// A selector over an events queue (the default theme auto-initializes).
-    fn selector_for(tree: Vec<SessionTreeNode>, leaf: &str) -> TreeSelectorComponent {
+    fn selector_for(tree: &[SessionTreeNode], leaf: &str) -> TreeSelectorComponent {
         TreeSelectorComponent::new(
-            &tree,
+            tree,
             Some(leaf),
             24,
             None,
@@ -2201,7 +2201,7 @@ mod tests {
             user_message("user-3", Some("asst-1"), "sibling branch"),
         ];
         let tree = build_tree(entries);
-        let selector = selector_for(tree, "model-1");
+        let selector = selector_for(&tree, "model-1");
         // The metadata leaf is hidden; the walk lands on its parent user-2,
         // not on the chronologically later user-3.
         assert_eq!(selected_id(&selector), "user-2");
@@ -2219,7 +2219,7 @@ mod tests {
             user_message("user-3", Some("asst-1"), "sibling branch"),
         ];
         let tree = build_tree(entries);
-        let mut selector = selector_for(tree, "asst-2");
+        let mut selector = selector_for(&tree, "asst-2");
         assert_eq!(selected_id(&selector), "asst-2");
 
         Component::handle_input(&mut selector, "\x15"); // ctrl+u
@@ -2237,7 +2237,7 @@ mod tests {
             user_message("user-1", None, "hello"),
             assistant_message("asst-1", Some("user-1"), "hi"),
         ]);
-        let selector = selector_for(tree, "asst-1");
+        let selector = selector_for(&tree, "asst-1");
         let lines = Component::render(&selector, 30);
         let plain_lines: Vec<String> = lines
             .iter()
@@ -2261,7 +2261,7 @@ mod tests {
     #[test]
     fn search_cursor_only_while_focused() {
         let tree = build_tree(vec![user_message("user-1", None, "hello")]);
-        let mut selector = selector_for(tree, "user-1");
+        let mut selector = selector_for(&tree, "user-1");
 
         let lines = Component::render(&selector, 80);
         assert!(
@@ -2298,7 +2298,7 @@ mod tests {
             user_message("user-1", None, "hello"),
             assistant_message("asst-1", Some("user-1"), &message),
         ]);
-        let mut selector = selector_for(tree, "asst-1");
+        let mut selector = selector_for(&tree, "asst-1");
 
         Component::handle_input(&mut selector, "\x18"); // ctrl+x
         let events = take_events(&selector);
@@ -2326,7 +2326,7 @@ mod tests {
         tree[0].label = Some("checkpoint".to_string());
         tree[0].label_timestamp = Some(timestamp.clone());
 
-        let mut selector = selector_for(tree, "asst-1");
+        let mut selector = selector_for(&tree, "asst-1");
         let render = strip_terminal_sequences(&Component::render(&selector, 200).join("\n"));
         assert!(render.contains("[checkpoint]"), "{render}");
         assert!(!render.contains("[+label time]"), "{render}");
@@ -2352,7 +2352,7 @@ mod tests {
             assistant_message("asst-2", Some("user-2"), "goodbye"),
         ];
         let tree = build_tree(entries);
-        let mut selector = selector_for(tree, "asst-2");
+        let mut selector = selector_for(&tree, "asst-2");
         assert_eq!(selected_id(&selector), "asst-2");
 
         Component::handle_input(&mut selector, "\x0c"); // ctrl+l: labeled-only
@@ -2370,7 +2370,7 @@ mod tests {
             user_message("user-1", None, "hello"),
             assistant_message("asst-1", Some("user-1"), "hi"),
         ]);
-        let mut selector = selector_for(tree, "asst-1");
+        let mut selector = selector_for(&tree, "asst-1");
         assert_eq!(selected_id(&selector), "asst-1");
 
         Component::handle_input(&mut selector, "\x0c"); // ctrl+l -> labeled-only
@@ -2404,7 +2404,7 @@ mod tests {
             assistant_message("asst-3b", Some("user-3b"), "branch B response"),
             user_message("user-4b", Some("asst-3b"), "branch B deep"),
         ]);
-        let mut selector = selector_for(tree, "asst-4a");
+        let mut selector = selector_for(&tree, "asst-4a");
 
         Component::handle_input(&mut selector, CTRL_LEFT); // asst-4a → user-3a
         assert_eq!(selected_id(&selector), "user-3a");
@@ -2448,7 +2448,7 @@ mod tests {
             assistant_message("asst-3b", Some("user-3b"), "branch B response"),
             user_message("user-4b", Some("asst-3b"), "branch B deep"),
         ]);
-        let mut selector = selector_for(tree, "asst-4a");
+        let mut selector = selector_for(&tree, "asst-4a");
 
         Component::handle_input(&mut selector, CTRL_LEFT); // → user-3a
         Component::handle_input(&mut selector, CTRL_LEFT); // fold user-3a
@@ -2489,7 +2489,7 @@ mod tests {
             assistant_message("asst-3b", Some("user-3b"), "branch B response"),
             user_message("user-4b", Some("asst-3b"), "branch B deep"),
         ]);
-        let mut selector = selector_for(tree, "asst-4a");
+        let mut selector = selector_for(&tree, "asst-4a");
 
         Component::handle_input(&mut selector, CTRL_LEFT); // → user-3a
         Component::handle_input(&mut selector, CTRL_LEFT); // fold user-3a
@@ -2529,7 +2529,7 @@ mod tests {
             assistant_message("asst-3b", Some("user-3b"), "branch B response"),
             user_message("user-4b", Some("asst-3b"), "branch B deep"),
         ]);
-        let mut selector = selector_for(tree, "asst-4a");
+        let mut selector = selector_for(&tree, "asst-4a");
 
         Component::handle_input(&mut selector, CTRL_LEFT); // → user-3a
         Component::handle_input(&mut selector, CTRL_LEFT); // fold user-3a
@@ -2557,7 +2557,7 @@ mod tests {
     #[test]
     fn label_edit_opens_and_submits() {
         let tree = build_tree(vec![user_message("user-1", None, "hello")]);
-        let mut selector = selector_for(tree, "user-1");
+        let mut selector = selector_for(&tree, "user-1");
         selector.set_focused(true);
 
         Component::handle_input(&mut selector, "L"); // shift+l opens the input
@@ -2609,7 +2609,7 @@ mod tests {
     #[test]
     fn label_edit_escape_closes_without_saving() {
         let tree = build_tree(vec![user_message("user-1", None, "hello")]);
-        let mut selector = selector_for(tree, "user-1");
+        let mut selector = selector_for(&tree, "user-1");
 
         Component::handle_input(&mut selector, "L"); // shift+l
         Component::handle_input(&mut selector, "\x1b"); // escape
@@ -2631,7 +2631,7 @@ mod tests {
             user_message("user-2", Some("tool-asst-1"), "follow up"),
             assistant_message("asst-2", Some("user-2"), "response"),
         ]);
-        let mut selector = selector_for(tree, "asst-2");
+        let mut selector = selector_for(&tree, "asst-2");
 
         Component::handle_input(&mut selector, CTRL_LEFT); // asst-2 -> user-1
         assert_eq!(selected_id(&selector), "user-1");
