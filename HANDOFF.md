@@ -1693,6 +1693,37 @@ green); the fourth pair was killed mid-flight (below).
   `/share` deliberately skipped per the Radius policy). Work preserved
   uncommitted on disk — resume or wipe and respawn.
 
+## Oxc transpile disk cache (landed on `feat/oxc-transpile-cache`, 2026-11-17)
+
+User benchmarked the release binary at **7.8 s** for `pi --model mock/
+instant -p "hey"` (25 runs, ±0.6 s) and asked why the Rust port is
+slower than the npm pi. Decomposition (hyperfine): no-extensions
+floor `-ne` = 18.6 ms; one extension via `-e` = 192 ms; the ~260-file
+extension set cost ~24 ms/file, linear — and a full run wrote zero
+files into the agent cache dir. Upstream's loader leaves jiti 2.7.0's
+`fsCache` at its default `true` (`loader.ts:585-599` sets only
+`moduleCache: false`), so upstream warm starts reuse transformed
+modules from disk; the oxc port re-transformed every source on every
+start. That fidelity gap is fixed: `transpile()` now content-
+addresses (pipeline version, path, source) into
+`$XDG_CACHE_HOME/pi-rs` else `~/.cache/pi-rs` (`89a1a40`, CI
+44132602447). Entries carry their key on the first line (garbage =
+miss), writes are atomic tmp+rename, every cache I/O failure falls
+back to transpiling, `.js` passthrough never caches, and
+`transpile_with_cache_dir()` exposes explicit control for tests plus
+an `#[ignore]`d cold/warm bench (242 fixture sources: 41.6 ms cold →
+2.4 ms warm, 17.5×). Deviation from jiti: one flat content-addressed
+file per source instead of jiti's per-path cache layout.
+
+Honest scope note: the transpile cache is a fidelity fix, not the
+main cause of that 7.8 s — per-extension timing pinned ~5 s of it on
+the user's installed `pi-multi-account` extension, whose
+`refreshModels` refetched every account's model catalog on every
+launch (pi awaits each provider's refresh at startup and the composer
+never persists the results). Fixed in the extension itself
+(hakergeniusz/pi-multi-account `d41ceda`, disk-backed catalog cache,
+10.5× on an A/B harness) outside this repo.
+
 ## Gotchas / decisions
 - **Two locks of the same mutex inside one statement self-deadlock**
   (hit 2026-11-16, `/settings`): `let x = Foo { a: m.lock().f(), b:
