@@ -1342,6 +1342,16 @@ impl InteractiveMode {
             // `BUILTIN_SLASH_COMMANDS` (`slash-commands.ts:20-43`) descriptions
             // and hints, verbatim. `/bug` stays unadvertised: its flow needs
             // the bug-report bundle, upload, and archive infrastructure.
+            // `/share` (`slash-commands.ts:27`) is deliberately absent: it
+            // uploads to the upstream Radius gateway, which this repo bans.
+            autocomplete::SlashCommand::new(
+                "export",
+                "Export session (HTML default, or specify path: .html/.jsonl)",
+            ),
+            autocomplete::SlashCommand::new(
+                "import",
+                "Import a JSONL session, preserving its ID and working directory",
+            ),
             autocomplete::SlashCommand::new("copy", "Copy last agent message to clipboard"),
             autocomplete::SlashCommand::new("name", "Set session display name"),
             autocomplete::SlashCommand::new("session", "Show session info and stats"),
