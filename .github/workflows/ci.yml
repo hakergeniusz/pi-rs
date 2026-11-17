@@ -74,14 +74,14 @@ jobs:
       - name: Check without default features
         run: cargo check -p pi-coding-agent --no-default-features
 
-  # rust-version = 1.87 (rquickjs 0.14); stable CI can silently accept
-  # code newer std APIs would reject. Compile-compat only — the stable
-  # test job carries behavior.
+  # rust-version = 1.97 (the oxc 0.158 transpile engine); stable CI can
+  # silently accept code the declared floor would reject. Compile-compat
+  # only — the stable test job carries behavior.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace

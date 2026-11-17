@@ -17,7 +17,9 @@ edition = "2024"
 license = "MIT"
 authors = ["pi-rs contributors"]
 repository = "https://github.com/hakergeniusz/pi-rs"
-rust-version = "1.87"
+# The real floor: oxc 0.158 (the E1 transpile engine) requires 1.97; the
+# 1.87 declaration predated the oxc bump and CI's MSRV job caught it.
+rust-version = "1.97"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

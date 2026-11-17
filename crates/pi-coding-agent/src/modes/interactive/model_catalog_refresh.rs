@@ -13,6 +13,7 @@
 //! builds from the static catalog + models.json). Callers keep upstream's
 //! refresh-status texts; the timeout arm never fires.
 
+#[cfg(feature = "ext-js")]
 use std::sync::{Arc, Mutex};
 
 use crate::models_state::ModelsRefreshResult;
@@ -33,10 +34,9 @@ pub fn refresh_model_catalogs(
     }
 }
 
-/// The engine-free shape: no runner to join.
+/// The engine-free shape: no runner to join (the gated field the runner
+/// argument would reference does not exist in this build).
 #[cfg(not(feature = "ext-js"))]
-pub fn refresh_model_catalogs(
-    _runner: Option<&Arc<Mutex<pi_ext_js::ExtensionRunner>>>,
-) -> ModelsRefreshResult {
+pub fn refresh_model_catalogs() -> ModelsRefreshResult {
     crate::models_state::refresh_result()
 }

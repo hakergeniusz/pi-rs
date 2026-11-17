@@ -3462,7 +3462,10 @@ impl InteractiveMode {
         // the session scope still holds its entry value — the configured
         // branch re-resolves over the fresh snapshot, the session branch
         // keeps the selector's enabled set.
+        #[cfg(feature = "ext-js")]
         let result = refresh_model_catalogs(self.extension_runner.as_ref());
+        #[cfg(not(feature = "ext-js"))]
+        let result = refresh_model_catalogs();
         let available = self.available_models();
         let enabled_for_selector: Option<Option<Vec<String>>> = if self.scoped_models.is_empty() {
             let fresh = Self::configured_enabled_ids(configured_patterns.as_deref(), &available);
@@ -5414,7 +5417,10 @@ impl InteractiveMode {
         // the composed catalog recomposes over the reloaded models.json and
         // registrations — after the extension half, like upstream's
         // `_buildRuntime` follows `resourceLoader.reload()`.
+        #[cfg(feature = "ext-js")]
         let refresh_errors = refresh_model_catalogs(self.extension_runner.as_ref()).errors;
+        #[cfg(not(feature = "ext-js"))]
+        let refresh_errors = refresh_model_catalogs().errors;
 
         // The theme half of `resourceLoader.reload()` + `setRegisteredThemes`
         // + `applyRuntimeSettings` + `themeController.applyFromSettings`
