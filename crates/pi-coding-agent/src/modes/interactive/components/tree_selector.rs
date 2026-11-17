@@ -993,11 +993,14 @@ impl TreeList {
                 gutter = theme.bg(ThemeBg::SelectedBg, &gutter);
                 body = theme.bg(ThemeBg::SelectedBg, &body);
             }
+            // Width read before `body` moves into the row (a struct literal
+            // argument cannot borrow a field's own source afterwards).
+            let body_width = visible_width(&body);
             rendered_rows.push(ViewportRow {
                 gutter,
                 body,
                 anchor_col,
-                body_width: visible_width(&body),
+                body_width,
                 is_selected,
             });
         }
