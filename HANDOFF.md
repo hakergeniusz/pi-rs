@@ -2263,11 +2263,16 @@ live PTY-verified):
   90 columns): pre-fix binary fails the probe, fixed binary passes.
 
 **cargo-deny schema** (the new `audit` job failed on config
-deserialization, run 44163799428): the runner's cargo-deny (≥ 0.18) wants
-`unmaintained` as a scope selector (`all/workspace/transitive/none`) and
-`yanked` as a level (`deny/warn/allow`); the first attempt had the two
-shapes swapped. Fixed in f8deec0 (`vulnerability = "deny"`,
-`unmaintained = "all"`, `yanked = "warn"`).
+deserialization, run 44163799428; landed f8deec0 + 959ca82): the runner's
+cargo-deny is 0.21.0, where `unmaintained` is a scope selector
+(`all/workspace/transitive/none`), `yanked` a level (`deny/warn/allow`),
+and — the part that actually kept failing — the `vulnerability` key is
+REMOVED outright (PR #611: RustSec vulnerabilities always fail the check).
+Final `deny.toml` advisory block: `unmaintained = "none"`,
+`yanked = "warn"`; verified locally with 0.21.0 (all four checks ok).
+Known deliberate finding: chrono 0.4.x is RUSTSEC-2026-0543 (unmaintained,
+no safe upgrade) — named in the deny.toml comment; migrating pi-coding-
+agent's direct chrono use to `jiff`/`time` is backlog, fidelity-neutral.
 
 **The two-landings-one-day git lesson**: when landing via
 `gate/<name>:feat/<name>` pushes plus local `--ff-only <feature>`, main
