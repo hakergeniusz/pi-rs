@@ -441,7 +441,9 @@ fn matches_kitty_sequence(data: &str, expected_codepoint: i64, expected_modifier
     }
     // Base-layout fallback: only for codepoints that are not already a Latin
     // letter or a known symbol, so remapped layouts cannot alias.
-    if let Some(base) = parsed.base_layout_key && base == expected_codepoint {
+    if let Some(base) = parsed.base_layout_key
+        && base == expected_codepoint
+    {
         let is_latin_letter = (97..=122).contains(&normalized);
         let is_known_symbol =
             char::from_u32(normalized as u32).is_some_and(|c| SYMBOL_KEYS.contains(&c));
@@ -800,7 +802,9 @@ pub fn matches_key(data: &str, key_id: &str) -> bool {
                 return true;
             }
             if modifier == modifiers::CTRL {
-                if let Some(raw) = raw_ctrl && data == raw.to_string() {
+                if let Some(raw) = raw_ctrl
+                    && data == raw.to_string()
+                {
                     return true;
                 }
                 return matches_kitty_sequence(data, codepoint, modifiers::CTRL)
@@ -1068,7 +1072,9 @@ pub fn decode_kitty_printable(data: &str) -> Option<char> {
         return None;
     }
     let mut effective = parsed.codepoint;
-    if modifier & modifiers::SHIFT != 0 && let Some(shifted) = parsed.shifted_key {
+    if modifier & modifiers::SHIFT != 0
+        && let Some(shifted) = parsed.shifted_key
+    {
         effective = shifted;
     }
     effective = normalize_kitty_functional_codepoint(effective);

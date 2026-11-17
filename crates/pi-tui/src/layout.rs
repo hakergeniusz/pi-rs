@@ -374,7 +374,9 @@ fn layout_component(
         if lines.len() > allocated_height && allocated_height > 0 {
             // Keep the cursor line visible. `layout.ts:118-123`.
             let cursor_line = lines.iter().position(|line| line.contains(CURSOR_MARKER));
-            if let Some(cursor_line) = cursor_line && cursor_line >= allocated_height {
+            if let Some(cursor_line) = cursor_line
+                && cursor_line >= allocated_height
+            {
                 line_offset = cursor_line + 1 - allocated_height;
             }
         }
@@ -782,7 +784,9 @@ pub fn get_scroll_views_at(frame: &LayoutFrame, x: i64, y: i64) -> Vec<Component
         if !contains_point(box_.clip, x, y) {
             return;
         }
-        if let Some(scroll_view) = box_.scroll_view && contains_point(box_.rect, x, y) {
+        if let Some(scroll_view) = box_.scroll_view
+            && contains_point(box_.rect, x, y)
+        {
             out.push((scroll_view, depth));
         }
         for child in &box_.children {

@@ -223,7 +223,9 @@ impl Component for Container {
 
     fn handle_input(&mut self, data: &str) -> Option<ComponentMutation> {
         for child in &mut self.children {
-            if let Some(mutation) = child.handle_input(data) && mutation.consume {
+            if let Some(mutation) = child.handle_input(data)
+                && mutation.consume
+            {
                 return Some(mutation);
             }
         }

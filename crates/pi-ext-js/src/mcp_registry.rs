@@ -258,7 +258,9 @@ fn check_exposures(entry: &serde_json::Map<String, Value>) -> Option<String> {
         .map(|value| format!("\"{value}\""))
         .collect::<Vec<_>>()
         .join(", ");
-    if let Some(exposure) = entry.get("exposure") && !is_exposure(exposure) {
+    if let Some(exposure) = entry.get("exposure")
+        && !is_exposure(exposure)
+    {
         return Some(format!("exposure must be one of {exposures}"));
     }
     if let Some(tool_exposure) = entry.get("toolExposure") {
@@ -332,7 +334,9 @@ fn url_host(url: &str) -> String {
 #[must_use]
 pub fn get_mcp_tool_exposure(config: &Value, tool_name: &str) -> String {
     if let Some(overrides) = config.get("toolExposure").and_then(Value::as_object) {
-        if let Some(exact) = overrides.get(tool_name) && let Some(exposure) = exact.as_str() {
+        if let Some(exact) = overrides.get(tool_name)
+            && let Some(exposure) = exact.as_str()
+        {
             return exposure.to_string();
         }
         for (pattern, exposure) in overrides {
@@ -418,7 +422,9 @@ fn validate_http_fields(entry: &serde_json::Map<String, Value>, url: &str) -> Re
     if !is_http_url(url) {
         return Err("url must be an http or https URL".to_string());
     }
-    if let Some(headers) = entry.get("headers") && !is_string_record(headers) {
+    if let Some(headers) = entry.get("headers")
+        && !is_string_record(headers)
+    {
         return Err("headers must map names to strings".to_string());
     }
     validate_oauth(entry.get("oauth"))
@@ -445,10 +451,14 @@ fn validate_stdio_fields(entry: &serde_json::Map<String, Value>) -> Result<(), S
             return Err("args must be an array of strings".to_string());
         }
     }
-    if let Some(env) = entry.get("env") && !is_string_record(env) {
+    if let Some(env) = entry.get("env")
+        && !is_string_record(env)
+    {
         return Err("env must map names to strings".to_string());
     }
-    if let Some(cwd) = entry.get("cwd") && !cwd.is_string() {
+    if let Some(cwd) = entry.get("cwd")
+        && !cwd.is_string()
+    {
         return Err("cwd must be a string".to_string());
     }
     Ok(())
@@ -467,10 +477,14 @@ fn validate_oauth(value: Option<&Value>) -> Result<(), String> {
     let Some(oauth) = value.as_object() else {
         return Err("oauth must be an object".to_string());
     };
-    if let Some(client_id) = oauth.get("clientId") && !client_id.is_string() {
+    if let Some(client_id) = oauth.get("clientId")
+        && !client_id.is_string()
+    {
         return Err("oauth.clientId must be a string".to_string());
     }
-    if let Some(client_secret) = oauth.get("clientSecret") && !client_secret.is_string() {
+    if let Some(client_secret) = oauth.get("clientSecret")
+        && !client_secret.is_string()
+    {
         return Err("oauth.clientSecret must be a string".to_string());
     }
     if let Some(port) = oauth.get("callbackPort") {

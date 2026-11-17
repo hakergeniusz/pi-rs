@@ -288,7 +288,9 @@ pub async fn execute(
     let mut structured = Map::new();
     structured.insert("output".to_string(), json!(full_output.content));
     structured.insert("truncated".to_string(), json!(full_output.truncated));
-    if full_output.truncated && let Some(path) = snapshot.full_output_path.as_ref() {
+    if full_output.truncated
+        && let Some(path) = snapshot.full_output_path.as_ref()
+    {
         structured.insert(
             "full_output_path".to_string(),
             json!(path.display().to_string()),

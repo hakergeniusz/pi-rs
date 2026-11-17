@@ -117,14 +117,16 @@ fn render_horizontal_viewport(rows: &[ViewportRow], width: usize) -> Vec<String>
     let selected_row = rows.iter().find(|row| row.is_selected);
 
     let mut horizontal_scroll = 0;
-    if let Some(selected) = selected_row && max_horizontal_scroll > 0 {
+    if let Some(selected) = selected_row
+        && max_horizontal_scroll > 0
+    {
         let min_visible_anchor_content_width = MAX_VISIBLE_ANCHOR_CONTENT_WIDTH
             .min(MIN_VISIBLE_ANCHOR_CONTENT_WIDTH.max(viewport_width / 3));
         if selected.anchor_col > viewport_width.saturating_sub(min_visible_anchor_content_width) {
             let anchor_context_width =
                 MAX_ANCHOR_CONTEXT_WIDTH.min(MIN_ANCHOR_CONTEXT_WIDTH.max(viewport_width / 4));
-            horizontal_scroll = max_horizontal_scroll
-                .min(selected.anchor_col.saturating_sub(anchor_context_width));
+            horizontal_scroll =
+                max_horizontal_scroll.min(selected.anchor_col.saturating_sub(anchor_context_width));
         }
     }
 

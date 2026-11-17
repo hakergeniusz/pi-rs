@@ -200,14 +200,18 @@ impl SelectSubmenu {
             SelectListAction::Confirmed => {
                 if let Some(item) = self.select_list.selected_item() {
                     let value = item.value.clone();
-                    if self.auto_close && let Some(done) = &self.done {
+                    if self.auto_close
+                        && let Some(done) = &self.done
+                    {
                         done.close(Some(&value), None);
                     }
                     self.push(SelectSubmenuEvent::Select(value));
                 }
             }
             SelectListAction::Cancelled => {
-                if self.auto_close && let Some(done) = &self.done {
+                if self.auto_close
+                    && let Some(done) = &self.done
+                {
                     done.close(None, None);
                 }
                 self.push(SelectSubmenuEvent::Cancel);

@@ -695,7 +695,9 @@ pub fn build_request_body(
 
     // Thinking budgets: token-based via model.thinkingLevelMap when present,
     // otherwise level defaults capped to half the max tokens.
-    if let Some(level) = options.reasoning && model.reasoning {
+    if let Some(level) = options.reasoning
+        && model.reasoning
+    {
         let default_budgets: [(ThinkingLevel, u64); 5] = [
             (ThinkingLevel::Minimal, 1024),
             (ThinkingLevel::Off, 0),

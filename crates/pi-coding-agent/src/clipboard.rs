@@ -79,7 +79,9 @@ pub fn run_clipboard_command(
     // Clipboard writers can daemonize without draining stdin, and a blocking
     // write would eat the timeout budget: feed stdin from its own thread so
     // the deadline keeps ticking (upstream relies on Node's async write).
-    if let Some(input) = options.input && let Some(mut stdin) = child.stdin.take() {
+    if let Some(input) = options.input
+        && let Some(mut stdin) = child.stdin.take()
+    {
         let input = input.to_string();
         // A writer may exit before consuming all input; write errors are
         // ignored (`clipboard-command.ts:52`).

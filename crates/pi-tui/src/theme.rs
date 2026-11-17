@@ -466,7 +466,9 @@ pub fn validate_theme_json(label: &str, value: &Value) -> Result<ThemeJson, Stri
         Some(Value::String(_)) => {}
         Some(_) => others.push("  - /name: Expected string".to_string()),
     }
-    if let Some(schema) = object.get("$schema") && !schema.is_string() {
+    if let Some(schema) = object.get("$schema")
+        && !schema.is_string()
+    {
         others.push("  - /$schema: Expected string".to_string());
     }
     if let Some(appearance) = object.get("appearance") {
@@ -1067,7 +1069,9 @@ fn average_lightness(colors: impl Iterator<Item = Color>) -> Option<f64> {
     let mut sum = 0.0;
     let mut count = 0.0;
     for color in colors {
-        if let Color::Indexed(index) = color && index < 16 {
+        if let Color::Indexed(index) = color
+            && index < 16
+        {
             continue;
         }
         sum += crate::color::color_to_oklch(color).l;

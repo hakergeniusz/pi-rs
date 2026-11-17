@@ -1457,7 +1457,9 @@ impl ExtensionRunner {
                 if let Some(text) = value.get("text").and_then(Json::as_str) {
                     current["text"] = Json::String(text.to_string());
                 }
-                if let Some(images) = value.get("images") && !images.is_null() {
+                if let Some(images) = value.get("images")
+                    && !images.is_null()
+                {
                     current["images"] = images.clone();
                     images_supplied = true;
                 }

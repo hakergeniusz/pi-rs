@@ -158,7 +158,9 @@ pub fn resolve_default_tools(entries: &[Value]) -> Vec<String> {
         let index = tools.iter().position(|tool| tool == name);
         if entry.starts_with('+') && index.is_none() && !name.is_empty() {
             tools.push(name.to_string());
-        } else if entry.starts_with('-') && let Some(index) = index {
+        } else if entry.starts_with('-')
+            && let Some(index) = index
+        {
             tools.remove(index);
         }
     }

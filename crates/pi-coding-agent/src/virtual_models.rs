@@ -825,7 +825,9 @@ impl PrepareRequest for VirtualRouteHook {
             );
             match route {
                 Ok(route) => {
-                    if let Some(new_state) = &route.state && Some(new_state) != state.as_ref() {
+                    if let Some(new_state) = &route.state
+                        && Some(new_state) != state.as_ref()
+                    {
                         self.state
                             .lock()
                             .expect("router state")

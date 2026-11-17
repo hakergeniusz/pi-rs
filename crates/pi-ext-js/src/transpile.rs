@@ -86,7 +86,9 @@ pub fn transpile_with_cache_dir(
         return Ok(source.to_string());
     }
     let key = cache_key(path, source);
-    if let Some(cache_dir) = cache_dir && let Some(cached) = read_cache_entry(cache_dir, &key) {
+    if let Some(cache_dir) = cache_dir
+        && let Some(cached) = read_cache_entry(cache_dir, &key)
+    {
         return Ok(cached);
     }
     let printed = transpile_typescript(path, source, source_type)?;
@@ -437,8 +439,10 @@ export const value = [Level.High, Util.tag];
             let path = entry.path();
             if path.is_dir() {
                 collect_fixture_sources(&path, sources);
-            } else if matches!(path.extension().and_then(|ext| ext.to_str()), Some("ts" | "js"))
-                && let Ok(source) = std::fs::read_to_string(&path)
+            } else if matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("ts" | "js")
+            ) && let Ok(source) = std::fs::read_to_string(&path)
             {
                 sources.push((path.display().to_string(), source));
             }

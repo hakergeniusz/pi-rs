@@ -475,7 +475,10 @@ fn pre_render_custom_tools(
                     .map_or_else(RenderedToolHtml::default, |(_, rendered)| rendered.clone());
                 merged.result_html_collapsed = rendered.collapsed;
                 merged.result_html_expanded = rendered.expanded;
-                match rendered_tools.iter_mut().find(|(id, _)| *id == result.tool_call_id) {
+                match rendered_tools
+                    .iter_mut()
+                    .find(|(id, _)| *id == result.tool_call_id)
+                {
                     Some((_, slot)) => *slot = merged,
                     None => rendered_tools.push((result.tool_call_id.clone(), merged)),
                 }

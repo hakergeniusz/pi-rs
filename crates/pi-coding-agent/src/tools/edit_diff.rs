@@ -827,7 +827,10 @@ pub fn diff_lines(old_content: &str, new_content: &str) -> Vec<DiffPart> {
 
     let mut parts: Vec<DiffPart> = Vec::new();
     let push = |added: bool, removed: bool, line: &str, parts: &mut Vec<DiffPart>| {
-        if let Some(last) = parts.last_mut() && last.added == added && last.removed == removed {
+        if let Some(last) = parts.last_mut()
+            && last.added == added
+            && last.removed == removed
+        {
             last.value.push_str(line);
             return;
         }

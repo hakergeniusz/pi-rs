@@ -117,12 +117,17 @@ pub fn exec(
     let mut killed = false;
     let mut force_kill_at: Option<Instant> = None;
     let status = loop {
-        if let Some(deadline) = deadline && !killed && Instant::now() >= deadline {
+        if let Some(deadline) = deadline
+            && !killed
+            && Instant::now() >= deadline
+        {
             killed = true;
             send_signal(pid, 15); // SIGTERM
             force_kill_at = Some(Instant::now() + FORCE_KILL_DELAY);
         }
-        if let Some(at) = force_kill_at && Instant::now() >= at {
+        if let Some(at) = force_kill_at
+            && Instant::now() >= at
+        {
             send_signal(pid, 9); // SIGKILL
         }
         match child.try_wait() {

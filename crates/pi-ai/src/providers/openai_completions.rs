@@ -234,7 +234,9 @@ async fn request_and_stream(
             }
         }
 
-        if let Some(text) = delta.get("content").and_then(Value::as_str) && !text.is_empty() {
+        if let Some(text) = delta.get("content").and_then(Value::as_str)
+            && !text.is_empty()
+        {
             let index = if let Some(index) = state.text_open {
                 index
             } else {

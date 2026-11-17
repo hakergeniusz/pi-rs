@@ -1410,7 +1410,10 @@ fn indexed_colors(saturation: f64, appearance: Option<ThemeAppearance>) -> Syste
                 ColorValue::Default
             },
         );
-        if neutral && let Token::Fg(fg) = entry && !FOREGROUND_TOKENS.contains(&fg) {
+        if neutral
+            && let Token::Fg(fg) = entry
+            && !FOREGROUND_TOKENS.contains(&fg)
+        {
             colors.dim.push(fg);
         }
     }

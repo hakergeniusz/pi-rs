@@ -1284,7 +1284,9 @@ impl Editor {
             let length = grapheme.chars().count();
             // A paste marker is one atomic unit; dropping it drops its registry
             // entry and renumbers the rest.
-            if is_paste_marker(&grapheme) && let Some(id) = parse_marker(&grapheme) {
+            if is_paste_marker(&grapheme)
+                && let Some(id) = parse_marker(&grapheme)
+            {
                 self.pastes.remove(&id);
                 self.paste_counter = self.paste_counter.saturating_sub(1);
                 let higher: Vec<u64> = self
@@ -1702,7 +1704,9 @@ impl Editor {
             let before = char_slice(&line, 0, self.state.cursor_col)
                 .unwrap_or("")
                 .to_string();
-            if let Some(last) = before.chars().last() && (last.is_alphanumeric() || last == '_') {
+            if let Some(last) = before.chars().last()
+                && (last.is_alphanumeric() || last == '_')
+            {
                 filtered.insert(0, ' ');
             }
         }
@@ -2032,7 +2036,9 @@ impl Editor {
         result.push(self.render_bottom_border(width, lines_below));
 
         self.rendered_autocomplete_height = 0;
-        if self.autocomplete_state.is_some() && let Some(list) = &self.autocomplete_list {
+        if self.autocomplete_state.is_some()
+            && let Some(list) = &self.autocomplete_list
+        {
             let autocomplete_lines = list.render(content_width);
             self.rendered_autocomplete_height = autocomplete_lines.len();
             for line in autocomplete_lines {
@@ -2225,7 +2231,9 @@ impl Editor {
             }
             // Terminals without shift+enter: `\` before the cursor means newline.
             let before = self.before_cursor();
-            if let Some(last) = before.chars().last() && last == '\\' {
+            if let Some(last) = before.chars().last()
+                && last == '\\'
+            {
                 self.handle_backspace();
                 self.add_new_line();
                 return;
@@ -2297,7 +2305,10 @@ impl Editor {
             self.insert_character(printable);
             return;
         }
-        if let Some(first) = data.chars().next() && first >= ' ' && data.chars().count() == 1 {
+        if let Some(first) = data.chars().next()
+            && first >= ' '
+            && data.chars().count() == 1
+        {
             self.insert_character(first);
         }
     }

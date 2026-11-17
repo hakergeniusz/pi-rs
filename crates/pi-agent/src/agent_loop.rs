@@ -288,7 +288,9 @@ fn bash_execution_to_text(message: &BashExecutionMessage) -> String {
         text.push_str("\n\nCommand exited with code ");
         text.push_str(&message.exit_code.unwrap_or(0).to_string());
     }
-    if message.truncated && let Some(path) = &message.full_output_path {
+    if message.truncated
+        && let Some(path) = &message.full_output_path
+    {
         text.push_str("\n\n[Output truncated. Full output: ");
         text.push_str(path);
         text.push(']');

@@ -238,7 +238,9 @@ fn rebuild(
 /// The composed snapshot; the flattened static catalog before the first
 /// refresh.
 pub fn all() -> Vec<Model> {
-    if let Ok(composed) = COMPOSED.read() && let Some(composed) = composed.as_ref() {
+    if let Ok(composed) = COMPOSED.read()
+        && let Some(composed) = composed.as_ref()
+    {
         return composed.as_ref().clone();
     }
     let mut models = Vec::new();
@@ -280,7 +282,9 @@ pub fn models_for(provider: &str) -> Vec<Model> {
 /// user-visible surface). Before the first refresh the static catalog is the
 /// answer.
 pub fn providers() -> Vec<String> {
-    if let Ok(ids) = PROVIDER_IDS.read() && let Some(ids) = ids.as_ref() {
+    if let Ok(ids) = PROVIDER_IDS.read()
+        && let Some(ids) = ids.as_ref()
+    {
         return ids.as_ref().clone();
     }
     pi_ai::catalog::catalog()

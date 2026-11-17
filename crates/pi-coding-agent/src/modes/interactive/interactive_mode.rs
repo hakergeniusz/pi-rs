@@ -7787,7 +7787,9 @@ impl InteractiveMode {
             }
         }
         if let Some(outcome) = retry_wait_outcome {
-            if let Some(wait) = self.retry_wait.take() && let Some(handle) = wait.handle {
+            if let Some(wait) = self.retry_wait.take()
+                && let Some(handle) = wait.handle
+            {
                 let _ = handle.join();
             }
             self.set_working_status(None);

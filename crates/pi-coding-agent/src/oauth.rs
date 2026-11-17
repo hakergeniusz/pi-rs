@@ -511,7 +511,9 @@ pub fn provider_auth_status(
     // The ambient env vars (`envApiKeyAuth.resolve`'s loop,
     // `helpers.ts:21-29`): the first set variable is the source label.
     for variable in crate::modes::print_mode::env_key_candidates(provider_id) {
-        if let Ok(value) = std::env::var(variable) && !value.is_empty() {
+        if let Ok(value) = std::env::var(variable)
+            && !value.is_empty()
+        {
             return Some(AuthStatus {
                 configured: true,
                 auth_type: "api_key",

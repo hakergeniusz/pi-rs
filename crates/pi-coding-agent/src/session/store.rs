@@ -2166,7 +2166,9 @@ impl SessionManager {
         from_hook: Option<bool>,
         usage: Option<Usage>,
     ) -> SessionResult<String> {
-        if let Some(id) = branch_from_id && !self.by_id.contains_key(id) {
+        if let Some(id) = branch_from_id
+            && !self.by_id.contains_key(id)
+        {
             return Err(SessionError::EntryNotFound(id.to_string()));
         }
         let from_id = self.leaf_id.clone().unwrap_or_else(|| "root".to_string());

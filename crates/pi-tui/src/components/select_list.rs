@@ -280,7 +280,9 @@ impl SelectList {
         let prefix = if is_selected { "→ " } else { "  " };
         let prefix_width = visible_width(prefix);
 
-        if let Some(description) = description && width > 40 {
+        if let Some(description) = description
+            && width > 40
+        {
             let effective_column = primary_column_width
                 .min(width.saturating_sub(prefix_width + 4))
                 .max(1);

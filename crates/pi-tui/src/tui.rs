@@ -1019,10 +1019,8 @@ impl Tui {
                 OverlayFocusRestoreState::Eligible { overlay } => {
                     if let Some(focused_overlay) = previous_focused_overlay
                         && overlay == focused_overlay
-                        && !self.is_overlay_focus_ancestor(
-                            focused_overlay,
-                            next_focus.map(|_| next_id),
-                        )
+                        && !self
+                            .is_overlay_focus_ancestor(focused_overlay, next_focus.map(|_| next_id))
                     {
                         self.overlay_focus_restore = OverlayFocusRestoreState::Blocked {
                             overlay: focused_overlay,
@@ -1057,7 +1055,9 @@ impl Tui {
         self.focused = next_focus;
         self.focused_component = None;
         self.focused_id = next_focus.map(|target| self.target_id(target));
-        if let Some(next) = self.focused_id && let Some(component) = self.component_mut(next) {
+        if let Some(next) = self.focused_id
+            && let Some(component) = self.component_mut(next)
+        {
             set_focus_flag(component, true);
         }
         if let Some(FocusTarget::Root(index)) = next_focus {

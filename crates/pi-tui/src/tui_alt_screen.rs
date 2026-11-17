@@ -1013,7 +1013,9 @@ impl Tui {
     ) {
         let mut moved = self.alt().is_some_and(|alt| alt.mouse_press_moved);
         let point = self.alt().and_then(|alt| alt.mouse_press_point);
-        if let Some((px, py)) = point && (raw.x != px || raw.y != py) {
+        if let Some((px, py)) = point
+            && (raw.x != px || raw.y != py)
+        {
             moved = true;
             let alt = self.alt_state();
             alt.mouse_press_moved = true;
