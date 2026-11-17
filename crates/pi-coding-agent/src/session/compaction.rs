@@ -113,6 +113,22 @@ impl FileOperations {
             _ => {}
         }
     }
+    /// Seed recorded file lists from a nested branch summary's details
+    /// (`branch-summarization.ts:215-229`): read files go into `read`;
+    /// modified files into both `edited` and `written` for deduplication.
+    pub(crate) fn seed_from_summary_details(
+        &mut self,
+        read_files: &[String],
+        modified_files: &[String],
+    ) {
+        for file in read_files {
+            self.read.insert(file.clone());
+        }
+        for file in modified_files {
+            self.edited.insert(file.clone());
+            self.written.insert(file.clone());
+        }
+    }
 }
 
 /// `computeFileLists` (`utils.ts:68-73`): files only read, and files
@@ -921,7 +937,7 @@ fn now_millis() -> i64 {
 
 /// One summarization request over the injected stream seam: a single
 /// `completeSimple`-shaped call collecting the final assistant message.
-async fn complete_summarization(
+pub(crate) async fn complete_summarization(
     model: &Model,
     prompt_text: &str,
     api_key: Option<&str>,
@@ -999,7 +1015,10 @@ fn event_partial(event: &AssistantMessageEvent) -> pi_ai::types::AssistantMessag
 
 /// `getSummarizationFailure` (`compaction.ts:585-593`): a length stop
 /// contains partial text and must not become a session checkpoint.
-fn summarization_failure(response: &pi_ai::types::AssistantMessage, label: &str) -> Option<String> {
+pub(crate) fn summarization_failure(
+    response: &pi_ai::types::AssistantMessage,
+    label: &str,
+) -> Option<String> {
     match response.stop_reason {
         StopReason::Error => Some(format!(
             "{label} failed: {}",
@@ -1017,7 +1036,10 @@ fn summarization_failure(response: &pi_ai::types::AssistantMessage, label: &str)
 
 /// The summarization thinking level: only when the model supports reasoning
 /// (`createSummarizationOptions`, `compaction.ts:595-609`).
-fn summarization_thinking_level(model: &Model, thinking_level: ThinkingLevel) -> ThinkingLevel {
+pub(crate) fn summarization_thinking_level(
+    model: &Model,
+    thinking_level: ThinkingLevel,
+) -> ThinkingLevel {
     if model.reasoning && thinking_level != ThinkingLevel::Off {
         thinking_level
     } else {
@@ -1026,7 +1048,7 @@ fn summarization_thinking_level(model: &Model, thinking_level: ThinkingLevel) ->
 }
 
 /// `contentText` (`pi-ai`): visible text of assistant content blocks.
-fn content_text(content: &[AssistantContent]) -> String {
+pub(crate) fn content_text(content: &[AssistantContent]) -> String {
     content
         .iter()
         .filter_map(|block| match block {

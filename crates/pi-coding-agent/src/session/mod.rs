@@ -26,6 +26,7 @@
 
 use std::path::PathBuf;
 
+pub mod branch_summarization;
 pub mod cache_stats;
 pub mod compaction;
 pub mod json;

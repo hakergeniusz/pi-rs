@@ -57,6 +57,8 @@ use super::components::auth_selector::{
     AuthSelectorComponent, AuthSelectorEvent, LoginPromptComponent, LoginPromptEvent,
 };
 use super::components::easter_egg_3d::{EasterEgg3d, EasterEggHandle, play_easter_egg_3d};
+use super::components::extension_editor::{ExtensionEditorComponent, ExtensionEditorEvent};
+use super::components::extension_selector::{ExtensionSelectorComponent, ExtensionSelectorEvent};
 use super::components::footer::{FooterComponent, FooterData, UsageTotals};
 use super::components::header::{BuiltInHeader, pi_logo_lines};
 use super::components::model_selector::{ModelSelectorComponent, ModelSelectorEvent};
@@ -66,6 +68,7 @@ use super::components::settings_selector::{
 };
 use super::components::status_indicator::{IdleStatus, StatusIndicator};
 use super::components::tool_execution::{ToolExecutionComponent, ToolResultView};
+use super::components::tree_selector::{TreeSelectorComponent, TreeSelectorEvent};
 use super::components::trust_selector::{TrustSelectorComponent, TrustSelectorEvent};
 use super::components::user_message::UserMessageComponent;
 use super::components::user_message_selector::{
@@ -352,6 +355,34 @@ impl ForkPosition {
 enum ForkOutcome {
     Cancelled,
     Completed(Option<String>),
+}
+
+/// `AgentSession.navigateTree`'s non-error outcomes (`agent-session.ts`
+/// :4140-4337): a `session_before_tree` veto, or the completed navigation
+/// with the editor text for a re-edited user/custom message (`editorText`).
+enum TreeNavigationOutcome {
+    Cancelled,
+    Completed(Option<String>),
+}
+
+/// One staged `/tree` navigation: the confirmed target plus the summarize
+/// dialog's decisions, and the branch summary worker while it runs
+/// (`showTreeSelector`'s selection tail, `interactive-mode.ts:5766-5871`).
+struct TreeNavigationRun {
+    target_id: String,
+    summarize: bool,
+    custom_instructions: Option<String>,
+    /// The branch summary worker, while summarizing.
+    summary_run: Option<BranchSummaryRun>,
+}
+
+/// The branch summary worker thread (`navigateTree`'s generateBranchSummary
+/// phase, `agent-session.ts:4230-4263`): the LLM call runs off the UI thread
+/// like the compaction worker.
+struct BranchSummaryRun {
+    abort: Arc<AbortSignal>,
+    events: std::sync::mpsc::Receiver<crate::session::branch_summarization::BranchSummaryResult>,
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// One compaction attempt on a worker thread (`session.compact`).
@@ -822,6 +853,18 @@ pub struct InteractiveMode {
     /// Events from the mounted `/fork` dialog (`UserMessageSelectorComponent`'s
     /// onSelect/onCancel).
     user_message_selector_events: Option<Arc<Mutex<Vec<UserMessageSelectorEvent>>>>,
+    /// Events from the mounted `/tree` selector
+    /// (`TreeSelectorComponent`'s onSelect/onCancel/onCopy/onLabelChange).
+    tree_selector_events: Option<Arc<Mutex<Vec<TreeSelectorEvent>>>>,
+    /// Events from the mounted "Summarize branch?" dialog
+    /// (`showExtensionSelector`'s resolve).
+    tree_summary_dialog_events: Option<Arc<Mutex<Vec<ExtensionSelectorEvent>>>>,
+    /// Events from the mounted custom-summarization-prompt editor
+    /// (`showExtensionEditor`'s resolve).
+    tree_prompt_editor_events: Option<Arc<Mutex<Vec<ExtensionEditorEvent>>>>,
+    /// The staged `/tree` navigation: the confirmed target, the dialog
+    /// decisions, and the branch summary worker while it runs.
+    tree_navigation: Option<TreeNavigationRun>,
     /// Events from the mounted `/login`//`/logout` selector
     /// (`OAuthSelectorComponent`'s onSelect/onCancel).
     auth_selector_events: Option<Arc<Mutex<Vec<AuthSelectorEvent>>>>,
@@ -1029,6 +1072,10 @@ impl InteractiveMode {
             settings_selector_events: None,
             session_selector_events: None,
             user_message_selector_events: None,
+            tree_selector_events: None,
+            tree_summary_dialog_events: None,
+            tree_prompt_editor_events: None,
+            tree_navigation: None,
             auth_selector_events: None,
             auth_selector_mode: None,
             pending_auth_type: None,
@@ -1266,6 +1313,7 @@ impl InteractiveMode {
                 "clone",
                 "Duplicate the current session at the current position",
             ),
+            autocomplete::SlashCommand::new("tree", "Navigate session tree (switch branches)"),
             // `BUILTIN_SLASH_COMMANDS` (`slash-commands.ts:37-38`); the
             // `/login` argument completions ride
             // `loginCommand.getArgumentCompletions`
@@ -2118,6 +2166,11 @@ impl InteractiveMode {
             self.handle_clone_command();
             return;
         }
+        // `/tree` (`interactive-mode.ts:3408-3411`).
+        if text == "/tree" {
+            self.show_tree_selector(None);
+            return;
+        }
         // `/login [provider]` (`interactive-mode.ts:3418-3423`): an empty
         // reference rides as `""`, which matches nothing and opens the
         // provider selector (`findMatchingProviders`'s normalized-empty
@@ -2149,9 +2202,11 @@ impl InteractiveMode {
                 return;
             }
         }
-        // Queue input during compaction (`interactive-mode.ts:3489-3499`):
-        // built-in commands already dispatched above.
-        if self.compaction_run.is_some() {
+        // Queue input during compaction or a branch summary
+        // (`interactive-mode.ts:3489-3499`, `session.isCompacting` covering
+        // both — `agent-session.ts:1719-1726`): built-in commands already
+        // dispatched above.
+        if self.is_compacting() {
             self.queue_compaction_message(&text, false);
             return;
         }
@@ -4583,6 +4638,14 @@ impl InteractiveMode {
         self.settings_selector_events = None;
         self.session_selector_events = None;
         self.user_message_selector_events = None;
+        if let Some(navigation) = self.tree_navigation.take() {
+            if let Some(run) = navigation.summary_run {
+                run.abort.abort();
+            }
+        }
+        self.tree_selector_events = None;
+        self.tree_summary_dialog_events = None;
+        self.tree_prompt_editor_events = None;
         self.auth_selector_events = None;
         self.login_prompt_events = None;
         self.login_prompt_provider = None;
@@ -4936,6 +4999,625 @@ impl InteractiveMode {
         self.streaming_index = None;
         self.render_initial_messages();
         self.refresh_footer();
+    }
+
+    // --------------------------------------------------------------
+    // /tree (`showTreeSelector`, `interactive-mode.ts:5751-5898`, and
+    // `AgentSession.navigateTree`, `agent-session.ts:4140-4337`)
+    // --------------------------------------------------------------
+
+    /// Whether compaction or a branch summary is running
+    /// (`session.isCompacting`, `agent-session.ts:1719-1726`).
+    fn is_compacting(&self) -> bool {
+        self.compaction_run.is_some()
+            || self
+                .tree_navigation
+                .as_ref()
+                .is_some_and(|navigation| navigation.summary_run.is_some())
+    }
+
+    /// `showTreeSelector` (`interactive-mode.ts:5751-5898`): the tree dialog
+    /// over the session's entries, preselected on the current leaf (or the
+    /// re-open target), seeded with the persisted filter mode.
+    fn show_tree_selector(&mut self, initial_selected_id: Option<&str>) {
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let tree = self.session.get_tree();
+        // `this.sessionManager.getTree()` + `getLeafId()` (`:5752-5753`).
+        let real_leaf_id = self.session.get_leaf_id().map(str::to_string);
+        let initial_filter_mode = self.settings.get_tree_filter_mode();
+        if tree.is_empty() {
+            self.show_status("No entries in session");
+            return;
+        }
+        // `this.ui.terminal.rows` → `maxVisibleLines`
+        // (`tree-selector.ts:1368`).
+        let terminal_rows = self
+            .tui
+            .terminal()
+            .size()
+            .map_or(24, |size| usize::from(size.rows));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let selector = TreeSelectorComponent::new(
+            tree,
+            real_leaf_id.as_deref(),
+            terminal_rows,
+            initial_selected_id,
+            initial_filter_mode,
+            Arc::clone(&events),
+        );
+        self.tree_selector_events = Some(events);
+        self.suspend_editor_with(Box::new(selector));
+    }
+
+    /// Put the editor back after the tree dialog closes.
+    fn close_tree_selector(&mut self) {
+        if self.suspended_editor.is_none() {
+            return;
+        }
+        self.tree_selector_events = None;
+        self.restore_editor();
+    }
+
+    /// The `/tree` dialog's events (`showTreeSelector`'s callbacks,
+    /// `interactive-mode.ts:5766-5895`).
+    fn handle_tree_selector_event(&mut self, event: TreeSelectorEvent) {
+        match event {
+            TreeSelectorEvent::Selected(entry_id) => {
+                self.close_tree_selector();
+                self.handle_tree_selection(entry_id);
+            }
+            TreeSelectorEvent::Cancel => self.close_tree_selector(),
+            TreeSelectorEvent::Copy(text) => match text {
+                Some(text) => match crate::clipboard::copy_to_clipboard(&text) {
+                    Ok(()) => self.show_status("Copied selected message to clipboard"),
+                    Err(error) => self.show_error(&error),
+                },
+                // `if (!text)` (`:5885-5888`).
+                None => self.show_error("Selected entry has no text to copy"),
+            },
+            TreeSelectorEvent::LabelChange(entry_id, label) => {
+                // `(entryId, label) => { this.sessionManager
+                // .appendLabelChange(entryId, label); this.ui.requestRender(); }`
+                // (`:5877-5880`).
+                if let Err(error) = self
+                    .session
+                    .append_label_change(&entry_id, label.as_deref())
+                {
+                    self.show_error(&error.to_string());
+                }
+                self.tui.request_render();
+            }
+        }
+    }
+
+    fn pump_tree_selector(&mut self) {
+        if self.tree_selector_events.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .tree_selector_events
+                .as_ref()
+                .expect("tree selector")
+                .lock()
+                .expect("tree selector events"),
+        );
+        for event in events {
+            self.handle_tree_selector_event(event);
+        }
+    }
+
+    /// The selection tail (`interactive-mode.ts:5766-5808`): the current-leaf
+    /// no-op, then the summarize prompt unless `branchSummary.skipPrompt`.
+    fn handle_tree_selection(&mut self, entry_id: String) {
+        // Selecting the current leaf is a no-op (already there).
+        if self.session.get_leaf_id() == Some(entry_id.as_str()) {
+            self.show_status("Already at this point");
+            return;
+        }
+
+        if !self.settings.get_branch_summary_settings().skip_prompt {
+            // Loop until the user makes a complete choice or cancels to tree
+            // (`:5777-5808`): the port stages the target and mounts the
+            // dialog; the pumps drive the loop.
+            self.tree_navigation = Some(TreeNavigationRun {
+                target_id: entry_id,
+                summarize: false,
+                custom_instructions: None,
+                summary_run: None,
+            });
+            self.open_tree_summary_dialog();
+            return;
+        }
+        self.proceed_tree_navigation(entry_id, false, None);
+    }
+
+    /// The "Summarize branch?" dialog (`showExtensionSelector`'s built-in
+    /// arm, `:5783-5788`).
+    fn open_tree_summary_dialog(&mut self) {
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let selector = ExtensionSelectorComponent::new(
+            "Summarize branch?",
+            vec![
+                "No summary".to_string(),
+                "Summarize".to_string(),
+                "Summarize with custom prompt".to_string(),
+            ],
+            Arc::clone(&events),
+        );
+        self.tree_summary_dialog_events = Some(events);
+        self.suspend_editor_with(Box::new(selector));
+    }
+
+    fn handle_tree_summary_event(&mut self, event: ExtensionSelectorEvent) {
+        // The navigation under the dialog: restore the editor, then drive
+        // the decision loop.
+        self.restore_editor();
+        self.tree_summary_dialog_events = None;
+        let Some(navigation) = self.tree_navigation.take() else {
+            return;
+        };
+        match event {
+            ExtensionSelectorEvent::Cancel => {
+                // User pressed escape — re-show the tree selector with the
+                // same selection (`:5790-5794`).
+                self.show_tree_selector(Some(&navigation.target_id));
+            }
+            ExtensionSelectorEvent::Selected(choice) => {
+                let mut navigation = navigation;
+                if choice == "Summarize with custom prompt" {
+                    // `customInstructions = await this.showExtensionEditor(...)`
+                    // (`:5798-5803`): a cancel loops back to the summary
+                    // dialog.
+                    navigation.summarize = true;
+                    self.tree_navigation = Some(navigation);
+                    self.open_tree_prompt_editor();
+                    return;
+                }
+                navigation.summarize = choice == "Summarize";
+                let TreeNavigationRun {
+                    target_id,
+                    summarize,
+                    custom_instructions,
+                    ..
+                } = navigation;
+                self.proceed_tree_navigation(target_id, summarize, custom_instructions);
+            }
+        }
+    }
+
+    fn pump_tree_summary_dialog(&mut self) {
+        if self.tree_summary_dialog_events.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .tree_summary_dialog_events
+                .as_ref()
+                .expect("tree summary dialog")
+                .lock()
+                .expect("tree summary dialog events"),
+        );
+        for event in events {
+            self.handle_tree_summary_event(event);
+        }
+    }
+
+    /// The custom-summarization-prompt editor (`showExtensionEditor`,
+    /// `:5799`).
+    fn open_tree_prompt_editor(&mut self) {
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let selector = ExtensionEditorComponent::new(
+            "Custom summarization instructions",
+            None,
+            Arc::clone(&events),
+        );
+        self.tree_prompt_editor_events = Some(events);
+        self.suspend_editor_with(Box::new(selector));
+    }
+
+    fn handle_tree_prompt_event(&mut self, event: ExtensionEditorEvent) {
+        self.restore_editor();
+        self.tree_prompt_editor_events = None;
+        let Some(navigation) = self.tree_navigation.take() else {
+            return;
+        };
+        match event {
+            ExtensionEditorEvent::Cancel => {
+                // A cancelled editor loops back to the summary selector
+                // (`:5800-5804`).
+                self.tree_navigation = Some(navigation);
+                self.open_tree_summary_dialog();
+            }
+            ExtensionEditorEvent::Submitted(text) => {
+                let TreeNavigationRun { target_id, .. } = navigation;
+                // `customInstructions = await this.showExtensionEditor(...)`
+                // (`:5799`): the submitted text rides verbatim.
+                self.proceed_tree_navigation(target_id, true, Some(text));
+            }
+        }
+    }
+
+    fn pump_tree_prompt_editor(&mut self) {
+        if self.tree_prompt_editor_events.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .tree_prompt_editor_events
+                .as_ref()
+                .expect("tree prompt editor")
+                .lock()
+                .expect("tree prompt editor events"),
+        );
+        for event in events {
+            self.handle_tree_prompt_event(event);
+        }
+    }
+
+    /// The committed navigation (`interactive-mode.ts:5811-5837`): stop the
+    /// active response, recheck availability, run the `session_before_tree`
+    /// gate, then start the summarizer or navigate directly.
+    fn proceed_tree_navigation(
+        &mut self,
+        target_id: String,
+        summarize: bool,
+        custom_instructions: Option<String>,
+    ) {
+        // The user committed to navigating: stop the active response first.
+        if self.agent_run.is_some() {
+            self.dequeue_queued();
+            self.abort_active_run();
+        }
+        // Recheck after the dialogs and streaming abort, before replacing
+        // another operation's UI.
+        if self.is_compacting() {
+            self.show_error(
+                "Wait for the current compaction or tree navigation to finish before navigating the session tree.",
+            );
+            return;
+        }
+
+        // The `session_before_tree` gate (`agent-session.ts:4201-4211`).
+        // Upstream runs it inside navigateTree, ahead of the summarization;
+        // the port hoists it ahead of the worker thread for the same
+        // ordering. The preparation rides verbatim minus `label` (the
+        // extension overrides land with E3).
+        let old_leaf_id = self.session.get_leaf_id().map(str::to_string);
+        let (entries_to_summarize, common_ancestor_id) =
+            crate::session::branch_summarization::collect_entries_for_branch_summary(
+                &self.session,
+                old_leaf_id.as_deref(),
+                &target_id,
+            );
+        let preparation = serde_json::json!({
+            "targetId": target_id,
+            "oldLeafId": old_leaf_id,
+            "commonAncestorId": common_ancestor_id,
+            "userWantsSummary": summarize,
+            "customInstructions": custom_instructions,
+            "replaceInstructions": false,
+            "entriesToSummarize": entries_to_summarize
+                .iter()
+                .map(|entry| serde_json::Value::Object(entry.to_record().object().clone()))
+                .collect::<Vec<_>>(),
+        });
+        if self.extension_cancelled(&serde_json::json!({
+            "type": "session_before_tree",
+            "preparation": preparation,
+        })) {
+            self.show_status("Navigation cancelled");
+            return;
+        }
+
+        self.tree_navigation = Some(TreeNavigationRun {
+            target_id,
+            summarize,
+            custom_instructions,
+            summary_run: None,
+        });
+        if summarize {
+            self.start_branch_summary();
+        } else {
+            let navigation = self.tree_navigation.take().expect("navigation");
+            self.finish_tree_navigation(navigation, None);
+        }
+    }
+
+    /// The branch summary worker (`navigateTree`'s summarize phase,
+    /// `agent-session.ts:4230-4263`): the entries between the old leaf and
+    /// the target go to `generateBranchSummary` off the UI thread, with the
+    /// `BranchSummaryStatusIndicator` standing in (`:5825-5837`).
+    fn start_branch_summary(&mut self) {
+        let Some(navigation) = &self.tree_navigation else {
+            return;
+        };
+        let target_id = navigation.target_id.clone();
+        let custom_instructions = navigation.custom_instructions.clone();
+        drop(navigation);
+        let old_leaf_id = self.session.get_leaf_id().map(str::to_string);
+        let (entries_to_summarize, _common_ancestor_id) =
+            crate::session::branch_summarization::collect_entries_for_branch_summary(
+                &self.session,
+                old_leaf_id.as_deref(),
+                &target_id,
+            );
+        if entries_to_summarize.is_empty() {
+            // `options.summarize && entriesToSummarize.length > 0`
+            // (`:4234`): an empty branch navigates without a summary.
+            let navigation = self.tree_navigation.take().expect("navigation");
+            self.finish_tree_navigation(navigation, None);
+            return;
+        }
+
+        let model = self.model.clone();
+        let api_key = self.api_key.clone();
+        let access_token = self.access_token.clone();
+        let thinking_level = self.thinking_level.clone();
+        let stream_fn = Arc::clone(&self.stream_fn);
+        let reserve_tokens = self
+            .settings
+            .get_branch_summary_settings()
+            .reserve_tokens
+            .max(0) as u64;
+        let signal = AbortSignal::new();
+        let worker_signal = Arc::clone(&signal);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let options = crate::session::branch_summarization::BranchSummaryOptions {
+                model: &model,
+                api_key: api_key.as_deref(),
+                access_token: access_token.as_deref(),
+                signal: &worker_signal,
+                thinking_level,
+                custom_instructions: custom_instructions.as_deref(),
+                replace_instructions: false,
+                reserve_tokens,
+                stream_fn: stream_fn.as_ref(),
+            };
+            let result = crate::runtime::block_on(
+                crate::session::branch_summarization::generate_branch_summary(
+                    &entries_to_summarize,
+                    &options,
+                ),
+            );
+            let _ = tx.send(result);
+        });
+        if let Some(navigation) = self.tree_navigation.as_mut() {
+            navigation.summary_run = Some(BranchSummaryRun {
+                abort: signal,
+                events: rx,
+                handle: Some(handle),
+            });
+        }
+        // The status indicator rides the editor border, like upstream's
+        // `BranchSummaryStatusIndicator` (`status-indicator.ts:102-112`).
+        self.set_working_status(Some(StatusIndicator::compaction(&format!(
+            "Summarizing branch... ({} to cancel)",
+            theme::key_text(theme::app_keys::INTERRUPT)
+        ))));
+        self.tui.request_render();
+    }
+
+    fn pump_branch_summary(&mut self) {
+        let Some(receiver) = self
+            .tree_navigation
+            .as_ref()
+            .and_then(|navigation| navigation.summary_run.as_ref())
+            .map(|run| &run.events)
+        else {
+            return;
+        };
+        let Ok(result) = receiver.try_recv() else {
+            return;
+        };
+        // Join the worker before mutating state (`abort_active_run`'s tail).
+        if let Some(run) = self
+            .tree_navigation
+            .as_mut()
+            .and_then(|navigation| navigation.summary_run.take())
+        {
+            if let Some(handle) = run.handle {
+                let _ = handle.join();
+            }
+        }
+        // `clearStatusIndicator("branchSummary")` (`:5866-5870`).
+        self.set_working_status(None);
+
+        if result.aborted {
+            // Summarization aborted — re-show the tree selector with the
+            // same selection (`:5845-5850`).
+            let target = self
+                .tree_navigation
+                .take()
+                .map(|navigation| navigation.target_id)
+                .unwrap_or_default();
+            self.show_status("Branch summarization cancelled");
+            self.show_tree_selector(Some(&target));
+            return;
+        }
+        if let Some(error) = result.error {
+            self.tree_navigation = None;
+            self.show_error(&error);
+            return;
+        }
+        let Some(navigation) = self.tree_navigation.take() else {
+            return;
+        };
+        self.finish_tree_navigation(navigation, Some(result));
+    }
+
+    /// `navigateTree` + the UI update (`agent-session.ts:4140-4337`,
+    /// `interactive-mode.ts:5839-5871`): the gate and the LLM phase already
+    /// ran (`proceed_tree_navigation` + the worker), so this is the leaf
+    /// move, the `session_tree` emission, and the transcript replay.
+    fn finish_tree_navigation(
+        &mut self,
+        navigation: TreeNavigationRun,
+        summary: Option<crate::session::branch_summarization::BranchSummaryResult>,
+    ) {
+        let summary = summary.and_then(|result| {
+            let summary_text = result.summary?;
+            // `summaryDetails = { readFiles, modifiedFiles }` (`:4255-4258`).
+            let details = serde_json::json!({
+                "readFiles": result.read_files,
+                "modifiedFiles": result.modified_files,
+            });
+            Some((summary_text, details, result.usage))
+        });
+        let target_id = navigation.target_id.clone();
+        match self.navigate_tree(&target_id, summary) {
+            Ok(TreeNavigationOutcome::Cancelled) => self.show_status("Navigation cancelled"),
+            Ok(TreeNavigationOutcome::Completed(editor_text)) => {
+                // Update UI: the transcript replays from the new leaf
+                // (`:5856-5863`).
+                self.chat_mut().clear();
+                self.render_initial_messages();
+                if let Some(text) = editor_text
+                    && self.editor_mut().editor.get_text().trim().is_empty()
+                {
+                    self.editor_mut().editor.set_text(&text);
+                }
+                self.show_status("Navigated to selected point");
+                self.tui.request_render();
+            }
+            Err(error) => self.show_error(&error),
+        }
+    }
+
+    /// `AgentSession.navigateTree` (`agent-session.ts:4140-4337`) without the
+    /// LLM summarization (the worker above) and with the gate hoisted to the
+    /// call site: the guards, the leaf move, the summary attachment, and the
+    /// `session_tree` emission.
+    fn navigate_tree(
+        &mut self,
+        target_id: &str,
+        summary: Option<(String, serde_json::Value, Option<pi_ai::types::Usage>)>,
+    ) -> Result<TreeNavigationOutcome, String> {
+        if self.agent_run.is_some() {
+            return Err(
+                "Wait for the current response to finish before navigating the session tree."
+                    .to_string(),
+            );
+        }
+        if self.is_compacting() {
+            return Err(
+                "Wait for the current compaction or tree navigation to finish before navigating the session tree."
+                    .to_string(),
+            );
+        }
+
+        let old_leaf_id = self.session.get_leaf_id().map(str::to_string);
+
+        // No-op if already at target (`:4155-4158`).
+        if old_leaf_id.as_deref() == Some(target_id) {
+            return Ok(TreeNavigationOutcome::Completed(None));
+        }
+
+        let Some(target_entry) = self.session.get_entry(target_id) else {
+            return Err(format!("Entry {target_id} not found"));
+        };
+
+        // The `session_before_tree` gate ran at the single call site,
+        // ahead of the summarizer worker (`:4201-4211`); the collected
+        // entries and preparation live there.
+
+        // Determine the new leaf position based on the target type
+        // (`:4265-4280`).
+        let (new_leaf_id, editor_text) = match &target_entry {
+            crate::session::records::SessionEntry::Message(message) => match &message.message {
+                AgentMessage::User(user) => (
+                    message.base.parent_id.clone(),
+                    Some(Self::user_message_text(&user.content)),
+                ),
+                _ => (Some(target_id.to_string()), None),
+            },
+            crate::session::records::SessionEntry::CustomMessage(custom) => {
+                let text = match &custom.content {
+                    pi_ai::types::UserContent::Text(text) => text.clone(),
+                    pi_ai::types::UserContent::Blocks(blocks) => blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            pi_ai::types::InputContent::Text(text) => Some(text.text.clone()),
+                            pi_ai::types::InputContent::Image(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                };
+                (custom.base.parent_id.clone(), Some(text))
+            }
+            _ => (Some(target_id.to_string()), None),
+        };
+
+        // Switch leaf, with or without the summary (`:4282-4306`): the
+        // summary attaches at the navigation target position, not the old
+        // branch.
+        let mut summary_entry_id: Option<String> = None;
+        if let Some((summary_text, details, usage)) = summary {
+            let summary_id = self
+                .session
+                .branch_with_summary(
+                    new_leaf_id.as_deref(),
+                    &summary_text,
+                    Some(details),
+                    Some(false),
+                    usage,
+                )
+                .map_err(|error| error.to_string())?;
+            summary_entry_id = Some(summary_id);
+        } else if new_leaf_id.is_none() {
+            // Navigating to root — reset the leaf.
+            self.session.reset_leaf();
+        } else {
+            self.session
+                .branch(new_leaf_id.as_deref().expect("new leaf"))
+                .map_err(|error| error.to_string())?;
+        }
+
+        // The port keeps the run state on the mode, not the session store:
+        // a navigation abandons any pending tool rows and streaming view.
+        self.pending_tools.clear();
+        self.streaming_index = None;
+
+        // `session_tree` (`:4319-4325`).
+        self.emit_extension_event(&serde_json::json!({
+            "type": "session_tree",
+            "newLeafId": self.session.get_leaf_id(),
+            "oldLeafId": old_leaf_id,
+            "summaryEntry": summary_entry_id,
+        }));
+
+        Ok(TreeNavigationOutcome::Completed(editor_text))
+    }
+
+    /// A notification-only extension emit (`runner.emit`): errors surface as
+    /// warnings, like `emit_extension_shutdown`.
+    fn emit_extension_event(&self, event: &serde_json::Value) {
+        #[cfg(feature = "ext-js")]
+        {
+            let Some(runner) = &self.extension_runner else {
+                return;
+            };
+            if let Err(error) = crate::extensions::emit_gate(runner, event) {
+                let event_name = event
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                eprintln!("Warning: Extension error: {event_name}: {error}");
+            }
+        }
+        #[cfg(not(feature = "ext-js"))]
+        {
+            let _ = event;
+        }
     }
 
     // --------------------------------------------------------------
@@ -5848,6 +6530,10 @@ impl InteractiveMode {
         self.pump_settings_selector();
         self.pump_session_selector();
         self.pump_user_message_selector();
+        self.pump_tree_selector();
+        self.pump_tree_summary_dialog();
+        self.pump_tree_prompt_editor();
+        self.pump_branch_summary();
         self.pump_auth_selector();
         self.pump_login_prompt();
         #[cfg(feature = "ext-js")]
@@ -6059,8 +6745,16 @@ impl InteractiveMode {
                 // (`session.abortRetry()`, `interactive-mode.ts:3874-3877`);
                 // while compacting, it cancels the compaction
                 // (`CompactionStatusIndicator`'s cancel hint + the escape
-                // override at `interactive-mode.ts:3810-3813`).
+                // override at `interactive-mode.ts:3810-3813`); while a
+                // branch summary runs, it cancels the summarizer (the
+                // escape override at `:5829-5832`).
+                let branch_summary_run = self
+                    .tree_navigation
+                    .as_ref()
+                    .and_then(|navigation| navigation.summary_run.as_ref());
                 if let Some(run) = &self.retry_wait {
+                    run.abort.abort();
+                } else if let Some(run) = branch_summary_run {
                     run.abort.abort();
                 } else if let Some(run) = &self.compaction_run {
                     run.abort.abort();
@@ -8321,5 +9015,310 @@ export default function (pi) {
         );
         let plain = strip_terminal_sequences(&capture.output());
         assert!(!plain.contains("Forked to new session"), "{plain}");
+    }
+
+    // --------------------------------------------------------------
+    // /tree (mirrors `interactive-mode-tree-navigation.test.ts` and the
+    // `showTreeSelector` flow in `interactive-mode.ts:5751-5898`)
+    // --------------------------------------------------------------
+
+    /// `/tree` on an empty session: the status line, no dialog
+    /// (`showTreeSelector`'s empty guard, `interactive-mode.ts:5756-5759`).
+    #[test]
+    fn tree_selector_on_an_empty_session_shows_status() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/tree");
+        mode.tui.render_now(false);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("No entries in session"), "{plain}");
+        assert!(mode.suspended_editor.is_none(), "no dialog mounted");
+    }
+
+    /// Confirming the current leaf is a no-op with its own status
+    /// (`interactive-mode.ts:5767-5772`).
+    #[test]
+    fn tree_selection_on_the_current_leaf_reports_already_there() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        mode.tui.start().expect("tui start");
+        let (_user_id, assistant_id) = seed_two_messages(&mut mode);
+
+        mode.submit("/tree");
+        assert!(mode.suspended_editor.is_some(), "the tree dialog mounts");
+        // The leaf is the assistant reply (the last entry).
+        mode.tree_selector_events
+            .as_ref()
+            .expect("selector events")
+            .lock()
+            .expect("selector events")
+            .push(TreeSelectorEvent::Selected(assistant_id));
+        mode.pump();
+        mode.tui.render_now(false);
+
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("Already at this point"), "{plain}");
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+        // The leaf never moved and no dialog chain started.
+        assert!(mode.tree_navigation.is_none());
+        assert_eq!(mode.session.get_entry_count(), 2);
+    }
+
+    /// The summarize prompt mounts after the selection, and choosing
+    /// "No summary" navigates to the target (`interactive-mode.ts`
+    /// :5783-5796, :5839-5863).
+    #[test]
+    fn tree_navigates_without_a_summary() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        mode.tui.start().expect("tui start");
+        let (user_id, _assistant_id) = seed_two_messages(&mut mode);
+
+        mode.editor_events
+            .lock()
+            .expect("editor events")
+            .push(EditorEventOut::Submit("/tree".to_string()));
+        mode.pump();
+        mode.tree_selector_events
+            .as_ref()
+            .expect("selector events")
+            .lock()
+            .expect("selector events")
+            .push(TreeSelectorEvent::Selected(user_id));
+        mode.pump();
+
+        // The "Summarize branch?" dialog occupies the editor slot.
+        assert!(mode.suspended_editor.is_some(), "summary dialog mounts");
+        mode.tree_summary_dialog_events
+            .as_ref()
+            .expect("summary dialog")
+            .lock()
+            .expect("summary dialog events")
+            .push(ExtensionSelectorEvent::Selected("No summary".to_string()));
+        mode.pump();
+        mode.tui.render_now(false);
+
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("Navigated to selected point"), "{plain}");
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+        // The target user message sits at the root: the leaf resets and its
+        // text returns for editing (`navigateTree`'s user-message branch,
+        // `agent-session.ts:4269-4272`).
+        assert!(mode.session.get_leaf_id().is_none());
+        assert_eq!(mode.session.get_entry_count(), 2, "no summary entry");
+        assert_eq!(mode.editor_mut().editor.get_text(), "first message");
+        assert!(mode.tree_navigation.is_none(), "navigation settled");
+    }
+
+    /// A text-only scripted stream for the summarizer: the branch summary
+    /// call must not carry tool calls (`generateBranchSummary` rejects them).
+    struct SummaryStream;
+
+    impl pi_agent::types::StreamFn for SummaryStream {
+        fn stream(
+            &self,
+            _request: pi_agent::types::StreamRequest,
+        ) -> futures::stream::BoxStream<'static, AssistantMessageEvent> {
+            let partial = scripted_assistant(
+                &[pi_ai::types::AssistantContent::Text(TextContent {
+                    text: "## Goal\nbranch work summarized".to_string(),
+                    text_signature: None,
+                })],
+                StopReason::Stop,
+            );
+            Box::pin(futures::stream::iter(vec![
+                AssistantMessageEvent::Start {
+                    partial: partial.clone(),
+                },
+                AssistantMessageEvent::Done {
+                    reason: StopReason::Stop,
+                    message: partial,
+                },
+            ]))
+        }
+    }
+
+    /// A branch summary runs on the worker and lands as a branch_summary
+    /// entry attached at the navigation target (`agent-session.ts`
+    /// :4230-4306).
+    #[test]
+    fn tree_summarize_attaches_a_branch_summary_at_the_target() {
+        let dir = tempfile::tempdir().expect("dir");
+        let stream: Arc<dyn pi_agent::types::StreamFn> = Arc::new(SummaryStream);
+        let (mut mode, capture) = fixture_with_stream(dir.path(), stream);
+        mode.tui.start().expect("tui start");
+        let (user_id, _assistant_id) = seed_two_messages(&mut mode);
+
+        mode.submit("/tree");
+        mode.tree_selector_events
+            .as_ref()
+            .expect("selector events")
+            .lock()
+            .expect("selector events")
+            .push(TreeSelectorEvent::Selected(user_id));
+        mode.pump();
+        mode.tree_summary_dialog_events
+            .as_ref()
+            .expect("summary dialog")
+            .lock()
+            .expect("summary dialog events")
+            .push(ExtensionSelectorEvent::Selected("Summarize".to_string()));
+        mode.pump();
+
+        // The worker starts; the summary status rides the editor border.
+        assert!(mode.tree_navigation.is_some(), "navigation staged");
+        for _ in 0..200 {
+            mode.pump();
+            mode.tui.render_now(false);
+            if mode.tree_navigation.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("Navigated to selected point"), "{plain}");
+        // The summary attached at the target position (the root), and the
+        // leaf moved onto the summary entry (`agent-session.ts:4287-4294`).
+        assert_eq!(mode.session.get_entry_count(), 3);
+        let summaries = mode
+            .session
+            .get_entries()
+            .into_iter()
+            .filter(|entry| entry.kind() == "branch_summary")
+            .count();
+        assert_eq!(summaries, 1);
+        assert!(mode.session.get_leaf_id().is_some(), "leaf on the summary");
+        assert_eq!(mode.editor_mut().editor.get_text(), "first message");
+        assert!(mode.tree_navigation.is_none());
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+    }
+
+    /// Choosing a summary while busy preserves the active operation's UI and
+    /// reports the busy error (regression #9178 / PR #9179,
+    /// `interactive-mode-tree-navigation.test.ts:73-91`).
+    #[test]
+    fn tree_busy_guard_preserves_the_operation_ui() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        mode.tui.start().expect("tui start");
+        let (user_id, _assistant_id) = seed_two_messages(&mut mode);
+        let original_leaf = mode.session.get_leaf_id().map(str::to_string);
+
+        mode.submit("/tree");
+        mode.tree_selector_events
+            .as_ref()
+            .expect("selector events")
+            .lock()
+            .expect("selector events")
+            .push(TreeSelectorEvent::Selected(user_id));
+        mode.pump();
+        // Compaction or another navigation can start while the dialog is
+        // open (`ui.session.isCompacting = true`).
+        mode.compaction_run = Some(CompactionRun {
+            abort: Arc::new(pi_agent::types::AbortSignal::new()),
+            events: std::sync::mpsc::channel().1,
+            handle: None,
+        });
+        mode.tree_summary_dialog_events
+            .as_ref()
+            .expect("summary dialog")
+            .lock()
+            .expect("summary dialog events")
+            .push(ExtensionSelectorEvent::Selected("No summary".to_string()));
+        mode.pump();
+        mode.tui.render_now(false);
+
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(
+            plain.contains(
+                "Wait for the current compaction or tree navigation to finish before navigating the session tree.",
+            ),
+            "{plain}"
+        );
+        // The original leaf stands; no navigation started and the editor
+        // came back.
+        assert_eq!(
+            mode.session.get_leaf_id().map(str::to_string),
+            original_leaf
+        );
+        assert!(mode.tree_navigation.is_none());
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+    }
+
+    /// An active response aborts (and settles) before the navigation
+    /// proceeds (`interactive-mode.ts:5811-5815`,
+    /// `interactive-mode-tree-navigation.test.ts:110-124`).
+    #[test]
+    fn tree_navigation_aborts_the_active_response_first() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, "content\n").expect("write");
+        let (mut mode, capture) = fixture(dir.path(), &file.to_string_lossy());
+        mode.tui.start().expect("tui start");
+        let (user_id, _assistant_id) = seed_two_messages(&mut mode);
+
+        // A streaming run to abort.
+        mode.start_agent_run("hello there");
+        assert!(mode.agent_run.is_some(), "run started");
+
+        mode.submit("/tree");
+        mode.tree_selector_events
+            .as_ref()
+            .expect("selector events")
+            .lock()
+            .expect("selector events")
+            .push(TreeSelectorEvent::Selected(user_id));
+        mode.pump();
+        mode.tree_summary_dialog_events
+            .as_ref()
+            .expect("summary dialog")
+            .lock()
+            .expect("summary dialog events")
+            .push(ExtensionSelectorEvent::Selected("No summary".to_string()));
+        mode.pump();
+        mode.tui.render_now(false);
+
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("Navigated to selected point"), "{plain}");
+        assert!(mode.agent_run.is_none(), "the run settled");
+        assert!(mode.session.get_leaf_id().is_none(), "leaf reset to root");
+    }
+
+    /// A label change from the tree dialog persists through
+    /// `appendLabelChange` (`interactive-mode.ts:5877-5880`).
+    #[test]
+    fn tree_label_change_persists() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        mode.tui.start().expect("tui start");
+        let (user_id, _assistant_id) = seed_two_messages(&mut mode);
+
+        mode.submit("/tree");
+        mode.tree_selector_events
+            .as_ref()
+            .expect("selector events")
+            .lock()
+            .expect("selector events")
+            .push(TreeSelectorEvent::LabelChange(
+                user_id.clone(),
+                Some("checkpoint".to_string()),
+            ));
+        mode.pump();
+        mode.tui.render_now(false);
+
+        assert_eq!(mode.session.get_label(&user_id), Some("checkpoint"));
+
+        // A second change replaces it; an empty label clears it.
+        mode.tree_selector_events
+            .as_ref()
+            .expect("selector events")
+            .lock()
+            .expect("selector events")
+            .push(TreeSelectorEvent::LabelChange(user_id.clone(), None));
+        mode.pump();
+        assert_eq!(mode.session.get_label(&user_id), None);
     }
 }
