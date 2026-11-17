@@ -8994,9 +8994,11 @@ mod tests {
             .expect("tool call")
         };
         let partial = scripted_assistant(
-            &[pi_ai::types::AssistantContent::ToolCall(call(serde_json::json!({
-                "command": ""
-            })))],
+            &[pi_ai::types::AssistantContent::ToolCall(call(
+                serde_json::json!({
+                    "command": ""
+                }),
+            ))],
             StopReason::Pending,
         );
         mode.start_assistant_stream();
