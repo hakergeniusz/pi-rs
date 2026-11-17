@@ -19,6 +19,7 @@ use pi_tui::theme::{
     detect_terminal_theme, load_theme_with_system,
 };
 
+use pi_agent::types::ThinkingLevel;
 use crate::config;
 
 /// The global theme instance, pi's `theme` proxy (`theme.ts:648-659`).
@@ -679,6 +680,27 @@ pub fn raw_key_hint(key: &str, description: &str) -> String {
         theme.fg(C::Dim, &format_key_text(key)),
         theme.fg(C::Muted, description)
     )
+}
+
+/// `getThinkingBorderColor` (`theme.ts:348-368`): the editor border carries
+/// the current thinking level's token.
+pub fn thinking_border_styler(level: ThinkingLevel) -> Styler {
+    use pi_tui::theme::ThemeColor as C;
+    let token = match level {
+        ThinkingLevel::Off => C::ThinkingOff,
+        ThinkingLevel::Minimal => C::ThinkingMinimal,
+        ThinkingLevel::Low => C::ThinkingLow,
+        ThinkingLevel::Medium => C::ThinkingMedium,
+        ThinkingLevel::High => C::ThinkingHigh,
+        ThinkingLevel::Xhigh => C::ThinkingXhigh,
+        ThinkingLevel::Max => C::ThinkingMax,
+    };
+    theme().fg_styler(token)
+}
+
+/// `getBashModeBorderColor` (`theme.ts:370-372`).
+pub fn bash_mode_border_styler() -> Styler {
+    theme().fg_styler(pi_tui::theme::ThemeColor::BashMode)
 }
 
 #[cfg(test)]

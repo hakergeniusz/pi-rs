@@ -206,6 +206,8 @@ enum AppAction {
     Clear,
     Exit,
     Interrupt,
+    /// shift+tab (`app.thinking.cycle`): cycle the thinking level.
+    CycleThinking,
     CycleModel(i32),
     ToggleThinking,
     ToolsExpand,
@@ -220,6 +222,9 @@ enum AppAction {
 enum EditorEventOut {
     Submit(String),
     Action(AppAction),
+    /// The bash-mode flag flipped (`interactive-mode.ts:3249-3252`); the
+    /// mode repaints the editor border.
+    BashModeChanged,
 }
 
 /// The editor host: wraps the editor, intercepts app keybindings, embeds the
@@ -230,6 +235,8 @@ enum EditorEventOut {
 struct ChatEditor {
     editor: Editor,
     events: Arc<Mutex<Vec<EditorEventOut>>>,
+    /// `isBashMode` (`interactive-mode.ts:551`): the draft starts with `!`.
+    is_bash_mode: bool,
 }
 
 impl ChatEditor {
@@ -266,7 +273,11 @@ impl ChatEditor {
             }
             String::new()
         }));
-        ChatEditor { editor, events }
+        ChatEditor {
+            editor,
+            events,
+            is_bash_mode: false,
+        }
     }
 }
 
@@ -289,6 +300,8 @@ impl Component for ChatEditor {
             }
         } else if theme::app_keys::matches(data, theme::app_keys::INTERRUPT) {
             Some(AppAction::Interrupt)
+        } else if theme::app_keys::matches(data, theme::app_keys::THINKING_CYCLE) {
+            Some(AppAction::CycleThinking)
         } else if theme::app_keys::matches(data, theme::app_keys::MODEL_CYCLE_FORWARD) {
             Some(AppAction::CycleModel(1))
         } else if theme::app_keys::matches(data, theme::app_keys::MODEL_CYCLE_BACKWARD) {
@@ -317,6 +330,17 @@ impl Component for ChatEditor {
                 .lock()
                 .expect("editor events")
                 .push(EditorEventOut::Submit(text));
+        }
+        // `defaultEditor.onChange` (`interactive-mode.ts:3248-3253`): the
+        // bash-mode flag tracks the draft; a transition repaints the border
+        // through the mode's `updateEditorBorderColor`.
+        let is_bash_mode = self.editor.get_text().trim_start().starts_with('!');
+        if is_bash_mode != self.is_bash_mode {
+            self.is_bash_mode = is_bash_mode;
+            self.events
+                .lock()
+                .expect("editor events")
+                .push(EditorEventOut::BashModeChanged);
         }
         mutation
     }
@@ -1223,6 +1247,8 @@ impl InteractiveMode {
         // setting resolves against the available snapshot; upstream rides the
         // `--models` flag through the same resolver.
         mode.seed_model_scope_from_settings();
+        // Startup border color (`interactive-mode.ts:2241`).
+        mode.update_editor_border_color();
         mode
     }
 
@@ -3115,7 +3141,7 @@ impl InteractiveMode {
                 .append_model_change(&self.model.provider, &self.model.id);
         }
         self.refresh_footer();
-        self.tui.request_render();
+        self.update_editor_border_color();
         Ok(())
     }
 
@@ -3154,6 +3180,47 @@ impl InteractiveMode {
             }
         }
         crate::virtual_models::with_virtual_model_listing(models, &virtual_models)
+    }
+
+    /// `cycleThinkingLevel` (`interactive-mode.ts:4711-4721`) over the
+    /// model's supported levels (`agent-session.ts:2813-2824`): modulo the
+    /// current index; an unlisted current level restarts at the first
+    /// (upstream's `indexOf` → `-1` → `0`).
+    fn cycle_thinking_level(&mut self) {
+        if !self.model.reasoning {
+            self.show_status("Current model does not support thinking");
+            return;
+        }
+        let levels = pi_ai::get_supported_thinking_levels(&self.model);
+        let next_index = levels
+            .iter()
+            .position(|level| *level == self.thinking_level.as_str())
+            .map_or(0, |index| (index + 1) % levels.len());
+        let Some(next_level) = levels
+            .get(next_index)
+            .and_then(|level| crate::modes::print_mode::thinking_level_from_str(level).ok())
+        else {
+            return;
+        };
+        self.thinking_level = next_level;
+        let _ = self.session.append_thinking_level_change(next_level.as_str());
+        self.refresh_footer();
+        self.update_editor_border_color();
+        self.show_status(&format!("Thinking level: {}", next_level.as_str()));
+    }
+
+    /// `updateEditorBorderColor` (`interactive-mode.ts:4700-4707`): bash
+    /// mode takes the `bashMode` color; otherwise the border carries the
+    /// thinking level's color.
+    fn update_editor_border_color(&mut self) {
+        let is_bash_mode = self.editor_mut().is_bash_mode;
+        let styler = if is_bash_mode {
+            theme::bash_mode_border_styler()
+        } else {
+            theme::thinking_border_styler(self.thinking_level)
+        };
+        self.editor_mut().editor.border_color = styler;
+        self.tui.request_render();
     }
 
     /// ctrl+p / ctrl+shift+p cycling (`cycleModel`, `interactive-mode.ts:4722-4741`).
@@ -3237,6 +3304,9 @@ impl InteractiveMode {
         } else {
             String::new()
         };
+        // `updateEditorBorderColor` on the switch
+        // (`interactive-mode.ts:4728-4730`).
+        self.update_editor_border_color();
         self.show_status(&format!("Switched to {label}{thinking_suffix}"));
     }
 
@@ -3611,6 +3681,7 @@ impl InteractiveMode {
                 let _ = theme::set_theme(&name);
                 self.tui.invalidate();
                 self.tui.request_render();
+                self.update_editor_border_color();
             }
             SettingsSelectorEvent::SteeringModeChange(mode) => {
                 // `onSteeringModeChange` → `session.setSteeringMode`
@@ -3765,6 +3836,7 @@ impl InteractiveMode {
                 self.thinking_level = level;
                 let _ = self.session.append_thinking_level_change(level.as_str());
                 self.refresh_footer();
+                self.update_editor_border_color();
             }
         }
     }
@@ -3794,7 +3866,7 @@ impl InteractiveMode {
                 let _ = self.session.append_thinking_level_change(level.as_str());
                 self.show_status(&format!("Thinking level: {}", level.as_str()));
                 self.refresh_footer();
-                self.tui.request_render();
+                self.update_editor_border_color();
             }
             Err(error) => self.show_error(&error),
         }
@@ -4141,6 +4213,7 @@ impl InteractiveMode {
         };
         self.tui.invalidate();
         self.tui.request_render();
+        self.update_editor_border_color();
         if let Err(error) = &result
             && show_error
         {
@@ -5348,6 +5421,7 @@ impl InteractiveMode {
             }
             None => theme::init_theme(None),
         }
+        self.update_editor_border_color();
         // `applyRuntimeSettings` (`interactive-mode.ts:6664-6665`, the
         // restore half): the thinking-hide setting re-reads.
         self.hide_thinking_block = self
@@ -7559,6 +7633,7 @@ impl InteractiveMode {
                     self.submit(&text);
                 }
                 EditorEventOut::Action(action) => self.handle_action(&action),
+                EditorEventOut::BashModeChanged => self.update_editor_border_color(),
             }
         }
 
@@ -7804,6 +7879,7 @@ impl InteractiveMode {
                 }
             }
             AppAction::CycleModel(direction) => self.cycle_model(*direction),
+            AppAction::CycleThinking => self.cycle_thinking_level(),
             AppAction::ToggleThinking => {
                 self.hide_thinking_block = !self.hide_thinking_block;
                 self.tui.request_render();
@@ -8570,6 +8646,76 @@ mod tests {
             mode.suspended_editor.is_some(),
             "the settings dialog occupies the editor slot"
         );
+    }
+
+    /// shift+tab cycles the thinking level over the model's supported list
+    /// (`interactive-mode.ts:4711-4721`) and repaints the border with the
+    /// new level's color.
+    #[test]
+    fn cycle_thinking_action_advances_the_level_and_border() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, _capture) = fixture(dir.path(), "unused.txt");
+        assert!(mode.model.reasoning, "the fixture model reasons");
+        let start = mode.thinking_level;
+        mode.editor_events
+            .lock()
+            .expect("editor events")
+            .push(EditorEventOut::Action(AppAction::CycleThinking));
+        mode.pump();
+        assert_ne!(mode.thinking_level, start, "the level advanced");
+        let border = mode.editor_mut().editor.border_color.clone();
+        assert_ne!(border("-"), "-", "the border carries a color token");
+    }
+
+    /// Typing `!` flips bash mode and repaints the border through the
+    /// editor-change event (`interactive-mode.ts:3248-3253`); clearing the
+    /// flag restores the thinking border (`:4700-4707`).
+    #[test]
+    fn bash_mode_border_tracks_the_draft() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, _capture) = fixture(dir.path(), "unused.txt");
+        // The thinking border for a known level (`thinkingOff` is neutral,
+        // `bashMode` green — never equal in the system theme).
+        mode.thinking_level = ThinkingLevel::Off;
+        mode.editor_events
+            .lock()
+            .expect("editor events")
+            .push(EditorEventOut::BashModeChanged);
+        mode.pump();
+        let thinking_border = mode.editor_mut().editor.border_color.clone();
+        let editor = mode.editor_mut();
+        editor.set_focused(true);
+        let _ = pi_tui::component::Component::handle_input(editor, "!");
+        mode.pump();
+        let bash_border = mode.editor_mut().editor.border_color.clone();
+        assert_ne!(
+            bash_border("-"),
+            thinking_border("-"),
+            "bash mode recolors the border"
+        );
+        mode.editor_mut().is_bash_mode = false;
+        mode.editor_events
+            .lock()
+            .expect("editor events")
+            .push(EditorEventOut::BashModeChanged);
+        mode.pump();
+        let restored = mode.editor_mut().editor.border_color.clone();
+        assert_eq!(
+            restored("-"),
+            thinking_border("-"),
+            "clearing the flag restores the thinking border"
+        );
+    }
+
+    /// The border stylers map the upstream theme tokens
+    /// (`theme.ts:348-372`).
+    #[test]
+    fn border_stylers_follow_the_thinking_tokens() {
+        let off = theme::thinking_border_styler(ThinkingLevel::Off);
+        let high = theme::thinking_border_styler(ThinkingLevel::High);
+        let bash = theme::bash_mode_border_styler();
+        assert_ne!(off("-"), high("-"));
+        assert_ne!(bash("-"), high("-"));
     }
 
     /// A capture-terminal mode over a read-only executor in `dir`, driven by a
