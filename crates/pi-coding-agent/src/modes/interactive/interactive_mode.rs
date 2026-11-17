@@ -4893,7 +4893,10 @@ impl InteractiveMode {
                 continue;
             };
             match (dialog, event) {
-                (ImportDialog::Confirm { input_path }, ExtensionSelectorEvent::Selected(option)) => {
+                (
+                    ImportDialog::Confirm { input_path },
+                    ExtensionSelectorEvent::Selected(option),
+                ) => {
                     self.close_import_selector();
                     if option != "Yes" {
                         self.show_status("Import cancelled");
