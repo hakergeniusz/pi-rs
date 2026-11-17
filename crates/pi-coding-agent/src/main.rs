@@ -57,8 +57,30 @@ fn main() {
         print_help();
         return;
     }
-    if args.resume || args.fork.is_some() || args.export.is_some() {
-        eprintln!("pi-rs: --resume/--fork/--export are not implemented yet (phase P5/P6)");
+    // `--export <file> [output]` (`main.ts:688-703`): export a session file
+    // to HTML and exit; the first positional argument is the output path.
+    if let Some(session_file) = &args.export {
+        let output_path = args.messages.first().map(String::as_str);
+        match pi_coding_agent::session::export_html::export_from_file(
+            session_file,
+            &pi_coding_agent::session::export_html::ExportOptions {
+                output_path,
+                ..Default::default()
+            },
+        ) {
+            Ok(result) => {
+                println!("Exported to: {}", result.display());
+            }
+            Err(message) => {
+                eprintln!("Error: {message}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if args.resume || args.fork.is_some() {
+        eprintln!("pi-rs: --resume/--fork are not implemented yet (phase P5/P6)");
         std::process::exit(2);
     }
 

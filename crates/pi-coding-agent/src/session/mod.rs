@@ -24,6 +24,8 @@
 //! * [`cwd`] — the stored-cwd existence gate (`core/session-cwd.ts`).
 //! * [`export`] — branch export to a portable JSONL file
 //!   (`core/session-export.ts`).
+//! * [`export_html`] — the self-contained HTML viewer export
+//!   (`core/export-html/`, templates embedded byte-identically).
 
 #![forbid(unsafe_code)]
 
@@ -34,6 +36,7 @@ pub mod cache_stats;
 pub mod compaction;
 pub mod cwd;
 pub mod export;
+pub mod export_html;
 pub mod json;
 pub mod migrate;
 pub mod records;

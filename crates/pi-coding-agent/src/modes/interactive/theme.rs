@@ -2,9 +2,11 @@
 //! key-hint formatting helpers.
 //!
 //! Ground truth: `modes/interactive/theme/theme.ts` (the global instance and
-//! the theme getters), `modes/interactive/theme/theme-tokens.ts` (token names
-//! — the tokens themselves live in `pi_tui::theme`), `core/keybindings.ts`
-//! (`APP_KEYBINDINGS`), and `modes/interactive/components/keybinding-hints.ts`.
+//! the theme getters, plus the "HTML Export Helpers" section `:834-897` that
+//! `crate::session::export_html` consumes), `modes/interactive/theme/theme-tokens.ts`
+//! (token names — the tokens themselves live in `pi_tui::theme`),
+//! `core/keybindings.ts` (`APP_KEYBINDINGS`), and
+//! `modes/interactive/components/keybinding-hints.ts`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -344,6 +346,103 @@ pub fn inverse(text: &str) -> String {
 /// A token styler for hosts that need `theme.fg(...)` as a closure.
 pub fn fg_styler(token: pi_tui::theme::ThemeColor) -> Styler {
     theme().fg_styler(token)
+}
+
+// ============================================================
+// HTML export helpers (`theme.ts:834-897`, the "HTML Export Helpers"
+// section) — consumed by `crate::session::export_html`.
+// ============================================================
+
+/// The name a color-less request resolves against: the live theme's own
+/// name, else the reserved system name (`theme.ts:835-837`'s
+/// `themeName ?? currentThemeName ?? SYSTEM_THEME_NAME`).
+fn export_theme_name(theme_name: Option<&str>) -> String {
+    theme_name
+        .map_or_else(
+            || {
+                theme()
+                    .name()
+                    .unwrap_or(pi_tui::theme::SYSTEM_THEME_NAME)
+                    .to_string()
+            },
+            str::to_string,
+        )
+}
+
+/// `getResolvedThemeColors` (`theme.ts:834-839`): every theme token as a CSS
+/// hex string, in the port's token declaration order (upstream iterates the
+/// resolved colors record, whose order follows the theme document; the values
+/// are the same either way). Fails when the theme cannot load, like
+/// upstream's `loadTheme` throw.
+pub fn get_resolved_theme_colors(theme_name: Option<&str>) -> Result<Vec<(String, String)>, String> {
+    let name = export_theme_name(theme_name);
+    let loaded = load_theme_by_name(&name)?;
+    let mut colors = Vec::with_capacity(
+        pi_tui::theme::ThemeColor::ALL.len() + pi_tui::theme::ThemeBg::ALL.len(),
+    );
+    for token in pi_tui::theme::ThemeColor::ALL {
+        colors.push((token.as_str().to_string(), pi_tui::color::color_to_hex(loaded.fg_color(*token))));
+    }
+    for token in pi_tui::theme::ThemeBg::ALL {
+        colors.push((token.as_str().to_string(), pi_tui::color::color_to_hex(loaded.bg_color(*token))));
+    }
+    Ok(colors)
+}
+
+/// `getThemeExportColors` (`theme.ts:849-897`): the theme document's explicit
+/// `export` colors, resolved through `vars` references. `okhsl(...)` values
+/// convert to hex because CSS has no `okhsl()`; hex, `oklch(...)`, and empty
+/// strings pass through (`undefined` for the latter). Unloadable themes and
+/// the system theme carry no export colors.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ThemeExportColors {
+    pub page_bg: Option<String>,
+    pub card_bg: Option<String>,
+    pub info_bg: Option<String>,
+}
+
+pub fn get_theme_export_colors(theme_name: Option<&str>) -> ThemeExportColors {
+    let name = export_theme_name(theme_name);
+    if name == pi_tui::theme::SYSTEM_THEME_NAME {
+        return ThemeExportColors::default();
+    }
+    let paths = pi_tui::theme::ThemePaths::new("/nonexistent", custom_themes_dir());
+    let registry = pi_tui::theme::ThemeRegistry::new();
+    let Ok(json) = pi_tui::theme::load_theme_json(&paths, &registry, &name) else {
+        return ThemeExportColors::default();
+    };
+    // The export colors end up in CSS, which understands hex and oklch()
+    // values directly but not okhsl() (`theme.ts:872-874`). An unparseable
+    // okhsl passes through raw where upstream would feed `colorToHex` an
+    // `undefined`.
+    let resolve = |key: &str| -> Option<String> {
+        let value = json.export.as_ref()?.get(key)?;
+        let resolved = value.resolve(&json.vars).ok()?;
+        match resolved {
+            pi_tui::theme::ColorValue::Default => None,
+            pi_tui::theme::ColorValue::Index(index) => {
+                Some(pi_tui::color::color_to_hex(pi_tui::color::indexed_color(u16::from(index))))
+            }
+            pi_tui::theme::ColorValue::Text(text) => {
+                // `if (resolved === "") return undefined` — a `vars` entry
+                // referencing the empty string lands here as `Text("")`.
+                if text.is_empty() {
+                    return None;
+                }
+                let lowered = text.to_ascii_lowercase();
+                if lowered.starts_with("okhsl(") {
+                    return Some(pi_tui::color::parse_color(&text)
+                        .map_or_else(|| text.clone(), pi_tui::color::color_to_hex));
+                }
+                Some(text)
+            }
+        }
+    };
+    ThemeExportColors {
+        page_bg: resolve("pageBg"),
+        card_bg: resolve("cardBg"),
+        info_bg: resolve("infoBg"),
+    }
 }
 
 // ============================================================

@@ -2035,6 +2035,25 @@ impl SessionManager {
             .collect()
     }
 
+    /// `getHeader` (`session-manager.ts:1523-1527`): the header as the stored
+    /// record, key order included — the HTML export embeds it verbatim.
+    pub fn get_header_record(&self) -> Option<Record> {
+        self.entries
+            .iter()
+            .find(|entry| entry.kind() == "session")
+            .cloned()
+    }
+
+    /// `getEntries` as raw records: the HTML export serializes these
+    /// verbatim (`JSON.stringify` of the typed views would reorder the
+    /// nested message fields).
+    pub fn get_entry_records(&self) -> Vec<Record> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.kind() != "session")
+            .cloned()
+    }
+
     /// `getTree` (`:1547-1585`): the session as a tree of defensive copies.
     /// A well-formed session has exactly one root; orphaned entries are also
     /// returned as roots. Children are sorted oldest first.
