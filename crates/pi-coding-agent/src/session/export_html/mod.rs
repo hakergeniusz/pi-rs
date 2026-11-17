@@ -920,7 +920,16 @@ mod tests {
         .expect("export");
         assert_eq!(path, out);
         let html = std::fs::read_to_string(&path).expect("html");
-        assert!(html.contains("hello"), "session content rides in the payload");
+        // The payload rides base64-encoded in the session-data script tag;
+        // decode it to find the message.
+        const MARKER: &str = "<script id=\"session-data\" type=\"application/json\">";
+        let payload_start = html
+            .find(MARKER)
+            .map(|index| index + MARKER.len())
+            .expect("session data script tag");
+        let payload = &html[payload_start..html.find("</script>").expect("script close")];
+        let decoded = String::from_utf8(BASE64.decode(payload).expect("base64")).expect("utf8");
+        assert!(decoded.contains("hello"), "{decoded}");
     }
 
     /// `preRenderCustomTools` skips template-rendered tools and merges call
@@ -978,6 +987,15 @@ mod tests {
         start_conversation(&mut session, "x");
         let _ = session.append_message(assistant_with_tool_calls(&[("call-9", "custom_tool")]));
 
+        // Decode the session-data script tag's payload.
+        let payload_of = |path: &Path| -> String {
+            let html = std::fs::read_to_string(path).expect("html");
+            const MARKER: &str = "<script id=\"session-data\" type=\"application/json\">";
+            let start = html.find(MARKER).map(|index| index + MARKER.len()).expect("tag");
+            String::from_utf8(BASE64.decode(&html[start..html.find("</script>").expect("close")]).expect("base64"))
+                .expect("utf8")
+        };
+
         let out_a = dir.path().join("with-renderer.html");
         let renderer = FakeRenderer::new();
         export_session_to_html(
@@ -990,8 +1008,9 @@ mod tests {
             },
         )
         .expect("export with renderer");
-        let html_a = std::fs::read_to_string(&out_a).expect("html");
-        assert!(html_a.contains("call call-9 custom_tool"), "{html_a}");
+        let payload_a = payload_of(&out_a);
+        assert!(payload_a.contains("call call-9 custom_tool"), "{payload_a}");
+        assert!(payload_a.contains("\"renderedTools\""), "{payload_a}");
 
         let out_b = dir.path().join("without-renderer.html");
         export_session_to_html(
@@ -1003,7 +1022,8 @@ mod tests {
             },
         )
         .expect("export without renderer");
-        let html_b = std::fs::read_to_string(&out_b).expect("html");
-        assert!(!html_b.contains("call call-9 custom_tool"), "{html_b}");
+        let payload_b = payload_of(&out_b);
+        assert!(!payload_b.contains("call call-9 custom_tool"), "{payload_b}");
+        assert!(!payload_b.contains("renderedTools"), "{payload_b}");
     }
 }
