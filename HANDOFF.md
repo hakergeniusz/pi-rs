@@ -2242,8 +2242,8 @@ showed only `...` for the whole run):
   empty→full args through the real paths.
 
 **Terminal resize** (user symptom: resizing the terminal left pi-rs
-painting at the old size; landed on `fix/terminal-resize`, commit 8379ac0,
-live PTY-verified):
+painting at the old size; landed on `fix/terminal-resize`, commits
+3b04f4b + 76ed4fc, live PTY-verified, CI 44172976032):
 
 - Upstream repaints on `process.stdout`'s `resize` event
   (`terminal.ts:190`, `tui.ts:919-922`). pi-tui has no signal watcher:
@@ -2256,11 +2256,53 @@ live PTY-verified):
   `process.stdout.on("resize")` equivalent (`interactive_mode.rs` run
   loop, commented as such).
 - Tests: `a_resize_tick_without_a_change_is_inert`,
-  `a_host_resize_tick_repaints_at_the_new_size` (modelled on
-  `Terminal::set_queried_size`, what the next `refresh_size` reports).
+  `a_host_resize_tick_repaints_at_the_new_size` (unit, modelled on
+  `Terminal::set_queried_size` — what the next `refresh_size` reports)
+  and `a_resize_re_measures_and_repaints_the_whole_frame` (integration).
+  Gotcha recorded by 76ed4fc: the integration test must mutate
+  `set_queried_size`, NOT `override_size` — the latter writes the cache
+  directly, so the drift guard sees no delta and never asks for a frame.
 - Verified live with a PTY probe (80×24 pty → `TIOCSWINSZ` on the master
   → kernel SIGWINCHes the child → assert an ANSI-stripped row wider than
   90 columns): pre-fix binary fails the probe, fixed binary passes.
+
+**The /settings selector, full port** (user symptom: the dialog had 11
+rows instead of the upstream list and looked different; landed
+`fix/settings-selector`, commits 215adc1 + 9f50eae + cca1272 + bf2efde,
+CI 44171501060 green):
+
+- `components/settings_selector.rs` now builds the full upstream list —
+  ~34 rows, the image rows spliced in only when
+  `getCapabilities().images` is set, order mirroring
+  `settings-selector.ts:488-872` (base rows, TUI/fullscreen/theme rows,
+  then the `splice(1..)` image block). The `WarningSettingsSubmenu` and
+  the theme/TUI-mode submenus port too; `config/settings.rs` gains the
+  full `settings-manager.ts:828-1533` accessor pairs.
+- Deliberate deviations (all itemized in the module docs): the "Session
+  share destination" row is omitted — share export is ZIP-only in this
+  port by policy (never upload to upstream's Radius gateway); an invalid
+  `httpIdleTimeoutMs` degrades to the default where upstream throws;
+  numeric rows parse to `i64`; the JS-truthiness getter coercions are
+  made explicit.
+- Rounds on the way in: salvage (E0499/E0716/E0382 borrow fixes),
+  clippy round (the TS-mirror config struct keeps its bools under an
+  `allow` with a split-when-extending note; `vec!` → array;
+  `i64::from`), and two test-truth fixes found by the first gate run
+  that ever reached the tests — `rendered_labels` broke only on
+  *consecutive* duplicates so scrolling past Theme captured the list
+  twice (~63 labels; now breaks on the first already-seen label), and
+  `showTerminalProgress` persists nested (`terminal.showTerminalProgress`,
+  `settings-manager.ts:1264`), not top-level.
+
+**clippy 1.100 collapsible_if wave** (blocked every gate for a day;
+landed `fix/collapsible-if`, commits c5c4698 + 4f4d463, CI 44169384035
+green): the extended `collapsible_if` (clippy ≥ 1.99, now also on GH
+stable) fires on nested `if let` + `if` with no `else` on either side.
+150 sites across 56 files collapsed into let-chains (edition 2024,
+MSRV 1.97 fine), conditions kept verbatim; 11 candidates correctly
+left alone because the outer `if` carries an `else` (clippy does not
+flag collapsible-with-else). Enumeration used an offline AST scanner
+mirroring the lint criterion; no cargo was run by the subagent.
 
 **cargo-deny schema** (the new `audit` job failed on config
 deserialization, run 44163799428; landed f8deec0 + 959ca82): the runner's
