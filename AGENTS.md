@@ -50,7 +50,7 @@ module cites its upstream ground truth; every landed slice updates
 
 ## Build and test
 
-Anyone with Rust 1.87 (MSRV) can run the standard suite:
+Anyone with Rust 1.97 (MSRV) can run the standard suite:
 
 ```sh
 cargo build

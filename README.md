@@ -72,7 +72,8 @@ Deferred (not in the core scope): `chord`, `pi-durable`, `apps/p2`.
 
 ## Build
 
-Requires Rust 1.87 (MSRV).
+Requires Rust 1.97 (MSRV) — pinned by the oxc 0.158 transpile engine in
+`pi-ext-js` (`rust-version` in the workspace `Cargo.toml`).
 
 ```sh
 cargo build
