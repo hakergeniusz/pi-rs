@@ -2003,6 +2003,57 @@ check is terminal-dependent).
 - Deviations documented in code: NFKC subset for fuzzy edit matching (no `unicode-normalization` dep yet), no revision-cache in auth storage, no `powershell` tool, bash tool description hardcodes "bash".
 - Local dev machine only (if ever resumed): plain `cargo` is broken there (rustup proxy misreads argv[0]); use `/tmp/ai-agent/cargo` wrapper (`exec -a cargo nice -n 19 ionice -c 2 -n 7 /usr/sbin/cargo`). On acer no wrapper needed — just prefix `nice -n 19`.
 
+## Remaining built-in commands: /reload + /scoped-models (landed on `feat/reload-scoped-models`, 2026-11-17)
+
+The last two unported built-ins. The slice started as a subagent run that
+died to a quota limit after committing its module layer but before any
+compile; the coordinator finished the wiring serially and the gate
+burned four rounds to make the unverified code real. Landed as `a1d7ae2`
+(CI 44151058808, 1780 tests green).
+
+- **Agent-committed layer** (its `fffd765`, salvaged): `model_resolver.rs`
+  (894 lines — `resolveModelReference` + `resolveModelScopeFromModels`
+  with diagnostics, `core/model-resolver.ts:74-393`; globs via globset),
+  `scoped_models_selector.rs` (1137 lines, full component port),
+  `model_catalog_refresh.rs` (the coordinator collapses to a synchronous
+  dispatch over the process-global compose — module doc carries the
+  deviation), `models_state.rs` per-provider `ModelsRefreshResult`,
+  settings `get/setEnabledModels` (`settings-manager.ts:1352-1367`), and
+  the six `app.models.*` keybindings (`keybindings.ts:119-142`).
+- **Coordinator-completed wiring** (0087417): `/scoped-models` mounts the
+  selector over the synchronous refresh — upstream's async mount →
+  "Refreshing model catalogs…" → swap sequence runs inline
+  (`showModelsSelector`, `interactive-mode.ts:5570-5686`), with
+  `updateSessionModels` (`:5591-5609`), `onPersist`'s clear-on-all-enabled
+  (`:5630-5638`), and the exact refresh-status texts. The session scope
+  seeds from the `enabledModels` setting at startup (`main.ts:871-882`),
+  rides a shared slot into the `/model` completions, and drives
+  ctrl+p cycling: `_cycleScopedModel` (`agent-session.ts:2709-2744`) with
+  explicit pattern thinking levels beating `defaultThinkingLevel` beating
+  the current level (`:2841-2853`).
+- **`/reload`** (`handleReloadCommand`, `interactive-mode.ts:6618-6706`
+  over `session.reload`, `agent-session.ts:3828-3874`): streaming/
+  compaction guards, `session_shutdown(reason:"reload")`,
+  `runner.invalidate`, `settingsManager.reload`, queue-mode re-sync,
+  `extensions::reload` (re-discovery against the reloaded settings →
+  incremental final-set load → re-bind → `session_start(reason:"reload")`
+  → MCP reconnect → bind-error report), catalog recompose, theme
+  re-resolve from settings, `hideThinkingBlock` re-read, the
+  `models.json error` report (`model-runtime.getError()` shape,
+  `model-runtime.ts:512-520`), and the verbatim status line.
+- **Deviations (mechanism, documented in module docs)**: the port's
+  reload is synchronous on the UI thread — upstream's bordered
+  "Reloading…" box has no observable frame here; the default-tools delta
+  rides a tool registry the port has not ported; the implicit
+  project-trust save after reload is startup-only, so the status never
+  carries "saved project trust"; keybindings are static constants
+  (`theme::app_keys`), so `keybindings.reload()` is a no-op; the
+  extension reload is INCREMENTAL (no per-path unload — already-loaded
+  extensions keep their registered handlers where upstream clears the
+  module cache and re-evaluates every file). `InteractiveOptions` now
+  carries the `--extension` paths + `--no-extensions` flag for the
+  re-discovery.
+
 - **Rebase grafts lose definitions and registry lines silently**
   (hit 2026-11-17, export slice): resolving repeated rebase conflicts
   with `checkout --ours` against a tip graft preserves call sites and
@@ -2040,6 +2091,31 @@ check is terminal-dependent).
   only after choosing a method, so PTY verifiers must drive through it;
   and CaptureTerminal-driven tests need an explicit `render_now(false)`
   after mounts/pumps or the frame never records the dialog.
+- **A quota-killed agent's commits are UNVERIFIED state** (hit
+  2026-11-17, reload slice): an agent that dies mid-run leaves
+  "committed" modules that never compiled — 8 compile errors, 16 clippy
+  lints, and 10 test failures surfaced across the first three gate
+  rounds (an orphaned tail expression, a planned-but-uncalled enum
+  conversion, unit tests asserting off-upstream values). Budget a
+  salvage round: fix compile first, then lints, then run the module's
+  own tests and treat each failure as either an implementation bug or a
+  test-transcription bug — decide per case against the upstream source,
+  not the test's authority.
+- **Test helpers must mirror upstream's exact char arithmetic** (hit
+  2026-11-17): upstream's `getMarkerStates` does `line.slice(2)` before
+  checking the ✓ marker; a port using `trim_start()` breaks on the
+  SELECTED row because its `"→ "` prefix is not whitespace. Same class:
+  JS `slice(n)` = Rust `chars().skip(n)`, byte-index panics on the
+  multi-byte arrows/boxes these renders use.
+- **Invented tests must respect upstream no-op semantics and real key
+  bytes** (hit 2026-11-17): `enableAll` from `null` returns `null`
+  unchanged (`scoped-models-selector.ts:39`), so "enable all scopes to
+  the filtered rows" only observable from an explicit list; and
+  alt+down's terminal bytes are `\x1bn`, NOT the down-arrow `\x1b[B`
+  (which is plain SELECT_DOWN). Also the fuzzy haystack includes the
+  provider name (`getModelSearchText`), so a synthetic provider named
+  "beta" matches the query "b" — give filtered-scoping fixtures
+  providers that cannot match the query.
 
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
