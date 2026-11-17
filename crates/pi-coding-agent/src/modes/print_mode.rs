@@ -3,9 +3,12 @@
 //! Port of `modes/print-mode.ts` (182 lines) plus the model/credential
 //! resolution the CLI host performs before it. Faithful where P4 can be:
 //! text mode with the same output/exit-code contract. Deferred, tracked for
-//! later phases: JSON event output (`--mode json`, P5), signal handlers and
-//! stdout backpressure (`core/output-guard.ts`, P7), extension binding (P5).
-//! `@file` attachments are handled (`cli/file-processor.ts`).
+//! later phases: signal handlers (P7), extension binding (P5). stdout
+//! writes route through [`crate::output_guard`] (the
+//! `core/output-guard.ts` port), mirroring `print-mode.ts`'s
+//! `writeRawStdout` (`:158`) and the `flushRawStdout` tail (`:180`);
+//! JSON event output lives in `modes/json_event.rs` (P5). `@file`
+//! attachments are handled (`cli/file-processor.ts`).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -90,7 +93,7 @@ impl PrintRuntime {
     }
 }
 
-/// `runPrintMode` (`print-mode.ts:33-181`), minus signals/backpressure (P7)
+/// `runPrintMode` (`print-mode.ts:33-181`), minus signal handling (P7)
 /// and extension binding (P5). Returns the process exit code.
 ///
 /// Unlike upstream — which persists messages through the event stream as
@@ -394,33 +397,40 @@ pub fn run_print_mode(
             .map_err(|error| error.to_string())?;
     }
 
-    // Output contract (`print-mode.ts:146-167`).
-    let Some(last) = new_messages.last() else {
-        return Ok(0);
-    };
-    let AgentMessage::Assistant(assistant) = last else {
-        return Ok(0);
-    };
-    if assistant.stop_reason == StopReason::Error || assistant.stop_reason == StopReason::Aborted {
-        eprintln!(
-            "{}",
-            assistant
-                .error_message
-                .clone()
-                .unwrap_or_else(|| format!("Request {}", assistant.stop_reason.as_str()))
-        );
-        return Ok(1);
-    }
-    for block in &assistant.content {
-        if let pi_ai::types::AssistantContent::Text(text) = block {
-            println!("{}", text.text);
+    // Output contract (`print-mode.ts:146-167`): the last assistant
+    // message's text blocks ride the stdout guard; the error and
+    // truncation notes stay on stderr (`console.error`).
+    let mut exit_code = 0;
+    if let Some(AgentMessage::Assistant(assistant)) = new_messages.last() {
+        if assistant.stop_reason == StopReason::Error
+            || assistant.stop_reason == StopReason::Aborted
+        {
+            eprintln!(
+                "{}",
+                assistant
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| format!("Request {}", assistant.stop_reason.as_str()))
+            );
+            exit_code = 1;
+        } else {
+            for block in &assistant.content {
+                if let pi_ai::types::AssistantContent::Text(text) = block {
+                    // `writeRawStdout(`${content.text}\n`)`
+                    // (`print-mode.ts:158`).
+                    crate::output_guard::write_raw_stdout(&format!("{}\n", text.text));
+                }
+            }
+            if assistant.stop_reason == StopReason::Length {
+                eprintln!("Response was truncated: the model reached its output token limit.");
+                exit_code = 1;
+            }
         }
     }
-    if assistant.stop_reason == StopReason::Length {
-        eprintln!("Response was truncated: the model reached its output token limit.");
-        return Ok(1);
-    }
-    Ok(0)
+    // The `finally { await flushRawStdout(); }` tail (`print-mode.ts:180`):
+    // a flush error overrides the outcome, like a rejected finally.
+    crate::output_guard::flush_raw_stdout().map_err(|error| error.to_string())?;
+    Ok(exit_code)
 }
 
 pub(crate) fn now_millis() -> i64 {

@@ -51,6 +51,9 @@ pub mod modes;
 /// provider, login/logout option surfaces (`core/provider-composer.ts` +
 /// `auth/resolve.ts` halves).
 pub mod oauth;
+/// stdout output guard: ordered raw stdout writes and the takeover
+/// (`core/output-guard.ts`).
+pub mod output_guard;
 
 pub mod package_manager;
 /// System prompt assembly (`core/system-prompt.ts`).

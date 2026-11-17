@@ -23,6 +23,7 @@ use pi_coding_agent::modes::print_mode::{
     thinking_level_from_str,
 };
 use pi_coding_agent::modes::rpc::run_rpc_mode;
+use pi_coding_agent::output_guard::{restore_stdout, take_over_stdout};
 use pi_coding_agent::session::store::{NewSessionOptions, SessionManager};
 use pi_coding_agent::tools::index::ToolRegistry;
 
@@ -107,6 +108,12 @@ fn main() {
             }
         }
     }
+
+    // `takeOverStdout()` for every runtime mode (`main.ts:703-707`; the
+    // plain metadata commands exited above). The port records the marker —
+    // the stderr diversion it stands for is structural (see the guard's
+    // module doc).
+    take_over_stdout();
 
     let outcome = match args.mode {
         Some(Mode::Rpc) => run_rpc(&args, &cwd, &cwd_string),
@@ -560,7 +567,11 @@ fn run_print(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32
         initial_message: initial,
         initial_images: images,
     };
-    run_print_mode(&mut runtime, &options)
+    // `restoreStdout()` after the mode returns (`main.ts:1059`; no theme
+    // watcher to stop first).
+    let outcome = run_print_mode(&mut runtime, &options);
+    restore_stdout();
+    outcome
 }
 
 /// Interactive mode: the chat TUI. Initial `@file`/message arguments ride
@@ -612,7 +623,10 @@ fn run_json(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32,
         initial_message: initial,
         initial_images: images,
     };
-    run_json_mode(&mut runtime, &options)
+    // `restoreStdout()` after the mode returns (`main.ts:1059`).
+    let outcome = run_json_mode(&mut runtime, &options);
+    restore_stdout();
+    outcome
 }
 
 fn run_rpc(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {

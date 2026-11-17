@@ -8,10 +8,12 @@
 //! `message_update` line carries `usage` plus the `partial`-less assistant
 //! event, exactly `json-event.ts`). Remaining deviation: upstream
 //! subscribes mid-loop (events stream as they happen); the port emits
-//! through a sink that writes synchronously, which is the same visible
-//! byte stream for a non-aborted run.
+//! through a sink that writes synchronously through
+//! [`crate::output_guard`] (the `core/output-guard.ts` port):
+//! `writeRawStdout` per line (`print-mode.ts:117`, `:132`) and
+//! `flushRawStdout` at the tail (`:180`) — the same visible byte stream
+//! for a non-aborted run.
 
-use std::io::{self, BufWriter, Write};
 use std::sync::Arc;
 
 use pi_agent::agent_loop::{AgentLoopConfig, DefaultConvertToLlm};
@@ -260,44 +262,30 @@ fn json_assistant_message_event(event: &pi_ai::types::AssistantMessageEvent) -> 
     value
 }
 
-/// Sink writing one JSON line per event (`json-event.ts:20-40`).
-pub struct JsonEventSink<W: Write> {
-    writer: BufWriter<W>,
-}
+/// Sink writing one JSON line per event (`json-event.ts:20-40`): every
+/// line rides the stdout guard, like upstream's `writeRawStdout` call
+/// sites (`print-mode.ts:117`).
+pub struct JsonEventSink;
 
-impl<W: Write> JsonEventSink<W> {
-    pub fn new(writer: W) -> Self {
-        Self {
-            writer: BufWriter::new(writer),
-        }
-    }
-
-    fn write_event(&mut self, event: &AgentEvent) {
+impl JsonEventSink {
+    fn write_event(event: &AgentEvent) {
         let line = serde_json::Value::Object(event_to_json(event)).to_string();
-        if writeln!(self.writer, "{line}").is_err() {
-            // stdout closed: upstream's output guard (P7) aborts the run; the
-            // port's signal handling lands with it.
-        }
+        // `writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`)`
+        // (`print-mode.ts:117`); a failed write exits inside the guard
+        // (`output-guard.ts:90-92`).
+        crate::output_guard::write_raw_stdout(&format!("{line}\n"));
     }
 
     /// Writes one pre-serialized value as a JSON line. JSON mode's prelude is
     /// the session header (`print-mode.ts:129-134`).
-    fn write_value(&mut self, value: &serde_json::Value) {
-        let line = value.to_string();
-        if writeln!(self.writer, "{line}").is_err() {
-            // stdout closed: upstream's output guard (P7) aborts the run; the
-            // port's signal handling lands with it.
-        }
-    }
-
-    fn flush(&mut self) {
-        let _ = self.writer.flush();
+    fn write_value(value: &serde_json::Value) {
+        crate::output_guard::write_raw_stdout(&format!("{}\n", value));
     }
 }
 
-impl<W: Write> AgentEventSink for JsonEventSink<W> {
+impl AgentEventSink for JsonEventSink {
     fn emit(&mut self, event: AgentEvent) -> pi_agent::types::BoxFuture<'_, ()> {
-        self.write_event(&event);
+        Self::write_event(&event);
         Box::pin(async {})
     }
 }
@@ -367,12 +355,12 @@ pub fn run_json_mode(
     }
 
     let mut queues = Queues::new();
-    let mut sink = JsonEventSink::new(io::stdout().lock());
+    let mut sink = JsonEventSink;
     // The session header prelude, before any event (`print-mode.ts:129-134`).
     if let Some(header) = runtime.session.get_header()
         && let Ok(header) = serde_json::to_value(&header)
     {
-        sink.write_value(&header);
+        JsonEventSink::write_value(&header);
     }
     let signal = Arc::new(AbortSignal::new());
     // Under a virtual selection every request routes first
@@ -576,7 +564,6 @@ pub fn run_json_mode(
     crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AgentSettled {
         aborted: signal.aborted(),
     }));
-    sink.flush();
     #[cfg(feature = "ext-js")]
     if let Some(routing) = &routing {
         // `entry_appended` for each router-state record
@@ -602,5 +589,8 @@ pub fn run_json_mode(
         Some(StopReason::Error | StopReason::Aborted) => 1,
         _ => 0,
     };
+    // The `finally { await flushRawStdout(); }` tail (`print-mode.ts:180`):
+    // a flush error overrides the outcome, like a rejected finally.
+    crate::output_guard::flush_raw_stdout().map_err(|error| error.to_string())?;
     Ok(exit_code)
 }
