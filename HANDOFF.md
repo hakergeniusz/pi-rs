@@ -2163,6 +2163,90 @@ stderr.
   lines at identical positions — the tell). `git checkout -- .` before
   every `-B` switch and never pipe checkout through a pipe.
 
+## P7 piped stdin (landed on `feat/stdin-pipe`, 2026-11-17)
+
+Subagent-authored (`87c919f` rebased to `093fdde`), coordinator-gated
+(a02b5af clippy if-not-else, 9e694a7 clippy field-reassign — the agent's
+uncommitted test polish rode along, 93b20cc fmt). CI 44158559000 green.
+
+- `readPipedStdin` (`main.ts:79-100`) → `read_piped_stdin` +
+  `read_piped_stdin_from` (`main.rs`): `IsTerminal` guard, read to EOF,
+  `trim()`, whitespace-only → `None`; invalid UTF-8 decodes lossily.
+- `resolveAppMode` (`main.ts:115-126`) → `resolve_app_mode` + private
+  `AppMode`: rpc/json win, `--print`/non-TTY → print, else interactive.
+- `buildInitialMessage` (`cli/initial-message.ts:20-43`) →
+  `resolve_prompt_messages` gains the stdin part FIRST (order: stdin,
+  fileText, first shifted message; `parts.join("")` no separator; stdin
+  keys on presence, empty `@file` text skipped). Both deferral markers
+  closed. 7 unit tests.
+- Deviations (all in the module docs): stdin read happens in `main()`
+  before dispatch (upstream reads after runtime creation — observable
+  only on runtime-failure pipe semantics); IO error → `None` (upstream
+  would crash); the defensive interactive→print flip is dead code both
+  sides (ported for fidelity); upstream's `prepareInitialMessage` runs
+  even for rpc/interactive (port skips it — unobservable); pre-existing:
+  diagnostics exit code 2 vs upstream 1.
+
+## User-test fidelity fixes: `!` border, shift+tab, streaming tool rows (2026-11-17)
+
+Four user-reported fidelity gaps against real TS pi. Two landed; the full
+settings-selector port is in flight on `fix/settings-selector`.
+
+**Editor border colors + shift+tab thinking cycle** (landed
+`fix/editor-border-thinking-cycle`, commits 3456507/4c307d3/5d5df6b/6707ea5,
+CI 44160974837 green):
+
+- `updateEditorBorderColor` (`interactive-mode.ts:4700-4707`) →
+  `update_editor_border_color` on the mode: bash mode takes `bashMode`,
+  otherwise the border carries the thinking level's token
+  (`getThinkingBorderColor`, `theme.ts:348-368`) via new
+  `thinking_border_styler`/`bash_mode_border_styler` in
+  `modes/interactive/theme.rs`. Wired at: constructor (startup, `:2241`),
+  editor `onChange` (new `EditorEventOut::BashModeChanged` — the flag
+  tracks `text.trimStart().starts_with('!')` in `ChatEditor::handle_input`),
+  thinking cycle, model cycle/apply, `/thinking`,
+  `apply_model_thinking_level`, theme apply/preview, `/reload`.
+- `app.thinking.cycle` (shift+tab) was bound but never dispatched: new
+  `AppAction::CycleThinking` → `cycle_thinking_level` mirroring
+  `interactive-mode.ts:4711-4721` over `agent-session.ts:2813-2824`
+  (modulo the supported levels; unlisted current level restarts at the
+  first, matching upstream's `indexOf` → `-1` → `0`; "Current model does
+  not support thinking" on non-reasoning models).
+- pi-tui: `Editor::set_border_color`/`border_color` accessors (the field
+  was private).
+- Deviations: the pi-tui `render(&self)` is immutable, so upstream's
+  render-time mutation paths are replaced by eager updates at the change
+  sites; the border-token unit test asserts only deterministic pairs —
+  the fallback test theme renders `thinkingHigh` and `bashMode` alike
+  (both default fg), while `thinkingOff` differs from both.
+
+**Streaming tool-call args** (landed `fix/tool-call-preview`, commits
+4f2a7a8 + 09ba127, CI 44161238747 green — user symptom: a model bash call
+showed only `...` for the whole run):
+
+- Two stacked causes. (1) `update_assistant_stream` skipped already-open
+  tool rows (`pending_tools.contains_key` → `continue`), so a row kept
+  its FIRST partial's arguments forever — upstream's else branch calls
+  `component.updateArgs(content.arguments)` (`interactive-mode.ts:3674-
+  3678`); ported. (2) `update_args` only set an `args_pending` flag that
+  nothing consumed — upstream applies it at render (`tool-execution.ts:
+  237`), which the port's immutable `render(&self)` cannot do; the port
+  now rebuilds eagerly in `update_args` and the dead flag is gone
+  (deviation documented in the module docs: one rebuild per args delta
+  instead of one per frame).
+- The bash renderer's `$ ...` placeholder for an empty command was
+  already faithful (`renderers/bash.ts:20-26`); the bug was purely that
+  the real command never reached the row.
+- Tests: component-level (`streamed_args_refresh_the_call_line`) and
+  mode-level (`streaming_tool_args_refresh_the_call_line`) both drive
+  empty→full args through the real paths.
+
+**The two-landings-one-day git lesson**: when landing via
+`gate/<name>:feat/<name>` pushes plus local `--ff-only <feature>`, main
+can fast-forward to the PRE-fmt-debris tip while the style commit rides
+only the remote branch — merge `--ff-only <gate-branch-tip>` (the commit
+that carries the debris), then push. Hit three times on 2026-11-17.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
