@@ -3342,10 +3342,10 @@ impl InteractiveMode {
         // The entry state (`interactive-mode.ts:5585-5588`): the session
         // scope's ids when one is set, else the configured patterns
         // resolved over the snapshot.
-        let mut current_enabled_ids = if !self.scoped_models.is_empty() {
-            Some(self.scoped_ids())
-        } else {
+        let mut current_enabled_ids = if self.scoped_models.is_empty() {
             Self::configured_enabled_ids(configured_patterns.as_deref(), &available)
+        } else {
+            Some(self.scoped_ids())
         };
         let events = Arc::new(Mutex::new(Vec::new()));
         let selector = ScopedModelsSelectorComponent::new(
@@ -3368,7 +3368,7 @@ impl InteractiveMode {
         let available = self.available_models();
         let enabled_for_selector: Option<Option<Vec<String>>> = if self.scoped_models.is_empty() {
             let fresh = Self::configured_enabled_ids(configured_patterns.as_deref(), &available);
-            current_enabled_ids = fresh.clone();
+            current_enabled_ids.clone_from(&fresh);
             Some(fresh)
         } else {
             None
@@ -3446,8 +3446,7 @@ impl InteractiveMode {
                         }
                     };
                     let new_patterns = match (&enabled_ids, all_enabled) {
-                        (None, _) => None,
-                        (Some(_), true) => None,
+                        (None, _) | (Some(_), true) => None,
                         (Some(ids), false) => Some(ids.clone()),
                     };
                     self.settings.set_enabled_models(new_patterns);

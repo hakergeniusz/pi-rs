@@ -497,7 +497,7 @@ fn has_date_suffix(id: &str) -> bool {
         && bytes[bytes.len() - 9] == b'-'
         && bytes[bytes.len() - 8..]
             .iter()
-            .all(|byte| byte.is_ascii_digit())
+            .all(u8::is_ascii_digit)
 }
 
 /// `resolveModelScopeFromModels` (`model-resolver.ts:333-393`): resolve scope
@@ -511,7 +511,7 @@ pub fn resolve_model_scope_from_models(
     models: &[Model],
 ) -> ResolveModelScopeResult {
     let mut result = ResolveModelScopeResult::default();
-    let mut add = |scoped_models: &mut Vec<ScopedModel>, model: Model, thinking_level: Option<ThinkingLevel>| {
+    let add = |scoped_models: &mut Vec<ScopedModel>, model: Model, thinking_level: Option<ThinkingLevel>| {
         if !scoped_models
             .iter()
             .any(|scoped| models_are_equal(&scoped.model, &model))
@@ -655,8 +655,7 @@ fn glob_matches(candidate: &str, pattern: &str) -> bool {
         .case_insensitive(true)
         .literal_separator(true)
         .build()
-        .map(|glob| glob.compile_matcher().is_match(candidate))
-        .unwrap_or(false)
+        .is_ok_and(|glob| glob.compile_matcher().is_match(candidate))
 }
 
 #[cfg(test)]

@@ -60,7 +60,7 @@ pub struct ModelsConfig {
     pub refresh_status: Option<String>,
 }
 
-/// EnabledIds: `None` = all enabled (no filter), list = explicit ordered
+/// `EnabledIds`: `None` = all enabled (no filter), list = explicit ordered
 /// list (`EnabledIds`, `scoped-models-selector.ts:15`).
 pub type EnabledIds = Option<Vec<String>>;
 
@@ -94,18 +94,14 @@ fn toggle(enabled_ids: &EnabledIds, all_ids: &[String], id: &str) -> EnabledIds 
                 .collect(),
         );
     };
-    match ids.iter().position(|existing| existing == id) {
-        Some(index) => {
-            let mut next = ids.clone();
-            next.remove(index);
-            Some(next)
-        }
-        None => {
-            let mut next = ids.clone();
-            next.push(id.to_string());
-            normalize_enabled(next, all_ids)
-        }
-    }
+    let Some(index) = ids.iter().position(|existing| existing == id) else {
+        let mut next = ids.clone();
+        next.push(id.to_string());
+        return normalize_enabled(next, all_ids);
+    };
+    let mut next = ids.clone();
+    next.remove(index);
+    Some(next)
 }
 
 /// `enableAll` (`scoped-models-selector.ts:35-45`).
@@ -129,6 +125,9 @@ fn enable_all(
 }
 
 /// `clearAll` (`scoped-models-selector.ts:47-56`).
+// Upstream's clearAll always returns a list; the `Option` wrap keeps the
+// return in the `EnabledIds` union.
+#[allow(clippy::unnecessary_wraps)]
 fn clear_all(
     enabled_ids: &EnabledIds,
     all_ids: &[String],
@@ -150,7 +149,7 @@ fn clear_all(
             };
             Some(
                 ids.iter()
-                    .filter(|id| !targets.contains(&id))
+                    .filter(|id| !targets.contains(id))
                     .cloned()
                     .collect(),
             )
@@ -663,14 +662,14 @@ impl ScopedModelsSelectorComponent {
         // Ctrl+C - clear search or cancel if empty
         // (`scoped-models-selector.ts:423-433`).
         if pi_tui::keys::matches_key(data, "ctrl+c") {
-            if !self.search_input.value().is_empty() {
-                self.search_input.set_value("");
-                self.refresh();
-            } else {
+            if self.search_input.value().is_empty() {
                 self.events
                     .lock()
                     .expect("selector events")
                     .push(ScopedModelsSelectorEvent::Cancel);
+            } else {
+                self.search_input.set_value("");
+                self.refresh();
             }
             return;
         }
@@ -975,10 +974,10 @@ mod tests {
         let models = vec![model("acme", "model-a", "Model A")];
         let (mut component, events, _states) = harness(&models, None);
         component.handle_input("mod");
-        assert!(!component.search_input.value().is_empty());
+        assert_ne!(component.search_input.value(), "");
         component.handle_input("\x03");
-        assert!(component.search_input.value().is_empty());
-        assert!(drained(&events).is_empty());
+        assert_eq!(component.search_input.value(), "");
+        assert_eq!(drained(&events).len(), 0);
     }
 
     #[test]
