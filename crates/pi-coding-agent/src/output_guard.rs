@@ -252,7 +252,10 @@ mod tests {
         };
         write_raw_stdout_chunk_to(&mut writer, "payload").expect("retries drain the blocks");
         assert_eq!(writer.remaining, 0);
-        assert_eq!(std::str::from_utf8(&writer.received).expect("utf8"), "payload");
+        assert_eq!(
+            std::str::from_utf8(&writer.received).expect("utf8"),
+            "payload"
+        );
     }
 
     /// Any other error surfaces immediately (`output-guard.ts:38-39`).
