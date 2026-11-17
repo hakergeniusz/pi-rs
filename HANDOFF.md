@@ -2241,6 +2241,34 @@ showed only `...` for the whole run):
   mode-level (`streaming_tool_args_refresh_the_call_line`) both drive
   empty→full args through the real paths.
 
+**Terminal resize** (user symptom: resizing the terminal left pi-rs
+painting at the old size; landed on `fix/terminal-resize`, commit 8379ac0,
+live PTY-verified):
+
+- Upstream repaints on `process.stdout`'s `resize` event
+  (`terminal.ts:190`, `tui.ts:919-922`). pi-tui has no signal watcher:
+  `apply_resize` was designed host-driven but nothing ever called it, and
+  crossterm's `Event::Resize` is deliberately ignored in the dispatch loop
+  (`terminal.rs:681`) — that combination is the root cause.
+- `Tui::apply_resize` (`pi-tui/src/tui.rs`) now re-measures and only
+  invalidates + requests a frame on drift, so the interactive run loop can
+  tick it every iteration (~25 ms cadence) for free — the port's
+  `process.stdout.on("resize")` equivalent (`interactive_mode.rs` run
+  loop, commented as such).
+- Tests: `a_resize_tick_without_a_change_is_inert`,
+  `a_host_resize_tick_repaints_at_the_new_size` (modelled on
+  `Terminal::set_queried_size`, what the next `refresh_size` reports).
+- Verified live with a PTY probe (80×24 pty → `TIOCSWINSZ` on the master
+  → kernel SIGWINCHes the child → assert an ANSI-stripped row wider than
+  90 columns): pre-fix binary fails the probe, fixed binary passes.
+
+**cargo-deny schema** (the new `audit` job failed on config
+deserialization, run 44163799428): the runner's cargo-deny (≥ 0.18) wants
+`unmaintained` as a scope selector (`all/workspace/transitive/none`) and
+`yanked` as a level (`deny/warn/allow`); the first attempt had the two
+shapes swapped. Fixed in f8deec0 (`vulnerability = "deny"`,
+`unmaintained = "all"`, `yanked = "warn"`).
+
 **The two-landings-one-day git lesson**: when landing via
 `gate/<name>:feat/<name>` pushes plus local `--ff-only <feature>`, main
 can fast-forward to the PRE-fmt-debris tip while the style commit rides
