@@ -958,7 +958,10 @@ mod tests {
         };
         let resolved = resolve_prompt_messages(&args, dir.path(), Some("piped"));
         let (initial, images, follow_ups) = resolved.expect("ok");
-        let expected = format!("piped<file name=\"{}\">\nalpha\n</file>\nfirst", path.display());
+        let expected = format!(
+            "piped<file name=\"{}\">\nalpha\n</file>\nfirst",
+            path.display()
+        );
         assert_eq!(initial, Some(expected));
         assert_eq!(images, Vec::<ImageContent>::new());
         assert_eq!(follow_ups, vec!["second".to_string()]);
