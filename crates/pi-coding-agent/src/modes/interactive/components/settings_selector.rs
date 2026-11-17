@@ -162,6 +162,7 @@ pub enum SettingsSelectorEvent {
 
 /// The values the dialog renders, gathered from the orchestrator
 /// (`showSettingsSelector`'s config object, `interactive-mode.ts:5103-5147`).
+#[allow(clippy::struct_excessive_bools)] // mirrors the TS config object; split when extending
 pub struct SettingsSelectorConfig {
     /// `autoCompact` — the session's auto-compaction gate
     /// (`session.autoCompactionEnabled` = `getCompactionEnabled`).
@@ -1200,7 +1201,7 @@ fn selector_items(
         )
         .with_description("Horizontal padding for input editor (0-3)")
         .with_values(
-            vec!["0", "1", "2", "3"]
+            ["0", "1", "2", "3"]
                 .iter()
                 .map(|v| (*v).to_string())
                 .collect(),
@@ -1576,7 +1577,7 @@ impl SettingsSelectorComponent {
                 "output-padding" => {
                     // `newValue === "0" ? 0 : 1`
                     // (`settings-selector.ts:966-968`).
-                    let padding = if value == "0" { 0 } else { 1 };
+                    let padding = i64::from(value != "0");
                     self.push(SettingsSelectorEvent::OutputPadChange(padding));
                 }
                 "autocomplete-max-visible" => {

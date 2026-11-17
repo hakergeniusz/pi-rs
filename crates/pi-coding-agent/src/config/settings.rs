@@ -2593,7 +2593,9 @@ mod tests {
                 .err()
                 .is_some_and(|message| message.contains("Invalid httpIdleTimeoutMs"))
         );
-        manager.set_http_idle_timeout_ms(60_000);
+        manager
+            .set_http_idle_timeout_ms(60_000)
+            .expect("valid http idle timeout");
         assert_eq!(manager.get_http_idle_timeout_ms(), Ok(60_000));
 
         assert_eq!(parse_http_idle_timeout_ms(&json!("")), None);
@@ -2696,13 +2698,12 @@ mod tests {
     fn warnings_round_trip_unknown_keys_included() {
         let manager = manager_with_global(&json!({}));
         assert_eq!(manager.get_warnings(), Settings::new());
-        assert_eq!(
+        assert!(
             manager
                 .get_warnings()
                 .get("anthropicExtraUsage")
                 .and_then(Value::as_bool)
-                .unwrap_or(DEFAULT_WARNINGS_ANTHROPIC_EXTRA_USAGE),
-            true
+                .unwrap_or(DEFAULT_WARNINGS_ANTHROPIC_EXTRA_USAGE)
         );
 
         let mut manager = manager_with_global(&json!({}));
