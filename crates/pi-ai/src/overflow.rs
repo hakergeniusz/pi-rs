@@ -78,27 +78,27 @@ static NON_OVERFLOW_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 /// window — the usage-based cases need it.
 pub fn is_context_overflow(message: &AssistantMessage, context_window: Option<u64>) -> bool {
     // Case 1: Check error message patterns
-    if message.stop_reason == StopReason::Error {
-        if let Some(error_message) = &message.error_message {
-            // Skip messages matching known non-overflow patterns (e.g.
-            // throttling / rate-limit)
-            let is_non_overflow = NON_OVERFLOW_PATTERNS
+    if message.stop_reason == StopReason::Error
+        && let Some(error_message) = &message.error_message
+    {
+        // Skip messages matching known non-overflow patterns (e.g.
+        // throttling / rate-limit)
+        let is_non_overflow = NON_OVERFLOW_PATTERNS
+            .iter()
+            .any(|pattern| pattern.is_match(error_message).unwrap_or(false));
+        if !is_non_overflow {
+            if OVERFLOW_PATTERNS
                 .iter()
-                .any(|pattern| pattern.is_match(error_message).unwrap_or(false));
-            if !is_non_overflow {
-                if OVERFLOW_PATTERNS
-                    .iter()
-                    .any(|pattern| pattern.is_match(error_message).unwrap_or(false))
-                {
-                    return true;
-                }
-                if message.provider == "cerebras"
-                    && CEREBRAS_BODYLESS_OVERFLOW_PATTERN
-                        .is_match(error_message)
-                        .unwrap_or(false)
-                {
-                    return true;
-                }
+                .any(|pattern| pattern.is_match(error_message).unwrap_or(false))
+            {
+                return true;
+            }
+            if message.provider == "cerebras"
+                && CEREBRAS_BODYLESS_OVERFLOW_PATTERN
+                    .is_match(error_message)
+                    .unwrap_or(false)
+            {
+                return true;
             }
         }
     }

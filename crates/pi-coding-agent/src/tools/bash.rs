@@ -199,11 +199,11 @@ pub async fn execute(
     let mut timed_out = false;
 
     while stdout_open || stderr_open {
-        if let Some(deadline) = timeout_ms {
-            if started_at.elapsed() >= Duration::from_millis(deadline) {
-                timed_out = true;
-                break;
-            }
+        if let Some(deadline) = timeout_ms
+            && started_at.elapsed() >= Duration::from_millis(deadline)
+        {
+            timed_out = true;
+            break;
         }
         if signal.aborted() {
             kill_tree(&mut child);
@@ -288,13 +288,11 @@ pub async fn execute(
     let mut structured = Map::new();
     structured.insert("output".to_string(), json!(full_output.content));
     structured.insert("truncated".to_string(), json!(full_output.truncated));
-    if full_output.truncated {
-        if let Some(path) = snapshot.full_output_path.as_ref() {
-            structured.insert(
-                "full_output_path".to_string(),
-                json!(path.display().to_string()),
-            );
-        }
+    if full_output.truncated && let Some(path) = snapshot.full_output_path.as_ref() {
+        structured.insert(
+            "full_output_path".to_string(),
+            json!(path.display().to_string()),
+        );
     }
     structured.insert("exit_code".to_string(), json!(exit_code));
     structured.insert("wall_time_seconds".to_string(), json!(wall_time_seconds));

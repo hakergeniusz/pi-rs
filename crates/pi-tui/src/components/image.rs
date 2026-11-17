@@ -112,10 +112,10 @@ impl Image {
 impl Component for Image {
     /// `image.ts:64-125`.
     fn render(&self, width: usize) -> Vec<String> {
-        if let Some((cached_width, lines)) = self.cached_lines.borrow().as_ref() {
-            if *cached_width == width {
-                return lines.clone();
-            }
+        if let Some((cached_width, lines)) = self.cached_lines.borrow().as_ref()
+            && *cached_width == width
+        {
+            return lines.clone();
         }
 
         // `Math.max(1, Math.min(width - 2, maxWidthCells ?? 60))`. The

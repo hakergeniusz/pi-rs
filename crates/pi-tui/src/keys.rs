@@ -441,14 +441,12 @@ fn matches_kitty_sequence(data: &str, expected_codepoint: i64, expected_modifier
     }
     // Base-layout fallback: only for codepoints that are not already a Latin
     // letter or a known symbol, so remapped layouts cannot alias.
-    if let Some(base) = parsed.base_layout_key {
-        if base == expected_codepoint {
-            let is_latin_letter = (97..=122).contains(&normalized);
-            let is_known_symbol =
-                char::from_u32(normalized as u32).is_some_and(|c| SYMBOL_KEYS.contains(&c));
-            if !is_latin_letter && !is_known_symbol {
-                return true;
-            }
+    if let Some(base) = parsed.base_layout_key && base == expected_codepoint {
+        let is_latin_letter = (97..=122).contains(&normalized);
+        let is_known_symbol =
+            char::from_u32(normalized as u32).is_some_and(|c| SYMBOL_KEYS.contains(&c));
+        if !is_latin_letter && !is_known_symbol {
+            return true;
         }
     }
     false
@@ -789,23 +787,21 @@ pub fn matches_key(data: &str, key_id: &str) -> bool {
             let codepoint = base as i64;
             let raw_ctrl = raw_ctrl_char(base);
 
-            if modifier == modifiers::CTRL | modifiers::ALT && !kitty {
+            if modifier == modifiers::CTRL | modifiers::ALT
+                && !kitty
+                && let Some(raw) = raw_ctrl
+                && data == format!("\x1b{raw}")
+            {
                 // Legacy ctrl+alt+key is ESC followed by the control character.
-                if let Some(raw) = raw_ctrl {
-                    if data == format!("\x1b{raw}") {
-                        return true;
-                    }
-                }
-                // tmux CSI-u / modifyOtherKeys must still be recognized.
+                return true;
             }
+            // tmux CSI-u / modifyOtherKeys must still be recognized.
             if modifier == modifiers::ALT && !kitty && data == format!("\x1b{base}") {
                 return true;
             }
             if modifier == modifiers::CTRL {
-                if let Some(raw) = raw_ctrl {
-                    if data == raw.to_string() {
-                        return true;
-                    }
+                if let Some(raw) = raw_ctrl && data == raw.to_string() {
+                    return true;
                 }
                 return matches_kitty_sequence(data, codepoint, modifiers::CTRL)
                     || matches_printable_modify_other_keys(data, codepoint, modifiers::CTRL);
@@ -1072,10 +1068,8 @@ pub fn decode_kitty_printable(data: &str) -> Option<char> {
         return None;
     }
     let mut effective = parsed.codepoint;
-    if modifier & modifiers::SHIFT != 0 {
-        if let Some(shifted) = parsed.shifted_key {
-            effective = shifted;
-        }
+    if modifier & modifiers::SHIFT != 0 && let Some(shifted) = parsed.shifted_key {
+        effective = shifted;
     }
     effective = normalize_kitty_functional_codepoint(effective);
     if effective < 32 {

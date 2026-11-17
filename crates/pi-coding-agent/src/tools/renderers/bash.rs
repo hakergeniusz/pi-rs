@@ -63,14 +63,15 @@ fn format_shell_result(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let full_output_path = result.details.get("fullOutputPath").and_then(Value::as_str);
-    if truncated && full_output_path.is_some() && output.ends_with(']') {
+    if truncated
+        && full_output_path.is_some()
+        && output.ends_with(']')
+        && let Some(footer_start) = output.rfind("\n\n[")
+        && output[footer_start..].contains(full_output_path.unwrap_or_default())
+    {
         // Trim the "[Full output: ...]" footer the tool appended, so the
         // preview does not repeat it (`bash.ts:42-47`).
-        if let Some(footer_start) = output.rfind("\n\n[") {
-            if output[footer_start..].contains(full_output_path.unwrap_or_default()) {
-                output = output[..footer_start].trim_end().to_string();
-            }
-        }
+        output = output[..footer_start].trim_end().to_string();
     }
 
     if !output.is_empty() {

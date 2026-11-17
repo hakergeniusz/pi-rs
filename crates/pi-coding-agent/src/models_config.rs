@@ -451,17 +451,16 @@ fn merge_compat(base: Option<JsonObject>, r#override: Option<JsonObject>) -> Opt
     };
     let mut merged = base.unwrap_or_default();
     for (key, value) in r#override {
-        if NESTED_COMPAT_KEYS.contains(&key.as_str()) {
-            if let (Some(Value::Object(nested)), Value::Object(incoming)) =
+        if NESTED_COMPAT_KEYS.contains(&key.as_str())
+            && let (Some(Value::Object(nested)), Value::Object(incoming)) =
                 (merged.get(&key).cloned(), &value)
-            {
-                let mut nested = nested;
-                for (nested_key, nested_value) in incoming {
-                    nested.insert(nested_key.clone(), nested_value.clone());
-                }
-                merged.insert(key, Value::Object(nested));
-                continue;
+        {
+            let mut nested = nested;
+            for (nested_key, nested_value) in incoming {
+                nested.insert(nested_key.clone(), nested_value.clone());
             }
+            merged.insert(key, Value::Object(nested));
+            continue;
         }
         merged.insert(key, value);
     }

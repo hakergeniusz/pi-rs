@@ -94,10 +94,8 @@ fn match_phrase_token(session: &SessionInfo, phrase: &str) -> Option<f64> {
 }
 
 fn match_regex(session: &SessionInfo, regex: &regex::Regex) -> Option<f64> {
-    if let Some(name) = &session.name {
-        if regex.is_match(name) {
-            return Some(tier_score(TIER_NAME, 0.0));
-        }
+    if let Some(name) = &session.name && regex.is_match(name) {
+        return Some(tier_score(TIER_NAME, 0.0));
     }
     if regex.is_match(&session.id)
         || regex.is_match(&session.all_messages_text)

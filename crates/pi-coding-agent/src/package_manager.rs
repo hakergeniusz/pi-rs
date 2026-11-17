@@ -184,17 +184,17 @@ fn build_git_source(
 /// ref there), or the bare `host/path(@ref)` form.
 fn split_ref(url: &str) -> (String, Option<String>) {
     // scp-like: `^git@([^:]+):(.+)$`.
-    if let Some(rest) = url.strip_prefix("git@") {
-        if let Some((host, path_with_maybe_ref)) = rest.split_once(':') {
-            if let Some(at) = path_with_maybe_ref.find('@') {
-                let repo_path = &path_with_maybe_ref[..at];
-                let ref_ = &path_with_maybe_ref[at + 1..];
-                if !repo_path.is_empty() && !ref_.is_empty() {
-                    return (format!("git@{host}:{repo_path}"), Some(ref_.to_string()));
-                }
+    if let Some(rest) = url.strip_prefix("git@")
+        && let Some((host, path_with_maybe_ref)) = rest.split_once(':')
+    {
+        if let Some(at) = path_with_maybe_ref.find('@') {
+            let repo_path = &path_with_maybe_ref[..at];
+            let ref_ = &path_with_maybe_ref[at + 1..];
+            if !repo_path.is_empty() && !ref_.is_empty() {
+                return (format!("git@{host}:{repo_path}"), Some(ref_.to_string()));
             }
-            return (url.to_string(), None);
         }
+        return (url.to_string(), None);
     }
     if let Some(separator) = url.find("://") {
         // The path segment runs to the query or fragment; the ref rides

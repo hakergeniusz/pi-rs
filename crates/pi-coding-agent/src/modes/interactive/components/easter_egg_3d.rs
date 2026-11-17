@@ -1661,22 +1661,21 @@ impl Component for EasterEgg3dAnimation {
                     },
                     background,
                 );
-                if let Some(hint) = &hint {
-                    if row == hint.row
-                        && column >= hint.start
-                        && column < hint.start + hint.text.len()
-                    {
-                        let offset = column - hint.start;
-                        let color = if offset < hint.key_length {
-                            hint.key_color
-                        } else {
-                            hint.color
-                        };
-                        let char = hint.text.chars().nth(offset).expect("in range");
-                        emitter.emit(&char.to_string(), Some(color), cell_bg);
-                        column += 1;
-                        continue;
-                    }
+                if let Some(hint) = &hint
+                    && row == hint.row
+                    && column >= hint.start
+                    && column < hint.start + hint.text.len()
+                {
+                    let offset = column - hint.start;
+                    let color = if offset < hint.key_length {
+                        hint.key_color
+                    } else {
+                        hint.color
+                    };
+                    let char = hint.text.chars().nth(offset).expect("in range");
+                    emitter.emit(&char.to_string(), Some(color), cell_bg);
+                    column += 1;
+                    continue;
                 }
                 let dots = raster.bits[index];
                 if dots != 0 {

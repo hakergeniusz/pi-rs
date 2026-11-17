@@ -306,13 +306,13 @@ pub fn run_json_mode(
     let session_context =
         build_session_context_from(&runtime.session.get_entries(), leaf_id.as_deref());
     let mut context_messages = session_context.messages;
-    if context_messages.is_empty() {
-        if let Some(system) = pi_agent::transcript::create_initial_system_message(
+    if context_messages.is_empty()
+        && let Some(system) = pi_agent::transcript::create_initial_system_message(
             Some(&runtime.system_prompt),
             &specs.iter().map(tool_declaration).collect::<Vec<_>>(),
-        ) {
-            context_messages.push(AgentMessage::System(system));
-        }
+        )
+    {
+        context_messages.push(AgentMessage::System(system));
     }
     let context = AgentContext {
         messages: context_messages,

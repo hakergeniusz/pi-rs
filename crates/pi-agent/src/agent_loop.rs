@@ -288,12 +288,10 @@ fn bash_execution_to_text(message: &BashExecutionMessage) -> String {
         text.push_str("\n\nCommand exited with code ");
         text.push_str(&message.exit_code.unwrap_or(0).to_string());
     }
-    if message.truncated {
-        if let Some(path) = &message.full_output_path {
-            text.push_str("\n\n[Output truncated. Full output: ");
-            text.push_str(path);
-            text.push(']');
-        }
+    if message.truncated && let Some(path) = &message.full_output_path {
+        text.push_str("\n\n[Output truncated. Full output: ");
+        text.push_str(path);
+        text.push(']');
     }
     text
 }
@@ -443,14 +441,14 @@ async fn run_loop(
             }
             let prepared_messages: Vec<AgentMessage> = Vec::new();
             if let Some(previous) = last_completed_turn.take() {
-                if let Some(prepare) = config.prepare_next_turn.as_ref() {
-                    if let Some(update) = prepare.call(&previous).await {
-                        if let Some(next_model) = update.model {
-                            model = next_model;
-                        }
-                        if let Some(level) = update.thinking_level {
-                            thinking_level = level;
-                        }
+                if let Some(prepare) = config.prepare_next_turn.as_ref()
+                    && let Some(update) = prepare.call(&previous).await
+                {
+                    if let Some(next_model) = update.model {
+                        model = next_model;
+                    }
+                    if let Some(level) = update.thinking_level {
+                        thinking_level = level;
                     }
                 }
                 // Preparation can be long (compaction), so steering queued while
@@ -773,10 +771,10 @@ async fn finish_assistant(
 }
 
 fn replace_last_assistant(context: &mut AgentContext, message: &AssistantMessage) {
-    if let Some(last) = context.messages.last_mut() {
-        if matches!(last, AgentMessage::Assistant(_)) {
-            *last = AgentMessage::Assistant(message.clone());
-        }
+    if let Some(last) = context.messages.last_mut()
+        && matches!(last, AgentMessage::Assistant(_))
+    {
+        *last = AgentMessage::Assistant(message.clone());
     }
 }
 
@@ -1140,10 +1138,10 @@ async fn finalize_executed_tool_call(
 ) -> FinalizedToolCall {
     let mut result = result;
     let mut is_error = is_error;
-    if let Some(after) = config.hooks.after.clone() {
-        if let Some(overrides) = after.call(assistant, tool_call, &result, is_error).await {
-            merge_after_tool_call(&mut result, &mut is_error, overrides);
-        }
+    if let Some(after) = config.hooks.after.clone()
+        && let Some(overrides) = after.call(assistant, tool_call, &result, is_error).await
+    {
+        merge_after_tool_call(&mut result, &mut is_error, overrides);
     }
     FinalizedToolCall {
         tool_call: tool_call.clone(),
@@ -1205,20 +1203,20 @@ async fn prepare_tool_call(
         ));
     }
 
-    if let Some(before) = hooks.before.as_ref() {
-        if let Some(decision) = before.call(assistant, tool_call).await {
-            if signal.aborted() {
-                return Some((AgentToolResult::error("Operation aborted"), true));
-            }
-            if decision.block {
-                let mut result = AgentToolResult::error(
-                    decision
-                        .reason
-                        .unwrap_or_else(|| "Tool execution was blocked".to_string()),
-                );
-                result.terminate = decision.terminate;
-                return Some((result, true));
-            }
+    if let Some(before) = hooks.before.as_ref()
+        && let Some(decision) = before.call(assistant, tool_call).await
+    {
+        if signal.aborted() {
+            return Some((AgentToolResult::error("Operation aborted"), true));
+        }
+        if decision.block {
+            let mut result = AgentToolResult::error(
+                decision
+                    .reason
+                    .unwrap_or_else(|| "Tool execution was blocked".to_string()),
+            );
+            result.terminate = decision.terminate;
+            return Some((result, true));
         }
     }
 

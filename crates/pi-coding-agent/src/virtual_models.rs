@@ -167,12 +167,11 @@ pub fn get_branch_selection(
         // The response names a physical model; the last `model_change` before
         // it only wins when it selected a (still registered) virtual model
         // (`change && model && isVirtualModel(model) ? change : response`).
-        if let Some(change) = find_last_model_change(branch, index) {
-            if let Some(model) = get_model(&change.0, &change.1) {
-                if is_virtual_model(&model) {
-                    return Some(change);
-                }
-            }
+        if let Some(change) = find_last_model_change(branch, index)
+            && let Some(model) = get_model(&change.0, &change.1)
+            && is_virtual_model(&model)
+        {
+            return Some(change);
         }
         return Some((response.provider.clone(), response.model.clone()));
     }
@@ -826,21 +825,19 @@ impl PrepareRequest for VirtualRouteHook {
             );
             match route {
                 Ok(route) => {
-                    if let Some(new_state) = &route.state {
-                        if Some(new_state) != state.as_ref() {
-                            self.state
-                                .lock()
-                                .expect("router state")
-                                .insert(key, new_state.clone());
-                            self.pending_state
-                                .lock()
-                                .expect("pending state")
-                                .push(json!({
-                                    "provider": model.provider,
-                                    "modelId": model.id,
-                                    "state": new_state,
-                                }));
-                        }
+                    if let Some(new_state) = &route.state && Some(new_state) != state.as_ref() {
+                        self.state
+                            .lock()
+                            .expect("router state")
+                            .insert(key, new_state.clone());
+                        self.pending_state
+                            .lock()
+                            .expect("pending state")
+                            .push(json!({
+                                "provider": model.provider,
+                                "modelId": model.id,
+                                "state": new_state,
+                            }));
                     }
                     TurnUpdate {
                         model: Some(route.model),

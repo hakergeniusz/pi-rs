@@ -216,18 +216,16 @@ fn parse_text_signature(signature: Option<&str>) -> (Option<String>, Option<Stri
     let Some(signature) = signature else {
         return (None, None);
     };
-    if signature.starts_with('{') {
-        if let Ok(parsed) = serde_json::from_str::<Value>(signature) {
-            if parsed.get("v").and_then(Value::as_u64) == Some(1) {
-                if let Some(id) = parsed.get("id").and_then(Value::as_str) {
-                    let phase = parsed.get("phase").and_then(Value::as_str);
-                    let phase = phase
-                        .filter(|p| *p == "commentary" || *p == "final_answer")
-                        .map(str::to_string);
-                    return (Some(id.to_string()), phase);
-                }
-            }
-        }
+    if signature.starts_with('{')
+        && let Ok(parsed) = serde_json::from_str::<Value>(signature)
+        && parsed.get("v").and_then(Value::as_u64) == Some(1)
+        && let Some(id) = parsed.get("id").and_then(Value::as_str)
+    {
+        let phase = parsed.get("phase").and_then(Value::as_str);
+        let phase = phase
+            .filter(|p| *p == "commentary" || *p == "final_answer")
+            .map(str::to_string);
+        return (Some(id.to_string()), phase);
     }
     (Some(signature.to_string()), None)
 }
@@ -365,10 +363,10 @@ fn convert_responses_messages(model: &Model, context: &TranscriptContext) -> Vec
                     match block {
                         AssistantContent::Thinking(thinking) => {
                             // Replay the serialized `ResponseReasoningItem` verbatim.
-                            if let Some(signature) = &thinking.thinking_signature {
-                                if let Ok(item) = serde_json::from_str::<Value>(signature) {
-                                    output.push(item);
-                                }
+                            if let Some(signature) = &thinking.thinking_signature
+                                && let Ok(item) = serde_json::from_str::<Value>(signature)
+                            {
+                                output.push(item);
                             }
                         }
                         AssistantContent::Text(text) => {
@@ -423,10 +421,8 @@ fn convert_responses_messages(model: &Model, context: &TranscriptContext) -> Vec
                             if let Some(id) = id {
                                 item["id"] = json!(id);
                             }
-                            if is_same_model {
-                                if let Some(namespace) = &tool_call.namespace {
-                                    item["namespace"] = json!(namespace);
-                                }
+                            if is_same_model && let Some(namespace) = &tool_call.namespace {
+                                item["namespace"] = json!(namespace);
                             }
                             output.push(item);
                         }
@@ -1328,20 +1324,20 @@ async fn request_and_stream(
     if !state.saw_terminal {
         return Err("OpenAI Responses stream ended before a terminal response event".to_string());
     }
-    if output.stop_reason == StopReason::ToolUse {
-        if let Some(&index) = state.unfinished.first() {
-            let name = match output.content.get(index) {
-                Some(AssistantContent::ToolCall(block)) => block.name.clone(),
-                _ => String::new(),
-            };
-            let id = match output.content.get(index) {
-                Some(AssistantContent::ToolCall(block)) => block.id.clone(),
-                _ => String::new(),
-            };
-            return Err(format!(
-                "OpenAI Responses stream completed with an unfinished tool call: {name} ({id})"
-            ));
-        }
+    if output.stop_reason == StopReason::ToolUse
+        && let Some(&index) = state.unfinished.first()
+    {
+        let name = match output.content.get(index) {
+            Some(AssistantContent::ToolCall(block)) => block.name.clone(),
+            _ => String::new(),
+        };
+        let id = match output.content.get(index) {
+            Some(AssistantContent::ToolCall(block)) => block.id.clone(),
+            _ => String::new(),
+        };
+        return Err(format!(
+            "OpenAI Responses stream completed with an unfinished tool call: {name} ({id})"
+        ));
     }
     Ok(())
 }

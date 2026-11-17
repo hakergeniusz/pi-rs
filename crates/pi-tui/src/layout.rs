@@ -374,10 +374,8 @@ fn layout_component(
         if lines.len() > allocated_height && allocated_height > 0 {
             // Keep the cursor line visible. `layout.ts:118-123`.
             let cursor_line = lines.iter().position(|line| line.contains(CURSOR_MARKER));
-            if let Some(cursor_line) = cursor_line {
-                if cursor_line >= allocated_height {
-                    line_offset = cursor_line + 1 - allocated_height;
-                }
+            if let Some(cursor_line) = cursor_line && cursor_line >= allocated_height {
+                line_offset = cursor_line + 1 - allocated_height;
             }
         }
         return LayoutBox {
@@ -434,12 +432,10 @@ fn layout_component(
             context
                 .pending
                 .push((component_id(component), state.clone(), update));
-            if update_changed {
+            if update_changed && let Some(request_render) = &context.request_render {
                 // `layout.ts:153`: `updateLayout` also stores the callback and
                 // asks for a frame when follow-end moved the viewport.
-                if let Some(request_render) = &context.request_render {
-                    request_render();
-                }
+                request_render();
             }
 
             let mut child_box = child_box;
@@ -734,11 +730,11 @@ pub fn render_layout_frame(
 pub fn apply_scroll_updates(root: &mut dyn Component, updates: &[(usize, ScrollUpdate)]) -> usize {
     let mut applied = 0;
     let id = component_id(root);
-    if let Some((_, update)) = updates.iter().find(|(update_id, _)| *update_id == id) {
-        if let Some(state) = root.scroll_state_mut() {
-            state.apply_scroll_update(update.clone());
-            applied += 1;
-        }
+    if let Some((_, update)) = updates.iter().find(|(update_id, _)| *update_id == id)
+        && let Some(state) = root.scroll_state_mut()
+    {
+        state.apply_scroll_update(update.clone());
+        applied += 1;
     }
     for child in root.layout_children_mut() {
         applied += apply_scroll_updates(child, updates);
@@ -786,10 +782,8 @@ pub fn get_scroll_views_at(frame: &LayoutFrame, x: i64, y: i64) -> Vec<Component
         if !contains_point(box_.clip, x, y) {
             return;
         }
-        if let Some(scroll_view) = box_.scroll_view {
-            if contains_point(box_.rect, x, y) {
-                out.push((scroll_view, depth));
-            }
+        if let Some(scroll_view) = box_.scroll_view && contains_point(box_.rect, x, y) {
+            out.push((scroll_view, depth));
         }
         for child in &box_.children {
             visit(child, x, y, depth + 1, out);

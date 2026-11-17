@@ -1017,19 +1017,18 @@ impl Tui {
                     }
                 }
                 OverlayFocusRestoreState::Eligible { overlay } => {
-                    if let Some(focused_overlay) = previous_focused_overlay {
-                        if overlay == focused_overlay
-                            && !self.is_overlay_focus_ancestor(
-                                focused_overlay,
-                                next_focus.map(|_| next_id),
-                            )
-                        {
-                            self.overlay_focus_restore = OverlayFocusRestoreState::Blocked {
-                                overlay: focused_overlay,
-                                blocked_by: next_id,
-                                resume: OverlayFocusResume::RestoreOverlay,
-                            };
-                        }
+                    if let Some(focused_overlay) = previous_focused_overlay
+                        && overlay == focused_overlay
+                        && !self.is_overlay_focus_ancestor(
+                            focused_overlay,
+                            next_focus.map(|_| next_id),
+                        )
+                    {
+                        self.overlay_focus_restore = OverlayFocusRestoreState::Blocked {
+                            overlay: focused_overlay,
+                            blocked_by: next_id,
+                            resume: OverlayFocusResume::RestoreOverlay,
+                        };
                     }
                 }
                 OverlayFocusRestoreState::Inactive | OverlayFocusRestoreState::Blocked { .. } => {}
@@ -1049,19 +1048,17 @@ impl Tui {
             }
         }
 
-        if let Some(previous) = previous_focus {
-            if let Some(component) = self.component_mut(previous) {
-                set_focus_flag(component, false);
-            }
+        if let Some(previous) = previous_focus
+            && let Some(component) = self.component_mut(previous)
+        {
+            set_focus_flag(component, false);
         }
 
         self.focused = next_focus;
         self.focused_component = None;
         self.focused_id = next_focus.map(|target| self.target_id(target));
-        if let Some(next) = self.focused_id {
-            if let Some(component) = self.component_mut(next) {
-                set_focus_flag(component, true);
-            }
+        if let Some(next) = self.focused_id && let Some(component) = self.component_mut(next) {
+            set_focus_flag(component, true);
         }
         if let Some(FocusTarget::Root(index)) = next_focus {
             self.focused_component = Some(index);
@@ -2064,17 +2061,16 @@ impl Tui {
             return true;
         }
         // A focused overlay that just became invisible loses focus.
-        if let Some(FocusTarget::Overlay(id)) = self.focused {
-            if let Some(index) = self.find_overlay(id) {
-                if !self.is_overlay_visible(&self.overlays[index]) {
-                    let pre_focus = self.overlays[index].pre_focus;
-                    let target = self
-                        .topmost_visible_overlay()
-                        .map(|index| FocusTarget::Overlay(self.overlays[index].id()))
-                        .or(pre_focus);
-                    self.set_focus(target);
-                }
-            }
+        if let Some(FocusTarget::Overlay(id)) = self.focused
+            && let Some(index) = self.find_overlay(id)
+            && !self.is_overlay_visible(&self.overlays[index])
+        {
+            let pre_focus = self.overlays[index].pre_focus;
+            let target = self
+                .topmost_visible_overlay()
+                .map(|index| FocusTarget::Overlay(self.overlays[index].id()))
+                .or(pre_focus);
+            self.set_focus(target);
         }
         let wants_release = match self.focused {
             Some(FocusTarget::Root(index)) => self

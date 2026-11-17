@@ -180,10 +180,8 @@ fn theme_items(available: &[String], current: &str) -> Vec<SelectItem> {
 
 /// `preferredTheme` (`settings-selector.ts:97-103`).
 fn preferred_theme(available: &[String], preferred: Option<&str>, fallback: &str) -> String {
-    if let Some(preferred) = preferred {
-        if available.iter().any(|name| name == preferred) {
-            return preferred.to_string();
-        }
+    if let Some(preferred) = preferred && available.iter().any(|name| name == preferred) {
+        return preferred.to_string();
     }
     if available.iter().any(|name| name == fallback) {
         return fallback.to_string();

@@ -450,14 +450,13 @@ impl SessionList {
         self.filter_sessions(&query);
         if !self.selection_touched {
             self.selected_index = 0;
-        } else if let Some(selected_path) = selected_path {
-            if let Some(index) = self
+        } else if let Some(selected_path) = selected_path
+            && let Some(index) = self
                 .filtered
                 .iter()
                 .position(|node| self.all_sessions[node.session_index].path == selected_path)
-            {
-                self.selected_index = index;
-            }
+        {
+            self.selected_index = index;
         }
     }
 

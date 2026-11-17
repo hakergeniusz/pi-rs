@@ -209,12 +209,12 @@ pub fn omit_attempt(
             continue;
         };
         let entry_id = entry.id().to_string();
-        if let Ok(edit_id) = session.append_context_edit(&entry_id, &ContextReplacement::Omit) {
-            if let Some(edit_entry) = session.get_entry(&edit_id) {
-                records.push(serde_json::Value::Object(
-                    edit_entry.to_record().object().clone(),
-                ));
-            }
+        if let Ok(edit_id) = session.append_context_edit(&entry_id, &ContextReplacement::Omit)
+            && let Some(edit_entry) = session.get_entry(&edit_id)
+        {
+            records.push(serde_json::Value::Object(
+                edit_entry.to_record().object().clone(),
+            ));
         }
     }
     records

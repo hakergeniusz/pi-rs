@@ -117,17 +117,14 @@ fn render_horizontal_viewport(rows: &[ViewportRow], width: usize) -> Vec<String>
     let selected_row = rows.iter().find(|row| row.is_selected);
 
     let mut horizontal_scroll = 0;
-    if let Some(selected) = selected_row {
-        if max_horizontal_scroll > 0 {
-            let min_visible_anchor_content_width = MAX_VISIBLE_ANCHOR_CONTENT_WIDTH
-                .min(MIN_VISIBLE_ANCHOR_CONTENT_WIDTH.max(viewport_width / 3));
-            if selected.anchor_col > viewport_width.saturating_sub(min_visible_anchor_content_width)
-            {
-                let anchor_context_width =
-                    MAX_ANCHOR_CONTEXT_WIDTH.min(MIN_ANCHOR_CONTEXT_WIDTH.max(viewport_width / 4));
-                horizontal_scroll = max_horizontal_scroll
-                    .min(selected.anchor_col.saturating_sub(anchor_context_width));
-            }
+    if let Some(selected) = selected_row && max_horizontal_scroll > 0 {
+        let min_visible_anchor_content_width = MAX_VISIBLE_ANCHOR_CONTENT_WIDTH
+            .min(MIN_VISIBLE_ANCHOR_CONTENT_WIDTH.max(viewport_width / 3));
+        if selected.anchor_col > viewport_width.saturating_sub(min_visible_anchor_content_width) {
+            let anchor_context_width =
+                MAX_ANCHOR_CONTEXT_WIDTH.min(MIN_ANCHOR_CONTEXT_WIDTH.max(viewport_width / 4));
+            horizontal_scroll = max_horizontal_scroll
+                .min(selected.anchor_col.saturating_sub(anchor_context_width));
         }
     }
 
@@ -376,18 +373,18 @@ impl TreeList {
 
             // Extract tool calls from assistant messages for later lookup
             // (`tree-selector.ts:257-269`).
-            if let SessionEntry::Message(message) = &node.entry {
-                if let pi_agent::AgentMessage::Assistant(assistant) = &message.message {
-                    for block in &assistant.content {
-                        if let pi_ai::types::AssistantContent::ToolCall(call) = block {
-                            self.tool_call_map.insert(
-                                call.id.clone(),
-                                ToolCallInfo {
-                                    name: call.name.clone(),
-                                    arguments: call.arguments.clone(),
-                                },
-                            );
-                        }
+            if let SessionEntry::Message(message) = &node.entry
+                && let pi_agent::AgentMessage::Assistant(assistant) = &message.message
+            {
+                for block in &assistant.content {
+                    if let pi_ai::types::AssistantContent::ToolCall(call) = block {
+                        self.tool_call_map.insert(
+                            call.id.clone(),
+                            ToolCallInfo {
+                                name: call.name.clone(),
+                                arguments: call.arguments.clone(),
+                            },
+                        );
                     }
                 }
             }
@@ -500,18 +497,17 @@ impl TreeList {
             // Skip assistant messages with only tool calls (no text) unless
             // error/aborted; always show the current leaf
             // (`tree-selector.ts:347-357`).
-            if let SessionEntry::Message(message) = entry {
-                if let pi_agent::AgentMessage::Assistant(assistant) = &message.message {
-                    if !is_current_leaf {
-                        let has_text = has_text_content_assistant(&assistant.content);
-                        let is_error_or_aborted = !matches!(
-                            assistant.stop_reason,
-                            pi_ai::types::StopReason::Stop | pi_ai::types::StopReason::ToolUse
-                        );
-                        if !has_text && !is_error_or_aborted {
-                            continue;
-                        }
-                    }
+            if let SessionEntry::Message(message) = entry
+                && let pi_agent::AgentMessage::Assistant(assistant) = &message.message
+                && !is_current_leaf
+            {
+                let has_text = has_text_content_assistant(&assistant.content);
+                let is_error_or_aborted = !matches!(
+                    assistant.stop_reason,
+                    pi_ai::types::StopReason::Stop | pi_ai::types::StopReason::ToolUse
+                );
+                if !has_text && !is_error_or_aborted {
+                    continue;
                 }
             }
 
@@ -566,10 +562,10 @@ impl TreeList {
             let mut skip_set: HashSet<String> = HashSet::new();
             for flat in &self.flat_nodes {
                 let id = flat.node.entry.id().to_string();
-                if let Some(parent_id) = flat.node.entry.parent_id() {
-                    if self.folded_nodes.contains(parent_id) || skip_set.contains(parent_id) {
-                        skip_set.insert(id);
-                    }
+                if let Some(parent_id) = flat.node.entry.parent_id()
+                    && (self.folded_nodes.contains(parent_id) || skip_set.contains(parent_id))
+                {
+                    skip_set.insert(id);
                 }
             }
             filtered.retain(|&index| !skip_set.contains(self.flat_nodes[index].node.entry.id()));
@@ -1296,12 +1292,11 @@ impl TreeList {
                 .get(&Some(parent_id.clone()))
                 .cloned()
                 .unwrap_or_default();
-            if children.len() > 1 {
-                if let Some(segment_start) = index_by_entry_id.get(current_id.as_str()).copied() {
-                    if segment_start < self.selected_index {
-                        return segment_start;
-                    }
-                }
+            if children.len() > 1
+                && let Some(segment_start) = index_by_entry_id.get(current_id.as_str()).copied()
+                && segment_start < self.selected_index
+            {
+                return segment_start;
             }
             current_id = parent_id;
         }

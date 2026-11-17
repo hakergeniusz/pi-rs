@@ -4589,8 +4589,8 @@ impl InteractiveMode {
             leaf_id.as_deref(),
         );
         let mut context_messages = session_context.messages;
-        if context_messages.is_empty() {
-            if let Some(system) = pi_agent::transcript::create_initial_system_message(
+        if context_messages.is_empty()
+            && let Some(system) = pi_agent::transcript::create_initial_system_message(
                 Some(&self.system_prompt),
                 &self
                     .executor
@@ -4598,9 +4598,9 @@ impl InteractiveMode {
                     .iter()
                     .map(tool_declaration)
                     .collect::<Vec<_>>(),
-            ) {
-                context_messages.push(AgentMessage::System(system));
-            }
+            )
+        {
+            context_messages.push(AgentMessage::System(system));
         }
 
         let user_message = pi_agent::transcript::user_message(text, now_millis());
@@ -5197,10 +5197,10 @@ impl InteractiveMode {
         self.settings_selector_events = None;
         self.session_selector_events = None;
         self.user_message_selector_events = None;
-        if let Some(navigation) = self.tree_navigation.take() {
-            if let Some(run) = navigation.summary_run {
-                run.abort.abort();
-            }
+        if let Some(navigation) = self.tree_navigation.take()
+            && let Some(run) = navigation.summary_run
+        {
+            run.abort.abort();
         }
         self.tree_selector_events = None;
         self.tree_summary_dialog_events = None;
@@ -5354,14 +5354,13 @@ impl InteractiveMode {
         // sync.
         self.emit_extension_shutdown("reload", None);
         #[cfg(feature = "ext-js")]
-        if let Some(runner) = &self.extension_runner {
-            if let Err(error) = runner
+        if let Some(runner) = &self.extension_runner
+            && let Err(error) = runner
                 .lock()
                 .expect("extension runner mutex poisoned")
                 .invalidate(None)
-            {
-                eprintln!("Warning: Extension error: invalidate: {error}");
-            }
+        {
+            eprintln!("Warning: Extension error: invalidate: {error}");
         }
         self.settings.reload();
         // `syncQueueModesFromSettings` (`agent-session.ts:2863+`): both
@@ -6559,10 +6558,9 @@ impl InteractiveMode {
             .tree_navigation
             .as_mut()
             .and_then(|navigation| navigation.summary_run.take())
+            && let Some(handle) = run.handle
         {
-            if let Some(handle) = run.handle {
-                let _ = handle.join();
-            }
+            let _ = handle.join();
         }
         // `clearStatusIndicator("branchSummary")` (`:5866-5870`).
         self.set_working_status(None);
@@ -7700,11 +7698,10 @@ impl InteractiveMode {
             .easter_egg
             .as_ref()
             .is_some_and(|handle| handle.done.load(Ordering::SeqCst))
+            && let Some(handle) = self.easter_egg.take()
         {
-            if let Some(handle) = self.easter_egg.take() {
-                self.tui.hide_overlay(handle.overlay);
-                self.tui.request_render();
-            }
+            self.tui.hide_overlay(handle.overlay);
+            self.tui.request_render();
         }
 
         // Agent events, without blocking the input loop: collect first,
@@ -7790,10 +7787,8 @@ impl InteractiveMode {
             }
         }
         if let Some(outcome) = retry_wait_outcome {
-            if let Some(wait) = self.retry_wait.take() {
-                if let Some(handle) = wait.handle {
-                    let _ = handle.join();
-                }
+            if let Some(wait) = self.retry_wait.take() && let Some(handle) = wait.handle {
+                let _ = handle.join();
             }
             self.set_working_status(None);
             match outcome {

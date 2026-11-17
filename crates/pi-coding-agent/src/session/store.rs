@@ -2166,10 +2166,8 @@ impl SessionManager {
         from_hook: Option<bool>,
         usage: Option<Usage>,
     ) -> SessionResult<String> {
-        if let Some(id) = branch_from_id {
-            if !self.by_id.contains_key(id) {
-                return Err(SessionError::EntryNotFound(id.to_string()));
-            }
+        if let Some(id) = branch_from_id && !self.by_id.contains_key(id) {
+            return Err(SessionError::EntryNotFound(id.to_string()));
         }
         let from_id = self.leaf_id.clone().unwrap_or_else(|| "root".to_string());
         self.leaf_id = branch_from_id.map(str::to_string);
@@ -2236,15 +2234,13 @@ impl SessionManager {
                     replacement_by_label_id.insert(label_id, id.to_string());
                 }
             }
-            if copy.kind() == "compaction" {
-                if let Some(first_kept) = copy.get_str("firstKeptEntryId").map(str::to_string) {
-                    // A compaction that keeps itself stays self-referencing.
-                    if first_kept != copy.id().unwrap_or_default() {
-                        if let Some(mapped) = replacement_by_label_id.get(&first_kept) {
-                            copy.set("firstKeptEntryId", mapped.clone());
-                        }
-                    }
-                }
+            // A compaction that keeps itself stays self-referencing.
+            if copy.kind() == "compaction"
+                && let Some(first_kept) = copy.get_str("firstKeptEntryId").map(str::to_string)
+                && first_kept != copy.id().unwrap_or_default()
+                && let Some(mapped) = replacement_by_label_id.get(&first_kept)
+            {
+                copy.set("firstKeptEntryId", mapped.clone());
             }
             path_parent = copy.id().map(str::to_string);
             kept.push(copy);

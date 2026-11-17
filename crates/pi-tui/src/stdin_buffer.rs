@@ -166,15 +166,14 @@ fn extract_complete_sequences(buffer: &str) -> (Vec<String>, String) {
                         // as CSI-u, arriving as `\x1b\x1b[27;…u`. Treat
                         // `\x1b\x1b` as a lone Escape when the next byte would
                         // start another escape sequence.
-                        if candidate == "\x1b\x1b" {
-                            if let Some(next) = remaining[seq_end..].chars().next() {
-                                if "[ ]OP_".contains(next) {
-                                    sequences.push("\x1b".to_string());
-                                    pos += 1;
-                                    emitted = true;
-                                    break;
-                                }
-                            }
+                        if candidate == "\x1b\x1b"
+                            && let Some(next) = remaining[seq_end..].chars().next()
+                            && "[ ]OP_".contains(next)
+                        {
+                            sequences.push("\x1b".to_string());
+                            pos += 1;
+                            emitted = true;
+                            break;
                         }
                         sequences.push(candidate.to_string());
                         pos += seq_end;

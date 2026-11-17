@@ -57,12 +57,10 @@ pub fn discover_extensions_in_dir(dir: &Path) -> Vec<PathBuf> {
             discovered.push(path);
             continue;
         }
-        if is_dir {
-            if let Some(entry) = resolve_directory_entries(&path) {
-                match entry {
-                    DirectoryEntry::Manifest(entries) => discovered.extend(entries),
-                    DirectoryEntry::Index(index) => discovered.push(index),
-                }
+        if is_dir && let Some(entry) = resolve_directory_entries(&path) {
+            match entry {
+                DirectoryEntry::Manifest(entries) => discovered.extend(entries),
+                DirectoryEntry::Index(index) => discovered.push(index),
             }
         }
     }

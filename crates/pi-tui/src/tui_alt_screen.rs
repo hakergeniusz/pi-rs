@@ -868,12 +868,11 @@ impl Tui {
                 break;
             }
         }
-        if remaining != 0 {
-            if let Some(primary) = layout.primary_scroll_view {
-                if !seen.contains(&primary) {
-                    remaining -= self.scroll_view_by(remaining, primary);
-                }
-            }
+        if remaining != 0
+            && let Some(primary) = layout.primary_scroll_view
+            && !seen.contains(&primary)
+        {
+            remaining -= self.scroll_view_by(remaining, primary);
         }
         delta != remaining
     }
@@ -1014,15 +1013,13 @@ impl Tui {
     ) {
         let mut moved = self.alt().is_some_and(|alt| alt.mouse_press_moved);
         let point = self.alt().and_then(|alt| alt.mouse_press_point);
-        if let Some((px, py)) = point {
-            if raw.x != px || raw.y != py {
-                moved = true;
-                let alt = self.alt_state();
-                alt.mouse_press_moved = true;
-                // `lastComponentClick = undefined`, `:919-920`: moving away
-                // from the pressed cell breaks the double-click chain.
-                alt.last_component_click.reset();
-            }
+        if let Some((px, py)) = point && (raw.x != px || raw.y != py) {
+            moved = true;
+            let alt = self.alt_state();
+            alt.mouse_press_moved = true;
+            // `lastComponentClick = undefined`, `:919-920`: moving away
+            // from the pressed cell breaks the double-click chain.
+            alt.last_component_click.reset();
         }
         let forwarded = retarget_mouse_event(event, &target);
         let mut render = false;
@@ -1136,10 +1133,10 @@ impl Tui {
         raw: &SgrMouseEvent,
         anchor_scroll_view: Option<ComponentId>,
     ) -> SelectionPoint {
-        if let Some(scroll_view) = anchor_scroll_view {
-            if let Some(point) = self.scroll_selection_point(layout, scroll_view, raw.x, raw.y) {
-                return point;
-            }
+        if let Some(scroll_view) = anchor_scroll_view
+            && let Some(point) = self.scroll_selection_point(layout, scroll_view, raw.x, raw.y)
+        {
+            return point;
         }
         let (columns, rows) = self.terminal_size();
         SelectionPoint {
@@ -1253,15 +1250,14 @@ impl Tui {
     /// screen; every other point reads the last painted frame
     /// (`previousScreen`).
     fn selection_source_line(&self, layout: &LayoutFrame, point: &SelectionPoint) -> String {
-        if let Some(scroll_view) = point.scroll_view {
-            if let Some(lines) = get_scroll_view_box(layout, scroll_view)
+        if let Some(scroll_view) = point.scroll_view
+            && let Some(lines) = get_scroll_view_box(layout, scroll_view)
                 .and_then(|box_| box_.scroll_content_lines.as_ref())
-            {
-                return lines
-                    .get(point.row.max(0) as usize)
-                    .cloned()
-                    .unwrap_or_default();
-            }
+        {
+            return lines
+                .get(point.row.max(0) as usize)
+                .cloned()
+                .unwrap_or_default();
         }
         self.alt()
             .and_then(|alt| alt.previous_screen.get(point.row.max(0) as usize))
@@ -1614,19 +1610,19 @@ impl Tui {
                 None
             };
             self.alt_state().pressed_url = None;
-            if let Some(url) = clicked_url {
-                if self.alt().is_some_and(|alt| alt.open_url.is_some()) {
-                    self.alt_state().selection_anchor = None;
-                    self.alt_state().selection_focus = None;
-                    // Best-effort: a host that throws must not take the renderer
-                    // down (`:1334-1338`).
-                    if let Some(open) = self.alt_state().open_url.take() {
-                        open(url);
-                        self.alt_state().open_url = Some(open);
-                    }
-                    self.request_render();
-                    return;
+            if let Some(url) = clicked_url
+                && self.alt().is_some_and(|alt| alt.open_url.is_some())
+            {
+                self.alt_state().selection_anchor = None;
+                self.alt_state().selection_focus = None;
+                // Best-effort: a host that throws must not take the renderer
+                // down (`:1334-1338`).
+                if let Some(open) = self.alt_state().open_url.take() {
+                    open(url);
+                    self.alt_state().open_url = Some(open);
                 }
+                self.request_render();
+                return;
             }
             if is_click {
                 let count = self

@@ -163,11 +163,9 @@ fn diff_words(old: &str, new: &str) -> Vec<WordPart> {
         if value.is_empty() {
             return;
         }
-        if let Some(last) = parts.last_mut() {
-            if last.removed == removed && last.added == added {
-                last.value.push_str(&value);
-                return;
-            }
+        if let Some(last) = parts.last_mut() && last.removed == removed && last.added == added {
+            last.value.push_str(&value);
+            return;
         }
         parts.push(WordPart {
             removed,

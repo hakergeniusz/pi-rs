@@ -1089,14 +1089,13 @@ pub fn hyperlink(text: &str, url: &str) -> String {
 
 /// Shorten a home-prefixed path to `~/...`. `terminal-image.ts:705-712`.
 pub fn shorten_image_path(filename: &str, home: Option<&str>) -> String {
-    if let Some(home) = home.filter(|home| !home.is_empty()) {
-        // Exact home, or the POSIX/Windows separators pi checks.
-        if filename == home
+    // Exact home, or the POSIX/Windows separators pi checks.
+    if let Some(home) = home.filter(|home| !home.is_empty())
+        && (filename == home
             || filename.starts_with(&format!("{home}/"))
-            || filename.starts_with(&format!("{home}\\"))
-        {
-            return format!("~{}", &filename[home.len()..]);
-        }
+            || filename.starts_with(&format!("{home}\\")))
+    {
+        return format!("~{}", &filename[home.len()..]);
     }
     filename.to_string()
 }

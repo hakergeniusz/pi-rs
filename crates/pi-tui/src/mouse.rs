@@ -383,22 +383,20 @@ fn parse_digits(text: &str) -> Option<u32> {
 /// report is raw terminal output and is not valid UTF-8 once the button or
 /// coordinate carries the high bit.
 pub fn parse_wheel_event_bytes(data: &[u8]) -> Option<WheelEvent> {
-    if let Ok(text) = std::str::from_utf8(data) {
-        if let Some(sgr) = parse_sgr_mouse_event(text) {
-            if sgr.button & 64 == 0 {
-                return None;
-            }
-            let direction = sgr.button & 3;
-            if direction != 0 && direction != 1 {
-                return None;
-            }
-            return Some(WheelEvent {
-                direction: if direction == 0 { -1 } else { 1 },
-                x: sgr.x,
-                y: sgr.y,
-                button: i64::from(sgr.button),
-            });
+    if let Ok(text) = std::str::from_utf8(data) && let Some(sgr) = parse_sgr_mouse_event(text) {
+        if sgr.button & 64 == 0 {
+            return None;
         }
+        let direction = sgr.button & 3;
+        if direction != 0 && direction != 1 {
+            return None;
+        }
+        return Some(WheelEvent {
+            direction: if direction == 0 { -1 } else { 1 },
+            x: sgr.x,
+            y: sgr.y,
+            button: i64::from(sgr.button),
+        });
     }
     if data.len() == 6 && data.starts_with(b"\x1b[M") {
         // pi reads the bytes with `charCodeAt`, so a payload below 32/33

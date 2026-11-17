@@ -92,14 +92,14 @@ fn check_into(value: &Value, schema: &Value, path: &str, errors: &mut Vec<Valida
     {
         check_into(value, nested, path, errors);
     }
-    if let Some(union) = union_members(schema) {
-        if !union.iter().any(|member| check(value, member).is_empty()) {
-            errors.push(ValidationError {
-                path: display_path(path),
-                message: "Expected value to match at least one schema in anyOf/oneOf".to_string(),
-            });
-            return;
-        }
+    if let Some(union) = union_members(schema)
+        && !union.iter().any(|member| check(value, member).is_empty())
+    {
+        errors.push(ValidationError {
+            path: display_path(path),
+            message: "Expected value to match at least one schema in anyOf/oneOf".to_string(),
+        });
+        return;
     }
 
     let types = schema_types(schema);
@@ -152,27 +152,24 @@ fn check_into(value: &Value, schema: &Value, path: &str, errors: &mut Vec<Valida
         }
     }
 
-    if value.is_array() {
-        if let Some(items) = schema.get("items") {
-            if let Some(entries) = value.as_array() {
-                if items.is_array() {
-                    for (index, entry) in entries.iter().enumerate() {
-                        if let Some(item_schema) =
-                            items.as_array().and_then(|items| items.get(index))
-                        {
-                            check_into(
-                                entry,
-                                item_schema,
-                                &join_path(path, &index.to_string()),
-                                errors,
-                            );
-                        }
-                    }
-                } else {
-                    for (index, entry) in entries.iter().enumerate() {
-                        check_into(entry, items, &join_path(path, &index.to_string()), errors);
-                    }
+    if value.is_array()
+        && let Some(items) = schema.get("items")
+        && let Some(entries) = value.as_array()
+    {
+        if items.is_array() {
+            for (index, entry) in entries.iter().enumerate() {
+                if let Some(item_schema) = items.as_array().and_then(|items| items.get(index)) {
+                    check_into(
+                        entry,
+                        item_schema,
+                        &join_path(path, &index.to_string()),
+                        errors,
+                    );
                 }
+            }
+        } else {
+            for (index, entry) in entries.iter().enumerate() {
+                check_into(entry, items, &join_path(path, &index.to_string()), errors);
             }
         }
     }

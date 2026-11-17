@@ -164,10 +164,10 @@ async fn request_and_stream(
                     if let Some(id) = message_obj.get("id").and_then(Value::as_str) {
                         output.response_id = Some(id.to_string());
                     }
-                    if let Some(response_model) = message_obj.get("model").and_then(Value::as_str) {
-                        if response_model != model.id {
-                            output.response_model = Some(response_model.to_string());
-                        }
+                    if let Some(response_model) = message_obj.get("model").and_then(Value::as_str)
+                        && response_model != model.id
+                    {
+                        output.response_model = Some(response_model.to_string());
                     }
                     if let Some(usage) = message_obj.get("usage") {
                         apply_usage_field(usage, output, true);
@@ -359,23 +359,23 @@ async fn request_and_stream(
                             .get("partial_json")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
-                        if let Some(state) = open_blocks.get_mut(&index) {
-                            if let Some(raw) = state.args_raw.as_mut() {
-                                raw.push_str(partial_json);
-                                if let Some(AssistantContent::ToolCall(block)) =
-                                    output.content.get_mut(state.content_index)
-                                {
-                                    block.arguments =
-                                        parse_tool_call_arguments(raw).unwrap_or_default();
-                                }
-                                let _ = sender
-                                    .send(AssistantMessageEvent::ToolcallDelta {
-                                        content_index: state.content_index,
-                                        delta: partial_json.to_string(),
-                                        partial: output.clone(),
-                                    })
-                                    .await;
+                        if let Some(state) = open_blocks.get_mut(&index)
+                            && let Some(raw) = state.args_raw.as_mut()
+                        {
+                            raw.push_str(partial_json);
+                            if let Some(AssistantContent::ToolCall(block)) =
+                                output.content.get_mut(state.content_index)
+                            {
+                                block.arguments =
+                                    parse_tool_call_arguments(raw).unwrap_or_default();
                             }
+                            let _ = sender
+                                .send(AssistantMessageEvent::ToolcallDelta {
+                                    content_index: state.content_index,
+                                    delta: partial_json.to_string(),
+                                    partial: output.clone(),
+                                })
+                                .await;
                         }
                     }
                     _ => {}
@@ -437,19 +437,19 @@ async fn request_and_stream(
                 }
             }
             "message_delta" => {
-                if let Some(delta) = event.get("delta") {
-                    if let Some(reason) = delta.get("stop_reason").and_then(Value::as_str) {
-                        output.raw_stop_reason = Some(reason.to_string());
-                        match map_stop_reason(reason) {
-                            Ok((stop, None)) => output.stop_reason = stop,
-                            Ok((stop, Some(error_message))) => {
-                                output.stop_reason = stop;
-                                output.error_message = Some(error_message);
-                            }
-                            Err(error_message) => {
-                                output.stop_reason = StopReason::Error;
-                                output.error_message = Some(error_message);
-                            }
+                if let Some(delta) = event.get("delta")
+                    && let Some(reason) = delta.get("stop_reason").and_then(Value::as_str)
+                {
+                    output.raw_stop_reason = Some(reason.to_string());
+                    match map_stop_reason(reason) {
+                        Ok((stop, None)) => output.stop_reason = stop,
+                        Ok((stop, Some(error_message))) => {
+                            output.stop_reason = stop;
+                            output.error_message = Some(error_message);
+                        }
+                        Err(error_message) => {
+                            output.stop_reason = StopReason::Error;
+                            output.error_message = Some(error_message);
                         }
                     }
                 }
@@ -695,36 +695,34 @@ pub fn build_request_body(
 
     // Thinking budgets: token-based via model.thinkingLevelMap when present,
     // otherwise level defaults capped to half the max tokens.
-    if let Some(level) = options.reasoning {
-        if model.reasoning {
-            let default_budgets: [(ThinkingLevel, u64); 5] = [
-                (ThinkingLevel::Minimal, 1024),
-                (ThinkingLevel::Off, 0),
-                (ThinkingLevel::Low, 2048),
-                (ThinkingLevel::Medium, 4096),
-                (ThinkingLevel::High, 8192),
-            ];
-            let mapped = model
-                .thinking_level_map
-                .as_ref()
-                .and_then(|m| m.get(map_key(level)))
-                .cloned();
-            let budget = mapped
-                .as_ref()
-                .and_then(Value::as_u64)
-                .or_else(|| {
-                    default_budgets
-                        .iter()
-                        .find(|(l, _)| *l == level)
-                        .map(|(_, b)| *b)
-                })
-                .unwrap_or(0);
-            if budget > 0 {
-                body["thinking"] = json!({
-                    "type": "enabled",
-                    "budget_tokens": budget.min(max_tokens / 2).max(1024),
-                });
-            }
+    if let Some(level) = options.reasoning && model.reasoning {
+        let default_budgets: [(ThinkingLevel, u64); 5] = [
+            (ThinkingLevel::Minimal, 1024),
+            (ThinkingLevel::Off, 0),
+            (ThinkingLevel::Low, 2048),
+            (ThinkingLevel::Medium, 4096),
+            (ThinkingLevel::High, 8192),
+        ];
+        let mapped = model
+            .thinking_level_map
+            .as_ref()
+            .and_then(|m| m.get(map_key(level)))
+            .cloned();
+        let budget = mapped
+            .as_ref()
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                default_budgets
+                    .iter()
+                    .find(|(l, _)| *l == level)
+                    .map(|(_, b)| *b)
+            })
+            .unwrap_or(0);
+        if budget > 0 {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget.min(max_tokens / 2).max(1024),
+            });
         }
     }
 

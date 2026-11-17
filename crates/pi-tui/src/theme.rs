@@ -466,10 +466,8 @@ pub fn validate_theme_json(label: &str, value: &Value) -> Result<ThemeJson, Stri
         Some(Value::String(_)) => {}
         Some(_) => others.push("  - /name: Expected string".to_string()),
     }
-    if let Some(schema) = object.get("$schema") {
-        if !schema.is_string() {
-            others.push("  - /$schema: Expected string".to_string());
-        }
+    if let Some(schema) = object.get("$schema") && !schema.is_string() {
+        others.push("  - /$schema: Expected string".to_string());
     }
     if let Some(appearance) = object.get("appearance") {
         let valid = appearance
@@ -909,14 +907,12 @@ impl Theme {
 
     /// The concrete colour of a foreground token (`theme.ts:318-333`).
     pub fn fg_color(&self, token: ThemeColor) -> Color {
-        if self.dim_tokens.contains(&token) {
-            if let Some(color) = self.fg.get(&token) {
-                if let Ok(mixed) =
-                    mix_colors(*color, self.default_background(), 0.4, ColorMixSpace::Oklch)
-                {
-                    return mixed;
-                }
-            }
+        if self.dim_tokens.contains(&token)
+            && let Some(color) = self.fg.get(&token)
+            && let Ok(mixed) =
+                mix_colors(*color, self.default_background(), 0.4, ColorMixSpace::Oklch)
+        {
+            return mixed;
         }
         self.fg
             .get(&token)
@@ -1071,10 +1067,8 @@ fn average_lightness(colors: impl Iterator<Item = Color>) -> Option<f64> {
     let mut sum = 0.0;
     let mut count = 0.0;
     for color in colors {
-        if let Color::Indexed(index) = color {
-            if index < 16 {
-                continue;
-            }
+        if let Color::Indexed(index) = color && index < 16 {
+            continue;
         }
         sum += crate::color::color_to_oklch(color).l;
         count += 1.0;
@@ -1564,11 +1558,11 @@ impl ThemeWatcher {
             };
             return false;
         }
-        if let Some(since) = self.pending_since_ms {
-            if now_ms.saturating_sub(since) >= THEME_WATCH_DEBOUNCE_MS {
-                self.pending_since_ms = None;
-                return true;
-            }
+        if let Some(since) = self.pending_since_ms
+            && now_ms.saturating_sub(since) >= THEME_WATCH_DEBOUNCE_MS
+        {
+            self.pending_since_ms = None;
+            return true;
         }
         false
     }

@@ -462,25 +462,22 @@ fn pre_render_custom_tools(
             let existing = rendered_tools
                 .iter()
                 .find(|(id, _)| *id == result.tool_call_id);
-            if existing.is_some() || !TEMPLATE_RENDERED_TOOLS.contains(&tool_name) {
-                if let Some(rendered) = tool_renderer.render_result(
+            if (existing.is_some() || !TEMPLATE_RENDERED_TOOLS.contains(&tool_name))
+                && let Some(rendered) = tool_renderer.render_result(
                     &result.tool_call_id,
                     tool_name,
                     &result.content,
                     result.details.as_ref(),
                     result.is_error,
-                ) {
-                    let mut merged = existing
-                        .map_or_else(RenderedToolHtml::default, |(_, rendered)| rendered.clone());
-                    merged.result_html_collapsed = rendered.collapsed;
-                    merged.result_html_expanded = rendered.expanded;
-                    match rendered_tools
-                        .iter_mut()
-                        .find(|(id, _)| *id == result.tool_call_id)
-                    {
-                        Some((_, slot)) => *slot = merged,
-                        None => rendered_tools.push((result.tool_call_id.clone(), merged)),
-                    }
+                )
+            {
+                let mut merged = existing
+                    .map_or_else(RenderedToolHtml::default, |(_, rendered)| rendered.clone());
+                merged.result_html_collapsed = rendered.collapsed;
+                merged.result_html_expanded = rendered.expanded;
+                match rendered_tools.iter_mut().find(|(id, _)| *id == result.tool_call_id) {
+                    Some((_, slot)) => *slot = merged,
+                    None => rendered_tools.push((result.tool_call_id.clone(), merged)),
                 }
             }
         }

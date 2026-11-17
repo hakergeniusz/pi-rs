@@ -303,11 +303,11 @@ fn interactive() -> io::Result<()> {
     loop {
         app.render();
         io::stdout().flush().ok();
-        if let Some(started) = responding_since {
-            if started.elapsed() >= Duration::from_secs(1) {
-                app.finish_response();
-                responding_since = None;
-            }
+        if let Some(started) = responding_since
+            && started.elapsed() >= Duration::from_secs(1)
+        {
+            app.finish_response();
+            responding_since = None;
         }
         if !crossterm::event::poll(Duration::from_millis(50))? {
             continue;

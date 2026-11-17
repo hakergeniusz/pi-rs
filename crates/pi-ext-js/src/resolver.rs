@@ -72,16 +72,16 @@ pub enum DirectoryEntry {
 /// declared paths exist wins, else `index.ts`, else `index.js`, else none.
 pub fn resolve_directory_entries(dir: &Path) -> Option<DirectoryEntry> {
     let package_json_path = dir.join("package.json");
-    if let Ok(package_json) = std::fs::read_to_string(&package_json_path) {
-        if let Some(manifest) = read_pi_manifest(&package_json) {
-            let entries: Vec<PathBuf> = manifest
-                .iter()
-                .map(|ext_path| dir.join(ext_path))
-                .filter(|resolved| resolved.exists())
-                .collect();
-            if !entries.is_empty() {
-                return Some(DirectoryEntry::Manifest(entries));
-            }
+    if let Ok(package_json) = std::fs::read_to_string(&package_json_path)
+        && let Some(manifest) = read_pi_manifest(&package_json)
+    {
+        let entries: Vec<PathBuf> = manifest
+            .iter()
+            .map(|ext_path| dir.join(ext_path))
+            .filter(|resolved| resolved.exists())
+            .collect();
+        if !entries.is_empty() {
+            return Some(DirectoryEntry::Manifest(entries));
         }
     }
     let ts_entry = dir.join("index.ts");

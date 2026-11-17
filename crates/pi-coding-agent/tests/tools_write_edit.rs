@@ -555,14 +555,13 @@ fn apply_patch_text(original: &str, patch: &str) -> String {
                 (start.parse().expect("start"), count.parse().expect("count"))
             };
             current = Some((parse(old_part), parse(new_part), Vec::new()));
-        } else if let Some(hunk) = current.as_mut() {
-            if line.starts_with(' ')
+        } else if let Some(hunk) = current.as_mut()
+            && (line.starts_with(' ')
                 || line.starts_with('+')
                 || line.starts_with('-')
-                || line.starts_with('\\')
-            {
-                hunk.2.push(line.to_string());
-            }
+                || line.starts_with('\\'))
+        {
+            hunk.2.push(line.to_string());
         }
     }
     if let Some(existing) = current.take() {

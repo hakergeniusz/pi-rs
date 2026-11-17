@@ -1274,12 +1274,10 @@ impl ExtensionRunner {
                 self.report_error(index, &event_type, error);
                 continue;
             }
-            if is_session_before {
-                if let Some(value) = outcome.value {
-                    last = Some(value.clone());
-                    if value.get("cancel").and_then(Json::as_bool) == Some(true) {
-                        break;
-                    }
+            if is_session_before && let Some(value) = outcome.value {
+                last = Some(value.clone());
+                if value.get("cancel").and_then(Json::as_bool) == Some(true) {
+                    break;
                 }
             }
         }
@@ -1459,11 +1457,9 @@ impl ExtensionRunner {
                 if let Some(text) = value.get("text").and_then(Json::as_str) {
                     current["text"] = Json::String(text.to_string());
                 }
-                if let Some(images) = value.get("images") {
-                    if !images.is_null() {
-                        current["images"] = images.clone();
-                        images_supplied = true;
-                    }
+                if let Some(images) = value.get("images") && !images.is_null() {
+                    current["images"] = images.clone();
+                    images_supplied = true;
                 }
             }
         }
@@ -1629,10 +1625,10 @@ impl ExtensionRunner {
                 if let Some(error) = &outcome.error {
                     self.report_error(index, &event_type, error.clone());
                 } else if let Some(value) = &outcome.value {
-                    if let Some(handler_entries) = value.get("entries") {
-                        if !handler_entries.is_null() {
-                            entries = handler_entries.clone();
-                        }
+                    if let Some(handler_entries) = value.get("entries")
+                        && !handler_entries.is_null()
+                    {
+                        entries = handler_entries.clone();
                     }
                     if let Some(handler_continue) = value.get("continue").and_then(Json::as_bool) {
                         continue_run = handler_continue;

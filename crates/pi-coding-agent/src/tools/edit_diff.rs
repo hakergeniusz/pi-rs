@@ -827,11 +827,9 @@ pub fn diff_lines(old_content: &str, new_content: &str) -> Vec<DiffPart> {
 
     let mut parts: Vec<DiffPart> = Vec::new();
     let push = |added: bool, removed: bool, line: &str, parts: &mut Vec<DiffPart>| {
-        if let Some(last) = parts.last_mut() {
-            if last.added == added && last.removed == removed {
-                last.value.push_str(line);
-                return;
-            }
+        if let Some(last) = parts.last_mut() && last.added == added && last.removed == removed {
+            last.value.push_str(line);
+            return;
         }
         parts.push(DiffPart {
             added,
@@ -1040,14 +1038,12 @@ fn middle_snake(old: &[&str], new: &[&str]) -> Option<(usize, usize, usize, usiz
                 k1_end += 2;
             } else if y > m {
                 k1_start += 2;
-            } else if front_first {
-                if let Some((x_back, y_back)) =
+            } else if front_first
+                && let Some((x_back, y_back)) =
                     backward_overlap(&backward, offset, length, delta, k1, n, m)
-                {
-                    if x >= x_back {
-                        return Some(common_run(old, new, x, y, x_back, y_back));
-                    }
-                }
+                && x >= x_back
+            {
+                return Some(common_run(old, new, x, y, x_back, y_back));
             }
             k1 += 2;
         }

@@ -119,13 +119,13 @@ pub fn run_print_mode(
     let session_context =
         build_session_context_from(&runtime.session.get_entries(), leaf_id.as_deref());
     let mut context_messages = session_context.messages;
-    if context_messages.is_empty() {
-        if let Some(system) = pi_agent::transcript::create_initial_system_message(
+    if context_messages.is_empty()
+        && let Some(system) = pi_agent::transcript::create_initial_system_message(
             Some(&runtime.system_prompt),
             &specs.iter().map(tool_declaration).collect::<Vec<_>>(),
-        ) {
-            context_messages.push(AgentMessage::System(system));
-        }
+        )
+    {
+        context_messages.push(AgentMessage::System(system));
     }
     let context = AgentContext {
         messages: context_messages,
@@ -760,12 +760,11 @@ pub fn resolve_wire_credential_composed(
                 // passes the `OAuthCredentials` object whole).
                 #[cfg(feature = "ext-js")]
                 if extension.is_some_and(|extension| extension.oauth.is_some()) {
-                    if let Ok(credential_json) = serde_json::to_value(&credential) {
-                        if let Some(key) =
+                    if let Ok(credential_json) = serde_json::to_value(&credential)
+                        && let Some(key) =
                             crate::models_state::extension_oauth_api_key(provider, &credential_json)
-                        {
-                            return Some((WireCredential::ApiKey(key), "stored credential"));
-                        }
+                    {
+                        return Some((WireCredential::ApiKey(key), "stored credential"));
                     }
                     // The handler is gone (engine reset) or failed: the
                     // provider reports unconfigured rather than falling
@@ -935,10 +934,10 @@ pub fn select_tools(
     // `--tools` allowlist (`sdk.ts:287-291` — the modifier form leaves
     // `allowedToolNames` undefined, so nothing filters them).
     for definition in extension {
-        if let Some(excluded) = &args.exclude_tools {
-            if excluded.contains(&definition.name.to_string()) {
-                continue;
-            }
+        if let Some(excluded) = &args.exclude_tools
+            && excluded.contains(&definition.name.to_string())
+        {
+            continue;
         }
         if !modifier_form
             && let Some(allow) = &args.tools

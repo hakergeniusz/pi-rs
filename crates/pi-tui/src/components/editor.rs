@@ -640,11 +640,11 @@ impl Editor {
         for (id, content) in &self.pastes {
             result = result.replace(&format!("[paste #{id}]"), content);
             // The marker may carry the `+N lines` / `N chars` suffix.
-            if let Some((_, tail)) = result.split_once(&format!("[paste #{id} ")) {
-                if let Some(end) = tail.find(']') {
-                    let full = format!("[paste #{id} {}", &tail[..=end]);
-                    result = result.replace(&full, content);
-                }
+            if let Some((_, tail)) = result.split_once(&format!("[paste #{id} "))
+                && let Some(end) = tail.find(']')
+            {
+                let full = format!("[paste #{id} {}", &tail[..=end]);
+                result = result.replace(&full, content);
             }
         }
         result
@@ -1284,27 +1284,25 @@ impl Editor {
             let length = grapheme.chars().count();
             // A paste marker is one atomic unit; dropping it drops its registry
             // entry and renumbers the rest.
-            if is_paste_marker(&grapheme) {
-                if let Some(id) = parse_marker(&grapheme) {
-                    self.pastes.remove(&id);
-                    self.paste_counter = self.paste_counter.saturating_sub(1);
-                    let higher: Vec<u64> = self
-                        .pastes
-                        .keys()
-                        .copied()
-                        .filter(|key| *key > id)
-                        .collect();
-                    for key in higher {
-                        if let Some(content) = self.pastes.remove(&key) {
-                            self.pastes.insert(key - 1, content);
-                        }
+            if is_paste_marker(&grapheme) && let Some(id) = parse_marker(&grapheme) {
+                self.pastes.remove(&id);
+                self.paste_counter = self.paste_counter.saturating_sub(1);
+                let higher: Vec<u64> = self
+                    .pastes
+                    .keys()
+                    .copied()
+                    .filter(|key| *key > id)
+                    .collect();
+                for key in higher {
+                    if let Some(content) = self.pastes.remove(&key) {
+                        self.pastes.insert(key - 1, content);
                     }
-                    let renumbered = self.state.lines.clone();
-                    self.state.lines = renumbered
-                        .iter()
-                        .map(|line| renumber_paste_markers(line, id))
-                        .collect();
                 }
+                let renumbered = self.state.lines.clone();
+                self.state.lines = renumbered
+                    .iter()
+                    .map(|line| renumber_paste_markers(line, id))
+                    .collect();
             }
             let current = self.line(line_index).to_string();
             let before_part = char_slice(&current, 0, cursor.saturating_sub(length))
@@ -1704,10 +1702,8 @@ impl Editor {
             let before = char_slice(&line, 0, self.state.cursor_col)
                 .unwrap_or("")
                 .to_string();
-            if let Some(last) = before.chars().last() {
-                if last.is_alphanumeric() || last == '_' {
-                    filtered.insert(0, ' ');
-                }
+            if let Some(last) = before.chars().last() && (last.is_alphanumeric() || last == '_') {
+                filtered.insert(0, ' ');
             }
         }
         let pasted_lines = filtered.split('\n').count();
@@ -2036,15 +2032,12 @@ impl Editor {
         result.push(self.render_bottom_border(width, lines_below));
 
         self.rendered_autocomplete_height = 0;
-        if self.autocomplete_state.is_some() {
-            if let Some(list) = &self.autocomplete_list {
-                let autocomplete_lines = list.render(content_width);
-                self.rendered_autocomplete_height = autocomplete_lines.len();
-                for line in autocomplete_lines {
-                    let line_padding =
-                        " ".repeat(content_width.saturating_sub(visible_width(&line)));
-                    result.push(format!("{left_padding}{line}{line_padding}{right_padding}"));
-                }
+        if self.autocomplete_state.is_some() && let Some(list) = &self.autocomplete_list {
+            let autocomplete_lines = list.render(content_width);
+            self.rendered_autocomplete_height = autocomplete_lines.len();
+            for line in autocomplete_lines {
+                let line_padding = " ".repeat(content_width.saturating_sub(visible_width(&line)));
+                result.push(format!("{left_padding}{line}{line_padding}{right_padding}"));
             }
         }
         result
@@ -2232,12 +2225,10 @@ impl Editor {
             }
             // Terminals without shift+enter: `\` before the cursor means newline.
             let before = self.before_cursor();
-            if let Some(last) = before.chars().last() {
-                if last == '\\' {
-                    self.handle_backspace();
-                    self.add_new_line();
-                    return;
-                }
+            if let Some(last) = before.chars().last() && last == '\\' {
+                self.handle_backspace();
+                self.add_new_line();
+                return;
             }
             self.submit_value();
             return;
@@ -2306,10 +2297,8 @@ impl Editor {
             self.insert_character(printable);
             return;
         }
-        if let Some(first) = data.chars().next() {
-            if first >= ' ' && data.chars().count() == 1 {
-                self.insert_character(first);
-            }
+        if let Some(first) = data.chars().next() && first >= ' ' && data.chars().count() == 1 {
+            self.insert_character(first);
         }
     }
 
@@ -2434,19 +2423,19 @@ fn decode_csi_u_control(text: &str) -> String {
         if let Some(end) = tail.find('u') {
             let body = &tail[..end];
             let mut parts = body.split(';');
-            if let (Some(code), Some("5")) = (parts.next(), parts.next()) {
-                if let Ok(codepoint) = code.parse::<u32>() {
-                    let decoded = match codepoint {
-                        97..=122 => Some((codepoint - 96) as u8 as char),
-                        65..=90 => Some((codepoint - 64) as u8 as char),
-                        _ => None,
-                    };
-                    if let Some(decoded) = decoded {
-                        result.push_str(&rest[..index]);
-                        result.push(decoded);
-                        rest = &tail[end + 1..];
-                        continue;
-                    }
+            if let (Some(code), Some("5")) = (parts.next(), parts.next())
+                && let Ok(codepoint) = code.parse::<u32>()
+            {
+                let decoded = match codepoint {
+                    97..=122 => Some((codepoint - 96) as u8 as char),
+                    65..=90 => Some((codepoint - 64) as u8 as char),
+                    _ => None,
+                };
+                if let Some(decoded) = decoded {
+                    result.push_str(&rest[..index]);
+                    result.push(decoded);
+                    rest = &tail[end + 1..];
+                    continue;
                 }
             }
         }

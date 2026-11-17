@@ -281,33 +281,33 @@ pub fn ansi_to_html(text: &str) -> String {
                 let _ = write!(result, "<span style=\"{}\">", style_to_inline_css(&style));
                 in_span = true;
             }
-        } else if let Some(osc_group) = captures.get(2) {
-            if let Some(hyperlink) = osc8_regex().captures(osc_group.as_str()) {
-                // Keep spans nested inside the link: close and reopen the
-                // current style around link changes. Browsers strip C0
-                // controls from URLs, so strip them before checking the
-                // scheme.
-                let url = hyperlink[1]
-                    .trim()
-                    .chars()
-                    .filter(|character| !matches!(character, '\x00'..='\x1f' | '\x7f'))
-                    .collect::<String>();
-                if in_span {
-                    result.push_str("</span>");
-                    in_span = false;
-                }
-                if in_link {
-                    result.push_str("</a>");
-                    in_link = false;
-                }
-                if !url.is_empty() && safe_link_regex().is_match(&url) {
-                    let _ = write!(result, "<a href=\"{}\">", escape_html(&url));
-                    in_link = true;
-                }
-                if has_style(&style) {
-                    let _ = write!(result, "<span style=\"{}\">", style_to_inline_css(&style));
-                    in_span = true;
-                }
+        } else if let Some(osc_group) = captures.get(2)
+            && let Some(hyperlink) = osc8_regex().captures(osc_group.as_str())
+        {
+            // Keep spans nested inside the link: close and reopen the
+            // current style around link changes. Browsers strip C0
+            // controls from URLs, so strip them before checking the
+            // scheme.
+            let url = hyperlink[1]
+                .trim()
+                .chars()
+                .filter(|character| !matches!(character, '\x00'..='\x1f' | '\x7f'))
+                .collect::<String>();
+            if in_span {
+                result.push_str("</span>");
+                in_span = false;
+            }
+            if in_link {
+                result.push_str("</a>");
+                in_link = false;
+            }
+            if !url.is_empty() && safe_link_regex().is_match(&url) {
+                let _ = write!(result, "<a href=\"{}\">", escape_html(&url));
+                in_link = true;
+            }
+            if has_style(&style) {
+                let _ = write!(result, "<span style=\"{}\">", style_to_inline_css(&style));
+                in_span = true;
             }
             // Other OSC sequences are dropped
         }

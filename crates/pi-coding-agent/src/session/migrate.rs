@@ -92,14 +92,12 @@ fn migrate_v2_to_v3(entries: &mut [Record]) {
             entry.set("version", 3u32);
             continue;
         }
-        if entry.kind() == "message" {
-            if let Some(message) = entry.object_mut().get_mut("message") {
-                if message.get("role").and_then(serde_json::Value::as_str) == Some("hookMessage") {
-                    if let Some(object) = message.as_object_mut() {
-                        object.insert("role".into(), "custom".into());
-                    }
-                }
-            }
+        if entry.kind() == "message"
+            && let Some(message) = entry.object_mut().get_mut("message")
+            && message.get("role").and_then(serde_json::Value::as_str) == Some("hookMessage")
+            && let Some(object) = message.as_object_mut()
+        {
+            object.insert("role".into(), "custom".into());
         }
     }
 }

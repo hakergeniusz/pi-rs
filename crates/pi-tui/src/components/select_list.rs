@@ -280,31 +280,29 @@ impl SelectList {
         let prefix = if is_selected { "→ " } else { "  " };
         let prefix_width = visible_width(prefix);
 
-        if let Some(description) = description {
-            if width > 40 {
-                let effective_column = primary_column_width
-                    .min(width.saturating_sub(prefix_width + 4))
-                    .max(1);
-                let max_primary_width = effective_column.saturating_sub(PRIMARY_COLUMN_GAP).max(1);
-                let truncated_value =
-                    truncate_to_width(item.display_value(), max_primary_width, "", false);
-                let value_width = visible_width(&truncated_value);
-                let spacing = " ".repeat(effective_column.saturating_sub(value_width).max(1));
-                let description_start = prefix_width + value_width + spacing.len();
-                let remaining_width = width as i64 - description_start as i64 - 2;
-                if remaining_width > MIN_DESCRIPTION_WIDTH as i64 {
-                    let truncated_desc =
-                        truncate_to_width(description, remaining_width as usize, "", false);
-                    if is_selected {
-                        return (self.theme.selected_text)(&format!(
-                            "{prefix}{truncated_value}{spacing}{truncated_desc}"
-                        ));
-                    }
-                    return format!(
-                        "{prefix}{truncated_value}{}",
-                        (self.theme.description)(&format!("{spacing}{truncated_desc}"))
-                    );
+        if let Some(description) = description && width > 40 {
+            let effective_column = primary_column_width
+                .min(width.saturating_sub(prefix_width + 4))
+                .max(1);
+            let max_primary_width = effective_column.saturating_sub(PRIMARY_COLUMN_GAP).max(1);
+            let truncated_value =
+                truncate_to_width(item.display_value(), max_primary_width, "", false);
+            let value_width = visible_width(&truncated_value);
+            let spacing = " ".repeat(effective_column.saturating_sub(value_width).max(1));
+            let description_start = prefix_width + value_width + spacing.len();
+            let remaining_width = width as i64 - description_start as i64 - 2;
+            if remaining_width > MIN_DESCRIPTION_WIDTH as i64 {
+                let truncated_desc =
+                    truncate_to_width(description, remaining_width as usize, "", false);
+                if is_selected {
+                    return (self.theme.selected_text)(&format!(
+                        "{prefix}{truncated_value}{spacing}{truncated_desc}"
+                    ));
                 }
+                return format!(
+                    "{prefix}{truncated_value}{}",
+                    (self.theme.description)(&format!("{spacing}{truncated_desc}"))
+                );
             }
         }
 

@@ -158,10 +158,8 @@ pub fn resolve_default_tools(entries: &[Value]) -> Vec<String> {
         let index = tools.iter().position(|tool| tool == name);
         if entry.starts_with('+') && index.is_none() && !name.is_empty() {
             tools.push(name.to_string());
-        } else if entry.starts_with('-') {
-            if let Some(index) = index {
-                tools.remove(index);
-            }
+        } else if entry.starts_with('-') && let Some(index) = index {
+            tools.remove(index);
         }
     }
     tools
@@ -265,22 +263,22 @@ pub fn migrate_settings(settings: &mut Settings) {
     }
 
     // legacy websockets boolean -> transport enum
-    if !settings.contains_key("transport") {
-        if let Some(Value::Bool(websockets)) = settings.get("websockets").cloned() {
-            settings.insert(
-                "transport".to_string(),
-                Value::String(if websockets { "websocket" } else { "sse" }.to_string()),
-            );
-            settings.remove("websockets");
-        }
+    if !settings.contains_key("transport")
+        && let Some(Value::Bool(websockets)) = settings.get("websockets").cloned()
+    {
+        settings.insert(
+            "transport".to_string(),
+            Value::String(if websockets { "websocket" } else { "sse" }.to_string()),
+        );
+        settings.remove("websockets");
     }
 
     // old skills object -> enableSkillCommands + array skills
     if let Some(Value::Object(skills_settings)) = settings.get("skills").cloned() {
-        if let Some(enabled) = skills_settings.get("enableSkillCommands").cloned() {
-            if !settings.contains_key("enableSkillCommands") {
-                settings.insert("enableSkillCommands".to_string(), enabled);
-            }
+        if let Some(enabled) = skills_settings.get("enableSkillCommands").cloned()
+            && !settings.contains_key("enableSkillCommands")
+        {
+            settings.insert("enableSkillCommands".to_string(), enabled);
         }
         let directories = skills_settings
             .get("customDirectories")
@@ -1041,11 +1039,11 @@ impl SettingsManager {
     pub fn flush(&mut self) {
         let queue = std::mem::take(&mut self.write_queue);
         for write in queue {
-            if write.scope == SettingsScope::Project {
-                if let Err(message) = self.assert_project_trusted_for_write() {
-                    self.record_error(write.scope, message);
-                    continue;
-                }
+            if write.scope == SettingsScope::Project
+                && let Err(message) = self.assert_project_trusted_for_write()
+            {
+                self.record_error(write.scope, message);
+                continue;
             }
             let result = SettingsManager::persist_scoped_settings(
                 &*self.storage,
@@ -1216,13 +1214,13 @@ impl SettingsManager {
     ) -> Result<i64, String> {
         let compaction = self.settings.get("compaction").and_then(Value::as_object);
         let ordinary = compaction.and_then(|compaction| compaction.get(field));
-        if let Some(ordinary) = ordinary.filter(|value| !value.is_null()) {
-            if !is_non_negative_safe_integer(ordinary) {
-                return Err(format!(
-                    "Invalid compaction.{field} setting: {}. Expected a non-negative safe integer.",
-                    js_value_to_string(ordinary)
-                ));
-            }
+        if let Some(ordinary) = ordinary.filter(|value| !value.is_null())
+            && !is_non_negative_safe_integer(ordinary)
+        {
+            return Err(format!(
+                "Invalid compaction.{field} setting: {}. Expected a non-negative safe integer.",
+                js_value_to_string(ordinary)
+            ));
         }
         let model_key = model.map(|(provider, model_id)| format!("{provider}/{model_id}"));
         let entry = match model_key.as_deref() {
@@ -1232,26 +1230,26 @@ impl SettingsManager {
                 .and_then(|overrides| overrides.get(model_key)),
             None => None,
         };
-        if let Some(entry) = entry.filter(|entry| !entry.is_null()) {
-            if !is_mergeable_object(Some(entry)) {
-                return Err(format!(
-                    "Invalid compaction.modelOverrides[\"{}\"] setting: {}. Expected an object.",
-                    model_key.as_deref().unwrap_or(""),
-                    js_value_to_string(entry)
-                ));
-            }
+        if let Some(entry) = entry.filter(|entry| !entry.is_null())
+            && !is_mergeable_object(Some(entry))
+        {
+            return Err(format!(
+                "Invalid compaction.modelOverrides[\"{}\"] setting: {}. Expected an object.",
+                model_key.as_deref().unwrap_or(""),
+                js_value_to_string(entry)
+            ));
         }
         let override_value = entry
             .and_then(Value::as_object)
             .and_then(|entry| entry.get(field));
-        if let Some(override_value) = override_value.filter(|value| !value.is_null()) {
-            if !is_non_negative_safe_integer(override_value) {
-                return Err(format!(
-                    "Invalid compaction.modelOverrides[\"{}\"].{field} setting: {}. Expected a non-negative safe integer.",
-                    model_key.as_deref().unwrap_or(""),
-                    js_value_to_string(override_value)
-                ));
-            }
+        if let Some(override_value) = override_value.filter(|value| !value.is_null())
+            && !is_non_negative_safe_integer(override_value)
+        {
+            return Err(format!(
+                "Invalid compaction.modelOverrides[\"{}\"].{field} setting: {}. Expected a non-negative safe integer.",
+                model_key.as_deref().unwrap_or(""),
+                js_value_to_string(override_value)
+            ));
         }
         if let Some(value) = override_value.and_then(Value::as_f64) {
             return Ok(value.floor() as i64);

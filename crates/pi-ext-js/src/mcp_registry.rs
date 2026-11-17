@@ -98,13 +98,13 @@ impl McpRegistry {
     /// before applying (`loader.ts:489-504`). The error strings are the
     /// ones the API method throws.
     pub fn check_register(&self, name: &str, extension_path: &str) -> Result<(), String> {
-        if let Some(existing) = self.servers.iter().find(|server| server.name == name) {
-            if existing.extension_path != extension_path {
-                return Err(format!(
-                    "MCP server \"{name}\" is already registered by extension \"{}\"",
-                    existing.extension_path
-                ));
-            }
+        if let Some(existing) = self.servers.iter().find(|server| server.name == name)
+            && existing.extension_path != extension_path
+        {
+            return Err(format!(
+                "MCP server \"{name}\" is already registered by extension \"{}\"",
+                existing.extension_path
+            ));
         }
         if let Some(clash) = self.servers.iter().find(|server| {
             server.name != name && mcp_namespace(&server.name) == mcp_namespace(name)
@@ -187,19 +187,19 @@ pub fn validate_mcp_server_config(name: &str, raw: &Value) -> Result<Value, Stri
             "legacy SSE transport is not supported; use the streamable HTTP URL".to_string(),
         );
     }
-    if let Some(url) = url {
-        if matches!(
+    if let Some(url) = url
+        && matches!(
             entry.get("type").and_then(Value::as_str),
             None | Some("http" | "streamable-http")
-        ) {
-            return match validate_http_fields(entry, url)
-                .and_then(|()| check_exposures(entry).map_or(Ok(()), Err))
-                .and_then(|()| check_auth(entry, url).map_or(Ok(()), Err))
-            {
-                Ok(()) => Ok(resolved),
-                Err(error) => invalid(error),
-            };
-        }
+        )
+    {
+        return match validate_http_fields(entry, url)
+            .and_then(|()| check_exposures(entry).map_or(Ok(()), Err))
+            .and_then(|()| check_auth(entry, url).map_or(Ok(()), Err))
+        {
+            Ok(()) => Ok(resolved),
+            Err(error) => invalid(error),
+        };
     }
     if command.is_some()
         && matches!(
@@ -226,10 +226,10 @@ const CODEMODE_DEFERRED_ALIAS: &str = "codemode-deferred";
 /// current names (`resolveExposureAliases`, `mcp-servers.ts:157-167`).
 fn resolve_exposure_aliases(entry: &serde_json::Map<String, Value>) -> Value {
     let mut resolved = entry.clone();
-    if let Some(exposure) = resolved.get_mut("exposure") {
-        if exposure.as_str() == Some(CODEMODE_DEFERRED_ALIAS) {
-            *exposure = Value::String("codemode".to_string());
-        }
+    if let Some(exposure) = resolved.get_mut("exposure")
+        && exposure.as_str() == Some(CODEMODE_DEFERRED_ALIAS)
+    {
+        *exposure = Value::String("codemode".to_string());
     }
     if let Some(Value::Object(tool_exposure)) = resolved.get_mut("toolExposure") {
         for value in tool_exposure.values_mut() {
@@ -258,10 +258,8 @@ fn check_exposures(entry: &serde_json::Map<String, Value>) -> Option<String> {
         .map(|value| format!("\"{value}\""))
         .collect::<Vec<_>>()
         .join(", ");
-    if let Some(exposure) = entry.get("exposure") {
-        if !is_exposure(exposure) {
-            return Some(format!("exposure must be one of {exposures}"));
-        }
+    if let Some(exposure) = entry.get("exposure") && !is_exposure(exposure) {
+        return Some(format!("exposure must be one of {exposures}"));
     }
     if let Some(tool_exposure) = entry.get("toolExposure") {
         let Some(tool_exposure) = tool_exposure.as_object() else {
@@ -334,10 +332,8 @@ fn url_host(url: &str) -> String {
 #[must_use]
 pub fn get_mcp_tool_exposure(config: &Value, tool_name: &str) -> String {
     if let Some(overrides) = config.get("toolExposure").and_then(Value::as_object) {
-        if let Some(exact) = overrides.get(tool_name) {
-            if let Some(exposure) = exact.as_str() {
-                return exposure.to_string();
-            }
+        if let Some(exact) = overrides.get(tool_name) && let Some(exposure) = exact.as_str() {
+            return exposure.to_string();
         }
         for (pattern, exposure) in overrides {
             if pattern.contains('*')
@@ -422,10 +418,8 @@ fn validate_http_fields(entry: &serde_json::Map<String, Value>, url: &str) -> Re
     if !is_http_url(url) {
         return Err("url must be an http or https URL".to_string());
     }
-    if let Some(headers) = entry.get("headers") {
-        if !is_string_record(headers) {
-            return Err("headers must map names to strings".to_string());
-        }
+    if let Some(headers) = entry.get("headers") && !is_string_record(headers) {
+        return Err("headers must map names to strings".to_string());
     }
     validate_oauth(entry.get("oauth"))
 }
@@ -451,15 +445,11 @@ fn validate_stdio_fields(entry: &serde_json::Map<String, Value>) -> Result<(), S
             return Err("args must be an array of strings".to_string());
         }
     }
-    if let Some(env) = entry.get("env") {
-        if !is_string_record(env) {
-            return Err("env must map names to strings".to_string());
-        }
+    if let Some(env) = entry.get("env") && !is_string_record(env) {
+        return Err("env must map names to strings".to_string());
     }
-    if let Some(cwd) = entry.get("cwd") {
-        if !cwd.is_string() {
-            return Err("cwd must be a string".to_string());
-        }
+    if let Some(cwd) = entry.get("cwd") && !cwd.is_string() {
+        return Err("cwd must be a string".to_string());
     }
     Ok(())
 }
@@ -477,15 +467,11 @@ fn validate_oauth(value: Option<&Value>) -> Result<(), String> {
     let Some(oauth) = value.as_object() else {
         return Err("oauth must be an object".to_string());
     };
-    if let Some(client_id) = oauth.get("clientId") {
-        if !client_id.is_string() {
-            return Err("oauth.clientId must be a string".to_string());
-        }
+    if let Some(client_id) = oauth.get("clientId") && !client_id.is_string() {
+        return Err("oauth.clientId must be a string".to_string());
     }
-    if let Some(client_secret) = oauth.get("clientSecret") {
-        if !client_secret.is_string() {
-            return Err("oauth.clientSecret must be a string".to_string());
-        }
+    if let Some(client_secret) = oauth.get("clientSecret") && !client_secret.is_string() {
+        return Err("oauth.clientSecret must be a string".to_string());
     }
     if let Some(port) = oauth.get("callbackPort") {
         let ok = port

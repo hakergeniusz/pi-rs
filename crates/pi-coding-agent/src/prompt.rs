@@ -366,14 +366,12 @@ pub fn build_system_prompt_sections(
     } else {
         None
     };
-    if let Some(file_read_tool) = skill_file_read_tool {
-        if !skills.is_empty() {
-            let skills_prompt = format_skills_for_prompt(&skills, file_read_tool)
-                .trim()
-                .to_string();
-            if !skills_prompt.is_empty() {
-                push("skills", skills_prompt, &mut prompt_sections);
-            }
+    if let Some(file_read_tool) = skill_file_read_tool && !skills.is_empty() {
+        let skills_prompt = format_skills_for_prompt(&skills, file_read_tool)
+            .trim()
+            .to_string();
+        if !skills_prompt.is_empty() {
+            push("skills", skills_prompt, &mut prompt_sections);
         }
     }
     push("cwd", cwd.replace('\\', "/"), &mut prompt_sections);

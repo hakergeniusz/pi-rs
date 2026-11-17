@@ -263,10 +263,8 @@ fn resolve_template(parts: &[Part], env: Option<&JsonObject>) -> Option<String> 
 pub fn get_config_value_env_var_names(config: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for part in parse_config_value_template(config) {
-        if let Part::Env(name) = part {
-            if !names.contains(&name) {
-                names.push(name);
-            }
+        if let Part::Env(name) = part && !names.contains(&name) {
+            names.push(name);
         }
     }
     names

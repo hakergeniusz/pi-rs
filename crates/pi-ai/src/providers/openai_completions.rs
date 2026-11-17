@@ -157,16 +157,17 @@ async fn request_and_stream(
             Err(error) => return Err(format!("could not parse OpenAI SSE chunk: {error}")),
         };
 
-        if let Some(id) = chunk.get("id").and_then(Value::as_str) {
-            if output.response_id.is_none() {
-                output.response_id = Some(id.to_string());
-            }
+        if let Some(id) = chunk.get("id").and_then(Value::as_str)
+            && output.response_id.is_none()
+        {
+            output.response_id = Some(id.to_string());
         }
-        if let Some(chunk_model) = chunk.get("model").and_then(Value::as_str) {
-            if !chunk_model.is_empty() && chunk_model != model.id && output.response_model.is_none()
-            {
-                output.response_model = Some(chunk_model.to_string());
-            }
+        if let Some(chunk_model) = chunk.get("model").and_then(Value::as_str)
+            && !chunk_model.is_empty()
+            && chunk_model != model.id
+            && output.response_model.is_none()
+        {
+            output.response_model = Some(chunk_model.to_string());
         }
         if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
             apply_chunk_usage(usage, output);
@@ -233,37 +234,35 @@ async fn request_and_stream(
             }
         }
 
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            if !text.is_empty() {
-                let index = if let Some(index) = state.text_open {
-                    index
-                } else {
-                    output
-                        .content
-                        .push(AssistantContent::Text(crate::types::TextContent {
-                            text: String::new(),
-                            text_signature: None,
-                        }));
-                    let index = output.content.len() - 1;
-                    state.text_open = Some(index);
-                    let _ = sender
-                        .send(AssistantMessageEvent::TextStart {
-                            content_index: index,
-                            partial: output.clone(),
-                        })
-                        .await;
-                    index
-                };
-                if let Some(AssistantContent::Text(block)) = output.content.get_mut(index) {
-                    block.text += text;
-                    let _ = sender
-                        .send(AssistantMessageEvent::TextDelta {
-                            content_index: index,
-                            delta: text.to_string(),
-                            partial: output.clone(),
-                        })
-                        .await;
-                }
+        if let Some(text) = delta.get("content").and_then(Value::as_str) && !text.is_empty() {
+            let index = if let Some(index) = state.text_open {
+                index
+            } else {
+                output
+                    .content
+                    .push(AssistantContent::Text(crate::types::TextContent {
+                        text: String::new(),
+                        text_signature: None,
+                    }));
+                let index = output.content.len() - 1;
+                state.text_open = Some(index);
+                let _ = sender
+                    .send(AssistantMessageEvent::TextStart {
+                        content_index: index,
+                        partial: output.clone(),
+                    })
+                    .await;
+                index
+            };
+            if let Some(AssistantContent::Text(block)) = output.content.get_mut(index) {
+                block.text += text;
+                let _ = sender
+                    .send(AssistantMessageEvent::TextDelta {
+                        content_index: index,
+                        delta: text.to_string(),
+                        partial: output.clone(),
+                    })
+                    .await;
             }
         }
 
@@ -305,71 +304,68 @@ async fn request_and_stream(
                 if let Some(AssistantContent::ToolCall(block)) =
                     output.content.get_mut(content_index)
                 {
-                    if block.id.is_empty() {
-                        if let Some(id) = call_delta.get("id").and_then(Value::as_str) {
-                            block.id = id.to_string();
-                        }
+                    if block.id.is_empty()
+                        && let Some(id) = call_delta.get("id").and_then(Value::as_str)
+                    {
+                        block.id = id.to_string();
                     }
-                    if block.name.is_empty() {
-                        if let Some(name) = call_delta
+                    if block.name.is_empty()
+                        && let Some(name) = call_delta
                             .get("function")
                             .and_then(|f| f.get("name"))
                             .and_then(Value::as_str)
-                        {
-                            block.name = name.to_string();
-                        }
+                    {
+                        block.name = name.to_string();
                     }
                 }
                 if let Some(arguments) = call_delta
                     .get("function")
                     .and_then(|f| f.get("arguments"))
                     .and_then(Value::as_str)
+                    && !arguments.is_empty()
                 {
-                    if !arguments.is_empty() {
-                        if let Some(raw) = state.tool_args_raw.get_mut(&content_index) {
-                            raw.push_str(arguments);
-                            if let Some(AssistantContent::ToolCall(block)) =
-                                output.content.get_mut(content_index)
-                            {
-                                block.arguments =
-                                    parse_tool_call_arguments(raw).unwrap_or_default();
-                            }
+                    if let Some(raw) = state.tool_args_raw.get_mut(&content_index) {
+                        raw.push_str(arguments);
+                        if let Some(AssistantContent::ToolCall(block)) =
+                            output.content.get_mut(content_index)
+                        {
+                            block.arguments = parse_tool_call_arguments(raw).unwrap_or_default();
                         }
-                        let _ = sender
-                            .send(AssistantMessageEvent::ToolcallDelta {
-                                content_index,
-                                delta: arguments.to_string(),
-                                partial: output.clone(),
-                            })
-                            .await;
                     }
+                    let _ = sender
+                        .send(AssistantMessageEvent::ToolcallDelta {
+                            content_index,
+                            delta: arguments.to_string(),
+                            partial: output.clone(),
+                        })
+                        .await;
                 }
             }
         }
     }
 
     // Close open blocks with their terminal events.
-    if let Some(index) = state.thinking_open {
-        if let Some(AssistantContent::Thinking(block)) = output.content.get(index) {
-            let _ = sender
-                .send(AssistantMessageEvent::ThinkingEnd {
-                    content_index: index,
-                    content: block.thinking.clone(),
-                    partial: output.clone(),
-                })
-                .await;
-        }
+    if let Some(index) = state.thinking_open
+        && let Some(AssistantContent::Thinking(block)) = output.content.get(index)
+    {
+        let _ = sender
+            .send(AssistantMessageEvent::ThinkingEnd {
+                content_index: index,
+                content: block.thinking.clone(),
+                partial: output.clone(),
+            })
+            .await;
     }
-    if let Some(index) = state.text_open {
-        if let Some(AssistantContent::Text(block)) = output.content.get(index) {
-            let _ = sender
-                .send(AssistantMessageEvent::TextEnd {
-                    content_index: index,
-                    content: block.text.clone(),
-                    partial: output.clone(),
-                })
-                .await;
-        }
+    if let Some(index) = state.text_open
+        && let Some(AssistantContent::Text(block)) = output.content.get(index)
+    {
+        let _ = sender
+            .send(AssistantMessageEvent::TextEnd {
+                content_index: index,
+                content: block.text.clone(),
+                partial: output.clone(),
+            })
+            .await;
     }
     for index in state.tool_args_raw.keys().copied().collect::<Vec<_>>() {
         let raw = state.tool_args_raw.get(&index).cloned().unwrap_or_default();

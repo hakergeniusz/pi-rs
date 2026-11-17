@@ -342,12 +342,13 @@ pub fn parse_args(input: &[String]) -> Args {
             result.no_context_files = true;
         } else if arg == "--list-models" {
             // `args.ts:218-224`: an optional search pattern follows.
-            if let Some(next) = input.get(index + 1) {
-                if !next.starts_with('-') && !next.starts_with('@') {
-                    result.list_models = Some(Some(next.clone()));
-                    index += 1;
-                    continue;
-                }
+            if let Some(next) = input.get(index + 1)
+                && !next.starts_with('-')
+                && !next.starts_with('@')
+            {
+                result.list_models = Some(Some(next.clone()));
+                index += 1;
+                continue;
             }
             result.list_models = Some(None);
         } else if arg == "--tui-mode" {

@@ -94,13 +94,13 @@ pub fn prepare_edit_arguments(input: Value) -> Value {
     let edits_is_string = args.get("edits").is_some_and(Value::is_string);
     let edits_is_single = args.get("edits").is_some_and(is_single_edit_input);
     if edits_is_string {
-        if let Some(text) = args.get("edits").and_then(Value::as_str) {
-            if let Ok(parsed) = serde_json::from_str::<Value>(text) {
-                if parsed.is_array() {
-                    args.insert("edits".to_string(), parsed);
-                } else if is_single_edit_input(&parsed) {
-                    args.insert("edits".to_string(), Value::Array(vec![parsed]));
-                }
+        if let Some(text) = args.get("edits").and_then(Value::as_str)
+            && let Ok(parsed) = serde_json::from_str::<Value>(text)
+        {
+            if parsed.is_array() {
+                args.insert("edits".to_string(), parsed);
+            } else if is_single_edit_input(&parsed) {
+                args.insert("edits".to_string(), Value::Array(vec![parsed]));
             }
         }
     } else if edits_is_single {
