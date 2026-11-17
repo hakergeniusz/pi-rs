@@ -1,9 +1,13 @@
 //! Pi coding agent CLI (Rust port of `@earendil-works/pi-coding-agent`).
 //!
-//! Binary `pi`. Phase P4 wires print mode (`pi -p`); P5 adds JSON and RPC
-//! modes; interactive mode (P6) still exits with a phase note.
+//! Binary `pi`. The startup dispatch mirrors upstream `main.ts`: mode
+//! resolution (`resolveAppMode`, `main.ts:115-126`), stdout takeover
+//! (`main.ts:703-707`), piped stdin (`readPipedStdin`, `main.ts:79-100`,
+//! skipped for rpc; `main.ts:960-968`), prompt assembly
+//! (`prepareInitialMessage`, `main.ts:258-277`, into `buildInitialMessage`,
+//! `cli/initial-message.ts:20-43`), and the mode runs (`main.ts:1013-1064`).
 
-use std::io::BufReader;
+use std::io::{BufReader, IsTerminal};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,6 +31,10 @@ use pi_coding_agent::output_guard::{restore_stdout, take_over_stdout};
 use pi_coding_agent::session::store::{NewSessionOptions, SessionManager};
 use pi_coding_agent::tools::index::ToolRegistry;
 
+/// CLI entry (`runAgentMain`, `main.ts:630-1065`): subcommands, parsing,
+/// mode resolution (`main.ts:702`), piped stdin (`main.ts:960-968`), and the
+/// mode dispatch (`main.ts:1013-1064`).
+#[allow(clippy::too_many_lines)] // mirrors the TS main dispatch; split when extending
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
 
@@ -93,32 +101,37 @@ fn main() {
         return;
     }
 
-    if args.mode.is_none() && !args.print {
-        // Interactive mode requires a terminal; piped stdin stays a P7 item.
-        if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-            eprintln!("pi-rs: no prompt given and stdout is not a terminal; use -p for print mode");
-            std::process::exit(2);
-        }
-        let outcome = run_interactive(&args, &cwd, &cwd_string);
-        match outcome {
-            Ok(code) => std::process::exit(code),
-            Err(error) => {
-                eprintln!("{error}");
-                std::process::exit(1);
-            }
-        }
+    // App-mode resolution (`main.ts:702` — `resolveAppMode`): explicit
+    // `--mode rpc`/`--mode json` win; `--print` or a non-TTY stdin/stdout
+    // forces print; else interactive.
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    let mut app_mode = resolve_app_mode(&args, stdin_is_tty, stdout_is_tty);
+    // `takeOverStdout()` for every runtime mode (`main.ts:703-707`; the plain
+    // metadata commands exited above). The port records the marker — the
+    // stderr diversion it stands for is structural (see the guard's module
+    // doc).
+    if app_mode != AppMode::Interactive {
+        take_over_stdout();
     }
 
-    // `takeOverStdout()` for every runtime mode (`main.ts:703-707`; the
-    // plain metadata commands exited above). The port records the marker —
-    // the stderr diversion it stands for is structural (see the guard's
-    // module doc).
-    take_over_stdout();
+    // Read piped stdin content (if any) - skip for RPC mode which uses stdin
+    // for JSON-RPC (`main.ts:960-968`); content present while interactive
+    // flips the mode to print.
+    let stdin_content = if app_mode != AppMode::Rpc {
+        read_piped_stdin()
+    } else {
+        None
+    };
+    if stdin_content.is_some() && app_mode == AppMode::Interactive {
+        app_mode = AppMode::Print;
+    }
 
-    let outcome = match args.mode {
-        Some(Mode::Rpc) => run_rpc(&args, &cwd, &cwd_string),
-        Some(Mode::Json) => run_json(&args, &cwd, &cwd_string),
-        _ => run_print(&args, &cwd, &cwd_string),
+    let outcome = match app_mode {
+        AppMode::Rpc => run_rpc(&args, &cwd, &cwd_string),
+        AppMode::Json => run_json(&args, &cwd, &cwd_string, stdin_content.as_deref()),
+        AppMode::Print => run_print(&args, &cwd, &cwd_string, stdin_content.as_deref()),
+        AppMode::Interactive => run_interactive(&args, &cwd, &cwd_string),
     };
     match outcome {
         Ok(code) => std::process::exit(code),
@@ -126,6 +139,60 @@ fn main() {
             eprintln!("{error}");
             std::process::exit(1);
         }
+    }
+}
+
+/// App mode (`AppMode`, `core/project-trust.ts:13`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppMode {
+    Interactive,
+    Print,
+    Json,
+    Rpc,
+}
+
+/// `resolveAppMode` (`main.ts:115-126`): `--mode rpc` and `--mode json` win
+/// outright; `--print`, a piped stdin, or a piped stdout forces print mode;
+/// only a fully terminal run stays interactive. Pure in the TTY flags like
+/// upstream's signature so tests can drive it.
+fn resolve_app_mode(args: &Args, stdin_is_tty: bool, stdout_is_tty: bool) -> AppMode {
+    match args.mode {
+        Some(Mode::Rpc) => return AppMode::Rpc,
+        Some(Mode::Json) => return AppMode::Json,
+        _ => {}
+    }
+    if args.print || !stdin_is_tty || !stdout_is_tty {
+        return AppMode::Print;
+    }
+    AppMode::Interactive
+}
+
+/// `readPipedStdin` (`main.ts:79-100`): `undefined` when stdin is a TTY
+/// (interactive terminal — nothing to pipe); otherwise read everything to
+/// EOF and resolve with `data.trim() || undefined`.
+fn read_piped_stdin() -> Option<String> {
+    if std::io::stdin().is_terminal() {
+        return None;
+    }
+    read_piped_stdin_from(&mut std::io::stdin())
+}
+
+/// The read half of `readPipedStdin` (`main.ts:89-99`): accumulate every
+/// byte to EOF and resolve with `data.trim() || undefined`; an IO error
+/// resolves `undefined` (upstream has no error path to mirror). Invalid
+/// UTF-8 decodes with replacement characters, matching upstream's
+/// `setEncoding("utf8")` chunk accumulation (`main.ts:91`).
+fn read_piped_stdin_from(reader: &mut impl std::io::Read) -> Option<String> {
+    let mut bytes = Vec::new();
+    if reader.read_to_end(&mut bytes).is_err() {
+        return None;
+    }
+    let data = String::from_utf8_lossy(&bytes);
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -529,17 +596,28 @@ fn build_runtime_with_ui(
     })
 }
 
-/// Combines `@file` text, image attachments, and the first CLI message into
-/// the initial prompt (`cli/initial-message.ts` `buildInitialMessage`): the
-/// parts join with no separator, remaining messages become follow-ups.
-/// Upstream also prepends piped stdin content here; stdin handling lands
-/// with P7's output-guard work.
+/// The initial prompt pieces: `(initialMessage, initialImages, followUps)`.
 type PromptParts = (Option<String>, Vec<ImageContent>, Vec<String>);
 
-fn resolve_prompt_messages(args: &Args, cwd: &std::path::Path) -> Result<PromptParts, String> {
+/// `prepareInitialMessage` (`main.ts:258-277`) fanning into
+/// `buildInitialMessage` (`cli/initial-message.ts:20-43`): with no `@file`
+/// arguments only stdin content and the CLI messages join; otherwise the
+/// files process first. The parts order is stdinContent, fileText, first
+/// message (shifted off); they join with no separator (`parts.join("")`),
+/// the stdin part keys on presence (`!== undefined`) while an empty `@file`
+/// text block is skipped by the truthy `if (fileText)` check, and the
+/// remaining messages become follow-ups.
+fn resolve_prompt_messages(
+    args: &Args,
+    cwd: &std::path::Path,
+    stdin_content: Option<&str>,
+) -> Result<PromptParts, String> {
     let mut messages = args.messages.clone();
     let mut images = Vec::new();
     let mut parts: Vec<String> = Vec::new();
+    if let Some(stdin) = stdin_content {
+        parts.push(stdin.to_string());
+    }
     if !args.file_args.is_empty() {
         let files = process_file_arguments(&args.file_args, cwd)?;
         images = files.images;
@@ -558,9 +636,18 @@ fn resolve_prompt_messages(args: &Args, cwd: &std::path::Path) -> Result<PromptP
     Ok((initial, images, messages))
 }
 
-fn run_print(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
+/// The print-mode dispatch arm (`main.ts:1050-1059` — `runPrintMode` with
+/// `toPrintOutputMode`'s text output, `main.ts:128-130`): prompt assembly
+/// runs `prepareInitialMessage` (`main.ts:258-277`) over piped stdin
+/// content, `@file` arguments, and the CLI messages.
+fn run_print(
+    args: &Args,
+    cwd: &std::path::Path,
+    cwd_string: &str,
+    stdin_content: Option<&str>,
+) -> Result<i32, String> {
     let mut runtime = build_runtime(args, cwd, cwd_string, "print")?;
-    let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd)?;
+    let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd, stdin_content)?;
     let options = PrintModeOptions {
         mode: Mode::Text,
         messages: follow_ups,
@@ -614,9 +701,17 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
     )
 }
 
-fn run_json(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
+/// The JSON dispatch arm (`main.ts:1050-1059` with `toPrintOutputMode`'s
+/// json output, `main.ts:128-130`): the same prompt assembly as print mode,
+/// streamed as JSON events.
+fn run_json(
+    args: &Args,
+    cwd: &std::path::Path,
+    cwd_string: &str,
+    stdin_content: Option<&str>,
+) -> Result<i32, String> {
     let mut runtime = build_runtime(args, cwd, cwd_string, "json")?;
-    let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd)?;
+    let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd, stdin_content)?;
     let options = PrintModeOptions {
         mode: Mode::Json,
         messages: follow_ups,
@@ -788,5 +883,132 @@ mod tests {
             ),
             pi_agent::types::ThinkingLevel::Off
         );
+    }
+
+    // --- piped stdin slice (`main.ts:79-126`, `main.ts:960-968`,
+    // `cli/initial-message.ts:20-43`) ---
+
+    /// `resolveAppMode` (`main.ts:115-126`): rpc and json win outright;
+    /// `--print` or a non-TTY stdin/stdout forces print; only a fully
+    /// terminal run stays interactive. `echo hi | pi` lands in print mode
+    /// through the `!stdinIsTTY` arm.
+    #[test]
+    fn app_mode_resolution_mirrors_resolve_app_mode() {
+        let plain = Args::default();
+        assert_eq!(resolve_app_mode(&plain, true, true), AppMode::Interactive);
+        assert_eq!(resolve_app_mode(&plain, false, true), AppMode::Print);
+        assert_eq!(resolve_app_mode(&plain, true, false), AppMode::Print);
+        assert_eq!(resolve_app_mode(&plain, false, false), AppMode::Print);
+        let mut print_args = Args::default();
+        print_args.print = true;
+        assert_eq!(resolve_app_mode(&print_args, true, true), AppMode::Print);
+        let mut rpc = Args::default();
+        rpc.mode = Some(Mode::Rpc);
+        assert_eq!(resolve_app_mode(&rpc, false, false), AppMode::Rpc);
+        let mut json = Args::default();
+        json.mode = Some(Mode::Json);
+        assert_eq!(resolve_app_mode(&json, false, false), AppMode::Json);
+        // `--mode text` is neither rpc nor json; the TTY check decides.
+        let mut text = Args::default();
+        text.mode = Some(Mode::Text);
+        assert_eq!(resolve_app_mode(&text, true, true), AppMode::Interactive);
+    }
+
+    /// `readPipedStdin`'s read half (`main.ts:89-99`): everything to EOF,
+    /// trimmed; whitespace-only content resolves to `undefined`
+    /// (`data.trim() || undefined`, `main.ts:96`).
+    #[test]
+    fn piped_stdin_trims_and_maps_whitespace_only_to_none() {
+        assert_eq!(
+            read_piped_stdin_from(&mut &b"hi\n"[..]),
+            Some("hi".to_string())
+        );
+        assert_eq!(
+            read_piped_stdin_from(&mut &b"  hello world  \n"[..]),
+            Some("hello world".to_string())
+        );
+        assert_eq!(read_piped_stdin_from(&mut &b"  \n\t"[..]), None);
+        assert_eq!(read_piped_stdin_from(&mut &b""[..]), None);
+    }
+
+    /// Invalid UTF-8 decodes with replacement characters, matching
+    /// upstream's `setEncoding("utf8")` chunk accumulation (`main.ts:91`).
+    #[test]
+    fn piped_stdin_decodes_invalid_utf8_lossily() {
+        assert_eq!(
+            read_piped_stdin_from(&mut &[0xff_u8, 0xfe][..]),
+            Some("\u{fffd}\u{fffd}".to_string())
+        );
+    }
+
+    /// `buildInitialMessage` (`cli/initial-message.ts:20-43`) joins stdin
+    /// content, `@file` text, and the first CLI message in that order with
+    /// no separator (`parts.join("")`); remaining messages become follow-ups.
+    #[test]
+    fn stdin_file_text_and_first_message_join_with_no_separator() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, b"alpha").expect("write");
+        let mut args = Args::default();
+        args.file_args = vec!["notes.txt".to_string()];
+        args.messages = vec!["first".to_string(), "second".to_string()];
+        let (initial, images, follow_ups) =
+            resolve_prompt_messages(&args, dir.path(), Some("piped")).expect("ok");
+        assert_eq!(
+            initial,
+            Some(format!(
+                "piped<file name=\"{}\">\nalpha\n</file>\nfirst",
+                path.display()
+            ))
+        );
+        assert_eq!(images, Vec::<ImageContent>::new());
+        assert_eq!(follow_ups, vec!["second".to_string()]);
+    }
+
+    /// Stdin content rides first even without `@file` arguments; the first
+    /// CLI message still shifts off (`initial-message.ts:34-37`).
+    #[test]
+    fn stdin_content_rides_first_without_file_arguments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut args = Args::default();
+        args.messages = vec!["hello".to_string()];
+        let (initial, images, follow_ups) =
+            resolve_prompt_messages(&args, dir.path(), Some("piped")).expect("ok");
+        assert_eq!(initial, Some("pipedhello".to_string()));
+        assert_eq!(images, Vec::<ImageContent>::new());
+        assert_eq!(follow_ups, Vec::<String>::new());
+    }
+
+    /// The stdin part keys on `stdinContent !== undefined`
+    /// (`initial-message.ts:27`), unlike the truthy `if (fileText)` check
+    /// (`initial-message.ts:30`): a present-but-empty stdin part still makes
+    /// the joined message defined, while an empty `@file` text block is
+    /// skipped.
+    #[test]
+    fn stdin_part_keys_on_presence_while_empty_file_text_is_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (initial, _, _) =
+            resolve_prompt_messages(&Args::default(), dir.path(), Some("")).expect("ok");
+        assert_eq!(initial, Some(String::new()));
+        std::fs::write(dir.path().join("empty.txt"), b"").expect("write");
+        let mut args = Args::default();
+        args.file_args = vec!["empty.txt".to_string()];
+        let (initial, images, follow_ups) =
+            resolve_prompt_messages(&args, dir.path(), Some("piped")).expect("ok");
+        assert_eq!(initial, Some("piped".to_string()));
+        assert_eq!(images, Vec::<ImageContent>::new());
+        assert_eq!(follow_ups, Vec::<String>::new());
+    }
+
+    /// No stdin, files, or messages yields no initial message
+    /// (`initial-message.ts:40`).
+    #[test]
+    fn no_parts_yields_no_initial_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (initial, images, follow_ups) =
+            resolve_prompt_messages(&Args::default(), dir.path(), None).expect("ok");
+        assert_eq!(initial, None);
+        assert_eq!(images, Vec::<ImageContent>::new());
+        assert_eq!(follow_ups, Vec::<String>::new());
     }
 }
