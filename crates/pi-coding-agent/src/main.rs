@@ -899,18 +899,26 @@ mod tests {
         assert_eq!(resolve_app_mode(&plain, false, true), AppMode::Print);
         assert_eq!(resolve_app_mode(&plain, true, false), AppMode::Print);
         assert_eq!(resolve_app_mode(&plain, false, false), AppMode::Print);
-        let mut print_args = Args::default();
-        print_args.print = true;
+        let print_args = Args {
+            print: true,
+            ..Default::default()
+        };
         assert_eq!(resolve_app_mode(&print_args, true, true), AppMode::Print);
-        let mut rpc = Args::default();
-        rpc.mode = Some(Mode::Rpc);
+        let rpc = Args {
+            mode: Some(Mode::Rpc),
+            ..Default::default()
+        };
         assert_eq!(resolve_app_mode(&rpc, false, false), AppMode::Rpc);
-        let mut json = Args::default();
-        json.mode = Some(Mode::Json);
+        let json = Args {
+            mode: Some(Mode::Json),
+            ..Default::default()
+        };
         assert_eq!(resolve_app_mode(&json, false, false), AppMode::Json);
         // `--mode text` is neither rpc nor json; the TTY check decides.
-        let mut text = Args::default();
-        text.mode = Some(Mode::Text);
+        let text = Args {
+            mode: Some(Mode::Text),
+            ..Default::default()
+        };
         assert_eq!(resolve_app_mode(&text, true, true), AppMode::Interactive);
     }
 
@@ -943,9 +951,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("notes.txt");
         std::fs::write(&path, b"alpha").expect("write");
-        let mut args = Args::default();
-        args.file_args = vec!["notes.txt".to_string()];
-        args.messages = vec!["first".to_string(), "second".to_string()];
+        let args = Args {
+            file_args: vec!["notes.txt".to_string()],
+            messages: vec!["first".to_string(), "second".to_string()],
+            ..Default::default()
+        };
         let resolved = resolve_prompt_messages(&args, dir.path(), Some("piped"));
         let (initial, images, follow_ups) = resolved.expect("ok");
         let expected = format!("piped<file name=\"{}\">\nalpha\n</file>\nfirst", path.display());
@@ -959,8 +969,10 @@ mod tests {
     #[test]
     fn stdin_content_rides_first_without_file_arguments() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut args = Args::default();
-        args.messages = vec!["hello".to_string()];
+        let args = Args {
+            messages: vec!["hello".to_string()],
+            ..Default::default()
+        };
         let resolved = resolve_prompt_messages(&args, dir.path(), Some("piped"));
         let (initial, images, follow_ups) = resolved.expect("ok");
         assert_eq!(initial, Some("pipedhello".to_string()));
@@ -980,8 +992,10 @@ mod tests {
         let (initial, _, _) = resolved.expect("ok");
         assert_eq!(initial, Some(String::new()));
         std::fs::write(dir.path().join("empty.txt"), b"").expect("write");
-        let mut args = Args::default();
-        args.file_args = vec!["empty.txt".to_string()];
+        let args = Args {
+            file_args: vec!["empty.txt".to_string()],
+            ..Default::default()
+        };
         let resolved = resolve_prompt_messages(&args, dir.path(), Some("piped"));
         let (initial, images, follow_ups) = resolved.expect("ok");
         assert_eq!(initial, Some("piped".to_string()));
