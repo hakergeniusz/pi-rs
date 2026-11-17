@@ -452,10 +452,7 @@ mod tests {
 
     #[test]
     fn osc_payloads_other_than_8_are_dropped() {
-        assert_eq!(
-            ansi_to_html("\u{1b}]0;title\u{7}body"),
-            "body"
-        );
+        assert_eq!(ansi_to_html("\u{1b}]0;title\u{7}body"), "body");
     }
 
     #[test]

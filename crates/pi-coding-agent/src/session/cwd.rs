@@ -58,7 +58,10 @@ pub fn format_missing_session_cwd_error(issue: &SessionCwdIssue) -> String {
 
 /// `formatMissingSessionCwdPrompt` (`session-cwd.ts:40-42`).
 pub fn format_missing_session_cwd_prompt(issue: &SessionCwdIssue) -> String {
-    format!("Session cwd does not exist: {}", issue.session_cwd.display())
+    format!(
+        "Session cwd does not exist: {}",
+        issue.session_cwd.display()
+    )
 }
 
 /// `MissingSessionCwdChoice` (`session-cwd.ts:45`): how to open a session
@@ -213,15 +216,15 @@ mod tests {
         let session_file = dir.path().join("session.jsonl");
         write_session_file(&session_file, dir.path());
         let session_manager = SessionManager::open(&session_file, None, None).expect("open");
-        assert_eq!(get_missing_session_cwd_issue(&session_manager, dir.path()), None);
+        assert_eq!(
+            get_missing_session_cwd_issue(&session_manager, dir.path()),
+            None
+        );
 
         // In-memory sessions carry no session file, so they are never stale.
-        let in_memory = SessionManager::in_memory(
-            dir.path(),
-            &NewSessionOptions::default(),
-            Vec::new(),
-        )
-        .expect("in-memory");
+        let in_memory =
+            SessionManager::in_memory(dir.path(), &NewSessionOptions::default(), Vec::new())
+                .expect("in-memory");
         assert!(in_memory.get_session_file().is_none());
         assert_eq!(get_missing_session_cwd_issue(&in_memory, dir.path()), None);
     }

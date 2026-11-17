@@ -148,7 +148,9 @@ mod tests {
         let mut session =
             SessionManager::create(dir.path(), Some(dir.path()), &NewSessionOptions::default())
                 .expect("session");
-        session.append_message(user_message("hi", 1)).expect("append");
+        session
+            .append_message(user_message("hi", 1))
+            .expect("append");
         let exported = dir.path().join("out").join("export.jsonl");
         let path = export_session_to_jsonl(&session, Some(&exported)).expect("export");
         assert_eq!(path, exported);
@@ -200,4 +202,3 @@ mod tests {
         assert!(exported.ends_with('\n'), "pi ends the file with a newline");
     }
 }
-

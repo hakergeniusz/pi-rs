@@ -357,16 +357,15 @@ pub fn fg_styler(token: pi_tui::theme::ThemeColor) -> Styler {
 /// name, else the reserved system name (`theme.ts:835-837`'s
 /// `themeName ?? currentThemeName ?? SYSTEM_THEME_NAME`).
 fn export_theme_name(theme_name: Option<&str>) -> String {
-    theme_name
-        .map_or_else(
-            || {
-                theme()
-                    .name()
-                    .unwrap_or(pi_tui::theme::SYSTEM_THEME_NAME)
-                    .to_string()
-            },
-            str::to_string,
-        )
+    theme_name.map_or_else(
+        || {
+            theme()
+                .name()
+                .unwrap_or(pi_tui::theme::SYSTEM_THEME_NAME)
+                .to_string()
+        },
+        str::to_string,
+    )
 }
 
 /// `getResolvedThemeColors` (`theme.ts:834-839`): every theme token as a CSS
@@ -426,9 +425,9 @@ pub fn get_theme_export_colors(theme_name: Option<&str>) -> ThemeExportColors {
         let resolved = value.resolve(&json.vars).ok()?;
         match resolved {
             pi_tui::theme::ColorValue::Default => None,
-            pi_tui::theme::ColorValue::Index(index) => {
-                Some(pi_tui::color::color_to_hex(pi_tui::color::indexed_color(u16::from(index))))
-            }
+            pi_tui::theme::ColorValue::Index(index) => Some(pi_tui::color::color_to_hex(
+                pi_tui::color::indexed_color(u16::from(index)),
+            )),
             pi_tui::theme::ColorValue::Text(text) => {
                 // `if (resolved === "") return undefined` — a `vars` entry
                 // referencing the empty string lands here as `Text("")`.

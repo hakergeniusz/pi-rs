@@ -29,8 +29,8 @@ mod tool_renderer;
 
 use std::path::{Path, PathBuf};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Map, Value};
 
 pub use ansi_to_html::{ansi_lines_to_html, ansi_to_html, strip_ansi_escapes};
@@ -115,12 +115,7 @@ fn adjust_brightness(color: &str, factor: f64) -> String {
         return color.to_string();
     };
     let adjust = |c: f64| (c * factor).round().clamp(0.0, 255.0);
-    format!(
-        "rgb({}, {}, {})",
-        adjust(r),
-        adjust(g),
-        adjust(b)
-    )
+    format!("rgb({}, {}, {})", adjust(r), adjust(g), adjust(b))
 }
 
 /// `deriveExportColors` (`index.ts:81-106`): page/card/info backgrounds
@@ -194,15 +189,24 @@ fn generate_theme_vars(theme_name: Option<&str>) -> Result<String, String> {
 
     lines.push(format!(
         "--exportPageBg: {};",
-        theme_export.page_bg.as_ref().unwrap_or(&derived_colors.page_bg)
+        theme_export
+            .page_bg
+            .as_ref()
+            .unwrap_or(&derived_colors.page_bg)
     ));
     lines.push(format!(
         "--exportCardBg: {};",
-        theme_export.card_bg.as_ref().unwrap_or(&derived_colors.card_bg)
+        theme_export
+            .card_bg
+            .as_ref()
+            .unwrap_or(&derived_colors.card_bg)
     ));
     lines.push(format!(
         "--exportInfoBg: {};",
-        theme_export.info_bg.as_ref().unwrap_or(&derived_colors.info_bg)
+        theme_export
+            .info_bg
+            .as_ref()
+            .unwrap_or(&derived_colors.info_bg)
     ));
 
     Ok(lines.join("\n      "))
@@ -365,9 +369,18 @@ fn generate_html(
         .filter(|value| !value.is_empty())
         .unwrap_or("#343541");
     let derived_export_colors = derive_export_colors(user_message_bg);
-    let body_bg = theme_export.page_bg.as_ref().unwrap_or(&derived_export_colors.page_bg);
-    let container_bg = theme_export.card_bg.as_ref().unwrap_or(&derived_export_colors.card_bg);
-    let info_bg = theme_export.info_bg.as_ref().unwrap_or(&derived_export_colors.info_bg);
+    let body_bg = theme_export
+        .page_bg
+        .as_ref()
+        .unwrap_or(&derived_export_colors.page_bg);
+    let container_bg = theme_export
+        .card_bg
+        .as_ref()
+        .unwrap_or(&derived_export_colors.card_bg);
+    let info_bg = theme_export
+        .info_bg
+        .as_ref()
+        .unwrap_or(&derived_export_colors.info_bg);
 
     // Base64 encode session data to avoid escaping issues.
     let session_data_base64 =
@@ -457,13 +470,14 @@ fn pre_render_custom_tools(
                     result.details.as_ref(),
                     result.is_error,
                 ) {
-                    let mut merged = existing.map_or_else(
-                        RenderedToolHtml::default,
-                        |(_, rendered)| rendered.clone(),
-                    );
+                    let mut merged = existing
+                        .map_or_else(RenderedToolHtml::default, |(_, rendered)| rendered.clone());
                     merged.result_html_collapsed = rendered.collapsed;
                     merged.result_html_expanded = rendered.expanded;
-                    match rendered_tools.iter_mut().find(|(id, _)| *id == result.tool_call_id) {
+                    match rendered_tools
+                        .iter_mut()
+                        .find(|(id, _)| *id == result.tool_call_id)
+                    {
                         Some((_, slot)) => *slot = merged,
                         None => rendered_tools.push((result.tool_call_id.clone(), merged)),
                     }
@@ -500,7 +514,10 @@ fn resolve_export_output_path(output_path: Option<&str>, default: PathBuf) -> Pa
 /// The default output for a session file: `{APP_NAME}-session-<stem>.html`.
 /// `basename(file, ".jsonl")` is the stem (`index.ts:278-280`).
 fn default_export_output_name(session_file: &Path) -> PathBuf {
-    let stem = session_file.file_stem().unwrap_or_default().to_string_lossy();
+    let stem = session_file
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
     PathBuf::from(format!("{APP_NAME}-session-{stem}.html"))
 }
 
@@ -553,7 +570,10 @@ pub fn export_session_to_html(
     let html = generate_html(session_data, options.theme_name)?;
 
     let default = default_export_output_name(session_file);
-    write_export(html, &resolve_export_output_path(options.output_path, default))
+    write_export(
+        html,
+        &resolve_export_output_path(options.output_path, default),
+    )
 }
 
 /// `exportFromFile` (`index.ts:290-318`): export a session file to HTML
@@ -569,8 +589,8 @@ pub fn export_from_file(input_path: &str, options: &ExportOptions<'_>) -> Export
         return Err(format!("File not found: {}", resolved_input_path.display()));
     }
 
-    let session_manager =
-        SessionManager::open(&resolved_input_path, None, None).map_err(|error| error.to_string())?;
+    let session_manager = SessionManager::open(&resolved_input_path, None, None)
+        .map_err(|error| error.to_string())?;
 
     let session_data = session_data_value(
         session_manager
@@ -589,7 +609,10 @@ pub fn export_from_file(input_path: &str, options: &ExportOptions<'_>) -> Export
     let html = generate_html(session_data, options.theme_name)?;
 
     let default = default_export_output_name(&resolved_input_path);
-    write_export(html, &resolve_export_output_path(options.output_path, default))
+    write_export(
+        html,
+        &resolve_export_output_path(options.output_path, default),
+    )
 }
 
 #[cfg(test)]
@@ -737,7 +760,8 @@ mod tests {
     #[test]
     fn embedded_templates_are_upstream_bytes() {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let upstream_dir = std::path::PathBuf::from("/tmp/pi/packages/coding-agent/src/core/export-html");
+        let upstream_dir =
+            std::path::PathBuf::from("/tmp/pi/packages/coding-agent/src/core/export-html");
         // The upstream clone is the ground truth when present; the committed
         // copies under export-html/ are the shipped bytes either way.
         if !upstream_dir.exists() {
@@ -777,7 +801,8 @@ mod tests {
         assert_eq!(js_replace_first("abc", "b", "$`"), "aac");
         // "$'" is the text after the match: "a" + replacement "c" + "c".
         assert_eq!(js_replace_first("abc", "b", "$'"), "acc");
-        assert_eq!(js_replace_first("abc", "b", "$$"), "a$bc");
+        // "$$" is one literal dollar: "a" + "$" + "c".
+        assert_eq!(js_replace_first("abc", "b", "$$"), "a$c");
         assert_eq!(js_replace_first("abc", "b", "$1"), "a$1bc");
         assert_eq!(js_replace_first("[-+*?!$&|]", "$&", "X"), "[-+*?!X|]");
     }
@@ -932,7 +957,9 @@ mod tests {
         let name = default_export_output_name(source);
         assert_eq!(
             name,
-            Path::new(&format!("{APP_NAME}-session-2026-01-01T00_00_00_000Z_abc.html"))
+            Path::new(&format!(
+                "{APP_NAME}-session-2026-01-01T00_00_00_000Z_abc.html"
+            ))
         );
     }
 
@@ -940,9 +967,8 @@ mod tests {
     fn export_from_file_reports_missing_files_like_upstream() {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("nope.jsonl");
-        let error =
-            export_from_file(missing.to_str().expect("utf8"), &ExportOptions::default())
-                .expect_err("missing input");
+        let error = export_from_file(missing.to_str().expect("utf8"), &ExportOptions::default())
+            .expect_err("missing input");
         assert_eq!(error, format!("File not found: {}", missing.display()));
     }
 
@@ -989,10 +1015,12 @@ mod tests {
         let tool_result = pi_agent::AgentMessage::ToolResult(pi_ai::types::ToolResultMessage {
             tool_call_id: "call-2".to_string(),
             tool_name: "custom_tool".to_string(),
-            content: vec![pi_ai::types::InputContent::Text(pi_ai::types::TextContent {
-                text: "done".to_string(),
-                text_signature: None,
-            })],
+            content: vec![pi_ai::types::InputContent::Text(
+                pi_ai::types::TextContent {
+                    text: "done".to_string(),
+                    text_signature: None,
+                },
+            )],
             details: None,
             usage: None,
             nested_calls: None,
@@ -1069,7 +1097,10 @@ mod tests {
         )
         .expect("export without renderer");
         let payload_b = payload_of(&out_b);
-        assert!(!payload_b.contains("call call-9 custom_tool"), "{payload_b}");
+        assert!(
+            !payload_b.contains("call call-9 custom_tool"),
+            "{payload_b}"
+        );
         assert!(!payload_b.contains("renderedTools"), "{payload_b}");
     }
 }
