@@ -2054,6 +2054,42 @@ burned four rounds to make the unverified code real. Landed as `a1d7ae2`
   carries the `--extension` paths + `--no-extensions` flag for the
   re-discovery.
 
+## P7 output guard (landed on `feat/output-guard`, 2026-11-17)
+
+Subagent-authored (one agent, user-ordered), rebased onto the
+reload-slice main, landed as `842227d` (CI 44153436450). Port of
+`core/output-guard.ts` (108 lines) — the raw-stdout takeover that keeps
+JSON/print/RPC output flowing to a pipe while extension UI writes go to
+stderr.
+
+- **`output_guard.rs`** (crate root): `take_over_stdout`/`restore_stdout`/
+  `is_stdout_taken_over` (`:45-83`), `write_raw_stdout` (`:85-93`,
+  empty no-op + silent `exit(1)` on failure), `wait_for_raw_stdout_backpressure`
+  (`:95-103`), `flush_raw_stdout` (`:105-108`), the 10 ms retrying write
+  (`:20-43`, WouldBlock-retryable; ENOBUFS not representable without
+  libc — module doc).
+- **Wiring**: `main.rs` takes over before the mode dispatch and restores
+  after print/JSON return (`main.ts:703-707`, `:1059`; RPC stays taken
+  over, like upstream); `print_mode.rs`'s output contract routes through
+  `write_raw_stdout` and ends with the `flushRawStdout` tail
+  (`print-mode.ts:158`, `:180` — errors override the outcome like a
+  rejected finally); `json_event.rs`'s sink writes every event line
+  through the guard (`:117`, `:129-134`) with the flush at the run tail —
+  the old "stdout closed" swallow comments are replaced by the guard's
+  `exit(1)`.
+- **Deviations (module doc)**: no promise tail — blocking `write_all` in
+  call order (every call site is newline-terminated, so the LineWriter
+  drain upstream awaits has already happened; the wait fn exists for
+  call-site parity); no `process.stdout` patch (std handles can't rebind;
+  the takeover records the marker `is_stdout_taken_over` serves —
+  package-manager's consumer is P5 remainder); flush = explicit drain of
+  the stdout handle; stderr interleaving timing only. Untestable
+  in-process (real-TTY streaming, closed-stdout exit(1)) left to a PTY
+  smoke when the P7 release round runs.
+- Gate: r1 3 lints (dead test-seam fn moved into `mod tests`,
+  `assert_is_empty`, uninlined format arg) → f8a1ad4; r3 green after
+  r2's stale-checkout incident (gotcha below). 6 unit tests.
+
 - **Rebase grafts lose definitions and registry lines silently**
   (hit 2026-11-17, export slice): resolving repeated rebase conflicts
   with `checkout --ours` against a tip graft preserves call sites and
@@ -2116,6 +2152,12 @@ burned four rounds to make the unverified code real. Landed as `a1d7ae2`
   provider name (`getModelSearchText`), so a synthetic provider named
   "beta" matches the query "b" — give filtered-scoping fixtures
   providers that cannot match the query.
+- **`checkout | tail -1` masks a failed branch switch** (hit
+  2026-11-17, output-guard gate r2): fmt debris left by the previous
+  gate round made `git checkout -B` refuse, the pipe reported tail's
+  exit 0, and the next gate ran the STALE checkout (identical error
+  lines at identical positions — the tell). `git checkout -- .` before
+  every `-B` switch and never pipe checkout through a pipe.
 
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
