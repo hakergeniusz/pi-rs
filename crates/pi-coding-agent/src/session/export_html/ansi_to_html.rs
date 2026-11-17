@@ -94,6 +94,8 @@ fn color256_to_hex(index: i64) -> String {
 }
 
 /// A parsed SGR state (`TextStyle`, `ansi-to-html.ts:73-80`).
+// One flag per text attribute, mirroring upstream's `TextStyle`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct TextStyle {
     fg: Option<String>,

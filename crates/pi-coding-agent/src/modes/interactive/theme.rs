@@ -374,17 +374,21 @@ fn export_theme_name(theme_name: Option<&str>) -> String {
 /// resolved colors record, whose order follows the theme document; the values
 /// are the same either way). Fails when the theme cannot load, like
 /// upstream's `loadTheme` throw.
-pub fn get_resolved_theme_colors(theme_name: Option<&str>) -> Result<Vec<(String, String)>, String> {
+pub fn get_resolved_theme_colors(
+    theme_name: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
     let name = export_theme_name(theme_name);
     let loaded = load_theme_by_name(&name)?;
     let mut colors = Vec::with_capacity(
         pi_tui::theme::ThemeColor::ALL.len() + pi_tui::theme::ThemeBg::ALL.len(),
     );
     for token in pi_tui::theme::ThemeColor::ALL {
-        colors.push((token.as_str().to_string(), pi_tui::color::color_to_hex(loaded.fg_color(*token))));
+        let color = pi_tui::color::color_to_hex(loaded.fg_color(*token));
+        colors.push((token.as_str().to_string(), color));
     }
     for token in pi_tui::theme::ThemeBg::ALL {
-        colors.push((token.as_str().to_string(), pi_tui::color::color_to_hex(loaded.bg_color(*token))));
+        let color = pi_tui::color::color_to_hex(loaded.bg_color(*token));
+        colors.push((token.as_str().to_string(), color));
     }
     Ok(colors)
 }

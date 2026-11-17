@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use super::json;
 use super::store::{SessionManager, resolve_path};
-use super::{CURRENT_SESSION_VERSION, Record, SessionError};
+use super::{CURRENT_SESSION_VERSION, SessionError};
 
 /// `serializeSessionBranch` (`session-export.ts:9-29`): the freshly stamped
 /// header followed by every entry on the current branch, each entry's

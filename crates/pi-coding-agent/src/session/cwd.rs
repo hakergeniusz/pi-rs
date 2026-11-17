@@ -216,8 +216,12 @@ mod tests {
         assert_eq!(get_missing_session_cwd_issue(&session_manager, dir.path()), None);
 
         // In-memory sessions carry no session file, so they are never stale.
-        let in_memory = SessionManager::in_memory(dir.path(), &NewSessionOptions::default(), Vec::new())
-            .expect("in-memory");
+        let in_memory = SessionManager::in_memory(
+            dir.path(),
+            &NewSessionOptions::default(),
+            Vec::new(),
+        )
+        .expect("in-memory");
         assert!(in_memory.get_session_file().is_none());
         assert_eq!(get_missing_session_cwd_issue(&in_memory, dir.path()), None);
     }

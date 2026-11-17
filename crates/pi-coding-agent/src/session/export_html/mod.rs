@@ -477,9 +477,7 @@ fn resolve_export_output_path(output_path: Option<&str>, default: PathBuf) -> Pa
 /// The default output for a session file: `{APP_NAME}-session-<stem>.html`.
 /// `basename(file, ".jsonl")` is the stem (`index.ts:278-280`).
 fn default_export_output_name(session_file: &Path) -> PathBuf {
-    let stem = session_file
-        .file_stem()
-        .map_or_else(|| session_file.display().to_string(), |stem| stem.to_string_lossy().into_owned());
+    let stem = session_file.file_stem().unwrap_or_default().to_string_lossy();
     PathBuf::from(format!("{APP_NAME}-session-{stem}.html"))
 }
 
@@ -594,7 +592,12 @@ mod tests {
     }
 
     impl ToolHtmlRenderer for FakeRenderer {
-        fn render_call(&self, tool_call_id: &str, tool_name: &str, _args: &Value) -> Option<String> {
+        fn render_call(
+            &self,
+            tool_call_id: &str,
+            tool_name: &str,
+            _args: &Value,
+        ) -> Option<String> {
             self.calls
                 .lock()
                 .expect("calls")
@@ -727,7 +730,8 @@ mod tests {
             assert_eq!(committed, upstream, "{relative} diverged from upstream");
         }
         // And the embedded constants are those committed bytes.
-        let committed_html = std::fs::read(manifest.join("export-html/template.html")).expect("html");
+        let committed_html =
+            std::fs::read(manifest.join("export-html/template.html")).expect("html");
         assert_eq!(TEMPLATE_HTML.as_bytes(), committed_html.as_slice());
         let committed_hljs =
             std::fs::read(manifest.join("export-html/vendor/highlight.min.js")).expect("hljs");
@@ -888,8 +892,12 @@ mod tests {
     /// `{APP_NAME}-session-{basename}.html` in the working directory.
     #[test]
     fn default_export_output_name_stems_the_session_file() {
-        let name = default_export_output_name(Path::new("/sessions/2026-01-01T00_00_00_000Z_abc.jsonl"));
-        assert_eq!(name, Path::new(&format!("{APP_NAME}-session-2026-01-01T00_00_00_000Z_abc.html")));
+        let source = Path::new("/sessions/2026-01-01T00_00_00_000Z_abc.jsonl");
+        let name = default_export_output_name(source);
+        assert_eq!(
+            name,
+            Path::new(&format!("{APP_NAME}-session-2026-01-01T00_00_00_000Z_abc.html"))
+        );
     }
 
     #[test]
@@ -943,7 +951,7 @@ mod tests {
             ("call-1", "bash"),
             ("call-2", "custom_tool"),
         ]));
-        let _ = session.append_message(pi_agent::AgentMessage::ToolResult(pi_ai::types::ToolResultMessage {
+        let tool_result = pi_agent::AgentMessage::ToolResult(pi_ai::types::ToolResultMessage {
             tool_call_id: "call-2".to_string(),
             tool_name: "custom_tool".to_string(),
             content: vec![pi_ai::types::InputContent::Text(pi_ai::types::TextContent {
@@ -956,7 +964,8 @@ mod tests {
             is_error: false,
             timestamp: 1,
             duration_ms: None,
-        }));
+        });
+        let _ = session.append_message(tool_result);
 
         let renderer = FakeRenderer::new();
         let rendered = pre_render_custom_tools(&session.get_entries(), &renderer);
@@ -992,8 +1001,8 @@ mod tests {
             let html = std::fs::read_to_string(path).expect("html");
             const MARKER: &str = "<script id=\"session-data\" type=\"application/json\">";
             let start = html.find(MARKER).map(|index| index + MARKER.len()).expect("tag");
-            String::from_utf8(BASE64.decode(&html[start..html.find("</script>").expect("close")]).expect("base64"))
-                .expect("utf8")
+            let payload = &html[start..html.find("</script>").expect("close")];
+            String::from_utf8(BASE64.decode(payload).expect("base64")).expect("utf8")
         };
 
         let out_a = dir.path().join("with-renderer.html");
