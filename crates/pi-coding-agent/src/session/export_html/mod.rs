@@ -803,7 +803,9 @@ mod tests {
         assert_eq!(js_replace_first("abc", "b", "$'"), "acc");
         // "$$" is one literal dollar: "a" + "$" + "c".
         assert_eq!(js_replace_first("abc", "b", "$$"), "a$c");
-        assert_eq!(js_replace_first("abc", "b", "$1"), "a$1bc");
+        // "$n" with n > captures (0 for a string pattern) stays literal:
+        // "a" + "$1" + "c".
+        assert_eq!(js_replace_first("abc", "b", "$1"), "a$1c");
         assert_eq!(js_replace_first("[-+*?!$&|]", "$&", "X"), "[-+*?!X|]");
     }
 
