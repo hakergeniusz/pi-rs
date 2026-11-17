@@ -5,18 +5,51 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  # A new main push supersedes the run in progress; the merge gate is the
+  # newest commit's run only.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  # Cache-friendly build caps (rust-cache recommends no incremental); the
+  # container gate carries the memory-specific ones.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUGINFO: 0
 
 jobs:
-  check:
+  fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt
+      - name: Format
+        run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
       # The grep/find tools resolve `rg` and `fd` via `which()` (upstream
       # `ensureTool`); ubuntu-latest ships neither, and apt names fd
       # `fdfind`.
@@ -25,9 +58,70 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y ripgrep fd-find
           sudo ln -s "$(which fdfind)" /usr/local/bin/fd
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=4
+
+  # The container gate checks this too (`.gate.sh`), but CI never did —
+  # the cfg-fenced `ext-js` build went red once without anyone noticing.
+  no-default-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+      - name: Check without default features
+        run: cargo check -p pi-coding-agent --no-default-features
+
+  # rust-version = 1.87 (rquickjs 0.14); stable CI can silently accept
+  # code newer std APIs would reject. Compile-compat only — the stable
+  # test job carries behavior.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+      - name: Check on MSRV
+        run: cargo check --workspace --all-targets
+
+  # The operator's daily driver is the release binary; build it here and
+  # publish it as an artifact so a release-profile break is caught by CI
+  # instead of by the next local run.
+  release:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: 0
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: release
+          shared-key: workspace
+      - name: Build release binary
+        run: cargo build --release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-linux-x86_64
+          path: target/release/pi
+          if-no-files-found: error
+
+  # Advisory + license scan over the dependency tree; deliberately
+  # non-blocking so an unmaintained-crate warning cannot strand pushes.
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Deny check
+        run: cargo deny check
