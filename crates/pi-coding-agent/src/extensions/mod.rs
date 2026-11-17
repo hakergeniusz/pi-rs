@@ -665,6 +665,109 @@ pub fn load(
     }
 }
 
+/// `/reload`'s extension half, over the session's existing runner: the
+/// re-discovery against the reloaded settings, the incremental final-set
+/// load, the re-bind, `session_start(reason:"reload")`, and the MCP
+/// reconnect (`resourceLoader.reload()` → `loadFinalExtensionSet` →
+/// `bindExtensions` → `agent-session.ts:3871-3872`). Deviation
+/// (HANDOFF.md): upstream clears the module cache and re-evaluates every
+/// extension file; the port has no per-path unload, so already-loaded
+/// paths keep their registered handlers and only newly-discovered paths
+/// load.
+///
+/// The trust decision is the session's — upstream's reload keeps
+/// `SettingsManager.projectTrusted` (`resource-loader.ts:555`) — so the
+/// reloaded settings view and the project filter ride it.
+#[cfg(feature = "ext-js")]
+pub fn reload(
+    cli_extensions: &[String],
+    no_extensions: bool,
+    cwd: &Path,
+    agent_dir: &Path,
+    project_trusted: bool,
+    settings: &SettingsManager,
+    runner: &Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+) -> Vec<Diagnostic> {
+    use pi_ext_js::loader::{discover_cli_paths, discover_extensions, load_paths};
+
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    // `--no-extensions` still loads CLI extensions
+    // (`resource-loader.ts:609-610`); the settings-configured sources
+    // resolve inside the discovery against the reloaded settings.
+    let configured: Vec<String> = cli_extensions.to_vec();
+    let discovered = if no_extensions {
+        discover_cli_paths(&configured, cwd)
+    } else {
+        discover_extensions(&configured, cwd, agent_dir)
+    };
+
+    let mut runner = runner.lock().expect("extension runner mutex poisoned");
+    // The settings view flips with the reload (`setProjectTrusted` +
+    // `reload`).
+    runner.core().lock().expect("host core").settings = Value::Object(settings.get_settings());
+
+    // The final pass: everything trusted allows, minus already-loaded
+    // modules (`loadFinalExtensionSet`, `resource-loader.ts:791-833`).
+    let loaded: HashSet<String> = runner.extension_paths().into_iter().collect();
+    let remaining: Vec<PathBuf> = discovered
+        .iter()
+        .filter(|entry| project_trusted || entry.origin != pi_ext_js::ExtensionOrigin::Project)
+        .map(|entry| entry.path.clone())
+        .filter(|path| !loaded.contains(&path.to_string_lossy().into_owned()))
+        .collect();
+    let result = load_paths(&mut runner, &remaining);
+    for load_error in &result.errors {
+        diagnostics.push(error(format!(
+            "Failed to load extension \"{}\": {}",
+            load_error.path, load_error.error
+        )));
+    }
+
+    // `bindExtensions` (`agent-session.ts:3429-3449`): the re-bind re-arms
+    // the runtime after the invalidation, then `session_start` fires with
+    // the reload reason (`agent-session.ts:3871`).
+    if let Err(err) = runner.bind() {
+        diagnostics.push(warning(format!("Extension error: bind: {err}")));
+    }
+    if let Err(err) = runner.emit(&json!({ "type": "session_start", "reason": "reload" })) {
+        diagnostics.push(warning(format!("Extension error: session_start: {err}")));
+    }
+
+    // The MCP reconnect (`reportUnhandledMcpServers`,
+    // `agent-session.ts:3872`): the extension closed its connections on
+    // `session_shutdown`; the same attention report as startup.
+    match runner.connect_mcp_servers() {
+        Ok(reports) => {
+            let failures: Vec<String> = reports
+                .iter()
+                .filter(|report| report.state == "failed")
+                .map(|report| {
+                    let error = report.error.as_deref().unwrap_or("unknown error");
+                    let first_line = error.split('\n').next().unwrap_or(error);
+                    format!("  {}: failed: {first_line}", report.name)
+                })
+                .collect();
+            if !failures.is_empty() {
+                diagnostics.push(warning(format!(
+                    "MCP servers need attention:\n{}\nRun /mcp to fix.",
+                    failures.join("\n")
+                )));
+            }
+        }
+        Err(err) => diagnostics.push(warning(format!("Extension error: MCP connect: {err}"))),
+    }
+
+    // Bind-time registration failures report without failing the reload
+    // (the bindCore `emitError` reports, `runner.ts:470-521`).
+    for bind_error in runner.provider_registration_errors() {
+        diagnostics.push(warning(format!(
+            "Extension \"{}\" {} error: {}",
+            bind_error.extension_path, bind_error.event, bind_error.error
+        )));
+    }
+    diagnostics
+}
+
 /// The real path with the engine.
 #[cfg(feature = "ext-js")]
 #[allow(clippy::too_many_lines)] // the upstream reload() sequence, kept in one pass

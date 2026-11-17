@@ -594,6 +594,8 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
         auth_path: None,
         agent_dir: None,
         project_trusted,
+        extension_cli_paths: args.extensions.clone().unwrap_or_default(),
+        no_extensions: args.no_extensions,
     };
     pi_coding_agent::modes::interactive::interactive_mode::run_interactive_mode(
         &mut runtime,

@@ -51,6 +51,7 @@ use crate::session::store::{NewSessionOptions, SessionManager};
 
 use super::autocomplete;
 use super::chat_viewport::{self, ChatViewport, HostSlot};
+use super::model_catalog_refresh::refresh_model_catalogs;
 use super::components::armin::ArminComponent;
 use super::components::assistant_message::AssistantMessageComponent;
 use super::components::auth_selector::{
@@ -62,6 +63,9 @@ use super::components::extension_selector::{ExtensionSelectorComponent, Extensio
 use super::components::footer::{FooterComponent, FooterData, UsageTotals};
 use super::components::header::{BuiltInHeader, pi_logo_lines};
 use super::components::model_selector::{ModelSelectorComponent, ModelSelectorEvent};
+use super::components::scoped_models_selector::{
+    ModelsConfig, RefreshStatusKind, ScopedModelsSelectorComponent, ScopedModelsSelectorEvent,
+};
 use super::components::session_selector::{SessionSelectorComponent, SessionSelectorEvent};
 use super::components::settings_selector::{
     SettingsSelectorComponent, SettingsSelectorConfig, SettingsSelectorEvent,
@@ -75,6 +79,10 @@ use super::components::user_message_selector::{
     UserMessageItem, UserMessageSelectorComponent, UserMessageSelectorEvent,
 };
 use super::theme;
+use crate::cli::args::DiagnosticKind;
+use crate::model_resolver::{
+    ModelScopeDiagnosticCode, ScopedModel, models_are_equal, resolve_model_scope_from_models,
+};
 use crate::oauth::{self, AuthSelectorProvider};
 
 /// Where a cancelled login returns to (`startProviderLogin`'s `onBack`,
@@ -167,6 +175,13 @@ pub struct InteractiveOptions {
     /// Whether this project is trusted in the current session (the
     /// "Current session" line of the trust selector).
     pub project_trusted: bool,
+    /// The CLI `--extension` paths, carried for `/reload`'s re-discovery
+    /// (`resourceLoader.reload()` re-resolves them with the reloaded
+    /// settings, `resource-loader.ts:557-560`). Tests leave them empty.
+    pub extension_cli_paths: Vec<String>,
+    /// The `--no-extensions` flag — CLI extensions still load (`/reload`
+    /// re-applies the same split).
+    pub no_extensions: bool,
 }
 
 impl Default for InteractiveOptions {
@@ -178,6 +193,8 @@ impl Default for InteractiveOptions {
             auth_path: None,
             agent_dir: None,
             project_trusted: false,
+            extension_cli_paths: Vec::new(),
+            no_extensions: false,
         }
     }
 }
@@ -881,6 +898,21 @@ pub struct InteractiveMode {
     exiting: bool,
     /// The mounted `/model` selector's event queue, while open.
     model_selector_events: Option<Arc<Mutex<Vec<ModelSelectorEvent>>>>,
+    /// The mounted `/scoped-models` selector's event queue, while open.
+    scoped_models_selector_events: Option<Arc<Mutex<Vec<ScopedModelsSelectorEvent>>>>,
+    /// `AgentSession._scopedModels` (`agent-session.ts:414`): the session's
+    /// model scope — seeded from the `enabledModels` setting (upstream also
+    /// resolves the `--models` flag; the port has no such flag yet), changed
+    /// by `/scoped-models`, and honored by ctrl+p cycling, the `/model`
+    /// completions, and the footer's provider count. The entries' explicit
+    /// thinking levels apply on the scoped switch (`_cycleScopedModel`,
+    /// `agent-session.ts:2709-2745`).
+    scoped_models: Vec<ScopedModel>,
+    /// The `/model` argument-completion source's live view of the scope
+    /// (upstream's provider closure reads `session.scopedModels` per call,
+    /// `interactive-mode.ts:765-767`; the port's provider is built once, so
+    /// the scope rides a shared slot the scope mutations refresh).
+    scoped_completion_models: Arc<Mutex<Vec<pi_ai::types::Model>>>,
     /// Events from the mounted `/trust` selector, same queue pattern.
     trust_selector_events: Option<Arc<Mutex<Vec<TrustSelectorEvent>>>>,
     /// Events from the mounted `/settings` dialog, same queue pattern.
@@ -964,6 +996,13 @@ pub struct InteractiveMode {
     agent_dir: std::path::PathBuf,
     /// Whether this project is trusted in the current session.
     project_trusted: bool,
+    /// The CLI `--extension` paths (`/reload` re-resolves them with the
+    /// reloaded settings, `resource-loader.ts:557-560`).
+    #[cfg(feature = "ext-js")]
+    extension_cli_paths: Vec<String>,
+    /// The `--no-extensions` flag — CLI extensions still load.
+    #[cfg(feature = "ext-js")]
+    no_extensions: bool,
     /// The settings manager the dialog reads and writes
     /// (`this.settingsManager`, `interactive-mode.ts`).
     settings: SettingsManager,
@@ -1045,8 +1084,12 @@ impl InteractiveMode {
             .unwrap_or_default();
         #[cfg(not(feature = "ext-js"))]
         let virtual_catalog_models: Vec<pi_ai::types::Model> = Vec::new();
+        // The `/model` completions' live scope view (`createBaseAutocompleteProvider`'s
+        // closure reads `session.scopedModels` per call, `interactive-mode.ts:765`).
+        let scoped_completion_models: Arc<Mutex<Vec<pi_ai::types::Model>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let provider = autocomplete::CombinedAutocompleteProvider::new(
-            Self::autocomplete_commands(&virtual_catalog_models),
+            Self::autocomplete_commands(&virtual_catalog_models, Arc::clone(&scoped_completion_models)),
             runtime.session.get_cwd().to_path_buf(),
             crate::tools::bash::which("fd"),
         );
@@ -1078,7 +1121,7 @@ impl InteractiveMode {
         // settings (`getTuiMode`, default fullscreen).
         let tui_mode = options.tui_mode.unwrap_or_else(|| settings.get_tui_mode());
 
-        InteractiveMode {
+        let mut mode = InteractiveMode {
             tui,
             editor_events,
             status_handle,
@@ -1108,7 +1151,14 @@ impl InteractiveMode {
             tool_output_expanded: false,
             hide_thinking_block,
             exiting: false,
+            #[cfg(feature = "ext-js")]
+            extension_cli_paths: options.extension_cli_paths.clone(),
+            #[cfg(feature = "ext-js")]
+            no_extensions: options.no_extensions,
             model_selector_events: None,
+            scoped_models_selector_events: None,
+            scoped_models: Vec::new(),
+            scoped_completion_models,
             trust_selector_events: None,
             settings_selector_events: None,
             session_selector_events: None,
@@ -1165,7 +1215,47 @@ impl InteractiveMode {
             theme_late_reports,
             theme_scheme_reports,
             theme_query_start,
+        };
+        // The session's initial scope (`main.ts:871-882`): the `enabledModels`
+        // setting resolves against the available snapshot; upstream rides the
+        // `--models` flag through the same resolver.
+        mode.seed_model_scope_from_settings();
+        mode
+    }
+
+    /// Seed the session scope from the `enabledModels` setting
+    /// (`main.ts:871-882`): the resolved models + the pattern diagnostics,
+    /// which upstream returns as startup diagnostics (`main.ts:882-883`) and
+    /// the port prints as the loader's warning lines.
+    fn seed_model_scope_from_settings(&mut self) {
+        let Some(patterns) = self.settings.get_enabled_models() else {
+            return;
+        };
+        if patterns.is_empty() {
+            return;
         }
+        let available = self.available_models();
+        let resolved = resolve_model_scope_from_models(&patterns, &available);
+        for diagnostic in &resolved.diagnostics {
+            eprintln!("Warning: {}", diagnostic.message);
+        }
+        self.set_scoped_models(resolved.scoped_models);
+    }
+
+    /// `setScopedModels` (`agent-session.ts:1763-1766`) plus the port's live
+    /// completion slot: the scope state and the `/model` completions move
+    /// together.
+    fn set_scoped_models(&mut self, scoped_models: Vec<ScopedModel>) {
+        self.scoped_models = scoped_models;
+        let snapshot: Vec<pi_ai::types::Model> = self
+            .scoped_models
+            .iter()
+            .map(|scoped| scoped.model.clone())
+            .collect();
+        *self
+            .scoped_completion_models
+            .lock()
+            .expect("scoped completion models") = snapshot;
     }
 
     /// The regular renderer's flat mount: the six hosts in [`HostSlot`] order
@@ -1286,34 +1376,48 @@ impl InteractiveMode {
     /// `interactive-mode.ts:743-853`). Only the commands this port implements
     /// are listed — advertising upstream's unimplemented builtins would make
     /// the picker lie. Argument completions: `/model` fuzzy-searches the
-    /// whole catalog (upstream: the scoped-models subset or the runtime
-    /// snapshot; the scoped-models setting lands later), `/thinking` the
-    /// valid levels.
+    /// session's scoped models when a scope is set, else the whole catalog
+    /// (`interactive-mode.ts:764-767`), `/thinking` the valid levels.
     #[allow(clippy::too_many_lines)] // mirrors the TS command registry; split when extending
     fn autocomplete_commands(
         virtual_models: &[pi_ai::types::Model],
+        scoped_completion_models: Arc<Mutex<Vec<pi_ai::types::Model>>>,
     ) -> Vec<autocomplete::SlashCommand> {
         let virtual_models = virtual_models.to_vec();
         let commands = vec![
             autocomplete::SlashCommand::new("model", "Select model (opens selector UI)")
                 .with_argument_hint("<provider/model>")
                 .with_argument_completions(Arc::new(move |prefix: &str| {
+                    // The scoped subset wins over the whole snapshot
+                    // (`interactive-mode.ts:765-767`).
+                    let scoped = scoped_completion_models
+                        .lock()
+                        .expect("scoped completion models")
+                        .clone();
                     let composed = crate::models_state::all();
                     let mut models: Vec<(String, String, String)> = Vec::new(); // (id, provider, name)
-                    for provider in crate::models_state::providers() {
-                        for model in composed.iter().filter(|model| model.provider == provider) {
-                            // A virtual registration hides the same-id
-                            // physical entry (`withVirtualModels`).
-                            if virtual_models.iter().any(|virtual_model| {
-                                virtual_model.provider == provider && virtual_model.id == model.id
-                            }) {
-                                continue;
+                    if scoped.is_empty() {
+                        for provider in crate::models_state::providers() {
+                            for model in composed.iter().filter(|model| model.provider == provider)
+                            {
+                                // A virtual registration hides the same-id
+                                // physical entry (`withVirtualModels`).
+                                if virtual_models.iter().any(|virtual_model| {
+                                    virtual_model.provider == provider
+                                        && virtual_model.id == model.id
+                                }) {
+                                    continue;
+                                }
+                                models.push((model.id.clone(), provider.clone(), model.name.clone()));
                             }
-                            models.push((model.id.clone(), provider.clone(), model.name.clone()));
                         }
-                    }
-                    for model in &virtual_models {
-                        models.push((model.id.clone(), model.provider.clone(), model.name.clone()));
+                        for model in &virtual_models {
+                            models.push((model.id.clone(), model.provider.clone(), model.name.clone()));
+                        }
+                    } else {
+                        for model in &scoped {
+                            models.push((model.id.clone(), model.provider.clone(), model.name.clone()));
+                        }
                     }
                     // `getModelSearchText` (`model-search.ts:7-11`).
                     let filtered =
@@ -1368,6 +1472,11 @@ impl InteractiveMode {
                 "Duplicate the current session at the current position",
             ),
             autocomplete::SlashCommand::new("tree", "Navigate session tree (switch branches)"),
+            // `slash-commands.ts:24`.
+            autocomplete::SlashCommand::new(
+                "scoped-models",
+                "Enable/disable models for Ctrl+P cycling",
+            ),
             // `BUILTIN_SLASH_COMMANDS` (`slash-commands.ts:37-38`); the
             // `/login` argument completions ride
             // `loginCommand.getArgumentCompletions`
@@ -1409,6 +1518,11 @@ impl InteractiveMode {
                             .collect();
                     if items.is_empty() { None } else { Some(items) }
                 })),
+            // `slash-commands.ts:42`.
+            autocomplete::SlashCommand::new(
+                "reload",
+                "Reload keybindings, extensions, skills, prompts, themes, and context files",
+            ),
             autocomplete::SlashCommand::new("new", "Start a new session"),
             autocomplete::SlashCommand::new("quit", "Quit pi"),
         ];
@@ -2155,6 +2269,17 @@ impl InteractiveMode {
         // easter egg command — 3D when it can play, inline otherwise.
         if text == "/arminsayshi" {
             self.handle_armin_says_hi();
+            return;
+        }
+        // `/scoped-models` (`interactive-mode.ts:5572-5673`): the
+        // enable/disable selector behind ctrl+p cycling.
+        if text == "/scoped-models" {
+            self.open_scoped_models_selector();
+            return;
+        }
+        // `/reload` (`interactive-mode.ts:6618-6719`): the resource reload.
+        if text == "/reload" {
+            self.handle_reload_command();
             return;
         }
         if let Some(rest) = text.strip_prefix("/model") {
@@ -3017,9 +3142,14 @@ impl InteractiveMode {
     }
 
     /// ctrl+p / ctrl+shift+p cycling (`cycleModel`, `interactive-mode.ts:4722-4741`).
-    /// Upstream also applies per-model thinking defaults on the switch; those
-    /// land with the settings work.
+    /// The session scope wins over the whole available snapshot
+    /// (`agent-session.ts:2699-2707`); upstream also applies per-model
+    /// thinking defaults on the switch, which land with the settings work.
     fn cycle_model(&mut self, direction: i32) {
+        if !self.scoped_models.is_empty() {
+            self.cycle_scoped_model(direction);
+            return;
+        }
         let available = self.available_models();
         let Some(next) = cycle_next(&available, &self.model.provider, &self.model.id, direction)
         else {
@@ -3030,8 +3160,58 @@ impl InteractiveMode {
             self.show_error(&error);
             return;
         }
-        // `Switched to ${model.name || model.id}` + the thinking suffix
-        // (`interactive-mode.ts:4731-4735`).
+        self.report_model_switch();
+    }
+
+    /// `_cycleScopedModel` (`agent-session.ts:2709-2744`): the scope
+    /// filters to still-available models before cycling; a pattern's
+    /// explicit thinking level applies on the switch.
+    fn cycle_scoped_model(&mut self, direction: i32) {
+        let available = self.available_models();
+        let available_ids: std::collections::HashSet<String> = available
+            .iter()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .collect();
+        let scoped: Vec<&ScopedModel> = self
+            .scoped_models
+            .iter()
+            .filter(|scoped| {
+                available_ids.contains(&format!("{}/{}", scoped.model.provider, scoped.model.id))
+            })
+            .collect();
+        let current_index = scoped
+            .iter()
+            .position(|scoped| models_are_equal(&scoped.model, &self.model))
+            .map_or(-1, |index| index as isize);
+        let Some(next_index) = next_cycle_index(current_index, scoped.len(), direction > 0) else {
+            // `Only one model in scope` (`interactive-mode.ts:4726`).
+            self.show_status("Only one model in scope");
+            return;
+        };
+        let next_model = scoped[next_index].model.clone();
+        let next_thinking_level = scoped[next_index].thinking_level;
+        // The explicit pattern level wins; then the default-thinking-level
+        // setting; then the current level (`_getThinkingLevelForModelSwitch`,
+        // `agent-session.ts:2841-2853` — the port has no per-model overrides
+        // yet). Upstream clamps to the model's capabilities
+        // (`setThinkingLevel`).
+        let level = next_thinking_level.unwrap_or_else(|| {
+            self.settings
+                .get_default_thinking_level()
+                .and_then(|level| crate::modes::print_mode::thinking_level_from_str(&level).ok())
+                .unwrap_or(self.thinking_level)
+        });
+        if let Err(error) = self.apply_model(next_model) {
+            self.show_error(&error);
+            return;
+        }
+        self.thinking_level = level;
+        self.report_model_switch();
+    }
+
+    /// The `Switched to ${model.name || model.id}` + thinking-suffix status
+    /// (`interactive-mode.ts:4731-4735`).
+    fn report_model_switch(&mut self) {
         let label = if self.model.name.is_empty() {
             self.model.id.clone()
         } else {
@@ -3069,6 +3249,216 @@ impl InteractiveMode {
         }
         self.model_selector_events = None;
         self.restore_editor();
+    }
+
+    /// The session scope's `provider/id` list
+    /// (`sessionScopedModels.map(...)`, `interactive-mode.ts:5587`).
+    fn scoped_ids(&self) -> Vec<String> {
+        self.scoped_models
+            .iter()
+            .map(|scoped| format!("{}/{}", scoped.model.provider, scoped.model.id))
+            .collect()
+    }
+
+    /// `configuredEnabledIds` (`interactive-mode.ts:5575-5583`): the
+    /// `enabledModels` patterns resolved to ids over the given snapshot,
+    /// with each unmatched pattern appended so the selector shows it
+    /// unchecked. `None` when no patterns are configured (= all enabled).
+    fn configured_enabled_ids(
+        patterns: Option<&[String]>,
+        models: &[pi_ai::types::Model],
+    ) -> Option<Vec<String>> {
+        let patterns = patterns?;
+        if patterns.is_empty() {
+            return None;
+        }
+        let resolved = resolve_model_scope_from_models(patterns, models);
+        let mut ids: Vec<String> = resolved
+            .scoped_models
+            .iter()
+            .map(|scoped| format!("{}/{}", scoped.model.provider, scoped.model.id))
+            .collect();
+        for diagnostic in &resolved.diagnostics {
+            if diagnostic.code == ModelScopeDiagnosticCode::NoMatch
+                && !ids.contains(&diagnostic.pattern)
+            {
+                ids.push(diagnostic.pattern.clone());
+            }
+        }
+        Some(ids)
+    }
+
+    /// The mounted `/scoped-models` selector, downcast out of the
+    /// suspended-editor slot (the component's `as_any_mut` override).
+    fn scoped_selector_mut(&mut self) -> Option<&mut ScopedModelsSelectorComponent> {
+        let slot = self.suspended_editor.as_mut()?;
+        slot.as_any_mut()?
+            .downcast_mut::<ScopedModelsSelectorComponent>()
+    }
+
+    /// `updateSessionModels` (`interactive-mode.ts:5591-5609`): apply the
+    /// enabled set to the session scope — scoped only when at least one
+    /// enabled id is available and not every available model is enabled;
+    /// any other combination resets to the unscoped catalog — then refresh
+    /// the footer and render.
+    fn update_session_models(&mut self, enabled_ids: Option<&[String]>) {
+        let available = self.available_models();
+        let available_ids: Vec<String> = available
+            .iter()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .collect();
+        let scoped = match enabled_ids {
+            Some(ids) => {
+                let has_enabled_available = ids.iter().any(|id| available_ids.contains(id));
+                let all_available_enabled = available_ids.iter().all(|id| ids.contains(id));
+                if has_enabled_available && !all_available_enabled {
+                    resolve_model_scope_from_models(ids, &available).scoped_models
+                } else {
+                    Vec::new()
+                }
+            }
+            None => Vec::new(),
+        };
+        self.set_scoped_models(scoped);
+        self.refresh_footer();
+        self.tui.request_render();
+    }
+
+    /// Mount the `/scoped-models` selector in the editor's tree slot and
+    /// run the catalog refresh over it (`showModelsSelector`,
+    /// `interactive-mode.ts:5570-5686`). Upstream refreshes asynchronously:
+    /// the selector mounts with the cached snapshot and "Refreshing model
+    /// catalogs…", then the network pass swaps the fresh snapshot in. The
+    /// port's compose is synchronous ([`super::model_catalog_refresh`]), so
+    /// the same sequence runs inline — mount, refresh, post-refresh tail —
+    /// and the timed-out arm has no synchronous counterpart.
+    #[allow(clippy::too_many_lines)] // mirrors the TS showModelsSelector; split when extending
+    fn open_scoped_models_selector(&mut self) {
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let available = self.available_models();
+        let configured_patterns = self.settings.get_enabled_models();
+        // The entry state (`interactive-mode.ts:5585-5588`): the session
+        // scope's ids when one is set, else the configured patterns
+        // resolved over the snapshot.
+        let mut current_enabled_ids = if !self.scoped_models.is_empty() {
+            Some(self.scoped_ids())
+        } else {
+            Self::configured_enabled_ids(configured_patterns.as_deref(), &available)
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let selector = ScopedModelsSelectorComponent::new(
+            ModelsConfig {
+                all_models: available.clone(),
+                enabled_model_ids: current_enabled_ids.clone(),
+                refresh_status: Some("Refreshing model catalogs…".to_string()),
+            },
+            Arc::clone(&events),
+        );
+        self.scoped_models_selector_events = Some(events);
+        self.suspend_editor_with(Box::new(selector));
+
+        // The refresh tail (`interactive-mode.ts:5645-5667`), synchronous:
+        // nothing has been pumped yet, so `selectionChanged` is false and
+        // the session scope still holds its entry value — the configured
+        // branch re-resolves over the fresh snapshot, the session branch
+        // keeps the selector's enabled set.
+        let result = refresh_model_catalogs(self.extension_runner.as_ref());
+        let available = self.available_models();
+        let enabled_for_selector: Option<Option<Vec<String>>> = if self.scoped_models.is_empty() {
+            let fresh = Self::configured_enabled_ids(configured_patterns.as_deref(), &available);
+            current_enabled_ids = fresh.clone();
+            Some(fresh)
+        } else {
+            None
+        };
+        if let Some(selector) = self.scoped_selector_mut() {
+            match enabled_for_selector {
+                Some(enabled) => selector.update_models(&available, Some(enabled)),
+                None => selector.update_models(&available, None),
+            }
+        }
+        if let Some(ids) = &current_enabled_ids {
+            self.update_session_models(Some(ids));
+        }
+        // Errors name their providers (`interactive-mode.ts:5659-5665`).
+        let status: (String, RefreshStatusKind) = if result.errors.is_empty() {
+            (
+                "Model catalogs refreshed.".to_string(),
+                RefreshStatusKind::Success,
+            )
+        } else {
+            let providers = result.errors.keys().cloned().collect::<Vec<_>>().join(", ");
+            (
+                format!("Could not refresh {providers}; showing cached models."),
+                RefreshStatusKind::Warning,
+            )
+        };
+        if let Some(selector) = self.scoped_selector_mut() {
+            selector.set_refresh_status(&status.0, status.1);
+        }
+        self.tui.request_render();
+    }
+
+    /// Put the editor back (`showSelector`'s `done`).
+    fn close_scoped_models_selector(&mut self) {
+        if self.suspended_editor.is_none() {
+            return;
+        }
+        self.scoped_models_selector_events = None;
+        self.restore_editor();
+    }
+
+    /// The `/scoped-models` selector's drain (`showModelsSelector`'s
+    /// onChange / onPersist / onCancel, `interactive-mode.ts:5626-5642`).
+    fn pump_scoped_models_selector(&mut self) {
+        if self.scoped_models_selector_events.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .scoped_models_selector_events
+                .as_ref()
+                .expect("scoped models selector")
+                .lock()
+                .expect("selector events"),
+        );
+        for event in events {
+            match event {
+                ScopedModelsSelectorEvent::Change(enabled_ids) => {
+                    self.update_session_models(enabled_ids.as_deref());
+                }
+                ScopedModelsSelectorEvent::Persist(enabled_ids) => {
+                    // `onPersist` (`interactive-mode.ts:5630-5638`): the
+                    // patterns clear when nothing is selected or the
+                    // selection covers every available model.
+                    let available = self.available_models();
+                    let available_ids: Vec<String> = available
+                        .iter()
+                        .map(|model| format!("{}/{}", model.provider, model.id))
+                        .collect();
+                    let all_enabled = match &enabled_ids {
+                        None => false,
+                        Some(ids) => {
+                            ids.len() == available.len()
+                                && ids.iter().all(|id| available_ids.contains(id))
+                        }
+                    };
+                    let new_patterns = match (&enabled_ids, all_enabled) {
+                        (None, _) => None,
+                        (Some(_), true) => None,
+                        (Some(ids), false) => Some(ids.clone()),
+                    };
+                    self.settings.set_enabled_models(new_patterns);
+                    self.show_status("Model selection saved to settings");
+                }
+                ScopedModelsSelectorEvent::Cancel => {
+                    self.close_scoped_models_selector();
+                    self.tui.request_render();
+                }
+            }
+        }
     }
 
     /// Mount the `/trust` selector in the editor's tree slot
@@ -4827,6 +5217,153 @@ impl InteractiveMode {
             return Some(args_string);
         };
         Some(&args_string[..first_whitespace])
+    }
+
+    /// `/reload` (`handleReloadCommand`, `interactive-mode.ts:6618-6706`)
+    /// over the session reload sequence (`session.reload`,
+    /// `agent-session.ts:3828-3874`). Mechanism deviations (HANDOFF.md):
+    /// the port's reload is synchronous on the UI thread, so upstream's
+    /// bordered "Reloading…" editor box — which covers the async gap — has
+    /// no observable frame here; the default-tools delta rides a tool
+    /// registry the port has not ported; the implicit project-trust save
+    /// after a reload is startup-only in the port, so the status never
+    /// carries the "saved project trust" suffix; keybindings are static
+    /// constants (`theme::app_keys`), so `keybindings.reload()` is a no-op.
+    #[allow(clippy::too_many_lines)] // mirrors the TS handleReloadCommand; split when extending
+    fn handle_reload_command(&mut self) {
+        if self.agent_run.is_some() {
+            self.show_warning("Wait for the current response to finish before reloading.");
+            return;
+        }
+        if self.is_compacting() {
+            self.show_warning("Wait for compaction to finish before reloading.");
+            return;
+        }
+
+        // `resetExtensionUI` (`interactive-mode.ts:6628`): a pending
+        // extension login flow cancels; mounted dialogs cannot be open —
+        // the editor owns the input while `/reload` is typed.
+        #[cfg(feature = "ext-js")]
+        self.cancel_extension_login_flow();
+
+        // `session.reload` (`agent-session.ts:3838-3849`): the shutdown
+        // event, the invalidation, the settings reload, the queue-mode
+        // sync.
+        self.emit_extension_shutdown("reload", None);
+        #[cfg(feature = "ext-js")]
+        if let Some(runner) = &self.extension_runner {
+            if let Err(error) = runner
+                .lock()
+                .expect("extension runner mutex poisoned")
+                .invalidate(None)
+            {
+                eprintln!("Warning: Extension error: invalidate: {error}");
+            }
+        }
+        self.settings.reload();
+        // `syncQueueModesFromSettings` (`agent-session.ts:2863+`): both
+        // queue modes re-read from the reloaded settings.
+        {
+            let steering = self
+                .settings
+                .get("steeringMode")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let follow_up = self
+                .settings
+                .get("followUpMode")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let mut queues = self.queues.lock().expect("queues");
+            queues.set_steering_mode(queue_mode_from_setting(steering.as_deref()));
+            queues.set_follow_up_mode(queue_mode_from_setting(follow_up.as_deref()));
+        }
+
+        // The extension half: the re-discovery against the reloaded
+        // settings, the re-bind, `session_start(reason:"reload")`, and the
+        // MCP reconnect (`resourceLoader.reload()` →
+        // `agent-session.ts:3869-3872`); the diagnostics re-report like
+        // startup's (`showLoadedResources`, `interactive-mode.ts:6684-6687`).
+        #[cfg(feature = "ext-js")]
+        let reload_diagnostics = match &self.extension_runner {
+            Some(runner) => crate::extensions::reload(
+                &self.extension_cli_paths,
+                self.no_extensions,
+                self.session.get_cwd(),
+                &self.agent_dir,
+                self.project_trusted,
+                &self.settings,
+                runner,
+            ),
+            None => Vec::new(),
+        };
+        #[cfg(not(feature = "ext-js"))]
+        let reload_diagnostics: Vec<crate::cli::args::Diagnostic> = Vec::new();
+        for diagnostic in &reload_diagnostics {
+            if diagnostic.kind == DiagnosticKind::Warning {
+                eprintln!("Warning: {}", diagnostic.message);
+            }
+        }
+        for diagnostic in &reload_diagnostics {
+            if diagnostic.kind == DiagnosticKind::Error {
+                eprintln!("Error: {}", diagnostic.message);
+            }
+        }
+
+        // `resetApiProviders` + `_buildRuntime` (`agent-session.ts:3850-3862`):
+        // the composed catalog recomposes over the reloaded models.json and
+        // registrations — after the extension half, like upstream's
+        // `_buildRuntime` follows `resourceLoader.reload()`.
+        let refresh_errors = refresh_model_catalogs(self.extension_runner.as_ref()).errors;
+
+        // The theme half of `resourceLoader.reload()` + `setRegisteredThemes`
+        // + `applyRuntimeSettings` + `themeController.applyFromSettings`
+        // (`interactive-mode.ts:6678-6680`): the theme re-resolves from the
+        // reloaded settings — the `--theme` flag stays a startup-only
+        // override.
+        let theme_name = self
+            .settings
+            .get("theme")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        match theme_name.as_deref() {
+            Some(name) => {
+                if let Err(error) = theme::set_theme(name) {
+                    eprintln!("Warning: Theme error: {error}");
+                }
+            }
+            None => theme::init_theme(None),
+        }
+        // `applyRuntimeSettings` (`interactive-mode.ts:6664-6665`, the
+        // restore half): the thinking-hide setting re-reads.
+        self.hide_thinking_block = self
+            .settings
+            .get("hideThinkingBlock")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        // `models.json error` (`interactive-mode.ts:6689-6692` over
+        // `model-runtime.getError()`, `model-runtime.ts:512-520`): the
+        // config error plus the composition errors; the port's availability
+        // rides the request-time credential ladder, so there is no
+        // availability arm.
+        {
+            let models_config =
+                crate::models_config::ModelConfig::load(&crate::config::get_models_path());
+            let mut error_parts: Vec<String> = Vec::new();
+            if let Some(config_error) = models_config.get_error() {
+                error_parts.push(config_error.to_string());
+            }
+            for (provider_id, error) in &refresh_errors {
+                error_parts.push(format!("Provider \"{provider_id}\": {error}"));
+            }
+            if !error_parts.is_empty() {
+                self.show_error(&format!("models.json error: {}", error_parts.join("\n\n")));
+            }
+        }
+
+        // Status (`interactive-mode.ts:6693-6697`).
+        self.show_status("Reloaded keybindings, extensions, skills, prompts, themes, and context files");
     }
 
     /// `handleExportCommand` (`interactive-mode.ts:6708-6724`): a `.jsonl`
@@ -7012,6 +7549,7 @@ impl InteractiveMode {
         // Selector events, drained through the Arcs the components publish
         // to (`showSelector`'s onSelect/onCancel callbacks).
         self.pump_model_selector();
+        self.pump_scoped_models_selector();
         self.pump_trust_selector();
         self.pump_settings_selector();
         self.pump_session_selector();
