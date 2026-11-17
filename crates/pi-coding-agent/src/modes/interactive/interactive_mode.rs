@@ -45,6 +45,7 @@ use crate::cli::args::TuiMode;
 use crate::cli::project_trust::ProjectTrustStore;
 use crate::config::settings::{
     FullscreenExitOutput, FullscreenScrollbar, SettingsManager, SettingsManagerCreateOptions,
+    format_http_idle_timeout_ms,
 };
 use crate::modes::print_mode::PrintRuntime;
 use crate::session::store::{NewSessionOptions, SessionManager};
@@ -919,6 +920,10 @@ pub struct InteractiveMode {
     /// ctrl+o state: tool output expansion and the header hints.
     tool_output_expanded: bool,
     hide_thinking_block: bool,
+    /// The message rows' horizontal padding (`this.outputPad`,
+    /// `interactive-mode.ts`), read from `outputPad` at boot and applied by
+    /// the output-padding row.
+    output_pad: usize,
     exiting: bool,
     /// The mounted `/model` selector's event queue, while open.
     model_selector_events: Option<Arc<Mutex<Vec<ModelSelectorEvent>>>>,
@@ -1142,7 +1147,7 @@ impl InteractiveMode {
             &theme_late_reports,
             &theme_scheme_reports,
         );
-        let (agent_dir, settings, hide_thinking_block, queues) =
+        let (agent_dir, settings, hide_thinking_block, output_pad, queues) =
             Self::startup_settings(options, runtime);
         // The renderer choice: the `--tui-mode` flag wins, otherwise the
         // settings (`getTuiMode`, default fullscreen).
@@ -1177,6 +1182,7 @@ impl InteractiveMode {
             last_spinner_tick: Instant::now(),
             tool_output_expanded: false,
             hide_thinking_block,
+            output_pad,
             exiting: false,
             #[cfg(feature = "ext-js")]
             extension_cli_paths: options.extension_cli_paths.clone(),
@@ -1249,6 +1255,13 @@ impl InteractiveMode {
         mode.seed_model_scope_from_settings();
         // Startup border color (`interactive-mode.ts:2241`).
         mode.update_editor_border_color();
+        // `this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled)`
+        // (`interactive-mode.ts:686`): the boot value of the footer's
+        // auto-compact indicator; the mount predates the settings load.
+        let auto_compact = mode.settings.get_compaction_enabled();
+        if let Some(footer) = mode.downcast_tree::<FooterComponent>(HostSlot::Footer) {
+            footer.data.auto_compact_enabled = auto_compact;
+        }
         mode
     }
 
@@ -1366,6 +1379,7 @@ impl InteractiveMode {
         std::path::PathBuf,
         SettingsManager,
         bool,
+        usize,
         Arc<Mutex<Queues>>,
     ) {
         let agent_dir = options
@@ -1384,6 +1398,7 @@ impl InteractiveMode {
             .get("hideThinkingBlock")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        let output_pad = usize::try_from(settings.get_output_pad()).unwrap_or(1);
         let steering = settings
             .get("steeringMode")
             .and_then(|value| value.as_str())
@@ -1398,7 +1413,7 @@ impl InteractiveMode {
             pending.set_steering_mode(queue_mode_from_setting(steering.as_deref()));
             pending.set_follow_up_mode(queue_mode_from_setting(follow_up.as_deref()));
         }
-        (agent_dir, settings, hide_thinking_block, queues)
+        (agent_dir, settings, hide_thinking_block, output_pad, queues)
     }
 
     /// The `/`-commands offered by autocomplete (`createBaseAutocompleteProvider`,
@@ -1714,6 +1729,17 @@ impl InteractiveMode {
             .expect("editor host")
     }
 
+    /// The editor host, mounted or parked: `this.editor` stays reachable
+    /// while a selector occupies the slot, because the parked editor rides
+    /// in `suspended_editor`.
+    fn editor_host_mut(&mut self) -> Option<&mut ChatEditor> {
+        if let Some(host) = self.downcast_tree::<ChatEditor>(HostSlot::Editor) {
+            return Some(host);
+        }
+        let suspended = self.suspended_editor.as_mut()?;
+        suspended.as_any_mut()?.downcast_mut::<ChatEditor>()
+    }
+
     // --------------------------------------------------------------
     // Message rendering (`addMessageToChat`, `interactive-mode.ts:4008`)
     // --------------------------------------------------------------
@@ -1722,7 +1748,7 @@ impl InteractiveMode {
         if self.chat_len() > 0 {
             self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
         }
-        self.add_to_chat(Box::new(UserMessageComponent::new(text, 1)));
+        self.add_to_chat(Box::new(UserMessageComponent::new(text, self.output_pad)));
         self.tui.request_render();
     }
 
@@ -1770,7 +1796,7 @@ impl InteractiveMode {
                         super::components::compaction_summary::CompactionSummaryMessageComponent::new(
                             &compaction.summary,
                             compaction.tokens_before as u64,
-                            1,
+                            self.output_pad,
                         );
                     row.set_expanded(self.tool_output_expanded);
                     self.add_to_chat(Box::new(row));
@@ -1804,7 +1830,7 @@ impl InteractiveMode {
                     let mut row =
                         super::components::branch_summary::BranchSummaryMessageComponent::new(
                             &summary.summary,
-                            1,
+                            self.output_pad,
                         );
                     row.set_expanded(self.tool_output_expanded);
                     self.add_to_chat(Box::new(row));
@@ -1848,15 +1874,18 @@ impl InteractiveMode {
                     if self.chat_len() > 0 {
                         self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
                     }
-                    self.add_to_chat(Box::new(UserMessageComponent::new(&text, 1)));
+                    self.add_to_chat(Box::new(UserMessageComponent::new(&text, self.output_pad)));
                     if populate_history {
                         self.editor_mut().editor.add_to_history(&text);
                     }
                 }
             }
             AgentMessage::Assistant(assistant) => {
-                let mut component =
-                    AssistantMessageComponent::new(self.hide_thinking_block, "Thinking...", 1);
+                let mut component = AssistantMessageComponent::new(
+                    self.hide_thinking_block,
+                    "Thinking...",
+                    self.output_pad,
+                );
                 component.update_content(assistant, false);
                 self.add_to_chat(Box::new(component));
                 let aborted = assistant.stop_reason == pi_ai::types::StopReason::Aborted;
@@ -1869,7 +1898,7 @@ impl InteractiveMode {
                         &call.name,
                         &call.id,
                         serde_json::Value::Object(call.arguments.clone()),
-                        1,
+                        self.output_pad,
                         &self.session.get_cwd().to_string_lossy(),
                         crate::tools::renderers::renderers_for(&call.name),
                     );
@@ -1928,7 +1957,7 @@ impl InteractiveMode {
                 self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
                 let mut row = super::components::branch_summary::BranchSummaryMessageComponent::new(
                     &summary.summary,
-                    1,
+                    self.output_pad,
                 );
                 row.set_expanded(self.tool_output_expanded);
                 self.add_to_chat(Box::new(row));
@@ -1941,7 +1970,11 @@ impl InteractiveMode {
     }
 
     fn start_assistant_stream(&mut self) {
-        let component = AssistantMessageComponent::new(self.hide_thinking_block, "Thinking...", 1);
+        let component = AssistantMessageComponent::new(
+            self.hide_thinking_block,
+            "Thinking...",
+            self.output_pad,
+        );
         self.streaming_index = Some(self.add_to_chat(Box::new(component)));
         self.tui.request_render();
     }
@@ -1975,7 +2008,7 @@ impl InteractiveMode {
                 &call.name,
                 &call.id,
                 serde_json::Value::Object(call.arguments.clone()),
-                1,
+                self.output_pad,
                 &self.session.get_cwd().to_string_lossy(),
                 crate::tools::renderers::renderers_for(&call.name),
             );
@@ -2253,6 +2286,10 @@ impl InteractiveMode {
         };
         let (routed_model_id, routed_thinking_level) =
             routed.map_or((None, None), |(id, level)| (Some(id), level));
+        // `setAutoCompactEnabled(this.session.autoCompactionEnabled)`
+        // (`interactive-mode.ts:686`, `:2197`): the footer reads the live
+        // gate on every refresh. Read before the tree borrow.
+        let auto_compact_enabled = self.settings.get_compaction_enabled();
         let Some(footer) = self.downcast_tree::<FooterComponent>(HostSlot::Footer) else {
             return;
         };
@@ -2265,6 +2302,7 @@ impl InteractiveMode {
         footer.data.available_provider_count = provider_count;
         footer.data.routed_model_id = routed_model_id;
         footer.data.routed_thinking_level = routed_thinking_level;
+        footer.data.auto_compact_enabled = auto_compact_enabled;
     }
 
     // --------------------------------------------------------------
@@ -2912,7 +2950,7 @@ impl InteractiveMode {
         let mut row = super::components::compaction_summary::CompactionSummaryMessageComponent::new(
             &result.summary,
             result.tokens_before,
-            1,
+            self.output_pad,
         );
         row.set_expanded(self.tool_output_expanded);
         self.add_to_chat(Box::new(row));
@@ -3615,9 +3653,44 @@ impl InteractiveMode {
         };
         let selector = SettingsSelectorComponent::new(
             &SettingsSelectorConfig {
+                // `autoCompact` = `session.autoCompactionEnabled`
+                // (`interactive-mode.ts:5105` = `getCompactionEnabled`).
+                auto_compact: self.settings.get_compaction_enabled(),
                 steering_mode,
                 follow_up_mode,
+                transport: self.settings.get_transport(),
+                // An invalid stored timeout throws upstream, which would
+                // abort opening /settings; the port degrades to the default.
+                // deviation: defensive read.
+                http_idle_timeout_ms: self
+                    .settings
+                    .get_http_idle_timeout_ms()
+                    .unwrap_or(crate::config::settings::DEFAULT_HTTP_IDLE_TIMEOUT_MS),
+                cache_warming_mode: self.settings.get_cache_warming_mode(),
                 hide_thinking_block: self.hide_thinking_block,
+                mermaid_rendering_mode: self
+                    .settings
+                    .get_mermaid_rendering_mode()
+                    .as_name()
+                    .to_string(),
+                show_cache_miss_notices: self.settings.get_show_cache_miss_notices(),
+                collapse_changelog: self.settings.get_collapse_changelog(),
+                enable_install_telemetry: self.settings.get_enable_install_telemetry(),
+                quiet_startup: match self.settings.get_quiet_startup() {
+                    crate::config::settings::QuietStartup::Quiet => "true",
+                    crate::config::settings::QuietStartup::Header => "header",
+                    crate::config::settings::QuietStartup::Off => "false",
+                }
+                .to_string(),
+                // `getDefaultProjectTrust` reads the global layer only
+                // (`settings-manager.ts:1020-1023`).
+                default_project_trust: self
+                    .settings
+                    .get_default_project_trust()
+                    .as_name()
+                    .to_string(),
+                double_escape_action: self.settings.get_double_escape_action(),
+                tree_filter_mode: self.settings.get_tree_filter_mode().as_name().to_string(),
                 thinking_level: self
                     .settings
                     .get_default_thinking_level()
@@ -3626,17 +3699,23 @@ impl InteractiveMode {
                 available_models: self.available_models(),
                 current_model: Some((self.model.provider.clone(), self.model.id.clone())),
                 default_model,
+                show_images: self.settings.get_show_images(),
+                image_width_cells: self.settings.get_image_width_cells(),
+                auto_resize_images: self.settings.get_image_auto_resize(),
+                block_images: self.settings.get_block_images(),
+                enable_skill_commands: self.settings.get_enable_skill_commands(),
+                show_hardware_cursor: self.settings.get_show_hardware_cursor(),
+                editor_padding_x: self.settings.get_editor_padding_x(),
+                output_pad: self.settings.get_output_pad(),
+                autocomplete_max_visible: self.settings.get_autocomplete_max_visible(),
+                clear_on_shrink: self.settings.get_clear_on_shrink(),
+                show_terminal_progress: self.settings.get_show_terminal_progress(),
                 current_theme: self
                     .theme_setting
                     .clone()
                     .unwrap_or_else(|| pi_tui::theme::SYSTEM_THEME_NAME.to_string()),
                 terminal_theme: theme::terminal_theme().to_string(),
-                default_project_trust: self
-                    .settings
-                    .get("defaultProjectTrust")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("ask")
-                    .to_string(),
+                warnings: self.settings.get_warnings(),
                 tui_mode: tui_mode_as_setting(self.settings.get_tui_mode()).to_string(),
                 fullscreen_exit_output: match self.settings.get_fullscreen_exit_output() {
                     FullscreenExitOutput::Transcript => "transcript",
@@ -3670,7 +3749,8 @@ impl InteractiveMode {
     }
 
     /// The `/settings` dialog's event handlers
-    /// (`showSettingsSelector`'s callbacks, `interactive-mode.ts:4227-4412`).
+    /// (`showSettingsSelector`'s callbacks, `interactive-mode.ts:5148-5331`).
+    #[allow(clippy::too_many_lines)] // mirrors the TS callback object; split when extending
     fn handle_settings_event(&mut self, event: SettingsSelectorEvent) {
         match event {
             SettingsSelectorEvent::TuiModeChange(_)
@@ -3680,24 +3760,116 @@ impl InteractiveMode {
             | SettingsSelectorEvent::FullscreenWheelScrollLinesChange(_) => {
                 self.handle_fullscreen_settings_event(event);
             }
-            SettingsSelectorEvent::ThemeChange(setting) => {
-                // `onThemeChange` (`interactive-mode.ts:4301-4304`):
-                // persist, then re-apply through the controller.
-                self.settings
-                    .set("theme", serde_json::Value::String(setting.clone()));
-                self.theme_setting = Some(setting);
-                let _ = self.theme_apply_from_settings(true);
-            }
-            SettingsSelectorEvent::ThemePreview(setting) => {
-                // `onThemePreview` → `preview`
-                // (`theme-controller.ts:111-119`): switch the loaded theme
-                // without recording the setting.
-                let name = theme::resolve_theme_setting(Some(&setting))
-                    .unwrap_or_else(|| self.theme_active_name.clone());
-                let _ = theme::set_theme(&name);
-                self.tui.invalidate();
+            SettingsSelectorEvent::AutoCompactChange(enabled) => {
+                // `onAutoCompactChange` (`interactive-mode.ts:5149-5152`):
+                // `session.setAutoCompactionEnabled` =
+                // `settingsManager.setCompactionEnabled`
+                // (`agent-session.ts:3417-3419`), then the footer indicator.
+                self.settings.set_compaction_enabled(enabled);
+                if let Some(footer) = self.downcast_tree::<FooterComponent>(HostSlot::Footer) {
+                    footer.data.auto_compact_enabled = enabled;
+                }
                 self.tui.request_render();
                 self.update_editor_border_color();
+            }
+            SettingsSelectorEvent::ShowImagesChange(enabled) => {
+                // `onShowImagesChange` (`interactive-mode.ts:5153-5160`):
+                // persist; the live `ToolExecutionComponent.setShowImages`
+                // sweep lands with the image subsystem.
+                self.settings.set_show_images(enabled);
+            }
+            SettingsSelectorEvent::ImageWidthCellsChange(width) => {
+                // `onImageWidthCellsChange` (`interactive-mode.ts:5161-5168`).
+                self.settings.set_image_width_cells(width);
+            }
+            SettingsSelectorEvent::AutoResizeImagesChange(enabled) => {
+                // `onAutoResizeImagesChange` (`interactive-mode.ts:5169-5171`).
+                self.settings.set_image_auto_resize(enabled);
+            }
+            SettingsSelectorEvent::BlockImagesChange(blocked) => {
+                // `onBlockImagesChange` (`interactive-mode.ts:5172-5174`).
+                self.settings.set_block_images(blocked);
+            }
+            SettingsSelectorEvent::EnableSkillCommandsChange(enabled) => {
+                // `onEnableSkillCommandsChange`
+                // (`interactive-mode.ts:5175-5178`): persist; the
+                // autocomplete provider rebuild lands with the skill-command
+                // subsystem.
+                self.settings.set_enable_skill_commands(enabled);
+            }
+            SettingsSelectorEvent::ShowHardwareCursorChange(enabled) => {
+                // `onShowHardwareCursorChange`
+                // (`interactive-mode.ts:5259-5262`): persist, then push to
+                // the live TUI.
+                self.settings.set_show_hardware_cursor(enabled);
+                self.tui.set_show_hardware_cursor(enabled);
+            }
+            SettingsSelectorEvent::EditorPaddingXChange(padding) => {
+                // `onEditorPaddingXChange` (`interactive-mode.ts:5263-5269`):
+                // persist, then push to the editor (mounted or parked).
+                self.settings.set_editor_padding_x(padding);
+                if let Some(host) = self.editor_host_mut() {
+                    host.editor
+                        .set_padding_x(usize::try_from(padding).unwrap_or_default());
+                }
+            }
+            SettingsSelectorEvent::OutputPadChange(padding) => {
+                // `onOutputPadChange` (`interactive-mode.ts:5270-5281`):
+                // persist, remember for new rows, and update every chat row
+                // that has the setter.
+                self.settings.set_output_pad(padding);
+                self.output_pad = usize::try_from(padding).unwrap_or(1);
+                let output_pad = self.output_pad;
+                let chat_len = self.chat_len();
+                for index in 0..chat_len {
+                    if let Some(component) = self.downcast_chat::<AssistantMessageComponent>(index)
+                    {
+                        component.set_output_pad(output_pad);
+                    }
+                    if let Some(component) = self.downcast_chat::<UserMessageComponent>(index) {
+                        component.set_output_pad(output_pad);
+                    }
+                    if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
+                        component.set_output_pad(output_pad);
+                    }
+                    if let Some(component) = self.downcast_chat::<
+                        super::components::compaction_summary::CompactionSummaryMessageComponent,
+                    >(index)
+                    {
+                        component.set_output_pad(output_pad);
+                    }
+                    if let Some(component) = self.downcast_chat::<
+                        super::components::branch_summary::BranchSummaryMessageComponent,
+                    >(index)
+                    {
+                        component.set_output_pad(output_pad);
+                    }
+                }
+                self.tui.request_render();
+            }
+            SettingsSelectorEvent::AutocompleteMaxVisibleChange(max_visible) => {
+                // `onAutocompleteMaxVisibleChange`
+                // (`interactive-mode.ts:5282-5288`): persist, then push to
+                // the editor.
+                self.settings.set_autocomplete_max_visible(max_visible);
+                if let Some(host) = self.editor_host_mut() {
+                    host.editor
+                        .set_autocomplete_max_visible(usize::try_from(max_visible).unwrap_or(5));
+                }
+            }
+            SettingsSelectorEvent::ClearOnShrinkChange(enabled) => {
+                // `onClearOnShrinkChange` (`interactive-mode.ts:5289-5295`):
+                // persist, then push to the live TUI. The port's status
+                // lives in the chat, so upstream's status-container clear
+                // has no counterpart.
+                self.settings.set_clear_on_shrink(enabled);
+                self.tui.set_clear_on_shrink(enabled);
+            }
+            SettingsSelectorEvent::ShowTerminalProgressChange(enabled) => {
+                // `onShowTerminalProgressChange`
+                // (`interactive-mode.ts:5296-5298`); the OSC 9;4 writer is
+                // not ported yet.
+                self.settings.set_show_terminal_progress(enabled);
             }
             SettingsSelectorEvent::SteeringModeChange(mode) => {
                 // `onSteeringModeChange` → `session.setSteeringMode`
@@ -3718,14 +3890,88 @@ impl InteractiveMode {
                 self.settings
                     .set("followUpMode", serde_json::Value::String(mode));
             }
+            SettingsSelectorEvent::TransportChange(transport) => {
+                // `onTransportChange` (`interactive-mode.ts:5185-5188`):
+                // persist; the live agent transport swap lands with the
+                // transport subsystem.
+                self.settings.set_transport(&transport);
+            }
+            SettingsSelectorEvent::HttpIdleTimeoutMsChange(timeout_ms) => {
+                // `onHttpIdleTimeoutMsChange`
+                // (`interactive-mode.ts:5192-5196`): persist, then report;
+                // the dispatcher reconfiguration lands with the HTTP
+                // dispatcher subsystem.
+                let _ = self.settings.set_http_idle_timeout_ms(timeout_ms);
+                self.show_status(&format!(
+                    "HTTP idle timeout: {}",
+                    format_http_idle_timeout_ms(timeout_ms)
+                ));
+            }
+            SettingsSelectorEvent::CacheWarmingModeChange(mode) => {
+                // `onCacheWarmingModeChange`
+                // (`interactive-mode.ts:5197-5200`): persist; the warmer
+                // restart lands with the cache-warming subsystem.
+                self.settings.set_cache_warming_mode(&mode);
+                self.show_status(&format!("Cache warming: {mode}"));
+            }
             SettingsSelectorEvent::HideThinkingBlockChange(hidden) => {
                 // `onHideThinkingBlockChange`
-                // (`interactive-mode.ts:4306-4310`).
+                // (`interactive-mode.ts:5227-5231`).
                 self.hide_thinking_block = hidden;
                 self.settings
                     .set("hideThinkingBlock", serde_json::Value::Bool(hidden));
                 self.update_thinking_block_visibility();
                 self.tui.request_render();
+            }
+            SettingsSelectorEvent::MermaidRenderingModeChange(mode) => {
+                // `onMermaidRenderingModeChange`
+                // (`interactive-mode.ts:5232-5236`): persist, then repaint;
+                // the mermaid renderer lands with its subsystem.
+                self.settings.set_mermaid_rendering_mode(mode);
+                self.tui.request_render();
+            }
+            SettingsSelectorEvent::ShowCacheMissNoticesChange(shown) => {
+                // `onShowCacheMissNoticesChange`
+                // (`interactive-mode.ts:5237-5240`): persist; the chat
+                // rebuild lands with the cache-notice subsystem.
+                self.settings.set_show_cache_miss_notices(shown);
+            }
+            SettingsSelectorEvent::CollapseChangelogChange(collapsed) => {
+                // `onCollapseChangelogChange`
+                // (`interactive-mode.ts:5241-5243`).
+                self.settings.set_collapse_changelog(collapsed);
+            }
+            SettingsSelectorEvent::QuietStartupChange(quiet) => {
+                // `onQuietStartupChange` (`interactive-mode.ts:5247-5249`).
+                self.settings.set_quiet_startup(quiet);
+            }
+            SettingsSelectorEvent::EnableInstallTelemetryChange(enabled) => {
+                // `onEnableInstallTelemetryChange`
+                // (`interactive-mode.ts:5244-5246`); the ping is not ported
+                // yet.
+                self.settings.set_enable_install_telemetry(enabled);
+            }
+            SettingsSelectorEvent::DefaultProjectTrustChange(value) => {
+                // `onDefaultProjectTrustChange`
+                // (`interactive-mode.ts:5250-5252`).
+                self.settings
+                    .set("defaultProjectTrust", serde_json::Value::String(value));
+            }
+            SettingsSelectorEvent::DoubleEscapeActionChange(action) => {
+                // `onDoubleEscapeActionChange`
+                // (`interactive-mode.ts:5253-5255`); the double-escape
+                // handler lands with its subsystem.
+                self.settings.set_double_escape_action(&action);
+            }
+            SettingsSelectorEvent::TreeFilterModeChange(mode) => {
+                // `onTreeFilterModeChange` (`interactive-mode.ts:5256-5258`).
+                if let Some(mode) = crate::config::settings::TreeFilterMode::from_name(&mode) {
+                    self.settings.set_tree_filter_mode(mode);
+                }
+            }
+            SettingsSelectorEvent::WarningsChange(warnings) => {
+                // `onWarningsChange` (`interactive-mode.ts:5324-5326`).
+                self.settings.set_warnings(&warnings);
             }
             SettingsSelectorEvent::ModelThinkingLevelChange {
                 provider,
@@ -3737,9 +3983,23 @@ impl InteractiveMode {
             SettingsSelectorEvent::ModelThinkingLevelRemove { provider, model_id } => {
                 self.apply_model_thinking_level(&provider, &model_id, None);
             }
-            SettingsSelectorEvent::DefaultProjectTrustChange(value) => {
+            SettingsSelectorEvent::ThemeChange(setting) => {
+                // `onThemeChange` (`interactive-mode.ts:5222-5225`):
+                // persist, then re-apply through the controller.
                 self.settings
-                    .set("defaultProjectTrust", serde_json::Value::String(value));
+                    .set("theme", serde_json::Value::String(setting.clone()));
+                self.theme_setting = Some(setting);
+                let _ = self.theme_apply_from_settings(true);
+            }
+            SettingsSelectorEvent::ThemePreview(setting) => {
+                // `onThemePreview` → `preview`
+                // (`theme-controller.ts:111-119`): switch the loaded theme
+                // without recording the setting.
+                let name = theme::resolve_theme_setting(Some(&setting))
+                    .unwrap_or_else(|| self.theme_active_name.clone());
+                let _ = theme::set_theme(&name);
+                self.tui.invalidate();
+                self.tui.request_render();
             }
             SettingsSelectorEvent::Cancel => {
                 self.close_settings_selector();
@@ -4063,14 +4323,7 @@ impl InteractiveMode {
     /// `getCacheWarmingMode` (`settings-manager.ts:942-945`): the global
     /// `cacheWarming` setting when valid, else the default (`idle`).
     fn cache_warming_mode(&self) -> String {
-        const MODES: [&str; 3] = ["off", "streaming", "idle"];
-        self.settings
-            .get_global_settings()
-            .get("cacheWarming")
-            .and_then(|value| value.as_str())
-            .filter(|mode| MODES.contains(mode))
-            .unwrap_or("idle")
-            .to_string()
+        self.settings.get_cache_warming_mode()
     }
 
     /// `/hotkeys` (`handleHotkeysCommand`, `interactive-mode.ts:6999-7112`):
@@ -4418,7 +4671,7 @@ impl InteractiveMode {
             "bash",
             &format!("bash-{}", self.chat_len()),
             serde_json::json!({ "command": command }),
-            1,
+            self.output_pad,
             &self.session.get_cwd().to_string_lossy(),
             crate::tools::renderers::renderers_for("bash"),
         );

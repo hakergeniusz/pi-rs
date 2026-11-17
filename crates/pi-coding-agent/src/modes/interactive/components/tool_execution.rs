@@ -186,6 +186,12 @@ impl ToolExecutionComponent {
         self.update_display();
     }
 
+    /// `setOutputPad` (`tool-execution.ts:216-219`); the next render rebuilds
+    /// the content box from the field.
+    pub fn set_output_pad(&mut self, output_pad: usize) {
+        self.output_pad = output_pad;
+    }
+
     pub fn expanded(&self) -> bool {
         self.expanded
     }

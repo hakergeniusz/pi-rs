@@ -4,10 +4,15 @@
 //! Ground truth: `packages/coding-agent/src/core/settings-manager.ts` — the
 //! `Settings` shape (`:33-190`), the merge helpers (`:190-254`), the storage
 //! backends (`:267-377`), the load path (`:471-498`), and the manager
-//! (`:378-1533`). Only the data-layer surface is ported here: scoped access,
-//! merging, migration, and persistence. The per-key typed getters that only
-//! the interactive UI reads (themes, TUI layout, wheel scrolling, ...) are
-//! P6 land and are omitted.
+//! (`:378-1533`). The data-layer surface is ported: scoped access, merging,
+//! migration, and persistence, plus the typed per-key accessors the
+//! `/settings` selector reads and writes (the `settings-manager.ts:828-1533`
+//! getter/setter pairs, keyed by the `settings-schema.ts` names and the
+//! `settings-defaults.ts` defaults). The HTTP idle timeout helpers port
+//! `core/http-dispatcher.ts:4-43` (`DEFAULT_HTTP_IDLE_TIMEOUT_MS`,
+//! `HTTP_IDLE_TIMEOUT_CHOICES`, `parseHttpIdleTimeoutMs`,
+//! `formatHttpIdleTimeoutMs`) — the dispatcher machinery they configure is
+//! not ported yet.
 //!
 //! What is faithful:
 //!
@@ -69,6 +74,88 @@ pub const DEFAULT_BRANCH_SUMMARY_SKIP_PROMPT: bool = false;
 pub const DEFAULT_RETRY_ENABLED: bool = true;
 pub const DEFAULT_RETRY_MAX_RETRIES: i64 = 3;
 pub const DEFAULT_RETRY_BASE_DELAY_MS: i64 = 2000;
+
+/// The `SETTINGS_DEFAULTS` values the selector-driven accessors resolve
+/// (`settings-defaults.ts`); grouped by their `settings-schema.ts` key.
+pub const DEFAULT_TRANSPORT: &str = "auto";
+pub const DEFAULT_HIDE_THINKING_BLOCK: bool = false;
+pub const DEFAULT_SHOW_CACHE_MISS_NOTICES: bool = false;
+pub const DEFAULT_QUIET_STARTUP: QuietStartup = QuietStartup::Off;
+pub const DEFAULT_DEFAULT_PROJECT_TRUST: DefaultProjectTrust = DefaultProjectTrust::Ask;
+pub const DEFAULT_COLLAPSE_CHANGELOG: bool = false;
+pub const DEFAULT_ENABLE_INSTALL_TELEMETRY: bool = true;
+pub const DEFAULT_ENABLE_SKILL_COMMANDS: bool = true;
+pub const DEFAULT_DOUBLE_ESCAPE_ACTION: &str = "tree";
+pub const DEFAULT_EDITOR_PADDING_X: i64 = 0;
+pub const DEFAULT_OUTPUT_PAD: i64 = 1;
+pub const DEFAULT_AUTOCOMPLETE_MAX_VISIBLE: i64 = 5;
+pub const DEFAULT_MERMAID_RENDERING_MODE: MermaidRenderingMode = MermaidRenderingMode::Streaming;
+pub const DEFAULT_WARNINGS_ANTHROPIC_EXTRA_USAGE: bool = true;
+/// `SETTINGS_DEFAULTS.terminal` (`settings-defaults.ts:35-40`).
+pub const DEFAULT_TERMINAL_SHOW_IMAGES: bool = true;
+pub const DEFAULT_TERMINAL_IMAGE_WIDTH_CELLS: i64 = 60;
+pub const DEFAULT_TERMINAL_CLEAR_ON_SHRINK: bool = false;
+pub const DEFAULT_TERMINAL_SHOW_TERMINAL_PROGRESS: bool = false;
+/// `SETTINGS_DEFAULTS.images` (`settings-defaults.ts:41-44`).
+pub const DEFAULT_IMAGES_AUTO_RESIZE: bool = true;
+pub const DEFAULT_IMAGES_BLOCK_IMAGES: bool = false;
+/// `SETTINGS_DEFAULTS.cacheWarming` (`settings-defaults.ts:61`).
+pub const DEFAULT_CACHE_WARMING: &str = "idle";
+
+/// `DEFAULT_HTTP_IDLE_TIMEOUT_MS` (`core/http-dispatcher.ts:4`).
+pub const DEFAULT_HTTP_IDLE_TIMEOUT_MS: i64 = 300_000;
+
+/// `HTTP_IDLE_TIMEOUT_CHOICES` (`core/http-dispatcher.ts:8-14`): the row
+/// values of the HTTP idle timeout setting, label first.
+pub const HTTP_IDLE_TIMEOUT_CHOICES: [(&str, i64); 5] = [
+    ("30 sec", 30_000),
+    ("1 min", 60_000),
+    ("2 min", 120_000),
+    ("5 min", 300_000),
+    ("disabled", 0),
+];
+
+/// `CACHE_WARMING_MODES` (`settings-manager.ts:54`).
+pub const CACHE_WARMING_MODES: [&str; 3] = ["off", "streaming", "idle"];
+
+/// `parseHttpIdleTimeoutMs` (`core/http-dispatcher.ts:19-35`): a trimmed
+/// case-insensitive `"disabled"` is 0, a numeric string or a non-negative
+/// finite number floors, anything else (including an empty string) is
+/// `None`.
+pub fn parse_http_idle_timeout_ms(value: &Value) -> Option<i64> {
+    let number = match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.eq_ignore_ascii_case("disabled") {
+                return Some(0);
+            }
+            if trimmed.is_empty() {
+                return None;
+            }
+            // `Number(trimmed)` in TS; an unparseable string is NaN.
+            Some(trimmed.parse::<f64>().ok()?)
+        }
+        Value::Number(number) => Some(number.as_f64()?),
+        _ => None,
+    };
+    let timeout = number?;
+    if !timeout.is_finite() || timeout < 0.0 {
+        return None;
+    }
+    Some(timeout.floor() as i64)
+}
+
+/// `formatHttpIdleTimeoutMs` (`core/http-dispatcher.ts:37-43`): a choice
+/// label when the value is one, else the seconds (`45000` → `"45 sec"`).
+pub fn format_http_idle_timeout_ms(timeout_ms: i64) -> String {
+    if let Some((label, _)) = HTTP_IDLE_TIMEOUT_CHOICES
+        .iter()
+        .find(|(_, choice)| *choice == timeout_ms)
+    {
+        return (*label).to_string();
+    }
+    format!("{} sec", timeout_ms as f64 / 1000.0)
+}
 
 // ---------------------------------------------------------------------------
 // merge helpers
@@ -540,7 +627,9 @@ impl TreeFilterMode {
         TreeFilterMode::All,
     ];
 
-    fn from_name(name: &str) -> Option<Self> {
+    /// The wire name → variant; an unknown name is `None` (the getter falls
+    /// back to the default, `settings-manager.ts:1379-1383`).
+    pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "default" => Some(Self::Default),
             "no-tools" => Some(Self::NoTools),
@@ -606,6 +695,112 @@ impl From<FullscreenScrollbar> for pi_tui::components::scroll_view::Scrollbar {
             FullscreenScrollbar::Auto => Self::Auto,
             FullscreenScrollbar::Always => Self::Always,
             FullscreenScrollbar::Hidden => Self::Hidden,
+        }
+    }
+}
+
+/// The startup output volume (`quietStartup`,
+/// `settings-schema.ts:265-270`): `false` verbose, `true` hide everything,
+/// `"header"` keep only the startup header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuietStartup {
+    /// Verbose startup output (the default).
+    #[default]
+    Off,
+    /// Hide all startup output.
+    Quiet,
+    /// Keep only the startup header.
+    Header,
+}
+
+impl QuietStartup {
+    /// `getQuietStartup` (`settings-manager.ts:1009-1012`): only `true` and
+    /// `"header"` survive; anything else — `false` included — is the
+    /// default.
+    fn from_setting(value: &Value) -> Option<Self> {
+        match value {
+            Value::Bool(true) => Some(Self::Quiet),
+            Value::String(text) if text == "header" => Some(Self::Header),
+            _ => None,
+        }
+    }
+
+    /// The stored JSON form (`settings-schema.ts:265-270`).
+    fn to_value(self) -> Value {
+        match self {
+            Self::Off => Value::Bool(false),
+            Self::Quiet => Value::Bool(true),
+            Self::Header => Value::String("header".to_string()),
+        }
+    }
+}
+
+/// The fallback when no extension or saved trust decision decides project
+/// trust (`defaultProjectTrust`, `settings-schema.ts:271-276`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DefaultProjectTrust {
+    /// Ask every time (the default).
+    #[default]
+    Ask,
+    /// Trust without asking.
+    Always,
+    /// Never trust.
+    Never,
+}
+
+impl DefaultProjectTrust {
+    /// The wire spelling (`settings-manager.ts:1020-1023`).
+    pub fn as_name(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+
+    /// `getDefaultProjectTrust` (`settings-manager.ts:1020-1023`): only
+    /// `"always"` and `"never"` survive; note the read is **global only**
+    /// (`this.globalSettings.defaultProjectTrust`).
+    fn from_setting(value: &Value) -> Option<Self> {
+        match value.as_str()? {
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
+
+/// The Mermaid rendering mode (`markdown.mermaid`,
+/// `settings-schema.ts:135-142`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MermaidRenderingMode {
+    /// Render Mermaid code blocks as plain code.
+    Off,
+    /// Render once the message completes.
+    Final,
+    /// Render while the message streams (the default).
+    #[default]
+    Streaming,
+}
+
+impl MermaidRenderingMode {
+    /// `getMermaidRenderingMode` (`settings-manager.ts:1435-1438`): only
+    /// `"off"` and `"final"` survive; `"streaming"` never needs storing — it
+    /// is the default.
+    fn from_setting(value: &Value) -> Option<Self> {
+        match value.as_str()? {
+            "off" => Some(Self::Off),
+            "final" => Some(Self::Final),
+            _ => None,
+        }
+    }
+
+    /// The wire spelling.
+    pub fn as_name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Final => "final",
+            Self::Streaming => "streaming",
         }
     }
 }
@@ -1503,6 +1698,355 @@ impl SettingsManager {
         };
         self.set_global("fullscreenWheelScrollLines", value);
     }
+
+    // -- the /settings selector accessors ------------------------------------
+    //
+    // The `settings-manager.ts:828-1533` getter/setter pairs the
+    // `SettingsSelectorComponent` rows read and write, in the selectors'
+    // row order. Rows whose machinery is not ported yet persist the flag
+    // only; the consumer lands with its subsystem.
+
+    // -- images --------------------------------------------------------------
+
+    /// `getShowImages` (`settings-manager.ts:1208-1210`).
+    pub fn get_show_images(&self) -> bool {
+        bool_or(
+            self.nested("terminal", "showImages"),
+            DEFAULT_TERMINAL_SHOW_IMAGES,
+        )
+    }
+
+    /// `setShowImages` (`settings-manager.ts:1212-1219`).
+    pub fn set_show_images(&mut self, show: bool) {
+        self.set_global_nested("terminal", "showImages", Value::Bool(show));
+    }
+
+    /// `getImageWidthCells` (`settings-manager.ts:1221-1227`): a present
+    /// non-number falls back to the default; a number clamps to >= 1.
+    pub fn get_image_width_cells(&self) -> i64 {
+        self.nested("terminal", "imageWidthCells")
+            .and_then(Value::as_f64)
+            .filter(|width| width.is_finite())
+            .map_or(DEFAULT_TERMINAL_IMAGE_WIDTH_CELLS, |width| {
+                width.floor().max(1.0) as i64
+            })
+    }
+
+    /// `setImageWidthCells` (`settings-manager.ts:1229-1236`).
+    pub fn set_image_width_cells(&mut self, width: i64) {
+        let clamped = width.max(1);
+        self.set_global_nested("terminal", "imageWidthCells", Value::from(clamped));
+    }
+
+    /// `getImageAutoResize` (`settings-manager.ts:1326-1328`).
+    pub fn get_image_auto_resize(&self) -> bool {
+        bool_or(
+            self.nested("images", "autoResize"),
+            DEFAULT_IMAGES_AUTO_RESIZE,
+        )
+    }
+
+    /// `setImageAutoResize` (`settings-manager.ts:1330-1337`).
+    pub fn set_image_auto_resize(&mut self, enabled: bool) {
+        self.set_global_nested("images", "autoResize", Value::Bool(enabled));
+    }
+
+    /// `getBlockImages` (`settings-manager.ts:1339-1341`).
+    pub fn get_block_images(&self) -> bool {
+        bool_or(
+            self.nested("images", "blockImages"),
+            DEFAULT_IMAGES_BLOCK_IMAGES,
+        )
+    }
+
+    /// `setBlockImages` (`settings-manager.ts:1343-1350`).
+    pub fn set_block_images(&mut self, blocked: bool) {
+        self.set_global_nested("images", "blockImages", Value::Bool(blocked));
+    }
+
+    // -- skills and transport ------------------------------------------------
+
+    /// `getEnableSkillCommands` (`settings-manager.ts:1184-1186`).
+    pub fn get_enable_skill_commands(&self) -> bool {
+        bool_or(
+            self.settings.get("enableSkillCommands"),
+            DEFAULT_ENABLE_SKILL_COMMANDS,
+        )
+    }
+
+    /// `setEnableSkillCommands` (`settings-manager.ts:1188-1192`).
+    pub fn set_enable_skill_commands(&mut self, enabled: bool) {
+        self.set_global("enableSkillCommands", Value::Bool(enabled));
+    }
+
+    /// `getTransport` (`settings-manager.ts:810-812`): the raw merged value
+    /// when set — pi does not validate here — else the default.
+    pub fn get_transport(&self) -> String {
+        opt_string(self.settings.get("transport")).unwrap_or_else(|| DEFAULT_TRANSPORT.to_string())
+    }
+
+    /// `setTransport` (`settings-manager.ts:814-818`).
+    pub fn set_transport(&mut self, transport: &str) {
+        self.set_global("transport", Value::String(transport.to_string()));
+    }
+
+    // -- http and cache ------------------------------------------------------
+
+    /// `getHttpIdleTimeoutMs` (`settings-manager.ts:928-930` via
+    /// `parseTimeoutSetting`, `:149-158`): a present-but-unparseable value
+    /// throws upstream, so the port reports it as `Err`.
+    pub fn get_http_idle_timeout_ms(&self) -> Result<i64, String> {
+        match self.settings.get("httpIdleTimeoutMs") {
+            None => Ok(DEFAULT_HTTP_IDLE_TIMEOUT_MS),
+            Some(value) => parse_http_idle_timeout_ms(value).ok_or_else(|| {
+                format!(
+                    "Invalid httpIdleTimeoutMs setting: {}",
+                    js_value_to_string(value)
+                )
+            }),
+        }
+    }
+
+    /// `setHttpIdleTimeoutMs` (`settings-manager.ts:932-939`): a negative
+    /// timeout throws upstream, so the port reports it as `Err`.
+    pub fn set_http_idle_timeout_ms(&mut self, timeout_ms: i64) -> Result<(), String> {
+        if timeout_ms < 0 {
+            return Err(format!("Invalid httpIdleTimeoutMs setting: {timeout_ms}"));
+        }
+        self.set_global("httpIdleTimeoutMs", Value::from(timeout_ms));
+        Ok(())
+    }
+
+    /// `getCacheWarmingMode` (`settings-manager.ts:941-945`): the **global**
+    /// layer only, because warming costs money; an unknown value is the
+    /// default.
+    pub fn get_cache_warming_mode(&self) -> String {
+        self.global_settings
+            .get("cacheWarming")
+            .and_then(Value::as_str)
+            .filter(|mode| CACHE_WARMING_MODES.contains(mode))
+            .unwrap_or(DEFAULT_CACHE_WARMING)
+            .to_string()
+    }
+
+    /// `setCacheWarmingMode` (`settings-manager.ts:947-951`).
+    pub fn set_cache_warming_mode(&mut self, mode: &str) {
+        self.set_global("cacheWarming", Value::String(mode.to_string()));
+    }
+
+    // -- notices, changelog, telemetry ---------------------------------------
+
+    /// `getShowCacheMissNotices` (`settings-manager.ts:970-972`).
+    pub fn get_show_cache_miss_notices(&self) -> bool {
+        bool_or(
+            self.settings.get("showCacheMissNotices"),
+            DEFAULT_SHOW_CACHE_MISS_NOTICES,
+        )
+    }
+
+    /// `setShowCacheMissNotices` (`settings-manager.ts:992-996`).
+    pub fn set_show_cache_miss_notices(&mut self, show: bool) {
+        self.set_global("showCacheMissNotices", Value::Bool(show));
+    }
+
+    /// `getCollapseChangelog` (`settings-manager.ts:1051-1053`).
+    pub fn get_collapse_changelog(&self) -> bool {
+        bool_or(
+            self.settings.get("collapseChangelog"),
+            DEFAULT_COLLAPSE_CHANGELOG,
+        )
+    }
+
+    /// `setCollapseChangelog` (`settings-manager.ts:1055-1059`).
+    pub fn set_collapse_changelog(&mut self, collapse: bool) {
+        self.set_global("collapseChangelog", Value::Bool(collapse));
+    }
+
+    /// `getEnableInstallTelemetry` (`settings-manager.ts:1061-1063`). The
+    /// ping itself is not ported yet; the flag persists.
+    pub fn get_enable_install_telemetry(&self) -> bool {
+        bool_or(
+            self.settings.get("enableInstallTelemetry"),
+            DEFAULT_ENABLE_INSTALL_TELEMETRY,
+        )
+    }
+
+    /// `setEnableInstallTelemetry` (`settings-manager.ts:1065-1069`).
+    pub fn set_enable_install_telemetry(&mut self, enabled: bool) {
+        self.set_global("enableInstallTelemetry", Value::Bool(enabled));
+    }
+
+    // -- quiet startup and project trust -------------------------------------
+
+    /// `getQuietStartup` (`settings-manager.ts:1009-1012`).
+    pub fn get_quiet_startup(&self) -> QuietStartup {
+        self.settings
+            .get("quietStartup")
+            .and_then(QuietStartup::from_setting)
+            .unwrap_or(DEFAULT_QUIET_STARTUP)
+    }
+
+    /// `setQuietStartup` (`settings-manager.ts:1014-1018`).
+    pub fn set_quiet_startup(&mut self, quiet: QuietStartup) {
+        self.set_global("quietStartup", quiet.to_value());
+    }
+
+    /// `getDefaultProjectTrust` (`settings-manager.ts:1020-1023`): the
+    /// **global** layer only.
+    pub fn get_default_project_trust(&self) -> DefaultProjectTrust {
+        self.global_settings
+            .get("defaultProjectTrust")
+            .and_then(DefaultProjectTrust::from_setting)
+            .unwrap_or(DEFAULT_DEFAULT_PROJECT_TRUST)
+    }
+
+    /// `setDefaultProjectTrust` (`settings-manager.ts:1025-1029`).
+    pub fn set_default_project_trust(&mut self, trust: DefaultProjectTrust) {
+        self.set_global(
+            "defaultProjectTrust",
+            Value::String(trust.as_name().to_string()),
+        );
+    }
+
+    // -- editor, output, terminal ---------------------------------------------
+
+    /// `getDoubleEscapeAction` (`settings-manager.ts:1369-1371`).
+    pub fn get_double_escape_action(&self) -> String {
+        opt_string(self.settings.get("doubleEscapeAction"))
+            .unwrap_or_else(|| DEFAULT_DOUBLE_ESCAPE_ACTION.to_string())
+    }
+
+    /// `setDoubleEscapeAction` (`settings-manager.ts:1373-1377`).
+    pub fn set_double_escape_action(&mut self, action: &str) {
+        self.set_global("doubleEscapeAction", Value::String(action.to_string()));
+    }
+
+    /// `getShowHardwareCursor` (`settings-manager.ts:1391-1393`): the
+    /// setting, else the `PI_HARDWARE_CURSOR=1` environment opt-in.
+    pub fn get_show_hardware_cursor(&self) -> bool {
+        self.settings
+            .get("showHardwareCursor")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| std::env::var("PI_HARDWARE_CURSOR").is_ok_and(|v| v == "1"))
+    }
+
+    /// `setShowHardwareCursor` (`settings-manager.ts:1395-1399`).
+    pub fn set_show_hardware_cursor(&mut self, enabled: bool) {
+        self.set_global("showHardwareCursor", Value::Bool(enabled));
+    }
+
+    /// `getEditorPaddingX` (`settings-manager.ts:1401-1403`).
+    pub fn get_editor_padding_x(&self) -> i64 {
+        self.settings
+            .get("editorPaddingX")
+            .and_then(Value::as_i64)
+            .unwrap_or(DEFAULT_EDITOR_PADDING_X)
+    }
+
+    /// `setEditorPaddingX` (`settings-manager.ts:1405-1409`): clamped to
+    /// 0–3.
+    pub fn set_editor_padding_x(&mut self, padding: i64) {
+        self.set_global("editorPaddingX", Value::from(padding.clamp(0, 3)));
+    }
+
+    /// `getOutputPad` (`settings-manager.ts:1411-1413`): anything but a
+    /// stored `0` resolves to the default, 1.
+    pub fn get_output_pad(&self) -> i64 {
+        match self.settings.get("outputPad") {
+            Some(value) if value.as_i64() == Some(0) => 0,
+            _ => DEFAULT_OUTPUT_PAD,
+        }
+    }
+
+    /// `setOutputPad` (`settings-manager.ts:1415-1419`).
+    pub fn set_output_pad(&mut self, padding: i64) {
+        self.set_global("outputPad", Value::from(padding));
+    }
+
+    /// `getAutocompleteMaxVisible` (`settings-manager.ts:1421-1423`).
+    pub fn get_autocomplete_max_visible(&self) -> i64 {
+        self.settings
+            .get("autocompleteMaxVisible")
+            .and_then(Value::as_i64)
+            .unwrap_or(DEFAULT_AUTOCOMPLETE_MAX_VISIBLE)
+    }
+
+    /// `setAutocompleteMaxVisible` (`settings-manager.ts:1425-1429`):
+    /// clamped to 3–20.
+    pub fn set_autocomplete_max_visible(&mut self, max_visible: i64) {
+        self.set_global(
+            "autocompleteMaxVisible",
+            Value::from(max_visible.clamp(3, 20)),
+        );
+    }
+
+    /// `getClearOnShrink` (`settings-manager.ts:1238-1245`): the setting
+    /// first, then the `PI_CLEAR_ON_SHRINK=1` environment opt-in, then the
+    /// default.
+    pub fn get_clear_on_shrink(&self) -> bool {
+        if let Some(value) = self
+            .nested("terminal", "clearOnShrink")
+            .filter(|v| !v.is_null())
+        {
+            return js_truthy(value);
+        }
+        if std::env::var("PI_CLEAR_ON_SHRINK").is_ok_and(|v| v == "1") {
+            return true;
+        }
+        DEFAULT_TERMINAL_CLEAR_ON_SHRINK
+    }
+
+    /// `setClearOnShrink` (`settings-manager.ts:1247-1254`).
+    pub fn set_clear_on_shrink(&mut self, enabled: bool) {
+        self.set_global_nested("terminal", "clearOnShrink", Value::Bool(enabled));
+    }
+
+    /// `getShowTerminalProgress` (`settings-manager.ts:1256-1258`).
+    pub fn get_show_terminal_progress(&self) -> bool {
+        bool_or(
+            self.nested("terminal", "showTerminalProgress"),
+            DEFAULT_TERMINAL_SHOW_TERMINAL_PROGRESS,
+        )
+    }
+
+    /// `setShowTerminalProgress` (`settings-manager.ts:1260-1267`).
+    pub fn set_show_terminal_progress(&mut self, enabled: bool) {
+        self.set_global_nested("terminal", "showTerminalProgress", Value::Bool(enabled));
+    }
+
+    // -- markdown and warnings ------------------------------------------------
+
+    /// `getMermaidRenderingMode` (`settings-manager.ts:1435-1438`).
+    pub fn get_mermaid_rendering_mode(&self) -> MermaidRenderingMode {
+        self.nested("markdown", "mermaid")
+            .and_then(MermaidRenderingMode::from_setting)
+            .unwrap_or(DEFAULT_MERMAID_RENDERING_MODE)
+    }
+
+    /// `setMermaidRenderingMode` (`settings-manager.ts:1440-1445`).
+    pub fn set_mermaid_rendering_mode(&mut self, mode: MermaidRenderingMode) {
+        self.set_global_nested(
+            "markdown",
+            "mermaid",
+            Value::String(mode.as_name().to_string()),
+        );
+    }
+
+    /// `getWarnings` (`settings-manager.ts:1447-1449`): the whole
+    /// `warnings` object — unknown keys ride along, exactly like the TS
+    /// spread.
+    pub fn get_warnings(&self) -> Settings {
+        self.settings
+            .get("warnings")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// `setWarnings` (`settings-manager.ts:1451-1455`).
+    pub fn set_warnings(&mut self, warnings: &Settings) {
+        self.set_global("warnings", Value::Object(warnings.clone()));
+    }
 }
 
 #[cfg(test)]
@@ -1915,5 +2459,289 @@ mod tests {
         assert_eq!(TreeFilterMode::UserOnly.status_label(), " [user]");
         assert_eq!(TreeFilterMode::LabeledOnly.status_label(), " [labeled]");
         assert_eq!(TreeFilterMode::All.status_label(), " [all]");
+    }
+
+    // -- the /settings selector accessors ------------------------------------
+
+    /// `getShowImages`/`setShowImages` and the image rows' nested settings
+    /// keys (`settings-manager.ts:1208-1236`), with a round-trip through the
+    /// file.
+    #[test]
+    fn image_settings_round_trip_through_the_file() {
+        let mut manager = manager_with_global(&json!({}));
+        assert!(manager.get_show_images());
+        assert_eq!(manager.get_image_width_cells(), 60);
+        assert!(manager.get_image_auto_resize());
+        assert!(!manager.get_block_images());
+
+        manager.set_show_images(false);
+        manager.set_image_width_cells(120);
+        manager.set_image_auto_resize(false);
+        manager.set_block_images(true);
+        manager.flush();
+        let global = manager.get_global_settings();
+        assert_eq!(
+            global.get("terminal"),
+            Some(&json!({
+                "showImages": false,
+                "imageWidthCells": 120,
+            }))
+        );
+        assert_eq!(
+            global.get("images"),
+            Some(&json!({"autoResize": false, "blockImages": true}))
+        );
+
+        // The clamps: a width below 1 floors at 1
+        // (`settings-manager.ts:1233`).
+        manager.set_image_width_cells(0);
+        assert_eq!(manager.get_image_width_cells(), 1);
+        // A malformed stored value degrades to the default
+        // (`settings-manager.ts:1223-1225`).
+        let manager = manager_with_global(&json!({ "terminal": { "imageWidthCells": "big" } }));
+        assert_eq!(manager.get_image_width_cells(), 60);
+    }
+
+    /// `getQuietStartup`/`setQuietStartup` (`settings-manager.ts:1009-1018`):
+    /// only `true` and `"header"` survive, and each variant stores its own
+    /// JSON form.
+    #[test]
+    fn quiet_startup_round_trips_the_three_forms() {
+        let manager = manager_with_global(&json!({ "quietStartup": true }));
+        assert_eq!(manager.get_quiet_startup(), QuietStartup::Quiet);
+        let manager = manager_with_global(&json!({ "quietStartup": "header" }));
+        assert_eq!(manager.get_quiet_startup(), QuietStartup::Header);
+        // `false`, a bogus string, and a number all fall back to the
+        // default (`settings-manager.ts:1010-1011`).
+        for bogus in [json!(false), json!("no"), json!(3)] {
+            let manager = manager_with_global(&json!({ "quietStartup": bogus }));
+            assert_eq!(manager.get_quiet_startup(), QuietStartup::Off, "{bogus}");
+        }
+
+        let mut manager = manager_with_global(&json!({}));
+        manager.set_quiet_startup(QuietStartup::Header);
+        assert_eq!(
+            manager.get_global_settings().get("quietStartup"),
+            Some(&json!("header"))
+        );
+        manager.set_quiet_startup(QuietStartup::Quiet);
+        assert_eq!(
+            manager.get_global_settings().get("quietStartup"),
+            Some(&json!(true))
+        );
+        manager.set_quiet_startup(QuietStartup::Off);
+        assert_eq!(
+            manager.get_global_settings().get("quietStartup"),
+            Some(&json!(false))
+        );
+    }
+
+    /// `getDefaultProjectTrust`/`setDefaultProjectTrust`
+    /// (`settings-manager.ts:1020-1029`): the global layer only, and only
+    /// `"always"`/`"never"` survive.
+    #[test]
+    fn default_project_trust_reads_the_global_layer_only() {
+        let manager = manager_with_global(&json!({ "defaultProjectTrust": "always" }));
+        assert_eq!(
+            manager.get_default_project_trust(),
+            DefaultProjectTrust::Always
+        );
+        let manager = manager_with_global(&json!({ "defaultProjectTrust": "bogus" }));
+        assert_eq!(
+            manager.get_default_project_trust(),
+            DefaultProjectTrust::Ask
+        );
+
+        let mut manager = manager_with_global(&json!({}));
+        manager.set_default_project_trust(DefaultProjectTrust::Never);
+        assert_eq!(
+            manager.get_global_settings().get("defaultProjectTrust"),
+            Some(&json!("never"))
+        );
+    }
+
+    /// `getHttpIdleTimeoutMs`/`setHttpIdleTimeoutMs`
+    /// (`settings-manager.ts:928-939`, `core/http-dispatcher.ts:19-43`):
+    /// strings parse (`"disabled"`, numeric), an invalid value errors like
+    /// upstream's throw, and the label formatting matches the choices.
+    #[test]
+    fn http_idle_timeout_parses_validates_and_formats() {
+        let manager = manager_with_global(&json!({}));
+        assert_eq!(manager.get_http_idle_timeout_ms(), Ok(300_000));
+        for (value, expected) in [
+            (json!("disabled"), 0),
+            (json!("DISABLED"), 0),
+            (json!(" 60000 "), 60_000),
+            (json!(45_000.5), 45_000),
+        ] {
+            let manager = manager_with_global(&json!({ "httpIdleTimeoutMs": value }));
+            assert_eq!(manager.get_http_idle_timeout_ms(), Ok(expected), "{value}");
+        }
+        // Unparseable values throw upstream (`settings-manager.ts:154-157`).
+        for bogus in [json!("nope"), json!(null), json!(-1)] {
+            let manager = manager_with_global(&json!({ "httpIdleTimeoutMs": bogus }));
+            assert!(
+                manager.get_http_idle_timeout_ms().is_err(),
+                "{bogus} should be invalid"
+            );
+        }
+        // The setter rejects a negative timeout like upstream's throw.
+        let mut manager = manager_with_global(&json!({}));
+        assert!(
+            manager
+                .set_http_idle_timeout_ms(-1)
+                .err()
+                .is_some_and(|message| message.contains("Invalid httpIdleTimeoutMs"))
+        );
+        manager.set_http_idle_timeout_ms(60_000);
+        assert_eq!(manager.get_http_idle_timeout_ms(), Ok(60_000));
+
+        assert_eq!(parse_http_idle_timeout_ms(&json!("")), None);
+        assert_eq!(format_http_idle_timeout_ms(0), "disabled");
+        assert_eq!(format_http_idle_timeout_ms(120_000), "2 min");
+    }
+
+    /// `getCacheWarmingMode`/`setCacheWarmingMode`
+    /// (`settings-manager.ts:941-951`): the **global** layer only, an
+    /// unknown value is the default, and the modes list matches
+    /// `CACHE_WARMING_MODES`.
+    #[test]
+    fn cache_warming_reads_the_global_layer_only() {
+        assert_eq!(CACHE_WARMING_MODES, ["off", "streaming", "idle"]);
+        let manager = manager_with_global(&json!({ "cacheWarming": "off" }));
+        assert_eq!(manager.get_cache_warming_mode(), "off");
+        let manager = manager_with_global(&json!({ "cacheWarming": "bogus" }));
+        assert_eq!(manager.get_cache_warming_mode(), "idle");
+
+        let mut manager = manager_with_global(&json!({}));
+        manager.set_cache_warming_mode("off");
+        manager.flush();
+        assert_eq!(
+            manager.get_global_settings().get("cacheWarming"),
+            Some(&json!("off"))
+        );
+    }
+
+    /// The persist-only selector rows: telemetry, changelog, transport,
+    /// notices, skill commands, and the editor/output/terminal values
+    /// round-trip through the file with upstream's keys and clamps
+    /// (`settings-manager.ts:1051-1069,1184-1192,1369-1429`).
+    #[test]
+    fn selector_flag_settings_round_trip_through_the_file() {
+        let mut manager = manager_with_global(&json!({}));
+        manager.set_enable_install_telemetry(false);
+        manager.set_collapse_changelog(true);
+        manager.set_transport("websocket");
+        manager.set_show_cache_miss_notices(true);
+        manager.set_enable_skill_commands(false);
+        manager.set_double_escape_action("fork");
+        manager.set_show_terminal_progress(true);
+        manager.set_editor_padding_x(9);
+        manager.set_output_pad(0);
+        manager.set_autocomplete_max_visible(2);
+        manager.flush();
+        let global = manager.get_global_settings();
+        assert_eq!(global.get("enableInstallTelemetry"), Some(&json!(false)));
+        assert_eq!(global.get("collapseChangelog"), Some(&json!(true)));
+        assert_eq!(global.get("transport"), Some(&json!("websocket")));
+        assert_eq!(global.get("showCacheMissNotices"), Some(&json!(true)));
+        assert_eq!(global.get("enableSkillCommands"), Some(&json!(false)));
+        assert_eq!(global.get("doubleEscapeAction"), Some(&json!("fork")));
+        assert_eq!(global.get("showTerminalProgress"), Some(&json!(true)));
+        // The clamps (`settings-manager.ts:1406,1426`).
+        assert_eq!(global.get("editorPaddingX"), Some(&json!(3)));
+        assert_eq!(global.get("outputPad"), Some(&json!(0)));
+        assert_eq!(global.get("autocompleteMaxVisible"), Some(&json!(3)));
+
+        assert_eq!(manager.get_editor_padding_x(), 3);
+        assert_eq!(manager.get_output_pad(), 0);
+        assert_eq!(manager.get_autocomplete_max_visible(), 3);
+        assert_eq!(manager.get_transport(), "websocket");
+        assert_eq!(manager.get_double_escape_action(), "fork");
+
+        // An absent `outputPad` resolves to 1 (`settings-manager.ts:1412`).
+        let manager = manager_with_global(&json!({}));
+        assert_eq!(manager.get_output_pad(), 1);
+    }
+
+    /// The selector values survive the storage round trip: set → flush → a
+    /// fresh manager over the same storage re-reads them.
+    #[test]
+    fn selector_values_persist_to_storage_and_reload() {
+        let storage = Arc::new(InMemorySettingsStorage::default());
+        let mut manager =
+            SettingsManager::from_storage(storage.clone(), SettingsManagerCreateOptions::default());
+        manager.set_enable_install_telemetry(false);
+        manager.set_collapse_changelog(true);
+        manager.set_image_width_cells(80);
+        manager.set_block_images(true);
+        manager.set_quiet_startup(QuietStartup::Header);
+        manager.set_editor_padding_x(2);
+        manager.flush();
+
+        let reloaded =
+            SettingsManager::from_storage(storage, SettingsManagerCreateOptions::default());
+        assert!(!reloaded.get_enable_install_telemetry());
+        assert!(reloaded.get_collapse_changelog());
+        assert_eq!(reloaded.get_image_width_cells(), 80);
+        assert!(reloaded.get_block_images());
+        assert_eq!(reloaded.get_quiet_startup(), QuietStartup::Header);
+        assert_eq!(reloaded.get_editor_padding_x(), 2);
+    }
+
+    /// `getWarnings`/`setWarnings` (`settings-manager.ts:1447-1455`): the
+    /// whole object round-trips, unknown keys included, and the submenu's
+    /// default applies when the key is absent.
+    #[test]
+    fn warnings_round_trip_unknown_keys_included() {
+        let manager = manager_with_global(&json!({}));
+        assert_eq!(manager.get_warnings(), Settings::new());
+        assert_eq!(
+            manager
+                .get_warnings()
+                .get("anthropicExtraUsage")
+                .and_then(Value::as_bool)
+                .unwrap_or(DEFAULT_WARNINGS_ANTHROPIC_EXTRA_USAGE),
+            true
+        );
+
+        let mut manager = manager_with_global(&json!({}));
+        let mut warnings = manager.get_warnings();
+        warnings.insert("anthropicExtraUsage".to_string(), Value::Bool(false));
+        warnings.insert("customKey".to_string(), json!("rides along"));
+        manager.set_warnings(&warnings);
+        manager.flush();
+        let stored = manager.get_global_settings().get("warnings").unwrap();
+        assert_eq!(stored.get("anthropicExtraUsage"), Some(&json!(false)));
+        assert_eq!(stored.get("customKey"), Some(&json!("rides along")));
+    }
+
+    /// `getMermaidRenderingMode`/`setMermaidRenderingMode`
+    /// (`settings-manager.ts:1435-1445`): nested under `markdown`, and only
+    /// `"off"`/`"final"` are read back — `"streaming"` is the default.
+    #[test]
+    fn mermaid_mode_nests_under_markdown() {
+        let manager = manager_with_global(&json!({}));
+        assert_eq!(
+            manager.get_mermaid_rendering_mode(),
+            MermaidRenderingMode::Streaming
+        );
+        let manager = manager_with_global(&json!({ "markdown": { "mermaid": "off" } }));
+        assert_eq!(
+            manager.get_mermaid_rendering_mode(),
+            MermaidRenderingMode::Off
+        );
+        let manager = manager_with_global(&json!({ "markdown": { "mermaid": "bogus" } }));
+        assert_eq!(
+            manager.get_mermaid_rendering_mode(),
+            MermaidRenderingMode::Streaming
+        );
+
+        let mut manager = manager_with_global(&json!({}));
+        manager.set_mermaid_rendering_mode(MermaidRenderingMode::Final);
+        assert_eq!(
+            manager.get_global_settings().get("markdown"),
+            Some(&json!({"mermaid": "final"}))
+        );
     }
 }

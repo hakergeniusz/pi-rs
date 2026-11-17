@@ -18,6 +18,9 @@ use super::super::theme;
 pub struct BranchSummaryMessageComponent {
     expanded: bool,
     output_pad: usize,
+    /// Stored so `setOutputPad` can rebuild the markdown child (upstream
+    /// resets the child's padding, `branch-summary-message.ts:42-44`).
+    summary: String,
     /// The expanded body (header + summary); renders at the real width like
     /// upstream's Markdown child.
     markdown: Markdown,
@@ -31,6 +34,7 @@ impl BranchSummaryMessageComponent {
         let mut component = Self {
             expanded: false,
             output_pad,
+            summary: summary.to_string(),
             markdown: Self::build_markdown(summary, output_pad),
             content: Vec::new(),
         };
@@ -42,6 +46,15 @@ impl BranchSummaryMessageComponent {
     pub fn set_expanded(&mut self, expanded: bool) {
         if self.expanded != expanded {
             self.expanded = expanded;
+            self.update_display();
+        }
+    }
+
+    /// `setOutputPad` (`branch-summary-message.ts:42-44`).
+    pub fn set_output_pad(&mut self, output_pad: usize) {
+        if self.output_pad != output_pad {
+            self.output_pad = output_pad;
+            self.markdown = Self::build_markdown(&self.summary, output_pad);
             self.update_display();
         }
     }

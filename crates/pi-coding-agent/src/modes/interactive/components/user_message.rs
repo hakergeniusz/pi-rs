@@ -14,6 +14,11 @@ use super::super::theme;
 /// The user message: markdown padded by one column, on the message
 /// background (`user-message.ts:44-71`).
 pub struct UserMessageComponent {
+    /// Stored with the padding so `setOutputPad` can rebuild the child
+    /// (`user-message.ts:39-42`).
+    text: String,
+    output_pad: usize,
+    markdown_theme: pi_tui::components::markdown::MarkdownTheme,
     markdown: Markdown,
 }
 
@@ -33,18 +38,46 @@ impl UserMessageComponent {
             bg_color: Some(theme.bg_styler(pi_tui::theme::ThemeBg::UserMessageBg)),
             ..DefaultTextStyle::default()
         };
+        let markdown = Self::build_markdown(text, output_pad, markdown_theme.clone(), style);
         UserMessageComponent {
-            markdown: Markdown::new(
-                text,
-                output_pad,
-                1,
-                markdown_theme,
-                Some(style),
-                MarkdownOptions {
-                    preserve_list_markers: true,
-                    preserve_backslash_escapes: true,
-                },
-            ),
+            text: text.to_string(),
+            output_pad,
+            markdown_theme,
+            markdown,
+        }
+    }
+
+    fn build_markdown(
+        text: &str,
+        output_pad: usize,
+        markdown_theme: pi_tui::components::markdown::MarkdownTheme,
+        style: DefaultTextStyle,
+    ) -> Markdown {
+        Markdown::new(
+            text,
+            output_pad,
+            1,
+            markdown_theme,
+            Some(style),
+            MarkdownOptions {
+                preserve_list_markers: true,
+                preserve_backslash_escapes: true,
+            },
+        )
+    }
+
+    /// `setOutputPad` (`user-message.ts:39-42`): store and rebuild.
+    pub fn set_output_pad(&mut self, output_pad: usize) {
+        if self.output_pad != output_pad {
+            self.output_pad = output_pad;
+            let theme = theme::theme();
+            let style = DefaultTextStyle {
+                color: Some(theme.fg_styler(pi_tui::theme::ThemeColor::UserMessageText)),
+                bg_color: Some(theme.bg_styler(pi_tui::theme::ThemeBg::UserMessageBg)),
+                ..DefaultTextStyle::default()
+            };
+            self.markdown =
+                Self::build_markdown(&self.text, output_pad, self.markdown_theme.clone(), style);
         }
     }
 }
