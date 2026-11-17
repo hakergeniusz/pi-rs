@@ -2083,9 +2083,13 @@ stderr.
   call-site parity); no `process.stdout` patch (std handles can't rebind;
   the takeover records the marker `is_stdout_taken_over` serves —
   package-manager's consumer is P5 remainder); flush = explicit drain of
-  the stdout handle; stderr interleaving timing only. Untestable
-  in-process (real-TTY streaming, closed-stdout exit(1)) left to a PTY
-  smoke when the P7 release round runs.
+  the stdout handle; stderr interleaving timing only. Verified LIVE with
+  the built binary (2026-11-17 pipe smokes, drivers outside the repo): a
+  normal pipe round-trip prints PONG through the guard; a reader that
+  exits immediately (`| head -0`) yields the silent `exit(1)` (pi exit
+  1, stderr empty — measured via zsh `pipestatus[1]`; bash's PIPESTATUS
+  is not available in zsh); a reader delayed 4 s still receives the full
+  response (`flush_raw_stdout` drains at the run tail).
 - Gate: r1 3 lints (dead test-seam fn moved into `mod tests`,
   `assert_is_empty`, uninlined format arg) → f8a1ad4; r3 green after
   r2's stale-checkout incident (gotcha below). 6 unit tests.
