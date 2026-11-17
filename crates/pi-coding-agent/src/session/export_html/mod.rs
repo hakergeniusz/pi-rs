@@ -775,7 +775,8 @@ mod tests {
         assert_eq!(js_replace_first("abc", "b", "$&$&"), "abbc");
         // "$`" is the text before the match: "a" + replacement "a" + "c".
         assert_eq!(js_replace_first("abc", "b", "$`"), "aac");
-        assert_eq!(js_replace_first("abc", "b", "$'"), "acbc");
+        // "$'" is the text after the match: "a" + replacement "c" + "c".
+        assert_eq!(js_replace_first("abc", "b", "$'"), "acc");
         assert_eq!(js_replace_first("abc", "b", "$$"), "a$bc");
         assert_eq!(js_replace_first("abc", "b", "$1"), "a$1bc");
         assert_eq!(js_replace_first("[-+*?!$&|]", "$&", "X"), "[-+*?!X|]");
@@ -788,10 +789,11 @@ mod tests {
         session_data.insert("entries".to_string(), Value::Array(vec![]));
         session_data.insert("leafId".to_string(), Value::Null);
         let html = generate_html(session_data, Some("dark")).expect("generate");
-        // The needles are gone — except `{{HIGHLIGHT_JS}}`: the vendored
-        // highlight.min.js contains a literal `$&`, which `String.replace`
-        // expands back to the needle text (the module doc's quirk), so the
-        // page carries the original needle plus the rewrite.
+        // The needles are gone — except `{{HIGHLIGHT_JS}}`: the template's
+        // needle is the match itself, and the vendored highlight.min.js
+        // carries a literal `$&`, which `String.replace` expands back to the
+        // needle text — so exactly one occurrence remains (the module doc's
+        // quirk; upstream's replace behaves identically).
         for needle in [
             "{{THEME_VARS}}",
             "{{BODY_BG}}",
@@ -807,8 +809,8 @@ mod tests {
         }
         assert_eq!(
             html.matches("{{HIGHLIGHT_JS}}").count(),
-            2,
-            "the template's needle plus the `$&` rewrite"
+            1,
+            "the template's needle is the match; the `$&` rewrite re-inserts it"
         );
         // The session data rides base64-encoded inside the JSON script tag
         // (`template.html`).
