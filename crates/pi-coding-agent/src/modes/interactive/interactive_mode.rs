@@ -842,6 +842,11 @@ pub struct InteractiveMode {
     /// Events from the mounted `/settings` dialog, same queue pattern.
     settings_selector_events: Option<Arc<Mutex<Vec<SettingsSelectorEvent>>>>,
     session_selector_events: Option<Arc<Mutex<Vec<SessionSelectorEvent>>>>,
+    /// Events from the mounted `/import` dialogs (`showExtensionConfirm` and
+    /// `promptForMissingSessionCwd`, `interactive-mode.ts:6762`/`:6778`) —
+    /// the generic selector with a pending decision in [`ImportDialog`].
+    import_selector_events: Option<Arc<Mutex<Vec<ExtensionSelectorEvent>>>>,
+    import_dialog: Option<ImportDialog>,
     /// Events from the mounted `/fork` dialog (`UserMessageSelectorComponent`'s
     /// onSelect/onCancel).
     user_message_selector_events: Option<Arc<Mutex<Vec<UserMessageSelectorEvent>>>>,
@@ -1063,6 +1068,8 @@ impl InteractiveMode {
             trust_selector_events: None,
             settings_selector_events: None,
             session_selector_events: None,
+            import_selector_events: None,
+            import_dialog: None,
             user_message_selector_events: None,
             tree_selector_events: None,
             tree_summary_dialog_events: None,
@@ -2126,6 +2133,16 @@ impl InteractiveMode {
         // `/copy` (`interactive-mode.ts:3372-3376`).
         if text == "/copy" {
             self.handle_copy_command();
+            return;
+        }
+        // `/export [path]` (`interactive-mode.ts:3352-3356`).
+        if text == "/export" || text.starts_with("/export ") {
+            self.handle_export_command(&text);
+            return;
+        }
+        // `/import <path>` (`interactive-mode.ts:3357-3361`).
+        if text == "/import" || text.starts_with("/import ") {
+            self.handle_import_command(&text);
             return;
         }
         // `/name [name]` (`interactive-mode.ts:3377-3381`).
@@ -4640,6 +4657,8 @@ impl InteractiveMode {
         self.tree_selector_events = None;
         self.tree_summary_dialog_events = None;
         self.tree_prompt_editor_events = None;
+        self.import_selector_events = None;
+        self.import_dialog = None;
         self.auth_selector_events = None;
         self.login_prompt_events = None;
         self.login_prompt_provider = None;
@@ -4714,6 +4733,417 @@ impl InteractiveMode {
         for event in events {
             self.handle_session_event(event);
         }
+    }
+
+    // --------------------------------------------------------------
+    // /export and /import (`handleExportCommand` `interactive-mode.ts:6708-6724`,
+    // `getPathCommandArgument` `:6726-6750`, `handleImportCommand`
+    // `:6752-6803`, `AgentSessionRuntime.importFromJsonl`
+    // `agent-session-runtime.ts:359-407`, and `switchToForkedSession`
+    // `interactive-mode.ts:5982-5999`)
+    // --------------------------------------------------------------
+
+    /// `getPathCommandArgument` (`interactive-mode.ts:6726-6750`): the first
+    /// argument of `/export`/`/import` — a quoted span or a whitespace
+    /// delimited token.
+    fn get_path_command_argument<'a>(text: &'a str, command: &str) -> Option<&'a str> {
+        if text == command {
+            return None;
+        }
+        // Only `command` followed by a space parses; `/importer …` does not.
+        let args_string = text.strip_prefix(command)?.strip_prefix(' ')?;
+        let args_string = args_string.trim_start();
+        if args_string.is_empty() {
+            return None;
+        }
+
+        let first_char = args_string.chars().next()?;
+        if first_char == '"' || first_char == '\'' {
+            let closing_quote = args_string[first_char.len_utf8()..].find(first_char)?;
+            return Some(
+                &args_string[first_char.len_utf8()..first_char.len_utf8() + closing_quote],
+            );
+        }
+
+        // `search(/\s/)` < 0 returns the whole argument
+        // (`interactive-mode.ts:6745-6747`) — apostrophes and other
+        // non-whitespace bytes survive unquoted.
+        let Some(first_whitespace) = args_string.find(char::is_whitespace) else {
+            return Some(args_string);
+        };
+        Some(&args_string[..first_whitespace])
+    }
+
+    /// `handleExportCommand` (`interactive-mode.ts:6708-6724`): a `.jsonl`
+    /// argument exports the branch as JSONL, anything else (including no
+    /// argument) exports HTML. The theme name rides the live theme
+    /// (`theme.name` at `:6716-6718`); `agent-session.exportToHtml`'s
+    /// settings fallback (`agent-session.ts:4471-4473`) is unreachable here
+    /// because the port's theme always resolves.
+    fn handle_export_command(&mut self, text: &str) {
+        let output_path = Self::get_path_command_argument(text, "/export");
+
+        // `outputPath?.endsWith(".jsonl")` (`interactive-mode.ts:6711`) —
+        // case-sensitive, like upstream.
+        let jsonl_output = output_path
+            .filter(|path| path.strip_suffix(".jsonl").is_some())
+            .map(std::path::Path::new);
+        let result = if let Some(path) = jsonl_output {
+            crate::session::export::export_session_to_jsonl(&self.session, Some(path))
+                .map_err(|error| error.to_string())
+        } else {
+            let state = crate::session::export_html::ExportState {
+                system_prompt: Some(self.system_prompt.clone()),
+                tools: Some(self.export_tools()),
+            };
+            // The Arc must outlive the options: bind it before borrowing the
+            // theme's name.
+            let current_theme = theme::theme();
+            crate::session::export_html::export_session_to_html(
+                &self.session,
+                Some(&state),
+                &crate::session::export_html::ExportOptions {
+                    output_path,
+                    theme_name: current_theme.name(),
+                    // The E1 extension boundary cannot run TUI tool renderers
+                    // (see `session::export_html::tool_renderer`); custom
+                    // tools fall back to the template's structured rendering.
+                    tool_renderer: None,
+                },
+            )
+        };
+        match result {
+            Ok(file_path) => {
+                self.show_status(&format!("Session exported to: {}", file_path.display()));
+            }
+            Err(message) => self.show_error(&format!("Failed to export session: {message}")),
+        }
+    }
+
+    /// `state.tools.map(t => ({name, description, parameters}))`
+    /// (`agent-session.ts:4486`): the composed executor's declarations.
+    fn export_tools(&self) -> Vec<crate::session::export_html::ExportTool> {
+        self.executor
+            .tools()
+            .into_iter()
+            .map(|tool| crate::session::export_html::ExportTool {
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.parameters,
+            })
+            .collect()
+    }
+
+    /// `handleImportCommand` up to the confirm dialog
+    /// (`interactive-mode.ts:6755-6766`): the usage line, then the
+    /// Yes/No gate.
+    fn handle_import_command(&mut self, text: &str) {
+        let Some(input_path) = Self::get_path_command_argument(text, "/import").map(str::to_string)
+        else {
+            self.show_error("Usage: /import <path.jsonl>");
+            return;
+        };
+
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        self.open_import_selector(
+            &format!("Import session\nReplace current session with {input_path}?"),
+            vec!["Yes".to_string(), "No".to_string()],
+            ImportDialog::Confirm { input_path },
+        );
+    }
+
+    /// Mount the generic selector for the pending `/import` decision.
+    fn open_import_selector(&mut self, title: &str, options: Vec<String>, dialog: ImportDialog) {
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let selector = ExtensionSelectorComponent::new(title, options, Arc::clone(&events));
+        self.import_selector_events = Some(events);
+        self.import_dialog = Some(dialog);
+        self.suspend_editor_with(Box::new(selector));
+    }
+
+    /// Put the editor back after an import decision or a cancel.
+    fn close_import_selector(&mut self) {
+        self.import_selector_events = None;
+        self.import_dialog = None;
+        self.restore_editor();
+    }
+
+    /// The mounted `/import` dialogs' events, drained like the other
+    /// selectors. `handleImportCommand`'s continuation
+    /// (`interactive-mode.ts:6767-6803`).
+    fn pump_import_selector(&mut self) {
+        if self.import_selector_events.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .import_selector_events
+                .as_ref()
+                .expect("import selector")
+                .lock()
+                .expect("import selector events"),
+        );
+        for event in events {
+            let Some(dialog) = self.import_dialog.clone() else {
+                continue;
+            };
+            match (dialog, event) {
+                (ImportDialog::Confirm { input_path }, ExtensionSelectorEvent::Selected(option)) => {
+                    self.close_import_selector();
+                    if option != "Yes" {
+                        self.show_status("Import cancelled");
+                        continue;
+                    }
+                    // `clearStatusIndicator()` before the import
+                    // (`interactive-mode.ts:6769`).
+                    self.set_working_status(None);
+                    match self.import_from_jsonl(&input_path, None) {
+                        Ok(true) => self.show_status("Import cancelled"),
+                        Ok(false) => {
+                            self.show_status(&format!("Session imported from: {input_path}"));
+                        }
+                        Err(ImportFromJsonlError::MissingSessionCwd(issue)) => {
+                            // `promptForMissingSessionCwd`
+                            // (`interactive-mode.ts:6777-6792`).
+                            let options =
+                                crate::session::cwd::get_missing_session_cwd_options(&issue);
+                            self.open_import_selector(
+                                &crate::session::cwd::format_missing_session_cwd_prompt(&issue),
+                                options.iter().map(|o| o.label.clone()).collect(),
+                                ImportDialog::MissingSessionCwd { input_path, issue },
+                            );
+                        }
+                        Err(error) => self.report_import_failure(error),
+                    }
+                }
+                (ImportDialog::Confirm { .. }, ExtensionSelectorEvent::Cancel) => {
+                    self.close_import_selector();
+                    // A dismissed confirm resolves false.
+                    self.show_status("Import cancelled");
+                }
+                (
+                    ImportDialog::MissingSessionCwd { input_path, issue },
+                    ExtensionSelectorEvent::Selected(option),
+                ) => {
+                    self.close_import_selector();
+                    let choice = crate::session::cwd::get_missing_session_cwd_options(&issue)
+                        .into_iter()
+                        .find(|o| o.label == option)
+                        .and_then(|o| o.value);
+                    match choice {
+                        Some(crate::session::cwd::MissingSessionCwdChoice::Continue) => {
+                            let result =
+                                self.import_from_jsonl(&input_path, Some(&issue.fallback_cwd));
+                            match result {
+                                Ok(true) => self.show_status("Import cancelled"),
+                                Ok(false) => self
+                                    .show_status(&format!("Session imported from: {input_path}")),
+                                Err(error) => self.report_import_failure(error),
+                            }
+                        }
+                        Some(crate::session::cwd::MissingSessionCwdChoice::Fork) => {
+                            match self.switch_to_forked_session(&input_path, &issue.fallback_cwd) {
+                                Ok(true) => self.show_status("Import cancelled"),
+                                Ok(false) => {}
+                                Err(error) => self.report_import_failure(error),
+                            }
+                        }
+                        None => self.show_status("Import cancelled"),
+                    }
+                }
+                (ImportDialog::MissingSessionCwd { .. }, ExtensionSelectorEvent::Cancel) => {
+                    self.close_import_selector();
+                    self.show_status("Import cancelled");
+                }
+            }
+        }
+    }
+
+    /// `handleFatalRuntimeError("Failed to import session", error)`
+    /// (`interactive-mode.ts:6798-6800`), minus the crash report and the
+    /// exit: the port's session-switch failures are non-fatal status lines
+    /// (see `switch_session`'s seam note), so the same message renders as an
+    /// error line here.
+    fn report_import_failure(&mut self, error: ImportFromJsonlError) {
+        let message = match error {
+            // Both variants render the message verbatim.
+            ImportFromJsonlError::FileNotFound(message) | ImportFromJsonlError::Other(message) => {
+                message
+            }
+            ImportFromJsonlError::MissingSessionCwd(_) => {
+                // Unreachable: the missing-cwd case opens the prompt instead.
+                return;
+            }
+        };
+        self.show_error(&format!("Failed to import session: {message}"));
+    }
+
+    /// `AgentSessionRuntime.importFromJsonl` (`agent-session-runtime.ts:359-407`):
+    /// copy the file into the session dir (deduplicated), gate on
+    /// `session_before_switch`, verify the stored cwd, then swap the session.
+    /// Returns `Ok(true)` when an extension cancelled the switch
+    /// (`{ cancelled: true }`). Deviation (same seam as [`Self::switch_session`]):
+    /// upstream rebuilds the whole runtime for the imported session's cwd;
+    /// the port keeps the startup runtime and only swaps the session.
+    fn import_from_jsonl(
+        &mut self,
+        input_path: &str,
+        cwd_override: Option<&std::path::Path>,
+    ) -> Result<bool, ImportFromJsonlError> {
+        let resolved_path = crate::session::store::resolve_path(std::path::Path::new(input_path));
+        if !resolved_path.exists() {
+            return Err(ImportFromJsonlError::FileNotFound(format!(
+                "File not found: {}",
+                resolved_path.display()
+            )));
+        }
+
+        let session_dir = self.session.get_session_dir().to_path_buf();
+        if !session_dir.exists() {
+            std::fs::create_dir_all(&session_dir)
+                .map_err(|error| ImportFromJsonlError::Other(error.to_string()))?;
+        }
+
+        let mut destination_path = session_dir.join(
+            resolved_path
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("session.jsonl")),
+        );
+        let source_already_stored =
+            crate::session::store::paths_equal(&destination_path, &resolved_path);
+        if !source_already_stored {
+            // `${name}-${suffix++}${ext}` (`agent-session-runtime.ts:373-376`).
+            let stem = destination_path.file_stem().map_or_else(
+                || "session".to_string(),
+                |stem| stem.to_string_lossy().into_owned(),
+            );
+            let extension = destination_path
+                .extension()
+                .map_or_else(String::new, |ext| format!(".{}", ext.to_string_lossy()));
+            let mut suffix = 1;
+            while destination_path.exists() {
+                destination_path = session_dir.join(format!("{stem}-{suffix}{extension}"));
+                suffix += 1;
+            }
+        }
+
+        // `emitBeforeSwitch("resume", destinationPath)`
+        // (`agent-session-runtime.ts:379-382`).
+        let target = destination_path.to_string_lossy().into_owned();
+        if self.extension_cancelled(&serde_json::json!({
+            "type": "session_before_switch",
+            "reason": "resume",
+            "targetSessionFile": target,
+        })) {
+            return Ok(true);
+        }
+
+        if !source_already_stored {
+            // `copyFileSync(resolvedPath, destinationPath, COPYFILE_EXCL)`.
+            copy_file_exclusive(&resolved_path, &destination_path)
+                .map_err(|error| ImportFromJsonlError::Other(error.to_string()))?;
+        }
+
+        let session =
+            match SessionManager::open(&destination_path, Some(&session_dir), cwd_override) {
+                Ok(session) => session,
+                Err(error) => {
+                    // The import did not happen; drop the copy so a retry with a
+                    // cwd override or a fork leaves no stray file.
+                    if !source_already_stored {
+                        let _ = std::fs::remove_file(&destination_path);
+                    }
+                    return Err(ImportFromJsonlError::Other(error.to_string()));
+                }
+            };
+        // `this.cwd` is the runtime's process cwd (`agent-session-runtime.ts:391`).
+        let fallback_cwd =
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        if let Err(error) = crate::session::cwd::assert_session_cwd_exists(&session, &fallback_cwd)
+        {
+            if !source_already_stored {
+                let _ = std::fs::remove_file(&destination_path);
+            }
+            return Err(ImportFromJsonlError::MissingSessionCwd(error.issue));
+        }
+
+        // `teardownCurrent("resume", …)` emits `session_shutdown` with the
+        // destination before the replacement
+        // (`agent-session-runtime.ts:396-399`).
+        let destination_file = session
+            .get_session_file()
+            .map(|path| path.to_string_lossy().into_owned());
+        self.emit_extension_shutdown("resume", destination_file.as_deref());
+        self.swap_imported_session(session);
+        Ok(false)
+    }
+
+    /// `switchToForkedSession` (`interactive-mode.ts:5982-5999`): fork the
+    /// source into `cwd` (in the current session dir) and switch to it. The
+    /// fork file is dropped when an extension vetoes the switch.
+    fn switch_to_forked_session(
+        &mut self,
+        source_path: &str,
+        cwd: &std::path::Path,
+    ) -> Result<bool, ImportFromJsonlError> {
+        let fork = SessionManager::fork_from(
+            std::path::Path::new(source_path),
+            cwd,
+            Some(self.session.get_session_dir()),
+            &NewSessionOptions::default(),
+        )
+        .map_err(|error| ImportFromJsonlError::Other(error.to_string()))?;
+        let fork_path = fork
+            .get_session_file()
+            .expect("the fork writes its file eagerly")
+            .to_path_buf();
+
+        if self.extension_cancelled(&serde_json::json!({
+            "type": "session_before_switch",
+            "reason": "resume",
+            "targetSessionFile": fork_path.to_string_lossy(),
+        })) {
+            // An extension vetoed the switch; drop the fork so cancelling
+            // leaves no copy behind.
+            let _ = std::fs::remove_file(&fork_path);
+            return Ok(true);
+        }
+
+        self.emit_extension_shutdown("resume", Some(&fork_path.to_string_lossy()));
+        let session_dir = Some(self.session.get_session_dir().to_path_buf());
+        let session = match SessionManager::open(&fork_path, session_dir.as_deref(), None) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = std::fs::remove_file(&fork_path);
+                return Err(ImportFromJsonlError::Other(error.to_string()));
+            }
+        };
+        let fork_id = session.get_session_id().to_string();
+        self.swap_imported_session(session);
+        self.show_status(&format!(
+            "Forked into new session {fork_id} in {}",
+            cwd.display()
+        ));
+        Ok(false)
+    }
+
+    /// `createRuntime` + `finishSessionReplacement` reduced to the port's
+    /// session-swap seam (`agent-session-runtime.ts:399-406`): replay the
+    /// new transcript and clear the in-flight state.
+    fn swap_imported_session(&mut self, session: SessionManager) {
+        self.session = session;
+        self.active_prompt = None;
+        self.queued_deliveries.clear();
+        self.pending_tools.clear();
+        self.streaming_index = None;
+        self.compaction_run = None;
+        self.render_initial_messages();
+        self.refresh_footer();
     }
 
     // --------------------------------------------------------------
@@ -6527,6 +6957,7 @@ impl InteractiveMode {
         self.pump_trust_selector();
         self.pump_settings_selector();
         self.pump_session_selector();
+        self.pump_import_selector();
         self.pump_user_message_selector();
         self.pump_tree_selector();
         self.pump_tree_summary_dialog();
@@ -6967,6 +7398,433 @@ mod tests {
 
     use crate::session::records::SessionEntry;
     use crate::tools::index::ToolRegistry;
+    use base64::Engine as _;
+
+    /// The template's session-data script tag (`template.html`), which the
+    /// export tests decode the base64 payload out of.
+    const SESSION_DATA_MARKER: &str = "<script id=\"session-data\" type=\"application/json\">";
+
+    // --------------------------------------------------------------
+    // /export and /import (`getPathCommandArgument` and the
+    // `interactive-mode-import-command.test.ts` cases)
+    // --------------------------------------------------------------
+
+    /// A mode whose session is persisted in `dir`, so `/import` has a real
+    /// session dir to copy into.
+    fn persisted_fixture(dir: &std::path::Path) -> (InteractiveMode, FrameCapture) {
+        let mut runtime = test_runtime(
+            dir,
+            Arc::new(ScriptedStream {
+                calls: AtomicUsize::new(0),
+                file_path: "unused".to_string(),
+            }),
+        );
+        runtime.session =
+            SessionManager::create(dir, Some(dir), &NewSessionOptions::default()).expect("session");
+        let terminal = CaptureTerminal::with_size(TerminalSize {
+            columns: 100,
+            rows: 40,
+        });
+        let capture = terminal.capture();
+        let options = InteractiveOptions {
+            auth_path: Some(dir.join("auth.json")),
+            ..InteractiveOptions::default()
+        };
+        let mut mode = InteractiveMode::new(&mut runtime, &options, Box::new(terminal));
+        mode.tui.start().expect("tui start");
+        (mode, capture)
+    }
+
+    /// A source session with one user message, persisted under `dir`.
+    fn source_session(dir: &std::path::Path, text: &str) -> std::path::PathBuf {
+        let mut session =
+            SessionManager::create(dir, Some(dir), &NewSessionOptions::default()).expect("source");
+        session
+            .append_message(pi_agent::transcript::user_message(text, 1))
+            .expect("append");
+        session
+            .get_session_file()
+            .expect("source file")
+            .to_path_buf()
+    }
+
+    /// `interactive-mode-import-command.test.ts:25-43`: quoted paths strip
+    /// their quotes, apostrophes survive unquoted, and command token
+    /// boundaries hold.
+    #[test]
+    fn path_command_argument_matches_upstream_parsing() {
+        assert_eq!(
+            InteractiveMode::get_path_command_argument(
+                "/import \"path/to/session.jsonl\"",
+                "/import"
+            ),
+            Some("path/to/session.jsonl")
+        );
+        assert_eq!(
+            InteractiveMode::get_path_command_argument(
+                "/import \"path with spaces/session.jsonl\"",
+                "/import"
+            ),
+            Some("path with spaces/session.jsonl")
+        );
+        // Apostrophes survive in unquoted arguments.
+        assert_eq!(
+            InteractiveMode::get_path_command_argument("/import john's/session.jsonl", "/import"),
+            Some("john's/session.jsonl")
+        );
+        // Command token boundaries: `/important` and `/exporter` do not parse.
+        assert_eq!(
+            InteractiveMode::get_path_command_argument("/important /tmp/session.jsonl", "/import"),
+            None
+        );
+        assert_eq!(
+            InteractiveMode::get_path_command_argument("/exporter out.html", "/export"),
+            None
+        );
+        assert_eq!(
+            InteractiveMode::get_path_command_argument("/import /tmp/session.jsonl", "/import"),
+            Some("/tmp/session.jsonl")
+        );
+        // A bare command and a bare trailing space parse to None.
+        assert_eq!(
+            InteractiveMode::get_path_command_argument("/import", "/import"),
+            None
+        );
+        assert_eq!(
+            InteractiveMode::get_path_command_argument("/import  ", "/import"),
+            None
+        );
+    }
+
+    /// The picker advertises `/export` and `/import` with the verbatim
+    /// upstream descriptions (`slash-commands.ts:25-26`); `/share`
+    /// (`slash-commands.ts:27`) stays absent — the Radius gateway it uploads
+    /// to is banned here.
+    #[test]
+    fn autocomplete_advertises_export_and_import_but_not_share() {
+        let commands = InteractiveMode::autocomplete_commands(&[]);
+        let find = |name: &str| {
+            commands
+                .iter()
+                .find(|command| command.name == name)
+                .and_then(|command| command.description.as_deref())
+        };
+        assert_eq!(
+            find("export"),
+            Some("Export session (HTML default, or specify path: .html/.jsonl)")
+        );
+        assert_eq!(
+            find("import"),
+            Some("Import a JSONL session, preserving its ID and working directory")
+        );
+        assert_eq!(find("share"), None);
+        // Neither command carries an argument hint upstream.
+        for name in ["export", "import"] {
+            let command = commands.iter().find(|c| c.name == name).expect(name);
+            assert_eq!(command.argument_hint, None, "{name} carries no hint");
+        }
+    }
+
+    #[test]
+    fn import_without_a_path_shows_the_usage_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = persisted_fixture(dir.path());
+        mode.submit("/import");
+        mode.tui.render_now(false);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("Usage: /import <path.jsonl>"), "{plain}");
+        assert!(mode.suspended_editor.is_none(), "no dialog for usage");
+    }
+
+    #[test]
+    fn import_confirm_cancel_reports_and_restores() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = persisted_fixture(dir.path());
+        mode.submit("/import nowhere.jsonl");
+        mode.tui.render_now(false);
+        assert!(mode.suspended_editor.is_some(), "confirm not mounted");
+        let selector = mode
+            .downcast_tree::<ExtensionSelectorComponent>(HostSlot::Editor)
+            .expect("selector in the editor slot");
+        let rendered = strip_terminal_sequences(&selector.render(100).join("\n"));
+        assert!(rendered.contains("Import session"), "{rendered}");
+        assert!(
+            rendered.contains("Replace current session with nowhere.jsonl?"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("→ Yes"), "{rendered}");
+
+        // Escape cancels: the confirm resolves false ("Import cancelled").
+        mode.import_selector_events
+            .as_ref()
+            .expect("import events")
+            .lock()
+            .expect("events lock")
+            .push(ExtensionSelectorEvent::Cancel);
+        mode.pump();
+        assert!(mode.suspended_editor.is_none(), "editor not restored");
+        mode.tui.render_now(false);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("Import cancelled"), "{plain}");
+    }
+
+    #[test]
+    fn import_confirm_yes_copies_and_swaps_the_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source_dir = tempfile::tempdir().expect("source dir");
+        // The source rides a short name: the status line must fit the
+        // 100-column capture without wrapping (the session-layout file name
+        // wrapped it and the contains-assert missed it).
+        let source_path = source_dir.path().join("source.jsonl");
+        std::fs::copy(
+            source_session(source_dir.path(), "imported hello"),
+            &source_path,
+        )
+        .expect("copy source");
+        let source = SessionManager::open(&source_path, None, None).expect("source open");
+        let source_id = source.get_session_id().to_string();
+
+        let (mut mode, capture) = persisted_fixture(dir.path());
+        mode.submit(&format!("/import {}", source_path.display()));
+        mode.import_selector_events
+            .as_ref()
+            .expect("import events")
+            .lock()
+            .expect("events lock")
+            .push(ExtensionSelectorEvent::Selected("Yes".to_string()));
+        mode.pump();
+        mode.tui.render_now(false);
+
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(
+            plain.contains(&format!("Session imported from: {}", source_path.display())),
+            "{plain}"
+        );
+        // The session store swapped to the imported session (its id and its
+        // entries replayed), and the file was copied into the mode's session
+        // dir under the source's basename.
+        assert_eq!(mode.session.get_session_id(), source_id);
+        let imported_text = mode.session.get_entries().iter().any(|entry| {
+            matches!(
+                entry,
+                SessionEntry::Message(entry)
+                    if matches!(&entry.message, AgentMessage::User(user)
+                        if matches!(&user.content,
+                            pi_ai::types::UserContent::Text(text) if text == "imported hello"))
+            )
+        });
+        assert!(imported_text, "imported entries did not replay");
+        let destination = dir
+            .path()
+            .join(source_path.file_name().expect("source basename"));
+        assert!(destination.exists(), "source copied into the session dir");
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+    }
+
+    #[test]
+    fn import_missing_file_reports_the_upstream_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = persisted_fixture(dir.path());
+        mode.submit("/import /nonexistent/nope.jsonl");
+        mode.import_selector_events
+            .as_ref()
+            .expect("import events")
+            .lock()
+            .expect("events lock")
+            .push(ExtensionSelectorEvent::Selected("Yes".to_string()));
+        mode.pump();
+        mode.tui.render_now(false);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(
+            plain.contains("Failed to import session: File not found:"),
+            "{plain}"
+        );
+        // The non-fatal path keeps the session untouched.
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+    }
+
+    /// A header pointing at a dead cwd mounts the missing-cwd prompt; the
+    /// continue option re-imports with the override, the fork option forks
+    /// into the fallback cwd.
+    #[test]
+    fn import_missing_cwd_prompt_offers_continue_fork_cancel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let dead_cwd = source_dir.path().join("does-not-exist");
+        let source_path = source_dir.path().join("stale.jsonl");
+        std::fs::write(
+            &source_path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"stale-session\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"{}\"}}\n",
+                dead_cwd.display()
+            ),
+        )
+        .expect("write stale session");
+        let fallback_cwd = std::env::current_dir().expect("cwd");
+
+        let (mut mode, capture) = persisted_fixture(dir.path());
+
+        // Confirm → import → missing-cwd prompt.
+        mode.submit(&format!("/import {}", source_path.display()));
+        mode.import_selector_events
+            .as_ref()
+            .expect("import events")
+            .lock()
+            .expect("events lock")
+            .push(ExtensionSelectorEvent::Selected("Yes".to_string()));
+        mode.pump();
+        mode.tui.render_now(false);
+        assert!(mode.suspended_editor.is_some(), "cwd prompt not mounted");
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(
+            plain.contains(&format!(
+                "Session cwd does not exist: {}",
+                dead_cwd.display()
+            )),
+            "{plain}"
+        );
+
+        // The prompt lists the upstream options; Continue re-imports with
+        // the fallback cwd.
+        let labels = crate::session::cwd::get_missing_session_cwd_options(
+            &crate::session::cwd::SessionCwdIssue {
+                session_file: None,
+                session_cwd: dead_cwd.clone(),
+                // The real issue's fallback is the runtime's process cwd
+                // (`agent-session-runtime.ts:391`); the labels must match it
+                // for the pump's label lookup to hit.
+                fallback_cwd: fallback_cwd.clone(),
+            },
+        );
+        mode.import_selector_events
+            .as_ref()
+            .expect("import events")
+            .lock()
+            .expect("events lock")
+            .push(ExtensionSelectorEvent::Selected(labels[0].label.clone()));
+        mode.pump();
+        mode.tui.render_now(false);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(
+            plain.contains(&format!("Session imported from: {}", source_path.display())),
+            "{plain}"
+        );
+        // The stored cwd was overridden by the fallback.
+        assert_eq!(mode.session.get_cwd(), fallback_cwd);
+        // The copied file was re-imported with the same id.
+        assert_eq!(mode.session.get_session_id(), "stale-session");
+    }
+
+    /// The fork option of the missing-cwd prompt: a new session id in the
+    /// fallback cwd, the original copy kept.
+    #[test]
+    fn import_missing_cwd_fork_creates_a_new_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let dead_cwd = source_dir.path().join("does-not-exist");
+        let source_path = source_dir.path().join("stale.jsonl");
+        std::fs::write(
+            &source_path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"stale-session\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"{}\"}}\n",
+                dead_cwd.display()
+            ),
+        )
+        .expect("write stale session");
+        let fallback_cwd = std::env::current_dir().expect("cwd");
+
+        let (mut mode, capture) = persisted_fixture(dir.path());
+        mode.submit(&format!("/import {}", source_path.display()));
+        mode.import_selector_events
+            .as_ref()
+            .expect("import events")
+            .lock()
+            .expect("events lock")
+            .push(ExtensionSelectorEvent::Selected("Yes".to_string()));
+        mode.pump();
+
+        let labels = crate::session::cwd::get_missing_session_cwd_options(
+            &crate::session::cwd::SessionCwdIssue {
+                session_file: None,
+                session_cwd: dead_cwd.clone(),
+                // The real issue's fallback is the runtime's process cwd
+                // (`agent-session-runtime.ts:391`); the labels must match it
+                // for the pump's label lookup to hit.
+                fallback_cwd: fallback_cwd.clone(),
+            },
+        );
+        mode.import_selector_events
+            .as_ref()
+            .expect("import events")
+            .lock()
+            .expect("events lock")
+            .push(ExtensionSelectorEvent::Selected(labels[1].label.clone()));
+        mode.pump();
+        mode.tui.render_now(false);
+
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("Forked into new session "), "{plain}");
+        // A fresh id in the fallback cwd; the copy of the original stayed.
+        assert_ne!(mode.session.get_session_id(), "stale-session");
+        assert_eq!(mode.session.get_cwd(), fallback_cwd);
+        assert!(
+            mode.session
+                .get_session_file()
+                .expect("fork file")
+                .parent()
+                .expect("parent")
+                == dir.path(),
+            "fork rides in the current session dir"
+        );
+    }
+
+    /// `/export <path>.jsonl` writes the branch export; `/export <path>.html`
+    /// writes the viewer page. Both report the resolved path.
+    #[test]
+    fn export_writes_jsonl_and_html_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = persisted_fixture(dir.path());
+        mode.session
+            .append_message(pi_agent::transcript::user_message("exported hello", 1))
+            .expect("append");
+
+        let jsonl = dir.path().join("out.jsonl");
+        mode.submit(&format!("/export {}", jsonl.display()));
+        mode.tui.render_now(false);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(
+            plain.contains(&format!("Session exported to: {}", jsonl.display())),
+            "{plain}"
+        );
+        let exported = std::fs::read_to_string(&jsonl).expect("exported jsonl");
+        assert!(
+            exported.starts_with("{\"type\":\"session\",\"version\":3,"),
+            "{exported}"
+        );
+
+        let html = dir.path().join("out.html");
+        mode.submit(&format!("/export {}", html.display()));
+        mode.tui.render_now(false);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(
+            plain.contains(&format!("Session exported to: {}", html.display())),
+            "{plain}"
+        );
+        let page = std::fs::read_to_string(&html).expect("exported html");
+        // The payload rides base64-encoded in the session-data script tag.
+        let payload_start = page
+            .find(SESSION_DATA_MARKER)
+            .map(|index| index + SESSION_DATA_MARKER.len())
+            .expect("session data script tag");
+        let payload = &page[payload_start..page.find("</script>").expect("script close")];
+        let decoded = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .expect("base64"),
+        )
+        .expect("utf8");
+        assert!(decoded.contains("exported hello"), "{decoded}");
+    }
 
     /// One `AssistantMessage` for the scripted stream, with the fields the
     /// wire always carries (the renderers read usage and stop reason).
