@@ -253,6 +253,7 @@ impl ScopedModelsSelectorComponent {
             selector.all_ids.push(full_id);
         }
         selector.filtered_items = selector.build_items();
+        selector.update_list();
         selector
     }
 
@@ -824,7 +825,8 @@ mod tests {
         models: &[pi_ai::types::Model],
     ) -> Vec<bool> {
         // `getMarkerStates` (`scoped-models-selector.test.ts:26-34`): the
-        // "✓ " marker's presence on each model's row.
+        // "✓ " marker's presence on each model's row — after slicing off
+        // the two-char selection prefix (`line.slice(2)`).
         let lines: Vec<String> = plain(component).lines().map(str::to_string).collect();
         models
             .iter()
@@ -832,7 +834,7 @@ mod tests {
                 lines
                     .iter()
                     .find(|line| line.contains(&format!("{} [", model.id)))
-                    .map(|line| line.trim_start().starts_with("✓ "))
+                    .map(|line| line.chars().skip(2).collect::<String>().starts_with("✓ "))
                     .expect("rendered row")
             })
             .collect()
@@ -992,25 +994,34 @@ mod tests {
         );
         let text = plain(&component);
         assert!(text.contains("[unavailable]"), "{text}");
-        assert!(text.contains("1/2 enabled · 1 unavailable"), "{text}");
+        // `${enabledCount}/${this.allIds.length}` — allIds holds only the
+        // available models; the ghost pattern counts separately
+        // (`scoped-models-selector.ts:203-209`).
+        assert!(text.contains("1/1 enabled · 1 unavailable"), "{text}");
     }
 
     #[test]
     fn search_filters_the_list_and_scopes_enable_all_to_the_matches() {
         let models = vec![
             model("acme", "model-a", "Model A"),
-            model("beta", "model-b", "Model B"),
+            model("acme", "model-b", "Model B"),
+            // A provider whose haystack cannot fuzzy-match the query.
+            model("gamma", "model-c", "Model C"),
         ];
-        let (mut component, events, _initial) = harness(&models, None);
+        let (mut component, events, _initial) =
+            harness(&models, Some(vec!["acme/model-a".to_string()]));
         for c in "b".chars() {
             component.handle_input(&c.to_string());
         }
-        key_sequence(&mut component, &["\x01"]); // enable all → only the filtered row
+        // enable all → the filtered row joins the explicit list
+        // (`scoped-models-selector.ts:383`: targets are the filtered rows;
+        // from `null` upstream returns `null` unchanged, `:39`).
+        key_sequence(&mut component, &["\x01"]);
         let drained = drained(&events);
         let Some(ScopedModelsSelectorEvent::Change(Some(ids))) = drained.last() else {
             panic!("expected a change, got {drained:?}");
         };
-        assert_eq!(ids, &["beta/model-b".to_string()]);
+        assert_eq!(ids, &["acme/model-a".to_string(), "acme/model-b".to_string()]);
         let text = plain(&component);
         assert!(text.contains("model-b"), "{text}");
         assert!(!text.contains("Model Name: Model A"), "{text}");
@@ -1023,8 +1034,8 @@ mod tests {
             &models,
             Some(vec!["acme/one".to_string(), "acme/two".to_string()]),
         );
-        // Selection starts at "one"; alt+down moves it below "two".
-        key_sequence(&mut component, &["\x1b[B"]);
+        // Selection starts at "one"; alt+down (`\x1bn`) moves it below "two".
+        key_sequence(&mut component, &["\x1bn"]);
         let drained = drained(&events);
         let Some(ScopedModelsSelectorEvent::Change(Some(ids))) = drained.last() else {
             panic!("expected a change, got {drained:?}");

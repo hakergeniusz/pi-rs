@@ -735,13 +735,14 @@ mod tests {
             assert_eq!(resolved.len(), 2, "{pattern}");
             assert!(resolved.contains(&("azure/gpt-4o".to_string(), level)), "{pattern}");
             assert!(resolved.contains(&("openai/gpt-4o".to_string(), level)), "{pattern}");
-            let head = pattern.split(':').next().expect("pattern head");
+            // Upstream's message carries the pattern verbatim, suffix
+            // included (`model-resolver.test.ts:410`).
             assert_eq!(
                 result.diagnostics,
                 vec![ModelScopeDiagnostic {
                     code: ModelScopeDiagnosticCode::Ambiguous,
                     message: format!(
-                        "Pattern \"{head}\" matches several providers: azure, openai. Use provider/id to choose one."
+                        "Pattern \"{pattern}\" matches several providers: azure, openai. Use provider/id to choose one."
                     ),
                     pattern: pattern.to_string(),
                 }]
