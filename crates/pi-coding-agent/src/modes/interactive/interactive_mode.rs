@@ -1733,8 +1733,9 @@ impl InteractiveMode {
     /// while a selector occupies the slot, because the parked editor rides
     /// in `suspended_editor`.
     fn editor_host_mut(&mut self) -> Option<&mut ChatEditor> {
-        if let Some(host) = self.downcast_tree::<ChatEditor>(HostSlot::Editor) {
-            return Some(host);
+        let mounted = self.downcast_tree::<ChatEditor>(HostSlot::Editor).is_some();
+        if mounted {
+            return self.downcast_tree::<ChatEditor>(HostSlot::Editor);
         }
         let suspended = self.suspended_editor.as_mut()?;
         suspended.as_any_mut()?.downcast_mut::<ChatEditor>()

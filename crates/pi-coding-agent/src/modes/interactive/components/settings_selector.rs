@@ -2020,7 +2020,7 @@ mod tests {
     #[test]
     fn the_automatic_theme_menu_applies_the_light_dark_setting() {
         let events = queue();
-        let mut selector = SettingsSelectorComponent::new(&config(), events);
+        let mut selector = SettingsSelectorComponent::new(&config(), events.clone());
         for _ in 0..31 {
             selector.handle_input("\x1b[B");
         }

@@ -2711,7 +2711,8 @@ mod tests {
         warnings.insert("customKey".to_string(), json!("rides along"));
         manager.set_warnings(&warnings);
         manager.flush();
-        let stored = manager.get_global_settings().get("warnings").unwrap();
+        let binding = manager.get_global_settings();
+        let stored = binding.get("warnings").unwrap();
         assert_eq!(stored.get("anthropicExtraUsage"), Some(&json!(false)));
         assert_eq!(stored.get("customKey"), Some(&json!("rides along")));
     }
