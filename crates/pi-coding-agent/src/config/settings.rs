@@ -2649,7 +2649,14 @@ mod tests {
         assert_eq!(global.get("showCacheMissNotices"), Some(&json!(true)));
         assert_eq!(global.get("enableSkillCommands"), Some(&json!(false)));
         assert_eq!(global.get("doubleEscapeAction"), Some(&json!("fork")));
-        assert_eq!(global.get("showTerminalProgress"), Some(&json!(true)));
+        // `terminal.showTerminalProgress` is nested like upstream's
+        // `settings-manager.ts:1264`.
+        assert_eq!(
+            global
+                .get("terminal")
+                .and_then(|terminal| terminal.get("showTerminalProgress")),
+            Some(&json!(true))
+        );
         // The clamps (`settings-manager.ts:1406,1426`).
         assert_eq!(global.get("editorPaddingX"), Some(&json!(3)));
         assert_eq!(global.get("outputPad"), Some(&json!(0)));

@@ -1842,7 +1842,9 @@ mod tests {
             let Some((label, _)) = after_cursor.split_once("  ") else {
                 break;
             };
-            if labels.last() == Some(&label.to_string()) {
+            // Down stops at the wrap-around: the first already-seen label
+            // means the list is fully captured.
+            if labels.contains(&label.to_string()) {
                 break;
             }
             labels.push(label.to_string());
