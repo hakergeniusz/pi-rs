@@ -19,8 +19,8 @@ use pi_tui::theme::{
     detect_terminal_theme, load_theme_with_system,
 };
 
-use pi_agent::types::ThinkingLevel;
 use crate::config;
+use pi_agent::types::ThinkingLevel;
 
 /// The global theme instance, pi's `theme` proxy (`theme.ts:648-659`).
 static THEME: RwLock<Option<Arc<Theme>>> = RwLock::new(None);

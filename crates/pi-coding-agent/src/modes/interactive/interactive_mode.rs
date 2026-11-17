@@ -3203,7 +3203,9 @@ impl InteractiveMode {
             return;
         };
         self.thinking_level = next_level;
-        let _ = self.session.append_thinking_level_change(next_level.as_str());
+        let _ = self
+            .session
+            .append_thinking_level_change(next_level.as_str());
         self.refresh_footer();
         self.update_editor_border_color();
         self.show_status(&format!("Thinking level: {}", next_level.as_str()));
