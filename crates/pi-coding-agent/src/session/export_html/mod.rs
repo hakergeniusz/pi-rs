@@ -65,18 +65,20 @@ fn parse_color(color: &str) -> Option<(f64, f64, f64)> {
     let rest = rest.strip_prefix('(')?;
     let inner = rest.strip_suffix(')')?;
     let mut channels = inner.split(',');
-    let mut numbers = [0.0; 3];
-    for (slot, channel) in numbers.iter_mut().zip(channels.by_ref()) {
+    let parse_channel = |channel: &str| -> Option<f64> {
         let channel = channel.trim();
         if channel.is_empty() || !channel.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        *slot = channel.parse::<f64>().ok()?;
-    }
+        channel.parse::<f64>().ok()
+    };
+    let r = parse_channel(channels.next()?)?;
+    let g = parse_channel(channels.next()?)?;
+    let b = parse_channel(channels.next()?)?;
     if channels.next().is_some() {
         return None;
     }
-    Some(numbers)
+    Some((r, g, b))
 }
 
 /// The `^#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})$` branch of
@@ -229,8 +231,9 @@ pub struct ExportState {
     pub tools: Option<Vec<ExportTool>>,
 }
 
-/// `ExportOptions` (`index.ts:35-40`).
-#[derive(Debug, Clone, Default)]
+/// `ExportOptions` (`index.ts:35-40`). No `Debug`: the renderer half is a
+/// trait object the upstream interface also never formats.
+#[derive(Clone, Default)]
 pub struct ExportOptions<'a> {
     pub output_path: Option<&'a str>,
     pub theme_name: Option<&'a str>,
@@ -394,7 +397,10 @@ fn pre_render_custom_tools(
     entries: &[crate::session::SessionEntry],
     tool_renderer: &dyn ToolHtmlRenderer,
 ) -> Map<String, Value> {
-    let mut rendered_tools: Map<String, RenderedToolHtml> = Map::new();
+    // The working structure is an insertion-ordered pair list: serde_json's
+    // Map API is specialized to `Value`, and a plain HashMap would lose the
+    // JS-object insertion order the export embeds.
+    let mut rendered_tools: Vec<(String, RenderedToolHtml)> = Vec::new();
 
     for entry in entries {
         let crate::session::SessionEntry::Message(entry) = entry else {
@@ -414,13 +420,19 @@ fn pre_render_custom_tools(
                         &call.name,
                         &Value::Object(call.arguments.clone()),
                     ) {
-                        rendered_tools.insert(
-                            call.id.clone(),
-                            RenderedToolHtml {
-                                call_html: Some(call_html),
-                                ..RenderedToolHtml::default()
-                            },
-                        );
+                        // `renderedTools[block.id] = { callHtml }` — an
+                        // existing entry keeps its position, like a JS
+                        // object literal overwrite.
+                        match rendered_tools.iter_mut().find(|(id, _)| *id == call.id) {
+                            Some((_, slot)) => slot.call_html = Some(call_html),
+                            None => rendered_tools.push((
+                                call.id.clone(),
+                                RenderedToolHtml {
+                                    call_html: Some(call_html),
+                                    ..RenderedToolHtml::default()
+                                },
+                            )),
+                        }
                     }
                 }
             }
@@ -431,7 +443,9 @@ fn pre_render_custom_tools(
             let tool_name = result.tool_name.as_str();
             // Only render if we have a pre-rendered call OR it's not
             // template-rendered.
-            let existing = rendered_tools.get(&result.tool_call_id);
+            let existing = rendered_tools
+                .iter()
+                .find(|(id, _)| *id == result.tool_call_id);
             if existing.is_some() || !TEMPLATE_RENDERED_TOOLS.contains(&tool_name) {
                 if let Some(rendered) = tool_renderer.render_result(
                     &result.tool_call_id,
@@ -440,10 +454,16 @@ fn pre_render_custom_tools(
                     result.details.as_ref(),
                     result.is_error,
                 ) {
-                    let mut merged = existing.cloned().unwrap_or_default();
+                    let mut merged = existing.map_or_else(
+                        RenderedToolHtml::default,
+                        |(_, rendered)| rendered.clone(),
+                    );
                     merged.result_html_collapsed = rendered.collapsed;
                     merged.result_html_expanded = rendered.expanded;
-                    rendered_tools.insert(result.tool_call_id.clone(), merged);
+                    match rendered_tools.iter_mut().find(|(id, _)| *id == result.tool_call_id) {
+                        Some((_, slot)) => *slot = merged,
+                        None => rendered_tools.push((result.tool_call_id.clone(), merged)),
+                    }
                 }
             }
         }
@@ -968,11 +988,11 @@ mod tests {
         let _ = session.append_message(tool_result);
 
         let renderer = FakeRenderer::new();
-        let rendered = pre_render_custom_tools(&session.get_entries(), &renderer);
+        let rendered_map = pre_render_custom_tools(&session.get_entries(), &renderer);
         // bash (template-rendered) was never rendered; the custom tool's
         // call and result merged under one id.
-        assert_eq!(rendered.len(), 1, "{rendered:?}");
-        let entry = rendered.get("call-2").expect("call-2 rendered");
+        assert_eq!(rendered_map.len(), 1, "{rendered_map:?}");
+        let entry = rendered_map.get("call-2").expect("call-2 rendered");
         assert_eq!(
             entry.get("callHtml").and_then(Value::as_str),
             Some("<div>call call-2 custom_tool</div>")

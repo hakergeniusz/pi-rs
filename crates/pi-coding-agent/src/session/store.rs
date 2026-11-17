@@ -2052,6 +2052,7 @@ impl SessionManager {
             .iter()
             .filter(|entry| entry.kind() != "session")
             .cloned()
+            .collect()
     }
 
     /// `getTree` (`:1547-1585`): the session as a tree of defensive copies.

@@ -109,10 +109,10 @@ struct TextStyle {
 /// `styleToInlineCSS` (`ansi-to-html.ts:93-102`).
 fn style_to_inline_css(style: &TextStyle) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(fg) = style.fg {
+    if let Some(fg) = &style.fg {
         parts.push(format!("color:{fg}"));
     }
-    if let Some(bg) = style.bg {
+    if let Some(bg) = &style.bg {
         parts.push(format!("background-color:{bg}"));
     }
     if style.bold {

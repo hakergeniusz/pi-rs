@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use super::json;
 use super::store::{SessionManager, resolve_path};
-use super::{CURRENT_SESSION_VERSION, SessionError};
+use super::{CURRENT_SESSION_VERSION, SessionError, SessionResult};
 
 /// `serializeSessionBranch` (`session-export.ts:9-29`): the freshly stamped
 /// header followed by every entry on the current branch, each entry's
@@ -136,10 +136,10 @@ mod tests {
         // Branch entries chain through `parentId`, `null` at the root.
         let first_entry: serde_json::Value = serde_json::from_str(lines[1]).expect("first json");
         assert_eq!(first_entry["parentId"], Value::Null);
-        assert_eq!(first_entry["id"], first.id.as_str());
+        assert_eq!(first_entry["id"], first.id());
         let second_entry: serde_json::Value = serde_json::from_str(lines[2]).expect("second json");
-        assert_eq!(second_entry["parentId"], first.id.as_str());
-        assert_eq!(second_entry["id"], second.id.as_str());
+        assert_eq!(second_entry["parentId"], first.id());
+        assert_eq!(second_entry["id"], second.id());
     }
 
     #[test]

@@ -166,7 +166,7 @@ mod tests {
             issue,
             Some(SessionCwdIssue {
                 session_file: Some(session_file.clone()),
-                session_cwd: missing_cwd,
+                session_cwd: missing_cwd.clone(),
                 fallback_cwd: fallback_cwd.clone(),
             })
         );

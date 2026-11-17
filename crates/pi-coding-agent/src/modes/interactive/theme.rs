@@ -437,8 +437,12 @@ pub fn get_theme_export_colors(theme_name: Option<&str>) -> ThemeExportColors {
                 }
                 let lowered = text.to_ascii_lowercase();
                 if lowered.starts_with("okhsl(") {
-                    return Some(pi_tui::color::parse_color(&text)
-                        .map_or_else(|| text.clone(), pi_tui::color::color_to_hex));
+                    // An unparseable okhsl passes through raw where upstream
+                    // would feed `colorToHex` an `undefined`.
+                    return Some(match pi_tui::color::parse_color(&text) {
+                        Ok(color) => pi_tui::color::color_to_hex(color),
+                        Err(_) => text.clone(),
+                    });
                 }
                 Some(text)
             }
