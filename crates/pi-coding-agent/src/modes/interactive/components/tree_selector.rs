@@ -210,7 +210,7 @@ impl TreeList {
         list.last_selected_id = list
             .filtered_nodes
             .get(list.selected_index)
-            .and_then(|&index| list.flat_nodes[index].node.entry.id().map(str::to_string));
+            .map(|&index| list.flat_nodes[index].node.entry.id().to_string());
         list
     }
 
@@ -226,10 +226,7 @@ impl TreeList {
         let parent_of: HashMap<&str, Option<&str>> = self
             .flat_nodes
             .iter()
-            .filter_map(|flat| {
-                let id = flat.node.entry.id()?;
-                Some((id, flat.node.entry.parent_id()))
-            })
+            .map(|flat| (flat.node.entry.id(), flat.node.entry.parent_id()))
             .collect();
 
         // Visible entry ids to their indices in filteredNodes.
@@ -237,10 +234,7 @@ impl TreeList {
             .filtered_nodes
             .iter()
             .enumerate()
-            .filter_map(|(index, &flat_index)| {
-                let id = self.flat_nodes[flat_index].node.entry.id()?;
-                Some((id, index))
-            })
+            .map(|(index, &flat_index)| (self.flat_nodes[flat_index].node.entry.id(), index))
             .collect();
 
         let mut current_id = entry_id;
@@ -264,15 +258,14 @@ impl TreeList {
         let parent_of: HashMap<String, Option<String>> = self
             .flat_nodes
             .iter()
-            .filter_map(|flat| {
-                let id = flat.node.entry.id()?.to_string();
-                Some((
-                    id,
+            .map(|flat| {
+                (
+                    flat.node.entry.id().to_string(),
                     flat.node
                         .entry
                         .parent_id()
                         .map(std::string::ToString::to_string),
-                ))
+                )
             })
             .collect();
 
@@ -310,20 +303,17 @@ impl TreeList {
             let mut has = self
                 .current_leaf_id
                 .as_deref()
-                .is_some_and(|leaf| node.entry.id() == Some(leaf));
+                .is_some_and(|leaf| leaf == node.entry.id());
             for child in &node.children {
-                if child
-                    .entry
-                    .id()
-                    .and_then(|id| contains_active.get(id).copied())
+                if contains_active
+                    .get(child.entry.id())
+                    .copied()
                     .unwrap_or(false)
                 {
                     has = true;
                 }
             }
-            if let Some(id) = node.entry.id() {
-                contains_active.insert(id.to_string(), has);
-            }
+            contains_active.insert(node.entry.id().to_string(), has);
         }
 
         // Stack items: [node, indent, justBranched, showConnector, isLast,
@@ -345,10 +335,9 @@ impl TreeList {
         let multiple_roots = roots.len() > 1;
         let mut ordered_roots: Vec<&SessionTreeNode> = roots.iter().collect();
         ordered_roots.sort_by_key(|node| {
-            let active = node
-                .entry
-                .id()
-                .and_then(|id| contains_active.get(id).copied())
+            let active = contains_active
+                .get(node.entry.id())
+                .copied()
                 .unwrap_or(false);
             !active as u8
         });
@@ -411,10 +400,9 @@ impl TreeList {
             let mut prioritized: Vec<&SessionTreeNode> = Vec::new();
             let mut rest: Vec<&SessionTreeNode> = Vec::new();
             for child in children {
-                let active = child
-                    .entry
-                    .id()
-                    .and_then(|id| contains_active.get(id).copied())
+                let active = contains_active
+                    .get(child.entry.id())
+                    .copied()
                     .unwrap_or(false);
                 if active {
                     prioritized.push(child);
@@ -480,7 +468,7 @@ impl TreeList {
                 .and_then(|&index| {
                     self.flat_nodes
                         .get(index)
-                        .and_then(|flat| flat.node.entry.id().map(str::to_string))
+                        .map(|flat| flat.node.entry.id().to_string())
                 })
                 .or(self.last_selected_id.clone());
         }
@@ -498,7 +486,7 @@ impl TreeList {
             if entry.kind() == "usage" {
                 continue;
             }
-            let is_current_leaf = entry.id() == self.current_leaf_id.as_deref();
+            let is_current_leaf = self.current_leaf_id.as_deref() == Some(entry.id());
 
             // Skip assistant messages with only tool calls (no text) unless
             // error/aborted; always show the current leaf
@@ -568,22 +556,14 @@ impl TreeList {
         if !self.folded_nodes.is_empty() {
             let mut skip_set: HashSet<String> = HashSet::new();
             for flat in &self.flat_nodes {
-                let Some(id) = flat.node.entry.id().map(str::to_string) else {
-                    continue;
-                };
+                let id = flat.node.entry.id().to_string();
                 if let Some(parent_id) = flat.node.entry.parent_id() {
                     if self.folded_nodes.contains(parent_id) || skip_set.contains(parent_id) {
                         skip_set.insert(id);
                     }
                 }
             }
-            filtered.retain(|&index| {
-                self.flat_nodes[index]
-                    .node
-                    .entry
-                    .id()
-                    .is_none_or(|id| !skip_set.contains(id))
-            });
+            filtered.retain(|&index| !skip_set.contains(self.flat_nodes[index].node.entry.id()));
         }
         self.filtered_nodes = filtered;
 
@@ -603,7 +583,7 @@ impl TreeList {
                 .and_then(|&index| {
                     self.flat_nodes
                         .get(index)
-                        .and_then(|flat| flat.node.entry.id().map(str::to_string))
+                        .map(|flat| flat.node.entry.id().to_string())
                 })
                 .or(self.last_selected_id.clone());
         }
@@ -621,22 +601,21 @@ impl TreeList {
         let visible_ids: HashSet<String> = self
             .filtered_nodes
             .iter()
-            .filter_map(|&index| self.flat_nodes[index].node.entry.id().map(str::to_string))
+            .map(|&index| self.flat_nodes[index].node.entry.id().to_string())
             .collect();
 
         // Full-tree parent lookup (`tree-selector.ts:444-448`).
         let parent_of: HashMap<String, Option<String>> = self
             .flat_nodes
             .iter()
-            .filter_map(|flat| {
-                let id = flat.node.entry.id()?.to_string();
-                Some((
-                    id,
+            .map(|flat| {
+                (
+                    flat.node.entry.id().to_string(),
                     flat.node
                         .entry
                         .parent_id()
                         .map(std::string::ToString::to_string),
-                ))
+                )
             })
             .collect();
 
@@ -658,9 +637,7 @@ impl TreeList {
         visible_children.insert(None, Vec::new());
 
         for &index in &self.filtered_nodes {
-            let Some(node_id) = self.flat_nodes[index].node.entry.id().map(str::to_string) else {
-                continue;
-            };
+            let node_id = self.flat_nodes[index].node.entry.id().to_string();
             let ancestor_id = find_visible_ancestor(&node_id);
             visible_parent.insert(node_id.clone(), ancestor_id.clone());
             visible_children
@@ -702,10 +679,11 @@ impl TreeList {
                 is_virtual_root_child,
             ) = item;
 
-            let Some(flat_index) =
-                self.filtered_nodes.iter().copied().find(|&index| {
-                    self.flat_nodes[index].node.entry.id() == Some(node_id.as_str())
-                })
+            let Some(flat_index) = self
+                .filtered_nodes
+                .iter()
+                .copied()
+                .find(|&index| self.flat_nodes[index].node.entry.id() == node_id)
             else {
                 continue;
             };
@@ -854,7 +832,7 @@ impl TreeList {
     /// `updateNodeLabel` (`tree-selector.ts:640-648`).
     fn update_node_label(&mut self, entry_id: &str, label: Option<&str>) {
         for flat in &mut self.flat_nodes {
-            if flat.node.entry.id() == Some(entry_id) {
+            if flat.node.entry.id() == entry_id {
                 flat.node.label = label.map(str::to_string);
                 flat.node.label_timestamp = label.map(|_| now_iso8601());
                 break;
@@ -931,7 +909,7 @@ impl TreeList {
             // their positions, with the fold indicator in the connector
             // (`tree-selector.ts:708-738`).
             let total_chars = display_indent * 3;
-            let is_folded = entry.id().is_some_and(|id| self.folded_nodes.contains(id));
+            let is_folded = self.folded_nodes.contains(entry.id());
             let connector = if flat.show_connector && !flat.is_virtual_root_child {
                 if flat.is_last { "└─ " } else { "├─ " }
             } else {
@@ -956,7 +934,7 @@ impl TreeList {
                     if pos_in_level == 0 {
                         prefix_chars.push(if flat.is_last { "└" } else { "├" });
                     } else if pos_in_level == 1 {
-                        let foldable = entry.id().is_some_and(|id| self.is_foldable(id));
+                        let foldable = self.is_foldable(entry.id());
                         prefix_chars.push(if is_folded {
                             "⊞"
                         } else if foldable {
@@ -984,9 +962,7 @@ impl TreeList {
 
             // The active-path marker sits right before the entry text
             // (`tree-selector.ts:744-746`).
-            let is_on_active_path = entry
-                .id()
-                .is_some_and(|id| self.active_path_ids.contains(id));
+            let is_on_active_path = self.active_path_ids.contains(entry.id());
             let path_marker = if is_on_active_path {
                 theme.fg(ThemeColor::Accent, "• ")
             } else {
@@ -1231,9 +1207,9 @@ impl TreeList {
             "ls" => format!("[ls: {}]", shorten("path", ".")),
             _ => {
                 let args = serde_json::Value::Object(arguments.clone()).to_string();
-                let args_str: String = args.chars().take(40).collect();
+                let args_preview: String = args.chars().take(40).collect();
                 let ellipsis = if args.chars().count() > 40 { "..." } else { "" };
-                format!("[{name}: {args_str}{ellipsis}]")
+                format!("[{name}: {args_preview}{ellipsis}]")
             }
         }
     }
@@ -1260,22 +1236,16 @@ impl TreeList {
     /// branch-segment start in the given direction. "up" walks the visible
     /// parent chain; "down" walks the first visible child.
     fn find_branch_segment_start(&self, direction: &str) -> usize {
-        let Some(selected_id) = self
-            .filtered_nodes
-            .get(self.selected_index)
-            .and_then(|&index| self.flat_nodes[index].node.entry.id().map(str::to_string))
-        else {
+        let Some(&selected_index) = self.filtered_nodes.get(self.selected_index) else {
             return self.selected_index;
         };
+        let selected_id = self.flat_nodes[selected_index].node.entry.id().to_string();
 
         let index_by_entry_id: HashMap<&str, usize> = self
             .filtered_nodes
             .iter()
             .enumerate()
-            .filter_map(|(index, &flat_index)| {
-                let id = self.flat_nodes[flat_index].node.entry.id()?;
-                Some((id, index))
-            })
+            .map(|(index, &flat_index)| (self.flat_nodes[flat_index].node.entry.id(), index))
             .collect();
         let mut current_id = selected_id;
         if direction == "down" {
@@ -1349,7 +1319,7 @@ impl TreeList {
             let current_id = self
                 .filtered_nodes
                 .get(self.selected_index)
-                .and_then(|&index| self.flat_nodes[index].node.entry.id().map(str::to_string));
+                .map(|&index| self.flat_nodes[index].node.entry.id().to_string());
             match current_id {
                 Some(current_id)
                     if self.is_foldable(&current_id)
@@ -1367,7 +1337,7 @@ impl TreeList {
             let current_id = self
                 .filtered_nodes
                 .get(self.selected_index)
-                .and_then(|&index| self.flat_nodes[index].node.entry.id().map(str::to_string));
+                .map(|&index| self.flat_nodes[index].node.entry.id().to_string());
             match current_id {
                 Some(current_id) if self.folded_nodes.contains(&current_id) => {
                     self.folded_nodes.remove(&current_id);
@@ -1394,7 +1364,7 @@ impl TreeList {
         } else if keybindings::matches(data, action::SELECT_CONFIRM) {
             match self
                 .get_selected_node()
-                .and_then(|node| node.entry.id().map(str::to_string))
+                .map(|node| node.entry.id().to_string())
             {
                 Some(id) => TreeListOutcome::Selected(id),
                 None => TreeListOutcome::None,
@@ -1489,10 +1459,9 @@ impl TreeList {
             // `app.tree.editLabel` (`:1083-1087`): the container opens the
             // label input for the selected entry.
             match self.get_selected_node() {
-                Some(node) => TreeListOutcome::LabelEdit(
-                    node.entry.id().unwrap_or_default().to_string(),
-                    node.label.clone(),
-                ),
+                Some(node) => {
+                    TreeListOutcome::LabelEdit(node.entry.id().to_string(), node.label.clone())
+                }
                 None => TreeListOutcome::None,
             }
         } else if theme::app_keys::matches(data, theme::app_keys::TREE_TOGGLE_LABEL_TIMESTAMP) {
@@ -2148,9 +2117,7 @@ mod tests {
             .collect();
         let mut by_id: HashMap<String, usize> = HashMap::new();
         for (index, node) in nodes.iter().enumerate() {
-            if let Some(id) = node.entry.id() {
-                by_id.insert(id.to_string(), index);
-            }
+            by_id.insert(node.entry.id().to_string(), index);
         }
         let mut children_of: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
         let mut roots: Vec<usize> = Vec::new();
@@ -2199,9 +2166,8 @@ mod tests {
         selector
             .tree_list()
             .get_selected_node()
-            .and_then(|node| node.entry.id())
+            .map(|node| node.entry.id().to_string())
             .unwrap_or_default()
-            .to_string()
     }
 
     fn take_events(selector: &TreeSelectorComponent) -> Vec<TreeSelectorEvent> {

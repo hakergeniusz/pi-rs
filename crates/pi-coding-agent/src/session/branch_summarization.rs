@@ -20,8 +20,8 @@ use pi_agent::{AgentMessage, StreamFn, ThinkingLevel};
 use pi_ai::types::Model;
 
 use super::compaction::{
-    self, CompactionError, FileOperations, SUMMARIZATION_SYSTEM_PROMPT, compute_file_lists,
-    format_file_operations, serialize_conversation,
+    self, CompactionError, FileOperations, compute_file_lists, format_file_operations,
+    serialize_conversation,
 };
 use super::records::{ContextEditEntry, SessionEntry};
 use super::store::SessionManager;
@@ -113,7 +113,7 @@ pub fn collect_entries_for_branch_summary(
         return (Vec::new(), None);
     };
     let old_path_ids: std::collections::HashSet<&str> =
-        old_path.iter().filter_map(|entry| entry.id()).collect();
+        old_path.iter().map(|entry| entry.id()).collect();
     let Ok(target_path) = session.get_branch(Some(target_id)) else {
         return (Vec::new(), None);
     };
@@ -123,8 +123,8 @@ pub fn collect_entries_for_branch_summary(
     let common_ancestor_id = target_path
         .iter()
         .rev()
-        .find(|entry| entry.id().is_some_and(|id| old_path_ids.contains(id)))
-        .and_then(|entry| entry.id().map(str::to_string));
+        .find(|entry| old_path_ids.contains(entry.id()))
+        .map(|entry| entry.id().to_string());
 
     // Collect entries from the old leaf back to the common ancestor.
     let mut entries: Vec<SessionEntry> = Vec::new();
@@ -263,14 +263,13 @@ pub fn prepare_branch_entries(entries: &[SessionEntry], token_budget: u64) -> Br
         std::collections::HashMap::new();
     for entry in entries {
         if let SessionEntry::ContextEdit(edit) = entry {
-            edits.insert(entry.target_id.as_str(), edit);
+            edits.insert(edit.target_id.as_str(), edit);
         }
     }
 
     // Second pass: newest to oldest (`branch-summarization.ts:239-265`).
     for entry in entries.iter().rev() {
-        let Some(message) = message_from_entry(entry, edits.get(entry.id().unwrap_or_default()))
-        else {
+        let Some(message) = message_from_entry(entry, edits.get(entry.id()).copied()) else {
             continue;
         };
 
@@ -508,17 +507,10 @@ mod tests {
         // with a1 the common ancestor... actually u1 is the root: the walk
         // stops before it, so a1, u2, a2 summarize.
         let (entries, ancestor) =
-            collect_entries_for_branch_summary(&session, Some(&a2.base.id), &u1.base.id);
-        let ids: Vec<&str> = entries.iter().filter_map(|entry| entry.id()).collect();
-        assert_eq!(
-            ids,
-            vec![
-                a1.base.id.as_str(),
-                u2.base.id.as_str(),
-                a2.base.id.as_str()
-            ]
-        );
-        assert_eq!(ancestor.as_deref(), Some(u1.base.id.as_str()));
+            collect_entries_for_branch_summary(&session, Some(a2.id()), u1.id());
+        let ids: Vec<&str> = entries.iter().map(|entry| entry.id()).collect();
+        assert_eq!(ids, vec![a1.id(), u2.id(), a2.id()]);
+        assert_eq!(ancestor.as_deref(), Some(u1.id()));
     }
 
     fn test_assistant_message(text: &str) -> AgentMessage {

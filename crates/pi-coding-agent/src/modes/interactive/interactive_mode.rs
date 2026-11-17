@@ -4906,7 +4906,11 @@ impl InteractiveMode {
 
         let session_dir = Some(self.session.get_session_dir().to_path_buf());
         if self.session.is_persisted() {
-            let Some(current_session_file) = self.session.session_file().map(str::to_string) else {
+            let Some(current_session_file) = self
+                .session
+                .session_file()
+                .map(|path| path.to_string_lossy().into_owned())
+            else {
                 return Err("Persisted session is missing a session file".to_string());
             };
             let Some(target_leaf_id) = target_leaf_id else {
@@ -5369,7 +5373,7 @@ impl InteractiveMode {
             .get_branch_summary_settings()
             .reserve_tokens
             .max(0) as u64;
-        let signal = AbortSignal::new();
+        let signal = Arc::new(AbortSignal::new());
         let worker_signal = Arc::clone(&signal);
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
@@ -8853,7 +8857,7 @@ export default function (pi) {
             .session
             .append_message(test_assistant_message("the reply"))
             .expect("append assistant");
-        (user.base.id.clone(), assistant.base.id.clone())
+        (user.id().to_string(), assistant.id().to_string())
     }
 
     /// A minimal assistant message (the wire fields the renderers read),
@@ -9293,7 +9297,7 @@ export default function (pi) {
     #[test]
     fn tree_label_change_persists() {
         let dir = tempfile::tempdir().expect("dir");
-        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        let (mut mode, _capture) = fixture(dir.path(), "unused.txt");
         mode.tui.start().expect("tui start");
         let (user_id, _assistant_id) = seed_two_messages(&mut mode);
 
