@@ -1724,6 +1724,177 @@ never persists the results). Fixed in the extension itself
 (hakergeniusz/pi-multi-account `d41ceda`, disk-backed catalog cache,
 10.5× on an A/B harness) outside this repo.
 
+## Session tree commands: /fork /clone /tree (landed on `feat/session-tree-commands`, 2026-11-17)
+
+Resumed the user-killed agent's WIP (settings/theme diffs + a 234-line
+`user_message_selector.rs`) and completed the slice; landed as `e44afb8`
+(CI 44129415351). All three commands are 1:1 ports; the `/resume`
+fork-tree prefixes and `Store::get_branch_records` primitives from the
+session-selector slice are reused, not duplicated.
+
+- **WIP salvage**: `TreeFilterMode` in config/settings.rs
+  (`tree-selector.ts:98`, cycle `:1065-1076`, status labels `:650-670`;
+  `settings-manager.ts:1379-1390`), `app.session.tree/fork` +
+  `app.tree.*` keybinding actions (`keybindings.ts:80-98`, `:143-170`),
+  and the `/fork` dialog component (`user-message-selector.ts:1-171`).
+- **`/fork` + `/clone`** (`interactive-mode.ts:3398-3411`, `:5692-5749`;
+  `agent-session-runtime.ts:262-350`; `getUserMessagesForForking`
+  `agent-session.ts:4342-4357`): the `session_before_fork` gate,
+  `extractUserMessageText`, `createBranchedSession` for persisted
+  sessions with the verbatim "not saved yet" error, the new-empty-session
+  path for forks from the root, in-memory in-place mutation, and
+  `teardownCurrent`'s abort → `session_shutdown` ordering. Dispatch and
+  autocomplete entries verbatim (`slash-commands.ts:22,34-35`).
+- **`BranchSummaryMessageComponent`** (`branch-summary-message.ts:1-96`)
+  wired into both replay paths (`interactive-mode.ts:4063-4074`) so
+  fork/tree leave visible transcript rows.
+- **`TreeSelectorComponent`** (`tree-selector.ts:1-1439`):
+  flatten/indentation (`:203-331`), five filter modes with
+  nearest-visible-ancestor selection (`:333-431`), filtered-view
+  recalculation (`:439-562`), horizontal viewport (`:65-95`),
+  fold/unfold + segment jumps (`:1001-1016`, `:1108-1152`), search with
+  reset-on-change, label edit, copy (`:907-934`), label timestamps
+  (`:865-888`), help rows (`:1182-1273`), search-line cursor.
+- **`ExtensionSelectorComponent`/`ExtensionEditorComponent`** (focused
+  ports of `extension-selector.ts:1-107`, `extension-editor.ts:1-145`)
+  for the "Summarize branch?" flow.
+- **`session/branch_summarization.rs`** (`branch-summarization.ts:1-398`):
+  `collectEntriesForBranchSummary`, `prepareBranchEntries`, the verbatim
+  `BRANCH_SUMMARY_PROMPT`/preamble, `generateBranchSummary` reusing the
+  compaction pipeline (helpers made `pub(crate)`).
+- **`/tree` navigation** (`interactive-mode.ts:3408-3411`, `:5751-5898`;
+  `AgentSession.navigateTree` `agent-session.ts:4140-4337`):
+  current-leaf no-op, skip-prompt summary dialog loop, abort-first, busy
+  recheck (the #9178 shape), the `session_before_tree` gate with the
+  preparation payload, `branchWithSummary`/`resetLeaf`/`branch` leaf
+  moves, `session_tree` emission, editor-text handback, transcript
+  replay. `isCompacting` now covers branch summaries
+  (`agent-session.ts:1719-1726`) for the submit queue and interrupt
+  chain; the worker mirrors `CompactionRun`.
+- **Tests** (41): 15 tree_selector, 12 interactive_mode (mirroring
+  `interactive-mode-clone-command.test.ts` /
+  `interactive-mode-tree-navigation.test.ts` incl. the busy-guard and
+  abort-then-navigate cases), 3 branch_summarization, 3 branch_summary,
+  2 extension_selector, 2 extension_editor, 2 settings.
+- **Deviations**: no `session_start` emission on fork replacement
+  (port-wide gap shared with `/resume`/`/new`, noted in the fork
+  comment); `session_before_tree` is cancel-only — extension
+  summary/label overrides land with E3, gate hoisted ahead of the
+  summarizer worker (same ordering as upstream's in-`navigateTree`
+  gate); branch summarization is a single LLM attempt (matches the
+  port's compaction deviation, upstream wraps retries);
+  `replaceInstructions` rides `false` to the worker; summarize-dialog
+  countdown/timeout and tools-expand passthrough unwired (no caller
+  passes opts — full extension-dialog machinery is E3); editor omits
+  ctrl+G external-editor (P7); `fork`/`tree`/`resume` app actions stay
+  unbound in `app_keys` (upstream default `[]` — the port reaches them
+  via commands, consistent with `app.session.new/resume`); unparseable
+  label timestamps render empty vs upstream's `NaN:NaN`.
+
+## Export/import commands + HTML export (landed on `feat/export-import-commands`, 2026-11-17)
+
+Resumed the user-killed agent's WIP (a correct 179-line
+`session/export.rs`, two small record hooks, the vendored upstream
+templates) and completed the slice; landed as `cff4973` (CI
+44134392721). The branch was rebased onto main mid-flight because the
+tree slice landed between branch creation and landing — see the rebase
+gotchas below. **`/share` is deliberately NOT ported** (upstream Radius
+gateway — banned by repo policy; a test pins its absence from
+autocomplete).
+
+- **`session/export.rs`** (`core/session-export.ts:1-45` whole file):
+  `serializeSessionBranch` (v3 header in literal key order, `parentId`
+  chaining rewritten per branch entry, first entry `null`, entries
+  without id drop the key like `JSON.stringify` dropping `undefined`)
+  and `exportSessionToJsonl` (timestamped default name with `[:.]→-`,
+  mkdir-recursive, resolved path returned). A golden round-trip test
+  exports a real pi-written fixture and reproduces every entry line
+  byte-for-byte (only the header timestamp refreshes).
+- **`session/cwd.rs`** (`core/session-cwd.ts:1-73` whole file):
+  `SessionCwdIssue`, `getMissingSessionCwdIssue` with the exact 3-line
+  error, `getMissingSessionCwdOptions`, `assertSessionCwdExists`.
+- **`store.rs`**: `get_header_record()`/`get_entry_records()` —
+  upstream's `getHeader`/`getEntries` return the file objects in their
+  original key order, which the HTML export serializes verbatim.
+- **`session/export_html/`**: `mod.rs` ports `core/export-html/index.ts:
+  1-318` (`parseColor`/`getLuminance`/`adjustBrightness`/
+  `deriveExportColors`/`generateThemeVars`/`generateHtml`/
+  `preRenderCustomTools` with `TEMPLATE_RENDERED_TOOLS`, call/result
+  merge keyed by tool-call id/`exportSessionToHtml`/`exportFromFile`)
+  plus a `js_replace_first` helper reproducing `String.replace`'s
+  first-occurrence + GetSubstitution `$`-pattern semantics (`$&`,
+  `` $` ``, `$'`, `$$`; `$n` stays literal when n > captures — the
+  vendored `highlight.min.js` contains a literal `$&` that upstream's
+  own export rewrites to the needle text); `ansi_to_html.rs` ports
+  `ansi-to-html.ts:1-297` (SGR state machine, 256-color cube/grayscale,
+  truecolor, OSC 8 links with the `https?:|mailto:` allow-list, escape
+  stripping); `tool_renderer.rs` carries the `ToolHtmlRenderer`
+  interface (`tool-renderer.ts:26-37`). Templates live at
+  `crates/pi-coding-agent/export-html/` (crate-root data dir, the
+  `pi-tui/themes` + `pi-ai/data` convention) embedded byte-identically
+  via `include_str!` (cmp-verified against upstream before/after).
+- **Theme**: `theme.rs` gained the "HTML Export Helpers"
+  (`theme.ts:834-897`) — `get_resolved_theme_colors`,
+  `get_theme_export_colors` (vars refs, okhsl→hex, empty→`undefined`,
+  indexed→hex, raw passthrough for hex/oklch).
+- **CLI**: `--export <file> [output]` wired to `exportFromFile`
+  (`main.ts:688-703`) — removes the P5/P6 stub for that flag.
+- **Interactive wiring**: `handleExportCommand`
+  (`interactive-mode.ts:6708-6724`), `getPathCommandArgument` verbatim
+  (`:6726-6750`), `handleImportCommand` state machine (`:6752-6803`:
+  usage line → Yes/No confirm → missing-cwd continue/fork/cancel →
+  file-not-found/fatal lines), `importFromJsonl`
+  (`agent-session-runtime.ts:359-407`: COPYFILE_EXCL copy into the
+  session dir with `${name}-${suffix}${ext}` dedup, the
+  `session_before_switch` resume gate, stored-cwd assertion dropping
+  the copy on failure, session swap), `switchToForkedSession`
+  (`:5982-5999`). The landed tree-slice `extension_selector.rs`
+  backs the confirm dialog. Autocomplete entries verbatim
+  (`slash-commands.ts:25-26`).
+- **Tests** (49): export.rs 4, cwd.rs 4, export_html/mod.rs 16 (incl.
+  the whitespace-rules mirror of `export-html-whitespace.test.ts` and
+  `embedded_templates_are_upstream_bytes`), ansi_to_html.rs 11,
+  extension_selector 4 (landed versions), interactive_mode.rs e2e
+  through the real submit path (import copy/swap, confirm-cancel
+  restore, missing-cwd continue/fork/cancel, path-parsing cases from
+  `interactive-mode-import-command.test.ts:25-43`,
+  autocomplete-advertises-export-and-import-but-not-share).
+- **Deviations**: template embedding via `include_str!` vs upstream's
+  runtime `getExportTemplateDir` (`config.ts:454-460`) — bytes are
+  upstream's exactly; `createToolHtmlRenderer` (`tool-renderer.ts:
+  57-175`) is not portable over the E1 headless extension boundary (no
+  `resolveToolRenderers`, TUI components cannot cross QuickJS) — the
+  trait + the full `preRenderCustomTools` orchestration are ported and
+  tested against a fake renderer, shipped wiring passes
+  `tool_renderer: None` so custom tools render via the template's
+  structured path (E2 restores the factory); import keeps the startup
+  runtime and swaps the session only (the documented `switch_session`
+  seam; upstream rebuilds the runtime for the imported cwd) and
+  `handleFatalRuntimeError` renders a non-fatal error line (no crash
+  report/`exit(1)`); CSS-var order is pi's declaration order
+  (`ThemeColor::ALL`/`ThemeBg::ALL`) vs upstream's theme-document key
+  order (values identical, no upstream test pins order);
+  extension-selector countdown/timeout and `onToggleToolsExpanded`
+  omitted (need E2's TUI binding); `/share` and
+  `createTrailingEntries` omitted (Radius policy; share was the only
+  caller); SGR digit strings too big for `i64` parse to `i64::MAX` (no
+  SGR branch matches, like JS's huge numbers);
+  `exportToHtml`'s `[themeName, settings.getTheme()]` fallback is
+  unreachable (the live theme always resolves).
+
+## PTY re-verification of the user-test round (2026-11-16→17)
+
+All three user-reported fixes re-verified live on the rebuilt release
+binary with PTY drivers (`/tmp/pi-rs-smoke/verify_round.py` +
+`esc_probe.py`, outside the repo): footer renders
+`(openai-codex) gpt-6-luna • medium` (provider prefix + default
+thinking level), `/settings` dialog mounts with the real rows and no
+freeze, `/login` opens the method dialog and then the full provider
+catalog (display names, radius/openrouter-first sort, `✓ stored` /
+`✦ not configured` statuses), ESC closes each dialog and `/exit`
+exits promptly. The egg close-fade stays code-verified 1:1 (visual
+check is terminal-dependent).
+
 ## Gotchas / decisions
 - **Two locks of the same mutex inside one statement self-deadlock**
   (hit 2026-11-16, `/settings`): `let x = Foo { a: m.lock().f(), b:
@@ -1831,6 +2002,44 @@ never persists the results). Fixed in the extension itself
 - Catalog reality check for tests: `models.json` has `claude-sonnet-4-5/4-6/5/5-5` but NOT plain `claude-sonnet-4`; bare `claude-sonnet-4-6` is ambiguous (anthropic + cloudflare-ai-gateway + opencode).
 - Deviations documented in code: NFKC subset for fuzzy edit matching (no `unicode-normalization` dep yet), no revision-cache in auth storage, no `powershell` tool, bash tool description hardcodes "bash".
 - Local dev machine only (if ever resumed): plain `cargo` is broken there (rustup proxy misreads argv[0]); use `/tmp/ai-agent/cargo` wrapper (`exec -a cargo nice -n 19 ionice -c 2 -n 7 /usr/sbin/cargo`). On acer no wrapper needed — just prefix `nice -n 19`.
+
+- **Rebase grafts lose definitions and registry lines silently**
+  (hit 2026-11-17, export slice): resolving repeated rebase conflicts
+  with `checkout --ours` against a tip graft preserves call sites and
+  tests but silently drops items that live OUTSIDE the grafted hunks —
+  the compiler catches referenced-but-missing items (enums, fns), but
+  pure data lines (autocomplete registry entries) vanish invisibly
+  until their specific test runs. After any programmatic graft,
+  inventory-audit: diff every definition (enums/structs/fns) AND every
+  registry/data line the pre-rebase tip had against the rebased branch
+  — not just what the compiler complains about.
+- **Green gate ≠ mergeable — ff-merge BEFORE deleting branches**
+  (hit 2026-11-17): a branch whose gate is green can still be based on
+  an older main (main moved twice during the export slice's gate
+  rounds), making `--ff-only` fail AFTER the branch refs were already
+  deleted. Recovery: the tip commit hash survives in the object store —
+  `git branch <name> <tip-hash>`, re-push, rebase onto main, re-gate.
+  Order is: verify `git merge-base main <branch>` == main tip →
+  ff-merge → push → poll CI → only then delete branch/worktree.
+- **rustfmt can be non-convergent on a first pass** (seen 2026-11-17):
+  one gate's FMTCHECK failed with diffs in a file the slice never
+  touched (pi-ext-js/transpile.rs) even though `cargo fmt --all` ran
+  first with exit 0; a second write+check cycle converged. If FMTCHECK
+  fails on untouched files, re-run `cargo fmt --all` and re-check
+  before hunting for a cause. Also: `git add -A` after a gate round
+  sweeps in the fmt rewrites left on the gate checkout — commit them
+  deliberately as a `style:` commit (or restore them) rather than
+  mixing them into a semantic fix.
+- **PTY driver exit detection: EOF-read EIO swallows the exit**
+  (hit 2026-11-16→17): on child exit the pty master becomes readable
+  and `os.read` raises OSError — a driver's `except OSError: break`
+  skips the waitpid reap, so a cleanly-exited process reads as "no
+  exit". Discriminate with `/proc/<pid>/state` (Z = zombie, already
+  exited; wchan/syscall are readable without ptrace). Related: `/login`
+  opens the auth-METHOD dialog first — the provider catalog renders
+  only after choosing a method, so PTY verifiers must drive through it;
+  and CaptureTerminal-driven tests need an explicit `render_now(false)`
+  after mounts/pumps or the frame never records the dialog.
 
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
