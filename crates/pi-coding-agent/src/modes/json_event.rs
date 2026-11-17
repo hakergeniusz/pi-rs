@@ -279,7 +279,7 @@ impl JsonEventSink {
     /// Writes one pre-serialized value as a JSON line. JSON mode's prelude is
     /// the session header (`print-mode.ts:129-134`).
     fn write_value(value: &serde_json::Value) {
-        crate::output_guard::write_raw_stdout(&format!("{}\n", value));
+        crate::output_guard::write_raw_stdout(&format!("{value}\n"));
     }
 }
 

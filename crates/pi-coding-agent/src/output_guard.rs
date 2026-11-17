@@ -126,12 +126,6 @@ fn retrying_write(mut write: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     }
 }
 
-/// `writeRawStdoutChunk` (`output-guard.ts:20-43`) over an injectable
-/// sink, so tests observe the write without a terminal.
-fn write_raw_stdout_chunk_to<W: Write>(writer: &mut W, text: &str) -> io::Result<()> {
-    retrying_write(|| writer.write_all(text.as_bytes()))
-}
-
 fn write_raw_stdout_chunk(text: &str) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     retrying_write(|| stdout.write_all(text.as_bytes()))
@@ -170,6 +164,12 @@ mod tests {
     /// Serializes the takeover test: the state is process-global and the
     /// harness runs tests on parallel threads.
     static TAKEOVER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// `writeRawStdoutChunk` (`output-guard.ts:20-43`) over an injectable
+    /// sink, so tests observe the write without a terminal.
+    fn write_raw_stdout_chunk_to<W: Write>(writer: &mut W, text: &str) -> io::Result<()> {
+        retrying_write(|| writer.write_all(text.as_bytes()))
+    }
 
     /// A writer that fails the first `remaining` writes with `WouldBlock`
     /// (the `EAGAIN`/`EWOULDBLOCK` arm, `output-guard.ts:37`), then
@@ -239,7 +239,7 @@ mod tests {
         };
         write_raw_stdout_chunk_to(&mut writer, "").expect("empty write");
         assert_eq!(writer.remaining, 1);
-        assert!(writer.received.is_empty());
+        assert_eq!(writer.received, Vec::<u8>::new());
     }
 
     /// A `WouldBlock` write retries until it succeeds
