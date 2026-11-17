@@ -35,6 +35,8 @@ pub fn refresh_model_catalogs(
 
 /// The engine-free shape: no runner to join.
 #[cfg(not(feature = "ext-js"))]
-pub fn refresh_model_catalogs(_runner: Option<&Arc<Mutex<pi_ext_js::ExtensionRunner>>>) -> ModelsRefreshResult {
+pub fn refresh_model_catalogs(
+    _runner: Option<&Arc<Mutex<pi_ext_js::ExtensionRunner>>>,
+) -> ModelsRefreshResult {
     crate::models_state::refresh_result()
 }

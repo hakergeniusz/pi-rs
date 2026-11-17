@@ -339,7 +339,10 @@ impl ScopedModelsSelectorComponent {
         let count_text = if self.enabled_ids.is_none() {
             "all enabled".to_string()
         } else if unavailable_count > 0 {
-            format!("{enabled_count}/{} enabled · {unavailable_count} unavailable", self.all_ids.len())
+            format!(
+                "{enabled_count}/{} enabled · {unavailable_count} unavailable",
+                self.all_ids.len()
+            )
         } else {
             format!("{enabled_count}/{} enabled", self.all_ids.len())
         };
@@ -463,15 +466,20 @@ impl ScopedModelsSelectorComponent {
             } else {
                 "  ".to_string()
             };
-            self.list_lines
-                .push(format!("{prefix}{status}{model_text}{name_text}{provider_badge}"));
+            self.list_lines.push(format!(
+                "{prefix}{status}{model_text}{name_text}{provider_badge}"
+            ));
         }
 
         // Add scroll indicator if needed
         if start > 0 || end < self.filtered_items.len() {
             self.list_lines.push(theme.fg(
                 ThemeColor::Muted,
-                &format!("  ({}/{})", self.selected_index + 1, self.filtered_items.len()),
+                &format!(
+                    "  ({}/{})",
+                    self.selected_index + 1,
+                    self.filtered_items.len()
+                ),
             ));
         }
 
@@ -565,8 +573,11 @@ impl ScopedModelsSelectorComponent {
                 };
                 let new_index = current_index as isize + delta;
                 // Only move if within bounds
-                let length =
-                    self.enabled_ids.as_ref().expect("checked is_none above").len();
+                let length = self
+                    .enabled_ids
+                    .as_ref()
+                    .expect("checked is_none above")
+                    .len();
                 if new_index >= 0 && new_index < length as isize {
                     self.enabled_ids = move_enabled(&self.enabled_ids, &item.full_id, delta);
                     self.is_dirty = true;
@@ -574,8 +585,7 @@ impl ScopedModelsSelectorComponent {
                     // (`scoped-models-selector.ts:359`); `refresh` clamps
                     // when the filtered row order drifts from the enabled
                     // order.
-                    self.selected_index =
-                        (self.selected_index as isize + delta).max(0) as usize;
+                    self.selected_index = (self.selected_index as isize + delta).max(0) as usize;
                     self.refresh();
                     self.notify_change();
                 }
@@ -700,10 +710,7 @@ impl Component for ScopedModelsSelectorComponent {
         let border = theme.fg_styler(ThemeColor::BorderMuted);
         let mut lines = vec![border(&"─".repeat(width.max(1)))];
         lines.push(String::new());
-        lines.push(theme.fg(
-            ThemeColor::Accent,
-            &theme::bold("Model Configuration"),
-        ));
+        lines.push(theme.fg(ThemeColor::Accent, &theme::bold("Model Configuration")));
         lines.push(theme.fg(
             ThemeColor::Muted,
             &format!(
@@ -804,15 +811,17 @@ mod tests {
                 continue;
             };
             for (index, model) in models.iter().enumerate() {
-                states[index] = enabled.as_ref().is_none_or(|list| {
-                    list.contains(&format!("{}/{}", model.provider, model.id))
-                });
+                states[index] = enabled
+                    .as_ref()
+                    .is_none_or(|list| list.contains(&format!("{}/{}", model.provider, model.id)));
             }
         }
         states
     }
 
-    fn drained(events: &Arc<Mutex<Vec<ScopedModelsSelectorEvent>>>) -> Vec<ScopedModelsSelectorEvent> {
+    fn drained(
+        events: &Arc<Mutex<Vec<ScopedModelsSelectorEvent>>>,
+    ) -> Vec<ScopedModelsSelectorEvent> {
         events.lock().expect("events").clone()
     }
 
@@ -860,7 +869,11 @@ mod tests {
         let rows: Vec<String> = plain(&component)
             .lines()
             .map(|line| {
-                line.chars().skip(4).collect::<String>().trim_end().to_string()
+                line.chars()
+                    .skip(4)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
             })
             .collect();
         assert!(rows.contains(&"model-a [acme]".to_string()), "{rows:?}");
@@ -915,7 +928,10 @@ mod tests {
 
         let states = states_from_events(&initial, &drained(&events), &models);
         assert_eq!(states, vec![false, false, false]);
-        assert_eq!(marker_states(&component, &models), vec![false, false, false]);
+        assert_eq!(
+            marker_states(&component, &models),
+            vec![false, false, false]
+        );
 
         key_sequence(&mut component, &["\r"]); // toggle model-a
         let states = states_from_events(&initial, &drained(&events), &models);
@@ -963,10 +979,7 @@ mod tests {
         let models = vec![model("acme", "model-a", "Model A")];
         let (mut component, events, _states) = harness(&models, None);
         component.handle_input("\x1b");
-        assert_eq!(
-            drained(&events),
-            vec![ScopedModelsSelectorEvent::Cancel]
-        );
+        assert_eq!(drained(&events), vec![ScopedModelsSelectorEvent::Cancel]);
         component.handle_input("\x03");
         assert_eq!(drained(&events).len(), 2);
     }
@@ -1021,7 +1034,10 @@ mod tests {
         let Some(ScopedModelsSelectorEvent::Change(Some(ids))) = drained.last() else {
             panic!("expected a change, got {drained:?}");
         };
-        assert_eq!(ids, &["acme/model-a".to_string(), "acme/model-b".to_string()]);
+        assert_eq!(
+            ids,
+            &["acme/model-a".to_string(), "acme/model-b".to_string()]
+        );
         let text = plain(&component);
         assert!(text.contains("model-b"), "{text}");
         assert!(!text.contains("Model Name: Model A"), "{text}");
@@ -1137,11 +1153,7 @@ mod tests {
         let enabled = Some(vec!["c".to_string()]);
         assert_eq!(
             get_sorted_ids(&enabled, &all),
-            vec![
-                "c".to_string(),
-                "a".to_string(),
-                "b".to_string()
-            ]
+            vec!["c".to_string(), "a".to_string(), "b".to_string()]
         );
         assert_eq!(get_sorted_ids(&None, &all), all);
     }

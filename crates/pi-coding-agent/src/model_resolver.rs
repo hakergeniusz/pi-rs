@@ -26,8 +26,8 @@
 
 use std::collections::HashSet;
 
-use pi_ai::types::Model;
 use pi_agent::types::ThinkingLevel;
+use pi_ai::types::Model;
 
 /// A scoped model with its pattern-explicit thinking level
 /// (`ScopedModel`, `model-resolver.ts:66-70`).
@@ -151,7 +151,10 @@ fn split_provider_prefix(text: &str, pool: &[&Model]) -> Option<(String, String)
         }
         // `best.provider.length >= provider.length` compares the original
         // lengths (`model-resolver.ts:146`); carry the original alongside.
-        if best.as_ref().is_some_and(|(length, _, _)| *length >= model.provider.len()) {
+        if best
+            .as_ref()
+            .is_some_and(|(length, _, _)| *length >= model.provider.len())
+        {
             continue;
         }
         for (slash_index, _) in text.match_indices('/') {
@@ -162,7 +165,11 @@ fn split_provider_prefix(text: &str, pool: &[&Model]) -> Option<(String, String)
             if model_text.is_empty() {
                 continue;
             }
-            best = Some((model.provider.len(), model.provider.clone(), model_text.to_string()));
+            best = Some((
+                model.provider.len(),
+                model.provider.clone(),
+                model_text.to_string(),
+            ));
             break;
         }
     }
@@ -264,13 +271,17 @@ fn resolve_text(
     if inner.is_not_found() {
         return inner;
     }
-    let warning =
-        format!("Invalid thinking level \"{suffix}\" in pattern \"{text}\". Using default instead.");
+    let warning = format!(
+        "Invalid thinking level \"{suffix}\" in pattern \"{text}\". Using default instead."
+    );
     apply_warning(inner, Some(warning)).with_thinking_level(None)
 }
 
 /// The `{...inner, warning}` spread (`model-resolver.ts:222-226`).
-fn apply_warning(mut result: ModelReferenceResult, warning: Option<String>) -> ModelReferenceResult {
+fn apply_warning(
+    mut result: ModelReferenceResult,
+    warning: Option<String>,
+) -> ModelReferenceResult {
     match &mut result {
         ModelReferenceResult::Resolved { warning: slot, .. }
         | ModelReferenceResult::Ambiguous { warning: slot, .. } => *slot = warning,
@@ -284,8 +295,13 @@ fn apply_warning(mut result: ModelReferenceResult, warning: Option<String>) -> M
 /// The thinking level and warning ride the recursion's outermost wrap
 /// ([`Reference::into_result`]), like upstream's spreads.
 enum Reference {
-    Resolved { model: Model },
-    Ambiguous { candidates: Vec<Model>, usable_count: usize },
+    Resolved {
+        model: Model,
+    },
+    Ambiguous {
+        candidates: Vec<Model>,
+        usable_count: usize,
+    },
 }
 
 impl Reference {
@@ -334,45 +350,46 @@ fn select_reference(
         .filter(|(_, model)| model.id.to_lowercase() == lower_text)
         .map(|(index, _)| index)
         .collect();
-    let named: Option<usize> = split_provider_prefix(text, pool).and_then(|(provider, model_text)| {
-        let provider_models: Vec<usize> = pool
-            .iter()
-            .enumerate()
-            .filter(|(_, model)| model.provider == provider)
-            .map(|(index, _)| index)
-            .collect();
-        let lower_model_text = model_text.to_lowercase();
-        // The provider's own literal id (OpenRouter's `openrouter/free`)
-        // beats its fuzzy matches (`model-resolver.ts:247-251`).
-        provider_models
-            .iter()
-            .find(|&&index| pool[index].id.to_lowercase() == lower_model_text)
-            .copied()
-            .or_else(|| {
-                raw.iter()
-                    .find(|&&index| pool[index].provider == provider)
-                    .copied()
-            })
-            .or_else(|| {
-                if !fuzzy {
-                    return None;
-                }
-                let matches: Vec<Model> = fuzzy_matches(
-                    &model_text,
-                    &provider_models
+    let named: Option<usize> =
+        split_provider_prefix(text, pool).and_then(|(provider, model_text)| {
+            let provider_models: Vec<usize> = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, model)| model.provider == provider)
+                .map(|(index, _)| index)
+                .collect();
+            let lower_model_text = model_text.to_lowercase();
+            // The provider's own literal id (OpenRouter's `openrouter/free`)
+            // beats its fuzzy matches (`model-resolver.ts:247-251`).
+            provider_models
+                .iter()
+                .find(|&&index| pool[index].id.to_lowercase() == lower_model_text)
+                .copied()
+                .or_else(|| {
+                    raw.iter()
+                        .find(|&&index| pool[index].provider == provider)
+                        .copied()
+                })
+                .or_else(|| {
+                    if !fuzzy {
+                        return None;
+                    }
+                    let matches: Vec<Model> = fuzzy_matches(
+                        &model_text,
+                        &provider_models
+                            .iter()
+                            .map(|&index| pool[index])
+                            .collect::<Vec<_>>(),
+                    );
+                    let best = best_fuzzy_match_owned(&matches)?;
+                    provider_models
                         .iter()
-                        .map(|&index| pool[index])
-                        .collect::<Vec<_>>(),
-                );
-                let best = best_fuzzy_match_owned(&matches)?;
-                provider_models
-                    .iter()
-                    .find(|&&index| {
-                        pool[index].provider == best.provider && pool[index].id == best.id
-                    })
-                    .copied()
-            })
-    });
+                        .find(|&&index| {
+                            pool[index].provider == best.provider && pool[index].id == best.id
+                        })
+                        .copied()
+                })
+        });
     // Identity comparison upstream (`raw.filter((model) => model !== named)`).
     let others: Vec<usize> = raw
         .iter()
@@ -415,7 +432,10 @@ fn select_reference(
         });
     }
     Some(Reference::Ambiguous {
-        candidates: candidates.iter().map(|&index| pool[index].clone()).collect(),
+        candidates: candidates
+            .iter()
+            .map(|&index| pool[index].clone())
+            .collect(),
         usable_count: usable_others.len(),
     })
 }
@@ -438,7 +458,12 @@ fn select_fuzzy(matches: &[Model], usable: &dyn Fn(&str) -> bool) -> Option<Refe
     if matches.is_empty() {
         return None;
     }
-    let multiple_providers = matches.iter().map(|model| model.provider.as_str()).collect::<HashSet<_>>().len() > 1;
+    let multiple_providers = matches
+        .iter()
+        .map(|model| model.provider.as_str())
+        .collect::<HashSet<_>>()
+        .len()
+        > 1;
     let usable_matches: Vec<Model> = if multiple_providers {
         matches
             .iter()
@@ -461,11 +486,18 @@ fn select_fuzzy(matches: &[Model], usable: &dyn Fn(&str) -> bool) -> Option<Refe
         .filter(|model| model.id == best.id)
         .cloned()
         .collect();
-    let tied_providers = tied.iter().map(|model| model.provider.as_str()).collect::<HashSet<_>>();
+    let tied_providers = tied
+        .iter()
+        .map(|model| model.provider.as_str())
+        .collect::<HashSet<_>>();
     if tied_providers.len() == 1 {
         return Some(Reference::Resolved { model: best });
     }
-    let usable_count = if usable_matches.is_empty() { 0 } else { tied.len() };
+    let usable_count = if usable_matches.is_empty() {
+        0
+    } else {
+        tied.len()
+    };
     Some(Reference::Ambiguous {
         candidates: tied,
         usable_count,
@@ -481,7 +513,11 @@ fn best_fuzzy_match_owned(matches: &[Model]) -> Option<Model> {
         .filter(|model| is_alias(&model.id))
         .cloned()
         .collect();
-    let pool: &[Model] = if aliases.is_empty() { matches } else { &aliases };
+    let pool: &[Model] = if aliases.is_empty() {
+        matches
+    } else {
+        &aliases
+    };
     pool.iter().max_by(|a, b| a.id.cmp(&b.id)).cloned()
 }
 
@@ -495,9 +531,7 @@ fn has_date_suffix(id: &str) -> bool {
     let bytes = id.as_bytes();
     bytes.len() > 9
         && bytes[bytes.len() - 9] == b'-'
-        && bytes[bytes.len() - 8..]
-            .iter()
-            .all(u8::is_ascii_digit)
+        && bytes[bytes.len() - 8..].iter().all(u8::is_ascii_digit)
 }
 
 /// `resolveModelScopeFromModels` (`model-resolver.ts:333-393`): resolve scope
@@ -511,7 +545,9 @@ pub fn resolve_model_scope_from_models(
     models: &[Model],
 ) -> ResolveModelScopeResult {
     let mut result = ResolveModelScopeResult::default();
-    let add = |scoped_models: &mut Vec<ScopedModel>, model: Model, thinking_level: Option<ThinkingLevel>| {
+    let add = |scoped_models: &mut Vec<ScopedModel>,
+               model: Model,
+               thinking_level: Option<ThinkingLevel>| {
         if !scoped_models
             .iter()
             .any(|scoped| models_are_equal(&scoped.model, &model))
@@ -529,7 +565,9 @@ pub fn resolve_model_scope_from_models(
             pattern: pattern.to_string(),
         });
     };
-    let ambiguous = |diagnostics: &mut Vec<ModelScopeDiagnostic>, pattern: &str, candidates: &[Model]| {
+    let ambiguous = |diagnostics: &mut Vec<ModelScopeDiagnostic>,
+                     pattern: &str,
+                     candidates: &[Model]| {
         let mut providers: Vec<String> = candidates
             .iter()
             .map(|model| model.provider.clone())
@@ -579,12 +617,17 @@ pub fn resolve_model_scope_from_models(
                     // Match against "provider/modelId" format OR just model ID
                     // (`model-resolver.ts:364-369`): this allows "*sonnet*" to
                     // match without requiring "anthropic/*sonnet*".
-                    matches.extend(models.iter().filter(|model| {
-                        glob_matches(
-                            &format!("{}/{}", model.provider, model.id),
-                            glob_pattern,
-                        ) || glob_matches(&model.id, glob_pattern)
-                    }).cloned());
+                    matches.extend(
+                        models
+                            .iter()
+                            .filter(|model| {
+                                glob_matches(
+                                    &format!("{}/{}", model.provider, model.id),
+                                    glob_pattern,
+                                ) || glob_matches(&model.id, glob_pattern)
+                            })
+                            .cloned(),
+                    );
                 }
             }
             if matches.is_empty() {
@@ -673,7 +716,10 @@ mod tests {
     }
 
     fn scope(patterns: &[&str], models: &[Model]) -> ResolveModelScopeResult {
-        let owned: Vec<String> = patterns.iter().map(|pattern| (*pattern).to_string()).collect();
+        let owned: Vec<String> = patterns
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect();
         resolve_model_scope_from_models(&owned, models)
     }
 
@@ -693,7 +739,10 @@ mod tests {
             .map(|scoped| scoped.model.id.as_str())
             .collect();
         assert_eq!(ids, ["claude-sonnet-4-5", "gpt-4o"]);
-        assert_eq!(result.scoped_models[0].thinking_level, Some(ThinkingLevel::High));
+        assert_eq!(
+            result.scoped_models[0].thinking_level,
+            Some(ThinkingLevel::High)
+        );
         assert_eq!(result.scoped_models[1].thinking_level, None);
         assert_eq!(
             result.diagnostics,
@@ -733,8 +782,14 @@ mod tests {
                 })
                 .collect();
             assert_eq!(resolved.len(), 2, "{pattern}");
-            assert!(resolved.contains(&("azure/gpt-4o".to_string(), level)), "{pattern}");
-            assert!(resolved.contains(&("openai/gpt-4o".to_string(), level)), "{pattern}");
+            assert!(
+                resolved.contains(&("azure/gpt-4o".to_string(), level)),
+                "{pattern}"
+            );
+            assert!(
+                resolved.contains(&("openai/gpt-4o".to_string(), level)),
+                "{pattern}"
+            );
             // Upstream's message carries the pattern verbatim, suffix
             // included (`model-resolver.test.ts:410`).
             assert_eq!(
@@ -773,7 +828,10 @@ mod tests {
             .map(|scoped| scoped.model.id.as_str())
             .collect();
         assert_eq!(ids, ["bracketed-model[1m]"]);
-        assert_eq!(result.scoped_models[0].thinking_level, Some(ThinkingLevel::High));
+        assert_eq!(
+            result.scoped_models[0].thinking_level,
+            Some(ThinkingLevel::High)
+        );
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     }
 
@@ -813,9 +871,15 @@ mod tests {
     #[test]
     fn deduplicates_repeated_models_keeping_the_first_level() {
         let models = vec![model("anthropic", "claude-sonnet-4-5", "Claude")];
-        let result = scope(&["claude-sonnet-4-5:low", "anthropic/claude-sonnet-4-5:high"], &models);
+        let result = scope(
+            &["claude-sonnet-4-5:low", "anthropic/claude-sonnet-4-5:high"],
+            &models,
+        );
         assert_eq!(result.scoped_models.len(), 1);
-        assert_eq!(result.scoped_models[0].thinking_level, Some(ThinkingLevel::Low));
+        assert_eq!(
+            result.scoped_models[0].thinking_level,
+            Some(ThinkingLevel::Low)
+        );
     }
 
     // `resolveModelReference` behavior the scope resolver leans on
@@ -842,7 +906,10 @@ mod tests {
         let ModelReferenceResult::Resolved { model, .. } = result else {
             panic!("expected a resolution, got {result:?}");
         };
-        assert_eq!((model.provider.as_str(), model.id.as_str()), ("zai", "glm-5"));
+        assert_eq!(
+            (model.provider.as_str(), model.id.as_str()),
+            ("zai", "glm-5")
+        );
     }
 
     #[test]
@@ -878,7 +945,9 @@ mod tests {
             &|_| true,
         );
         let ModelReferenceResult::Resolved {
-            model, thinking_level, warning,
+            model,
+            thinking_level,
+            warning,
         } = result
         else {
             panic!("expected a resolution, got {result:?}");
@@ -887,7 +956,9 @@ mod tests {
         assert_eq!(thinking_level, None);
         assert_eq!(
             warning.as_deref(),
-            Some("Invalid thinking level \"invalid\" in pattern \"gpt-4o:invalid\". Using default instead.")
+            Some(
+                "Invalid thinking level \"invalid\" in pattern \"gpt-4o:invalid\". Using default instead."
+            )
         );
     }
 }

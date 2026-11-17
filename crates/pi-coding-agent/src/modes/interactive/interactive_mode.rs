@@ -51,7 +51,6 @@ use crate::session::store::{NewSessionOptions, SessionManager};
 
 use super::autocomplete;
 use super::chat_viewport::{self, ChatViewport, HostSlot};
-use super::model_catalog_refresh::refresh_model_catalogs;
 use super::components::armin::ArminComponent;
 use super::components::assistant_message::AssistantMessageComponent;
 use super::components::auth_selector::{
@@ -78,6 +77,7 @@ use super::components::user_message::UserMessageComponent;
 use super::components::user_message_selector::{
     UserMessageItem, UserMessageSelectorComponent, UserMessageSelectorEvent,
 };
+use super::model_catalog_refresh::refresh_model_catalogs;
 use super::theme;
 use crate::cli::args::DiagnosticKind;
 use crate::model_resolver::{
@@ -1089,7 +1089,10 @@ impl InteractiveMode {
         let scoped_completion_models: Arc<Mutex<Vec<pi_ai::types::Model>>> =
             Arc::new(Mutex::new(Vec::new()));
         let provider = autocomplete::CombinedAutocompleteProvider::new(
-            Self::autocomplete_commands(&virtual_catalog_models, Arc::clone(&scoped_completion_models)),
+            Self::autocomplete_commands(
+                &virtual_catalog_models,
+                Arc::clone(&scoped_completion_models),
+            ),
             runtime.session.get_cwd().to_path_buf(),
             crate::tools::bash::which("fd"),
         );
@@ -1408,15 +1411,27 @@ impl InteractiveMode {
                                 }) {
                                     continue;
                                 }
-                                models.push((model.id.clone(), provider.clone(), model.name.clone()));
+                                models.push((
+                                    model.id.clone(),
+                                    provider.clone(),
+                                    model.name.clone(),
+                                ));
                             }
                         }
                         for model in &virtual_models {
-                            models.push((model.id.clone(), model.provider.clone(), model.name.clone()));
+                            models.push((
+                                model.id.clone(),
+                                model.provider.clone(),
+                                model.name.clone(),
+                            ));
                         }
                     } else {
                         for model in &scoped {
-                            models.push((model.id.clone(), model.provider.clone(), model.name.clone()));
+                            models.push((
+                                model.id.clone(),
+                                model.provider.clone(),
+                                model.name.clone(),
+                            ));
                         }
                     }
                     // `getModelSearchText` (`model-search.ts:7-11`).
@@ -5362,7 +5377,9 @@ impl InteractiveMode {
         }
 
         // Status (`interactive-mode.ts:6693-6697`).
-        self.show_status("Reloaded keybindings, extensions, skills, prompts, themes, and context files");
+        self.show_status(
+            "Reloaded keybindings, extensions, skills, prompts, themes, and context files",
+        );
     }
 
     /// `handleExportCommand` (`interactive-mode.ts:6708-6724`): a `.jsonl`
@@ -8097,10 +8114,8 @@ mod tests {
     /// to is banned here.
     #[test]
     fn autocomplete_advertises_export_and_import_but_not_share() {
-        let commands = InteractiveMode::autocomplete_commands(
-            &[],
-            Arc::new(Mutex::new(Vec::new())),
-        );
+        let commands =
+            InteractiveMode::autocomplete_commands(&[], Arc::new(Mutex::new(Vec::new())));
         let find = |name: &str| {
             commands
                 .iter()
