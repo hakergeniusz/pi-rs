@@ -278,12 +278,10 @@ impl TreeList {
 
         loop {
             self.active_path_ids.insert(current_id.clone());
-            let Some(parent) = parent_of.get(&current_id) else {
-                break;
-            };
-            match parent {
-                Some(parent) => current_id = parent.clone(),
-                None => break,
+            match parent_of.get(&current_id) {
+                Some(Some(parent)) => current_id = parent.clone(),
+                // A missing key or a null parent end the walk.
+                _ => break,
             }
         }
     }
@@ -292,6 +290,7 @@ impl TreeList {
     /// with pi's indentation rules — a single-child chain stays flat; a
     /// branch point and the first generation after one shift right. The
     /// branch containing the active leaf sorts first at every branch point.
+    #[allow(clippy::too_many_lines)] // mirrors the TS flattenTree; split when extending
     fn flatten_tree(&mut self, roots: &[SessionTreeNode]) -> Vec<FlatNode> {
         let mut result: Vec<FlatNode> = Vec::new();
         self.tool_call_map.clear();
@@ -470,6 +469,7 @@ impl TreeList {
     /// `applyFilter` (`tree-selector.ts:333-431`): filter the flat list, drop
     /// folded descendants, recompute the visual structure, and restore the
     /// selection (or its nearest visible ancestor).
+    #[allow(clippy::too_many_lines)] // mirrors the TS applyFilter; split when extending
     fn apply_filter(&mut self) {
         // Preserve the selection through empty filter results
         // (`tree-selector.ts:334-338`).
@@ -612,6 +612,7 @@ impl TreeList {
     /// `recalculateVisualStructure` (`tree-selector.ts:439-562`): recompute
     /// indentation/connectors for the filtered view; descendants attach to
     /// the nearest visible ancestor.
+    #[allow(clippy::too_many_lines)] // mirrors the TS recalculateVisualStructure; split when extending
     fn recalculate_visual_structure(&mut self) {
         if self.filtered_nodes.is_empty() {
             return;
@@ -715,7 +716,7 @@ impl TreeList {
                 flat.indent = indent;
                 flat.show_connector = show_connector;
                 flat.is_last = is_last;
-                flat.gutters = gutters.clone();
+                flat.gutters.clone_from(&gutters);
                 flat.is_virtual_root_child = is_virtual_root_child;
             }
 
@@ -872,6 +873,7 @@ impl TreeList {
     }
 
     /// `render` (`tree-selector.ts:672-774`).
+    #[allow(clippy::too_many_lines)] // mirrors the TS render; split when extending
     fn render(&self, width: usize) -> Vec<String> {
         let theme = theme::theme();
         let mut lines: Vec<String> = Vec::new();
@@ -1326,6 +1328,7 @@ impl TreeList {
 
     /// `handleInput` (`tree-selector.ts:995-1101`): the checks and their
     /// order are upstream's.
+    #[allow(clippy::too_many_lines)] // mirrors the TS handleInput; split when extending
     fn handle_input(&mut self, data: &str) -> TreeListOutcome {
         if keybindings::matches(data, action::SELECT_UP) {
             self.selected_index = if self.selected_index == 0 {

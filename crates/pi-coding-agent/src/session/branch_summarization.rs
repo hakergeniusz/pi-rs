@@ -319,6 +319,7 @@ pub struct BranchSummaryOptions<'a> {
 }
 
 /// `generateBranchSummary` (`branch-summarization.ts:307-398`).
+#[allow(clippy::too_many_lines)] // mirrors the TS generateBranchSummary; split when extending
 pub async fn generate_branch_summary(
     entries: &[SessionEntry],
     options: &BranchSummaryOptions<'_>,

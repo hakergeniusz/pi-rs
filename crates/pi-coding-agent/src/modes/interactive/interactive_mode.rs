@@ -4865,6 +4865,7 @@ impl InteractiveMode {
     /// and the message text returns for editing); `At` ends at the entry
     /// itself. `Completed(Some(text))` carries the selected message's text
     /// for the editor (`selectedText`, `"before"` only).
+    #[allow(clippy::too_many_lines)] // mirrors the TS AgentSessionRuntime.fork; split when extending
     fn fork_session(
         &mut self,
         entry_id: &str,
@@ -5361,7 +5362,7 @@ impl InteractiveMode {
         let model = self.model.clone();
         let api_key = self.api_key.clone();
         let access_token = self.access_token.clone();
-        let thinking_level = self.thinking_level.clone();
+        let thinking_level = self.thinking_level;
         let stream_fn = Arc::clone(&self.stream_fn);
         let reserve_tokens = self
             .settings
