@@ -4,8 +4,10 @@
 
 [advisories]
 vulnerability = "deny"
-unmaintained = "warn"
-yanked = "all"
+# cargo-deny >= 0.18 schema: `unmaintained` takes a scope selector
+# (all/workspace/transitive/none), `yanked` takes a level (deny/warn/allow).
+unmaintained = "all"
+yanked = "warn"
 
 [licenses]
 allow = [
