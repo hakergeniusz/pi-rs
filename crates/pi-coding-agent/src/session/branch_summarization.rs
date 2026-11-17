@@ -113,7 +113,7 @@ pub fn collect_entries_for_branch_summary(
         return (Vec::new(), None);
     };
     let old_path_ids: std::collections::HashSet<&str> =
-        old_path.iter().map(|entry| entry.id()).collect();
+        old_path.iter().map(SessionEntry::id).collect();
     let Ok(target_path) = session.get_branch(Some(target_id)) else {
         return (Vec::new(), None);
     };
@@ -194,12 +194,9 @@ fn message_from_entry(
                 timestamp: super::store::iso_to_ms(&compaction.base.timestamp),
             },
         )),
-        // These don't contribute to conversation content.
-        SessionEntry::ThinkingLevelChange(_)
-        | SessionEntry::ModelChange(_)
-        | SessionEntry::Custom(_)
-        | SessionEntry::Label(_)
-        | SessionEntry::SessionInfo(_) => None,
+        // Thinking/model changes, custom entries, labels, session info,
+        // and anything else unmodeled don't contribute to conversation
+        // content.
         _ => None,
     }
 }
@@ -508,7 +505,7 @@ mod tests {
         // stops before it, so a1, u2, a2 summarize.
         let (entries, ancestor) =
             collect_entries_for_branch_summary(&session, Some(a2.id()), u1.id());
-        let ids: Vec<&str> = entries.iter().map(|entry| entry.id()).collect();
+        let ids: Vec<&str> = entries.iter().map(SessionEntry::id).collect();
         assert_eq!(ids, vec![a1.id(), u2.id(), a2.id()]);
         assert_eq!(ancestor.as_deref(), Some(u1.id()));
     }

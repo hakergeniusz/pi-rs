@@ -147,6 +147,24 @@ fn render_horizontal_viewport(rows: &[ViewportRow], width: usize) -> Vec<String>
         .collect()
 }
 
+/// The flatten walk's stack item: [node, indent, justBranched,
+/// showConnector, isLast, gutters, isVirtualRootChild]
+/// (`tree-selector.ts:212-213`).
+type FlattenStackItem<'a> = (
+    &'a SessionTreeNode,
+    usize,
+    bool,
+    bool,
+    bool,
+    Vec<GutterInfo>,
+    bool,
+);
+
+/// The filtered-view walk's stack item: [nodeId, indent, justBranched,
+/// showConnector, isLast, gutters, isVirtualRootChild]
+/// (`tree-selector.ts:491-492`).
+type RecalcStackItem = (String, usize, bool, bool, bool, Vec<GutterInfo>, bool);
+
 /// Tool call info for lookup (`ToolCallInfo`, `tree-selector.ts:104-107`).
 struct ToolCallInfo {
     name: String,
@@ -318,16 +336,7 @@ impl TreeList {
 
         // Stack items: [node, indent, justBranched, showConnector, isLast,
         // gutters, isVirtualRootChild].
-        type StackItem<'a> = (
-            &'a SessionTreeNode,
-            usize,
-            bool,
-            bool,
-            bool,
-            Vec<GutterInfo>,
-            bool,
-        );
-        let mut stack: Vec<StackItem> = Vec::new();
+        let mut stack: Vec<FlattenStackItem> = Vec::new();
 
         // Roots ordered so the one containing the active leaf comes first;
         // multiple roots render as children of a virtual branching root
@@ -345,7 +354,7 @@ impl TreeList {
             let is_last = index == ordered_roots.len() - 1;
             stack.push((
                 node,
-                if multiple_roots { 1 } else { 0 },
+                usize::from(multiple_roots),
                 multiple_roots,
                 multiple_roots,
                 is_last,
@@ -543,7 +552,7 @@ impl TreeList {
             }
 
             if !search_tokens.is_empty() {
-                let node_text = self.get_searchable_text(flat).to_lowercase();
+                let node_text = Self::get_searchable_text(flat).to_lowercase();
                 if !search_tokens.iter().all(|token| node_text.contains(token)) {
                     continue;
                 }
@@ -653,13 +662,12 @@ impl TreeList {
 
         // DFS over the visible tree with the flattenTree indentation rules
         // (`tree-selector.ts:490-557`).
-        type StackItem = (String, usize, bool, bool, bool, Vec<GutterInfo>, bool);
-        let mut stack: Vec<StackItem> = Vec::new();
+        let mut stack: Vec<RecalcStackItem> = Vec::new();
         for (index, root_id) in visible_root_ids.iter().enumerate().rev() {
             let is_last = index == visible_root_ids.len() - 1;
             stack.push((
                 root_id.clone(),
-                if self.multiple_roots { 1 } else { 0 },
+                usize::from(self.multiple_roots),
                 self.multiple_roots,
                 self.multiple_roots,
                 is_last,
@@ -747,7 +755,7 @@ impl TreeList {
 
     /// `getSearchableText` (`tree-selector.ts:564-623`): label, role, and
     /// content pieces joined with spaces.
-    fn get_searchable_text(&self, flat: &FlatNode) -> String {
+    fn get_searchable_text(flat: &FlatNode) -> String {
         let node = &flat.node;
         let entry = &node.entry;
         let mut parts: Vec<String> = Vec::new();
@@ -1270,7 +1278,7 @@ impl TreeList {
                         .copied()
                         .unwrap_or(self.selected_index);
                 }
-                current_id = children[0].clone();
+                current_id.clone_from(&children[0]);
             }
         }
 
@@ -1375,13 +1383,15 @@ impl TreeList {
         } else if theme::app_keys::matches(data, theme::app_keys::MESSAGE_COPY) {
             TreeListOutcome::Copy(self.copy_selected())
         } else if keybindings::matches(data, action::SELECT_CANCEL) {
-            if !self.search_query.is_empty() {
+            if self.search_query.is_empty() {
+                TreeListOutcome::Cancel
+            } else {
+                // Escape clears the search and the fold state first
+                // (`tree-selector.ts:1030-1037`).
                 self.search_query.clear();
                 self.folded_nodes.clear();
                 self.apply_filter();
                 TreeListOutcome::None
-            } else {
-                TreeListOutcome::Cancel
             }
         } else if theme::app_keys::matches(data, theme::app_keys::TREE_FILTER_DEFAULT) {
             // Direct filter: default (`tree-selector.ts:1038-1042`).
@@ -1840,7 +1850,7 @@ pub struct TreeSelectorComponent {
 
 impl TreeSelectorComponent {
     pub fn new(
-        tree: Vec<SessionTreeNode>,
+        tree: &[SessionTreeNode],
         current_leaf_id: Option<&str>,
         terminal_height: usize,
         initial_selected_id: Option<&str>,
@@ -2087,7 +2097,7 @@ mod tests {
         })
     }
 
-    /// A model_change entry (`modelChange`, `tree-selector.test.ts:93-101`).
+    /// A `model_change` entry (`modelChange`, `tree-selector.test.ts:93-101`).
     fn model_change(id: &str, parent_id: Option<&str>) -> SessionEntry {
         SessionEntry::ModelChange(crate::session::records::ModelChangeEntry {
             base: crate::session::records::EntryBase {
@@ -2106,6 +2116,21 @@ mod tests {
     /// chronological order, so a depth-first assembly over the index map
     /// reproduces upstream's shared-node structure.
     fn build_tree(entries: Vec<SessionEntry>) -> Vec<SessionTreeNode> {
+        /// Depth-first assembly of the linked tree (the upstream test shares
+        /// node references; the port clones the subtree instead).
+        fn assemble(
+            nodes: &[SessionTreeNode],
+            children_of: &[Vec<usize>],
+            index: usize,
+        ) -> SessionTreeNode {
+            let mut node = nodes[index].clone();
+            node.children = children_of[index]
+                .iter()
+                .map(|&child| assemble(nodes, children_of, child))
+                .collect();
+            node
+        }
+
         if entries.is_empty() {
             return Vec::new();
         }
@@ -2124,27 +2149,14 @@ mod tests {
         }
         let mut children_of: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
         let mut roots: Vec<usize> = Vec::new();
-        for index in 0..nodes.len() {
-            match nodes[index].entry.parent_id().map(str::to_string) {
+        for (index, node) in nodes.iter().enumerate() {
+            match node.entry.parent_id().map(str::to_string) {
                 None => roots.push(index),
                 Some(parent) => match by_id.get(&parent).copied() {
                     Some(parent_index) => children_of[parent_index].push(index),
                     None => roots.push(index),
                 },
             }
-        }
-
-        fn assemble(
-            nodes: &[SessionTreeNode],
-            children_of: &[Vec<usize>],
-            index: usize,
-        ) -> SessionTreeNode {
-            let mut node = nodes[index].clone();
-            node.children = children_of[index]
-                .iter()
-                .map(|&child| assemble(nodes, children_of, child))
-                .collect();
-            node
         }
 
         roots
@@ -2156,7 +2168,7 @@ mod tests {
     /// A selector over an events queue (the default theme auto-initializes).
     fn selector_for(tree: Vec<SessionTreeNode>, leaf: &str) -> TreeSelectorComponent {
         TreeSelectorComponent::new(
-            tree,
+            &tree,
             Some(leaf),
             24,
             None,

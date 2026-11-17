@@ -357,14 +357,6 @@ enum ForkOutcome {
     Completed(Option<String>),
 }
 
-/// `AgentSession.navigateTree`'s non-error outcomes (`agent-session.ts`
-/// :4140-4337): a `session_before_tree` veto, or the completed navigation
-/// with the editor text for a re-edited user/custom message (`editorText`).
-enum TreeNavigationOutcome {
-    Cancelled,
-    Completed(Option<String>),
-}
-
 /// One staged `/tree` navigation: the confirmed target plus the summarize
 /// dialog's decisions, and the branch summary worker while it runs
 /// (`showTreeSelector`'s selection tail, `interactive-mode.ts:5766-5871`).
@@ -1615,6 +1607,7 @@ impl InteractiveMode {
 
     /// The per-message branch of the replay (`addMessageToChat` +
     /// `renderSessionItems`, `interactive-mode.ts:3261-3338`, `:3359-3416`).
+    #[allow(clippy::too_many_lines)] // mirrors the TS replay; split when extending
     fn render_replayed_message(
         &mut self,
         message: &AgentMessage,
@@ -2082,6 +2075,7 @@ impl InteractiveMode {
     // Submission (`setupEditorSubmitHandler`, `interactive-mode.ts:3324`)
     // --------------------------------------------------------------
 
+    #[allow(clippy::too_many_lines)] // mirrors the TS submit chain; split when extending
     fn submit(&mut self, text: &str) {
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -4740,8 +4734,7 @@ impl InteractiveMode {
                     pi_ai::types::InputContent::Text(text) => Some(text.text.clone()),
                     pi_ai::types::InputContent::Image(_) => None,
                 })
-                .collect::<Vec<_>>()
-                .join(""),
+                .collect::<String>(),
         }
     }
 
@@ -5045,7 +5038,7 @@ impl InteractiveMode {
             .map_or(24, |size| usize::from(size.rows));
         let events = Arc::new(Mutex::new(Vec::new()));
         let selector = TreeSelectorComponent::new(
-            tree,
+            &tree,
             real_leaf_id.as_deref(),
             terminal_rows,
             initial_selected_id,
@@ -5333,7 +5326,7 @@ impl InteractiveMode {
             self.start_branch_summary();
         } else {
             let navigation = self.tree_navigation.take().expect("navigation");
-            self.finish_tree_navigation(navigation, None);
+            self.finish_tree_navigation(&navigation, None);
         }
     }
 
@@ -5342,12 +5335,15 @@ impl InteractiveMode {
     /// the target go to `generateBranchSummary` off the UI thread, with the
     /// `BranchSummaryStatusIndicator` standing in (`:5825-5837`).
     fn start_branch_summary(&mut self) {
-        let Some(navigation) = &self.tree_navigation else {
-            return;
+        let (target_id, custom_instructions) = {
+            let Some(navigation) = &self.tree_navigation else {
+                return;
+            };
+            (
+                navigation.target_id.clone(),
+                navigation.custom_instructions.clone(),
+            )
         };
-        let target_id = navigation.target_id.clone();
-        let custom_instructions = navigation.custom_instructions.clone();
-        drop(navigation);
         let old_leaf_id = self.session.get_leaf_id().map(str::to_string);
         let (entries_to_summarize, _common_ancestor_id) =
             crate::session::branch_summarization::collect_entries_for_branch_summary(
@@ -5359,7 +5355,7 @@ impl InteractiveMode {
             // `options.summarize && entriesToSummarize.length > 0`
             // (`:4234`): an empty branch navigates without a summary.
             let navigation = self.tree_navigation.take().expect("navigation");
-            self.finish_tree_navigation(navigation, None);
+            self.finish_tree_navigation(&navigation, None);
             return;
         }
 
@@ -5457,7 +5453,7 @@ impl InteractiveMode {
         let Some(navigation) = self.tree_navigation.take() else {
             return;
         };
-        self.finish_tree_navigation(navigation, Some(result));
+        self.finish_tree_navigation(&navigation, Some(result));
     }
 
     /// `navigateTree` + the UI update (`agent-session.ts:4140-4337`,
@@ -5466,7 +5462,7 @@ impl InteractiveMode {
     /// move, the `session_tree` emission, and the transcript replay.
     fn finish_tree_navigation(
         &mut self,
-        navigation: TreeNavigationRun,
+        navigation: &TreeNavigationRun,
         summary: Option<crate::session::branch_summarization::BranchSummaryResult>,
     ) {
         let summary = summary.and_then(|result| {
@@ -5478,10 +5474,8 @@ impl InteractiveMode {
             });
             Some((summary_text, details, result.usage))
         });
-        let target_id = navigation.target_id.clone();
-        match self.navigate_tree(&target_id, summary) {
-            Ok(TreeNavigationOutcome::Cancelled) => self.show_status("Navigation cancelled"),
-            Ok(TreeNavigationOutcome::Completed(editor_text)) => {
+        match self.navigate_tree(&navigation.target_id, summary) {
+            Ok(editor_text) => {
                 // Update UI: the transcript replays from the new leaf
                 // (`:5856-5863`).
                 self.chat_mut().clear();
@@ -5506,7 +5500,7 @@ impl InteractiveMode {
         &mut self,
         target_id: &str,
         summary: Option<(String, serde_json::Value, Option<pi_ai::types::Usage>)>,
-    ) -> Result<TreeNavigationOutcome, String> {
+    ) -> Result<Option<String>, String> {
         if self.agent_run.is_some() {
             return Err(
                 "Wait for the current response to finish before navigating the session tree."
@@ -5524,7 +5518,7 @@ impl InteractiveMode {
 
         // No-op if already at target (`:4155-4158`).
         if old_leaf_id.as_deref() == Some(target_id) {
-            return Ok(TreeNavigationOutcome::Completed(None));
+            return Ok(None);
         }
 
         let Some(target_entry) = self.session.get_entry(target_id) else {
@@ -5554,8 +5548,7 @@ impl InteractiveMode {
                             pi_ai::types::InputContent::Text(text) => Some(text.text.clone()),
                             pi_ai::types::InputContent::Image(_) => None,
                         })
-                        .collect::<Vec<_>>()
-                        .join(""),
+                        .collect::<String>(),
                 };
                 (custom.base.parent_id.clone(), Some(text))
             }
@@ -5600,7 +5593,7 @@ impl InteractiveMode {
             "summaryEntry": summary_entry_id,
         }));
 
-        Ok(TreeNavigationOutcome::Completed(editor_text))
+        Ok(editor_text)
     }
 
     /// A notification-only extension emit (`runner.emit`): errors surface as
@@ -8964,6 +8957,7 @@ export default function (pi) {
             mode.suspended_editor.is_some(),
             "the fork dialog occupies the editor slot"
         );
+        mode.tui.render_now(false);
         let plain = strip_terminal_sequences(&capture.output());
         assert!(plain.contains("Fork from Message"), "{plain}");
         assert!(plain.contains("first message"), "{plain}");
@@ -8978,6 +8972,7 @@ export default function (pi) {
             .expect("selector events")
             .push(UserMessageSelectorEvent::Selected(user_id.clone()));
         mode.pump();
+        mode.tui.render_now(false);
 
         let plain = strip_terminal_sequences(&capture.output());
         assert!(plain.contains("Forked to new session"), "{plain}");
@@ -9001,6 +8996,7 @@ export default function (pi) {
 
         mode.submit("/fork");
         assert!(mode.suspended_editor.is_some(), "dialog mounted");
+        mode.tui.render_now(false);
         mode.user_message_selector_events
             .as_ref()
             .expect("selector events")
@@ -9008,6 +9004,7 @@ export default function (pi) {
             .expect("selector events")
             .push(UserMessageSelectorEvent::Cancel);
         mode.pump();
+        mode.tui.render_now(false);
 
         assert!(mode.suspended_editor.is_none(), "editor restored");
         assert!(mode.user_message_selector_events.is_none());
@@ -9145,7 +9142,7 @@ export default function (pi) {
         }
     }
 
-    /// A branch summary runs on the worker and lands as a branch_summary
+    /// A branch summary runs on the worker and lands as a `branch_summary`
     /// entry attached at the navigation target (`agent-session.ts`
     /// :4230-4306).
     #[test]

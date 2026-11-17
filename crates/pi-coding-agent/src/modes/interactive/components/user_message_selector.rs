@@ -150,7 +150,7 @@ impl UserMessageSelectorComponent {
 
     /// `buildBaseLayout` — the constructor's child order
     /// (`user-message-selector.ts:136-159`).
-    fn render_base(&self, content: Vec<String>, width: usize) -> Vec<String> {
+    fn render_base(content: Vec<String>, width: usize) -> Vec<String> {
         let theme = theme::theme();
         let border = DynamicBorder::new();
         let mut lines = vec![String::new()];
@@ -179,7 +179,7 @@ impl UserMessageSelectorComponent {
 
 impl Component for UserMessageSelectorComponent {
     fn render(&self, width: usize) -> Vec<String> {
-        self.render_base(self.message_list.render(width), width)
+        Self::render_base(self.message_list.render(width), width)
     }
 
     /// `handleInput` (`user-message-selector.ts:90-119`).

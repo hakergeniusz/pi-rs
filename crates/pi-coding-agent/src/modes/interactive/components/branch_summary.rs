@@ -17,7 +17,6 @@ use super::super::theme;
 /// The branch summary row (`branch-summary-message.ts:20-96`).
 pub struct BranchSummaryMessageComponent {
     expanded: bool,
-    summary: String,
     output_pad: usize,
     /// The expanded body (header + summary); renders at the real width like
     /// upstream's Markdown child.
@@ -31,7 +30,6 @@ impl BranchSummaryMessageComponent {
     pub fn new(summary: &str, output_pad: usize) -> Self {
         let mut component = Self {
             expanded: false,
-            summary: summary.to_string(),
             output_pad,
             markdown: Self::build_markdown(summary, output_pad),
             content: Vec::new(),
