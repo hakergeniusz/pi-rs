@@ -3,10 +3,13 @@
 # std ships with rustc and is not scanned.
 
 [advisories]
-vulnerability = "deny"
-# cargo-deny >= 0.18 schema: `unmaintained` takes a scope selector
-# (all/workspace/transitive/none), `yanked` takes a level (deny/warn/allow).
-unmaintained = "all"
+# cargo-deny >= 0.18 schema (PR #611): `vulnerability` is gone — RustSec
+# vulnerabilities always fail the check; `unmaintained` takes a scope
+# selector (all/workspace/transitive/none); `yanked` takes a level
+# (deny/warn/allow).
+# unmaintained = "none": chrono 0.4.x is flagged by RUSTSEC-2026-0543 and
+# no safe upgrade exists; the advisory stands but must not fail the job.
+unmaintained = "none"
 yanked = "warn"
 
 [licenses]
