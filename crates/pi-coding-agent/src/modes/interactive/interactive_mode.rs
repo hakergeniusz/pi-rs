@@ -1289,6 +1289,7 @@ impl InteractiveMode {
     /// whole catalog (upstream: the scoped-models subset or the runtime
     /// snapshot; the scoped-models setting lands later), `/thinking` the
     /// valid levels.
+    #[allow(clippy::too_many_lines)] // mirrors the TS command registry; split when extending
     fn autocomplete_commands(
         virtual_models: &[pi_ai::types::Model],
     ) -> Vec<autocomplete::SlashCommand> {
