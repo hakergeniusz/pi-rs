@@ -534,6 +534,24 @@ pub mod app_keys {
     pub const TREE_FILTER_CYCLE_FORWARD: &str = "app.tree.filter.cycleForward";
     /// Cycle the tree filter backward (`keybindings.ts:167-170`).
     pub const TREE_FILTER_CYCLE_BACKWARD: &str = "app.tree.filter.cycleBackward";
+    /// Scoped-models selector: save the selection to settings
+    /// (`keybindings.ts:119-122`).
+    pub const MODELS_SAVE: &str = "app.models.save";
+    /// Scoped-models selector: enable every (filtered) model
+    /// (`keybindings.ts:123-126`).
+    pub const MODELS_ENABLE_ALL: &str = "app.models.enableAll";
+    /// Scoped-models selector: clear every (filtered) model
+    /// (`keybindings.ts:127-130`).
+    pub const MODELS_CLEAR_ALL: &str = "app.models.clearAll";
+    /// Scoped-models selector: toggle all models of the selected entry's
+    /// provider (`keybindings.ts:131-134`).
+    pub const MODELS_TOGGLE_PROVIDER: &str = "app.models.toggleProvider";
+    /// Scoped-models selector: move the model up in cycle order
+    /// (`keybindings.ts:135-138`).
+    pub const MODELS_REORDER_UP: &str = "app.models.reorderUp";
+    /// Scoped-models selector: move the model down in cycle order
+    /// (`keybindings.ts:139-142`).
+    pub const MODELS_REORDER_DOWN: &str = "app.models.reorderDown";
 
     /// pi's default keys, in `APP_KEYBINDINGS` order.
     pub const DEFAULTS: &[(&str, &[&str])] = &[
@@ -575,6 +593,14 @@ pub mod app_keys {
         (TREE_FILTER_ALL, &["ctrl+a"]),
         (TREE_FILTER_CYCLE_FORWARD, &["ctrl+o"]),
         (TREE_FILTER_CYCLE_BACKWARD, &["shift+ctrl+o"]),
+        // The scoped-models selector's dialog bindings
+        // (`keybindings.ts:119-142`).
+        (MODELS_SAVE, &["ctrl+s"]),
+        (MODELS_ENABLE_ALL, &["ctrl+a"]),
+        (MODELS_CLEAR_ALL, &["ctrl+x"]),
+        (MODELS_TOGGLE_PROVIDER, &["ctrl+p"]),
+        (MODELS_REORDER_UP, &["alt+up"]),
+        (MODELS_REORDER_DOWN, &["alt+down"]),
     ];
 
     /// The keys bound to `action` (`keybindings.ts:60-70` getKeys).

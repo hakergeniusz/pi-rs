@@ -28,7 +28,12 @@
 //! registry itself is kept alongside the model list
 //! ([`providers`], `providerIds()` at `model-runtime.ts:288-295`), so the
 //! auth surfaces enumerate every composed provider even when it has no
-//! models.
+//! models. The interactive catalog refreshes (`/scoped-models`, `/reload`)
+//! drive [`refresh_result`] / [`refresh_result_with_runner`]
+//! (`modelRuntime.refresh`, `models.ts:115-118`): the compose is synchronous
+//! and local (static catalog + models.json + registrations), so the
+//! network-fetch abort/timeout arms upstream's refresh has cannot fire —
+//! `ModelsRefreshResult.aborted` is always `false` there.
 
 use std::collections::BTreeMap;
 #[cfg(feature = "ext-js")]
@@ -59,6 +64,10 @@ static PROVIDER_IDS: RwLock<Option<Arc<Vec<String>>>> = RwLock::new(None);
 /// rebuild only. Upstream surfaces these through the registry's error state
 /// (`ModelRegistry::getError`).
 static ERRORS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+/// The same errors keyed by provider — `ModelsRefreshResult.errors`
+/// (`model-catalog-refresh.ts` re-publishes `modelRuntime.refresh`'s
+/// per-provider map).
+static ERRORS_BY_PROVIDER: RwLock<BTreeMap<String, String>> = RwLock::new(BTreeMap::new());
 /// Serializes rebuild-touching tests: the snapshot is process-global, so
 /// composing tests (here and in [`crate::oauth`]) take this lock while they
 /// refresh and assert.
@@ -116,13 +125,15 @@ pub fn refresh_with_runner(runner: &pi_ext_js::ExtensionRunner) {
 }
 
 /// Compose the snapshot from the pure registration data — the extension
-/// registry stays behind the `ext-js` gate.
+/// registry stays behind the `ext-js` gate. Returns the per-provider error
+/// map the interactive refresh reports (`ModelsRefreshResult.errors`).
 fn rebuild(
     models_config: &ModelConfig,
     providers: &[(String, String, Value)],
     virtual_defs: &[(Value, String)],
-) {
+) -> BTreeMap<String, String> {
     let mut errors = Vec::new();
+    let mut errors_by_provider: BTreeMap<String, String> = BTreeMap::new();
 
     // Provider ids: base catalog first, then the models.json and extension
     // layers, then native registrations (data-only in the port — their
@@ -144,7 +155,10 @@ fn rebuild(
         }
         match models_config::ExtensionProviderConfig::from_config(config) {
             Ok(config) => registered_providers.push((name.clone(), config)),
-            Err(error) => errors.push(error),
+            Err(error) => {
+                errors_by_provider.insert(name.clone(), error.clone());
+                errors.push(error);
+            }
         }
     }
     // The auth layer's config snapshots (`model-runtime.ts`'s `this.config`
@@ -170,6 +184,7 @@ fn rebuild(
         {
             Ok(layered) => layered,
             Err(error) => {
+                errors_by_provider.insert(id.clone(), error.clone());
                 errors.push(error);
                 base
             }
@@ -181,6 +196,7 @@ fn rebuild(
         match models_config::apply_extension(id, &base, extension) {
             Ok(composed) => models.extend(composed),
             Err(error) => {
+                errors_by_provider.insert(id.clone(), error.clone());
                 errors.push(error);
                 models.extend(base);
             }
@@ -212,6 +228,9 @@ fn rebuild(
     }
     if let Ok(mut slot) = ERRORS.write() {
         *slot = errors;
+    }
+    if let Ok(mut slot) = ERRORS_BY_PROVIDER.write() {
+        *slot = errors_by_provider;
     }
 }
 
@@ -286,6 +305,66 @@ pub fn errors() -> Vec<String> {
         .read()
         .map(|errors| errors.clone())
         .unwrap_or_default()
+}
+
+/// One provider's composition errors from the last rebuild — the
+/// per-provider error map behind the interactive refresh status
+/// (`refreshModelCatalogs`' `ModelsRefreshResult.errors`, keyed by provider
+/// name; `model-catalog-refresh.ts` composes `modelRuntime.refresh`'s
+/// result).
+pub fn errors_by_provider() -> BTreeMap<String, String> {
+    ERRORS_BY_PROVIDER
+        .read()
+        .map(|errors| errors.clone())
+        .unwrap_or_default()
+}
+
+/// The interactive catalog-refresh result (`ModelsRefreshResult`,
+/// `packages/ai/src/models.ts:115-118`): `aborted` is the canceled-refresh
+/// flag — the port's rebuild is a synchronous local compose, so nothing can
+/// abort it and it is always `false` (the module doc carries the deviation).
+#[derive(Debug, Clone, Default)]
+pub struct ModelsRefreshResult {
+    pub aborted: bool,
+    /// One error message per failing provider (`result.errors`).
+    pub errors: BTreeMap<String, String>,
+}
+
+/// Rebuild and report the interactive refresh result
+/// (`modelRuntime.refresh`, `model-runtime.ts:446-462`'s compose + error
+/// collection). Engine-free builds and hosts without a runner compose from
+/// the static catalog + models.json only.
+pub fn refresh_result() -> ModelsRefreshResult {
+    refresh_result_with_config(&ModelConfig::load(&get_models_path()), &[], &[])
+}
+
+/// [`refresh_result`] over an explicit config (the tests' seam).
+pub fn refresh_result_with_config(
+    models_config: &ModelConfig,
+    providers: &[(String, String, Value)],
+    virtual_defs: &[(Value, String)],
+) -> ModelsRefreshResult {
+    let errors_by_provider = rebuild(models_config, providers, virtual_defs);
+    ModelsRefreshResult {
+        aborted: false,
+        errors: errors_by_provider,
+    }
+}
+
+/// [`refresh_result`] for the engine: compose with the runner's current
+/// registrations and record its generation (`refresh_with_runner`'s
+/// lazy-rebuild bookkeeping). Unlike [`refresh_with_runner`] this always
+/// rebuilds — the interactive refreshes (`/scoped-models`) must re-read
+/// models.json, not skip on an unchanged registry generation.
+#[cfg(feature = "ext-js")]
+pub fn refresh_result_with_runner(runner: &pi_ext_js::ExtensionRunner) -> ModelsRefreshResult {
+    let generation = runner.generation();
+    let providers = runner.providers();
+    let virtual_defs = runner.virtual_models();
+    let models_config = ModelConfig::load(&get_models_path());
+    let result = refresh_result_with_config(&models_config, &providers, &virtual_defs);
+    LAST_GENERATION.store(generation, Ordering::Relaxed);
+    result
 }
 
 /// The composed provider's stream dispatch (`streamWith` closure,

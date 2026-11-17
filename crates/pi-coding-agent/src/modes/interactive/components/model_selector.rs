@@ -31,7 +31,7 @@ pub enum ModelSelectorEvent {
 
 /// `getSelectPageIndex` (`packages/tui/src/keybindings.ts:327-341`): the page
 /// step for `tui.select.pageUp`/`pageDown`, or none for other keys.
-fn get_select_page_index(
+pub(crate) fn get_select_page_index(
     data: &str,
     selected_index: usize,
     item_count: usize,
@@ -49,8 +49,9 @@ fn get_select_page_index(
 }
 
 /// `getDistinctModelName` (`model-search.ts:25-34`): the model name when it
-/// has words the id does not.
-fn get_distinct_model_name(id: &str, name: &str) -> Option<String> {
+/// has words the id does not. Shared with the scoped-models selector
+/// (`getDistinctModelName`, `scoped-models-selector.ts:277`).
+pub(crate) fn get_distinct_model_name(id: &str, name: &str) -> Option<String> {
     let name = name.trim();
     if name.is_empty() {
         return None;

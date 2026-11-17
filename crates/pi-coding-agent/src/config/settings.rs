@@ -1150,6 +1150,37 @@ impl SettingsManager {
         self.set_global("defaultModel", Value::String(model_id.to_string()));
     }
 
+    /// `getEnabledModels` (`settings-manager.ts:1352-1354`): the scope
+    /// patterns `/scoped-models` persists, or `None` when unset. String
+    /// entries only — a malformed value degrades to the string list, like
+    /// the other array getters.
+    pub fn get_enabled_models(&self) -> Option<Vec<String>> {
+        let patterns = self.settings.get("enabledModels")?;
+        Some(
+            patterns
+                .as_array()
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter(|entry| entry.is_string())
+                        .filter_map(|entry| entry.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        )
+    }
+
+    /// `setEnabledModels` (`settings-manager.ts:1363-1367`): the global
+    /// layer's pattern list; `None` writes `undefined`, which
+    /// `JSON.stringify` drops (`set_global`'s null removal).
+    pub fn set_enabled_models(&mut self, patterns: Option<Vec<String>>) {
+        let value = match patterns {
+            Some(patterns) => Value::Array(patterns.into_iter().map(Value::String).collect()),
+            None => Value::Null,
+        };
+        self.set_global("enabledModels", value);
+    }
+
     /// `getDefaultThinkingLevel` (`:867-869`).
     pub fn get_default_thinking_level(&self) -> Option<String> {
         opt_string(self.settings.get("defaultThinkingLevel"))

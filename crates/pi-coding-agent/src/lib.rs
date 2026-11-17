@@ -35,6 +35,9 @@ pub mod clipboard;
 pub mod config;
 /// Runtime-agnostic extension host seam (runtime decision pending at the P5 gate).
 pub mod extensions;
+/// Model reference resolution and scope patterns
+/// (`core/model-resolver.ts`).
+pub mod model_resolver;
 /// models.json — the credential-blind provider/model configuration layer
 /// (`core/model-config.ts` plus the models.json halves of
 /// `core/provider-composer.ts`).

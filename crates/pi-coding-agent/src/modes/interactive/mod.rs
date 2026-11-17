@@ -10,4 +10,5 @@ pub mod autocomplete;
 pub mod chat_viewport;
 pub mod components;
 pub mod interactive_mode;
+pub mod model_catalog_refresh;
 pub mod theme;
