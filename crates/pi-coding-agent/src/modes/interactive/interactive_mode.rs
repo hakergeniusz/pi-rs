@@ -8098,7 +8098,10 @@ mod tests {
     /// to is banned here.
     #[test]
     fn autocomplete_advertises_export_and_import_but_not_share() {
-        let commands = InteractiveMode::autocomplete_commands(&[]);
+        let commands = InteractiveMode::autocomplete_commands(
+            &[],
+            Arc::new(Mutex::new(Vec::new())),
+        );
         let find = |name: &str| {
             commands
                 .iter()

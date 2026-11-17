@@ -230,8 +230,9 @@ fn rebuild(
         *slot = errors;
     }
     if let Ok(mut slot) = ERRORS_BY_PROVIDER.write() {
-        *slot = errors_by_provider;
+        *slot = errors_by_provider.clone();
     }
+    errors_by_provider
 }
 
 /// The composed snapshot; the flattened static catalog before the first

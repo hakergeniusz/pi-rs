@@ -195,6 +195,7 @@ fn get_sorted_ids(enabled_ids: &EnabledIds, all_ids: &[String]) -> Vec<String> {
 
 /// One rendered list row's data (`ModelItem`,
 /// `scoped-models-selector.ts:80-84`).
+#[derive(Clone)]
 struct ModelItem {
     full_id: String,
     model: Option<pi_ai::types::Model>,

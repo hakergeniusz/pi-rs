@@ -231,12 +231,12 @@ fn resolve_text(
     usable: &dyn Fn(&str) -> bool,
 ) -> ModelReferenceResult {
     if let Some(reference) = select_reference(text, pool, request.fuzzy, usable) {
-        return reference;
+        return reference.into_result(None, None);
     }
     if request.fuzzy {
         let fuzzy = select_fuzzy(&fuzzy_matches(text, pool), usable);
         if let Some(fuzzy) = fuzzy {
-            return fuzzy;
+            return fuzzy.into_result(None, None);
         }
     }
     if request.thinking_suffix == ThinkingSuffix::None {
@@ -465,13 +465,10 @@ fn select_fuzzy(matches: &[Model], usable: &dyn Fn(&str) -> bool) -> Option<Refe
     if tied_providers.len() == 1 {
         return Some(Reference::Resolved { model: best });
     }
+    let usable_count = if usable_matches.is_empty() { 0 } else { tied.len() };
     Some(Reference::Ambiguous {
         candidates: tied,
-        usable_count: if usable_matches.is_empty() {
-            0
-        } else {
-            tied.len()
-        },
+        usable_count,
     })
 }
 
@@ -556,7 +553,7 @@ pub fn resolve_model_scope_from_models(
         if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
             // Extract optional thinking level suffix (e.g., "provider/*:high").
             let thinking = split_thinking_suffix(pattern);
-            let glob_pattern = thinking.map_or(pattern, |(base, _)| base);
+            let glob_pattern = thinking.map_or(pattern.as_str(), |(base, _)| base);
             let thinking_level = thinking.map(|(_, level)| level);
 
             // Ids such as `bracketed-model[1m]` are not globs
@@ -583,9 +580,11 @@ pub fn resolve_model_scope_from_models(
                     // (`model-resolver.ts:364-369`): this allows "*sonnet*" to
                     // match without requiring "anthropic/*sonnet*".
                     matches.extend(models.iter().filter(|model| {
-                        glob_matches(&format!("{}/{model}", model.provider), glob_pattern)
-                            || glob_matches(&model.id, glob_pattern)
-                    }));
+                        glob_matches(
+                            &format!("{}/{}", model.provider, model.id),
+                            glob_pattern,
+                        ) || glob_matches(&model.id, glob_pattern)
+                    }).cloned());
                 }
             }
             if matches.is_empty() {
