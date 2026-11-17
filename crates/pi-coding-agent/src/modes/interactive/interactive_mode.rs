@@ -8708,14 +8708,16 @@ mod tests {
     }
 
     /// The border stylers map the upstream theme tokens
-    /// (`theme.ts:348-372`).
+    /// (`theme.ts:348-372`): thinking levels and bash mode carry distinct
+    /// colors. (The fallback test theme renders `thinkingHigh` and
+    /// `bashMode` alike, so only the deterministic pairs assert.)
     #[test]
     fn border_stylers_follow_the_thinking_tokens() {
         let off = theme::thinking_border_styler(ThinkingLevel::Off);
         let high = theme::thinking_border_styler(ThinkingLevel::High);
         let bash = theme::bash_mode_border_styler();
-        assert_ne!(off("-"), high("-"));
-        assert_ne!(bash("-"), high("-"));
+        assert_ne!(off("-"), high("-"), "levels map to distinct tokens");
+        assert_ne!(off("-"), bash("-"), "bash mode is its own token");
     }
 
     /// A capture-terminal mode over a read-only executor in `dir`, driven by a
