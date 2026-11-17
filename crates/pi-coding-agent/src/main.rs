@@ -118,10 +118,10 @@ fn main() {
     // Read piped stdin content (if any) - skip for RPC mode which uses stdin
     // for JSON-RPC (`main.ts:960-968`); content present while interactive
     // flips the mode to print.
-    let stdin_content = if app_mode != AppMode::Rpc {
-        read_piped_stdin()
-    } else {
+    let stdin_content = if app_mode == AppMode::Rpc {
         None
+    } else {
+        read_piped_stdin()
     };
     if stdin_content.is_some() && app_mode == AppMode::Interactive {
         app_mode = AppMode::Print;
@@ -919,14 +919,10 @@ mod tests {
     /// (`data.trim() || undefined`, `main.ts:96`).
     #[test]
     fn piped_stdin_trims_and_maps_whitespace_only_to_none() {
-        assert_eq!(
-            read_piped_stdin_from(&mut &b"hi\n"[..]),
-            Some("hi".to_string())
-        );
-        assert_eq!(
-            read_piped_stdin_from(&mut &b"  hello world  \n"[..]),
-            Some("hello world".to_string())
-        );
+        let got = read_piped_stdin_from(&mut &b"hi\n"[..]);
+        assert_eq!(got, Some("hi".to_string()));
+        let got = read_piped_stdin_from(&mut &b"  hello world  \n"[..]);
+        assert_eq!(got, Some("hello world".to_string()));
         assert_eq!(read_piped_stdin_from(&mut &b"  \n\t"[..]), None);
         assert_eq!(read_piped_stdin_from(&mut &b""[..]), None);
     }
@@ -935,10 +931,8 @@ mod tests {
     /// upstream's `setEncoding("utf8")` chunk accumulation (`main.ts:91`).
     #[test]
     fn piped_stdin_decodes_invalid_utf8_lossily() {
-        assert_eq!(
-            read_piped_stdin_from(&mut &[0xff_u8, 0xfe][..]),
-            Some("\u{fffd}\u{fffd}".to_string())
-        );
+        let got = read_piped_stdin_from(&mut &[0xff_u8, 0xfe][..]);
+        assert_eq!(got, Some("\u{fffd}\u{fffd}".to_string()));
     }
 
     /// `buildInitialMessage` (`cli/initial-message.ts:20-43`) joins stdin
@@ -952,15 +946,10 @@ mod tests {
         let mut args = Args::default();
         args.file_args = vec!["notes.txt".to_string()];
         args.messages = vec!["first".to_string(), "second".to_string()];
-        let (initial, images, follow_ups) =
-            resolve_prompt_messages(&args, dir.path(), Some("piped")).expect("ok");
-        assert_eq!(
-            initial,
-            Some(format!(
-                "piped<file name=\"{}\">\nalpha\n</file>\nfirst",
-                path.display()
-            ))
-        );
+        let resolved = resolve_prompt_messages(&args, dir.path(), Some("piped"));
+        let (initial, images, follow_ups) = resolved.expect("ok");
+        let expected = format!("piped<file name=\"{}\">\nalpha\n</file>\nfirst", path.display());
+        assert_eq!(initial, Some(expected));
         assert_eq!(images, Vec::<ImageContent>::new());
         assert_eq!(follow_ups, vec!["second".to_string()]);
     }
@@ -972,8 +961,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut args = Args::default();
         args.messages = vec!["hello".to_string()];
-        let (initial, images, follow_ups) =
-            resolve_prompt_messages(&args, dir.path(), Some("piped")).expect("ok");
+        let resolved = resolve_prompt_messages(&args, dir.path(), Some("piped"));
+        let (initial, images, follow_ups) = resolved.expect("ok");
         assert_eq!(initial, Some("pipedhello".to_string()));
         assert_eq!(images, Vec::<ImageContent>::new());
         assert_eq!(follow_ups, Vec::<String>::new());
@@ -987,14 +976,14 @@ mod tests {
     #[test]
     fn stdin_part_keys_on_presence_while_empty_file_text_is_skipped() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (initial, _, _) =
-            resolve_prompt_messages(&Args::default(), dir.path(), Some("")).expect("ok");
+        let resolved = resolve_prompt_messages(&Args::default(), dir.path(), Some(""));
+        let (initial, _, _) = resolved.expect("ok");
         assert_eq!(initial, Some(String::new()));
         std::fs::write(dir.path().join("empty.txt"), b"").expect("write");
         let mut args = Args::default();
         args.file_args = vec!["empty.txt".to_string()];
-        let (initial, images, follow_ups) =
-            resolve_prompt_messages(&args, dir.path(), Some("piped")).expect("ok");
+        let resolved = resolve_prompt_messages(&args, dir.path(), Some("piped"));
+        let (initial, images, follow_ups) = resolved.expect("ok");
         assert_eq!(initial, Some("piped".to_string()));
         assert_eq!(images, Vec::<ImageContent>::new());
         assert_eq!(follow_ups, Vec::<String>::new());
@@ -1005,8 +994,8 @@ mod tests {
     #[test]
     fn no_parts_yields_no_initial_message() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (initial, images, follow_ups) =
-            resolve_prompt_messages(&Args::default(), dir.path(), None).expect("ok");
+        let resolved = resolve_prompt_messages(&Args::default(), dir.path(), None);
+        let (initial, images, follow_ups) = resolved.expect("ok");
         assert_eq!(initial, None);
         assert_eq!(images, Vec::<ImageContent>::new());
         assert_eq!(follow_ups, Vec::<String>::new());
