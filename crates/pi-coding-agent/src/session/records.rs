@@ -70,6 +70,12 @@ impl Record {
         &mut self.object
     }
 
+    /// Consume the record into its ordered fields — the shape
+    /// `JSON.stringify(entry)` serializes, key order included.
+    pub fn into_object(self) -> JsonObject {
+        self.object
+    }
+
     /// Build a record from `type` plus fields, putting `type` first — matching
     /// pi's object-literal order for every entry pi itself writes.
     pub fn new_with_kind(kind: &str) -> Self {

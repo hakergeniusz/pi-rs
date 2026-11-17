@@ -21,6 +21,9 @@
 //!   loading/header discovery, listing, and the context-building functions.
 //! * [`json`] — the `JSON.stringify`-compatible writer that keeps rewritten
 //!   files byte-identical to what pi writes.
+//! * [`cwd`] — the stored-cwd existence gate (`core/session-cwd.ts`).
+//! * [`export`] — branch export to a portable JSONL file
+//!   (`core/session-export.ts`).
 
 #![forbid(unsafe_code)]
 
@@ -29,6 +32,8 @@ use std::path::PathBuf;
 pub mod branch_summarization;
 pub mod cache_stats;
 pub mod compaction;
+pub mod cwd;
+pub mod export;
 pub mod json;
 pub mod migrate;
 pub mod records;
