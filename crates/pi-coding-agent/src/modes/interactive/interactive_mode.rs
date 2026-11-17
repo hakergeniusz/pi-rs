@@ -1444,9 +1444,9 @@ impl InteractiveMode {
     /// upstream's `pendingTools` handoff.
     ///
     /// Deviations: entries with no ported component are skipped —
-    /// `custom_message`, `branch_summary` (forking is unported), and the
-    /// cache-miss/cache-warm usage notices (`showCacheMissNotices` is not
-    /// ported). `bashExecution` rows likewise (upstream's `!` persistence).
+    /// `custom_message` and the cache-miss/cache-warm usage notices
+    /// (`showCacheMissNotices` is not ported). `bashExecution` rows likewise
+    /// (upstream's `!` persistence).
     fn render_session_entries(
         &mut self,
         entries: &[crate::session::records::SessionEntry],
@@ -1494,6 +1494,20 @@ impl InteractiveMode {
                             0,
                         )));
                     }
+                }
+                crate::session::records::SessionEntry::BranchSummary(summary)
+                    if !summary.summary.is_empty() =>
+                {
+                    // `case "branchSummary"` (`interactive-mode.ts:4063-4074`):
+                    // a spacer, then the collapsible row.
+                    self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+                    let mut row =
+                        super::components::branch_summary::BranchSummaryMessageComponent::new(
+                            &summary.summary,
+                            1,
+                        );
+                    row.set_expanded(self.tool_output_expanded);
+                    self.add_to_chat(Box::new(row));
                 }
                 // `sessionEntryToContextMessages` returns [] for every other
                 // entry type this port models.
@@ -1608,8 +1622,19 @@ impl InteractiveMode {
                     );
                 }
             }
+            AgentMessage::BranchSummary(summary) => {
+                // `case "branchSummary"` (`interactive-mode.ts:4063-4074`).
+                self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+                let mut row =
+                    super::components::branch_summary::BranchSummaryMessageComponent::new(
+                        &summary.summary,
+                        1,
+                    );
+                row.set_expanded(self.tool_output_expanded);
+                self.add_to_chat(Box::new(row));
+            }
             // System messages render nothing upstream either
-            // (`case "system": break`); custom/bash/branch/compaction-summary
+            // (`case "system": break`); custom/bash/compaction-summary
             // messages have no ported component.
             _ => {}
         }

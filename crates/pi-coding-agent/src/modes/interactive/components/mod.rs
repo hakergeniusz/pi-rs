@@ -7,6 +7,7 @@
 pub mod armin;
 pub mod assistant_message;
 pub mod auth_selector;
+pub mod branch_summary;
 pub mod compaction_summary;
 pub mod easter_egg_3d;
 pub mod footer;
