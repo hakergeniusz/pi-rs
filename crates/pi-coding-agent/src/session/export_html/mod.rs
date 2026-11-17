@@ -162,6 +162,9 @@ fn derive_export_colors(base_color: &str) -> ExportDerivedColors {
 }
 
 /// The derived export backgrounds (`deriveExportColors`'s return shape).
+// The fields carry upstream's own names (`pageBg`/`cardBg`/`infoBg`,
+// `index.ts:81-106`), so the shared `bg` postfix stays.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExportDerivedColors {
     page_bg: String,
@@ -595,6 +598,10 @@ mod tests {
     use crate::session::store::NewSessionOptions;
     use std::sync::Mutex;
 
+    /// The template's session-data script tag (`template.html`), which the
+    /// export tests decode the base64 payload out of.
+    const SESSION_DATA_MARKER: &str = "<script id=\"session-data\" type=\"application/json\">";
+
     /// A renderer double: renders one call and one result, like a real
     /// extension tool would.
     struct FakeRenderer {
@@ -664,7 +671,7 @@ mod tests {
     #[test]
     fn adjust_brightness_clamps_and_rounds() {
         assert_eq!(adjust_brightness("#ffffff", 0.96), "rgb(245, 245, 245)");
-        assert_eq!(adjust_brightness("#343541", 0.7), "rgb(36, 37, 45)");
+        assert_eq!(adjust_brightness("#343541", 0.7), "rgb(36, 37, 46)");
         assert_eq!(adjust_brightness("not-a-color", 2.0), "not-a-color");
         // Clamp at 255.
         assert_eq!(adjust_brightness("#ffffff", 10.0), "rgb(255, 255, 255)");
@@ -682,7 +689,7 @@ mod tests {
     fn derive_export_colors_dark_branch() {
         // userMessageBg's default (#343541) is dark: brightened variants.
         let derived = derive_export_colors("#343541");
-        assert_eq!(derived.page_bg, "rgb(36, 37, 45)");
+        assert_eq!(derived.page_bg, "rgb(36, 37, 46)");
         assert_eq!(derived.card_bg, "rgb(44, 45, 55)");
         assert_eq!(derived.info_bg, "rgb(72, 68, 65)");
     }
@@ -766,7 +773,8 @@ mod tests {
         assert_eq!(js_replace_first("aXbXc", "X", "Y"), "aYbXc");
         assert_eq!(js_replace_first("abc", "zz", "Y"), "abc");
         assert_eq!(js_replace_first("abc", "b", "$&$&"), "abbc");
-        assert_eq!(js_replace_first("abc", "b", "$`"), "aabc");
+        // "$`" is the text before the match: "a" + replacement "a" + "c".
+        assert_eq!(js_replace_first("abc", "b", "$`"), "aac");
         assert_eq!(js_replace_first("abc", "b", "$'"), "acbc");
         assert_eq!(js_replace_first("abc", "b", "$$"), "a$bc");
         assert_eq!(js_replace_first("abc", "b", "$1"), "a$1bc");
@@ -780,7 +788,10 @@ mod tests {
         session_data.insert("entries".to_string(), Value::Array(vec![]));
         session_data.insert("leafId".to_string(), Value::Null);
         let html = generate_html(session_data, Some("dark")).expect("generate");
-        // The needles are gone.
+        // The needles are gone — except `{{HIGHLIGHT_JS}}`: the vendored
+        // highlight.min.js contains a literal `$&`, which `String.replace`
+        // expands back to the needle text (the module doc's quirk), so the
+        // page carries the original needle plus the rewrite.
         for needle in [
             "{{THEME_VARS}}",
             "{{BODY_BG}}",
@@ -791,16 +802,19 @@ mod tests {
             "{{SESSION_DATA}}",
             "{{MARKED_JS}}",
             "{{MARKED_CJK_FRIENDLY_JS}}",
-            "{{HIGHLIGHT_JS}}",
         ] {
             assert!(!html.contains(needle), "leftover {needle}");
         }
+        assert_eq!(
+            html.matches("{{HIGHLIGHT_JS}}").count(),
+            2,
+            "the template's needle plus the `$&` rewrite"
+        );
         // The session data rides base64-encoded inside the JSON script tag
         // (`template.html`).
-        const MARKER: &str = "<script id=\"session-data\" type=\"application/json\">";
         let payload_start = html
-            .find(MARKER)
-            .map(|index| index + MARKER.len())
+            .find(SESSION_DATA_MARKER)
+            .map(|index| index + SESSION_DATA_MARKER.len())
             .expect("session data script tag");
         let payload = &html[payload_start..html.find("</script>").expect("script close")];
         let decoded = String::from_utf8(BASE64.decode(payload).expect("base64")).expect("utf8");
@@ -950,10 +964,9 @@ mod tests {
         let html = std::fs::read_to_string(&path).expect("html");
         // The payload rides base64-encoded in the session-data script tag;
         // decode it to find the message.
-        const MARKER: &str = "<script id=\"session-data\" type=\"application/json\">";
         let payload_start = html
-            .find(MARKER)
-            .map(|index| index + MARKER.len())
+            .find(SESSION_DATA_MARKER)
+            .map(|index| index + SESSION_DATA_MARKER.len())
             .expect("session data script tag");
         let payload = &html[payload_start..html.find("</script>").expect("script close")];
         let decoded = String::from_utf8(BASE64.decode(payload).expect("base64")).expect("utf8");
@@ -1019,8 +1032,10 @@ mod tests {
         // Decode the session-data script tag's payload.
         let payload_of = |path: &Path| -> String {
             let html = std::fs::read_to_string(path).expect("html");
-            const MARKER: &str = "<script id=\"session-data\" type=\"application/json\">";
-            let start = html.find(MARKER).map(|index| index + MARKER.len()).expect("tag");
+            let start = html
+                .find(SESSION_DATA_MARKER)
+                .map(|index| index + SESSION_DATA_MARKER.len())
+                .expect("tag");
             let payload = &html[start..html.find("</script>").expect("close")];
             String::from_utf8(BASE64.decode(payload).expect("base64")).expect("utf8")
         };

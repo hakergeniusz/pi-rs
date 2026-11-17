@@ -161,10 +161,12 @@ mod tests {
     #[test]
     fn default_export_name_stamps_the_timestamp() {
         let name = default_jsonl_export_name();
+        // `session-${stamp.replace(/[:.]/g, "-")}.jsonl`
+        // (`session-export.ts:38`): the stamp loses every `:` and `.`; the
+        // `.jsonl` suffix keeps its dot.
         assert!(name.starts_with("session-"), "{name}");
-        assert!(name.ends_with(".jsonl"), "{name}");
-        // `replace(/[:.]/g, "-")` — no `:` or `.` survives from the ISO stamp.
-        assert!(!name.contains(':') && !name.contains('.'), "{name}");
+        assert!(!name.contains(':'), "{name}");
+        assert_eq!(name.matches('.').count(), 1, "{name}");
     }
 
     /// The canonical path: an export of a real pi-written session must

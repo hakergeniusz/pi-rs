@@ -13,6 +13,8 @@
 //! - OSC 8 hyperlinks with http, https, or mailto URLs; other CSI, OSC, and
 //!   APC sequences and stray ESC characters are dropped
 
+use std::fmt::Write as _;
+
 use regex::Regex;
 
 /// Standard ANSI color palette 0-15 (`ANSI_COLORS`, `ansi-to-html.ts:16-33`).
@@ -276,7 +278,7 @@ pub fn ansi_to_html(text: &str) -> String {
             apply_sgr_code(&params, &mut style);
             // openSpan()
             if has_style(&style) {
-                result.push_str(&format!("<span style=\"{}\">", style_to_inline_css(&style)));
+                let _ = write!(result, "<span style=\"{}\">", style_to_inline_css(&style));
                 in_span = true;
             }
         } else if let Some(osc_group) = captures.get(2) {
@@ -299,11 +301,11 @@ pub fn ansi_to_html(text: &str) -> String {
                     in_link = false;
                 }
                 if !url.is_empty() && safe_link_regex().is_match(&url) {
-                    result.push_str(&format!("<a href=\"{}\">", escape_html(&url)));
+                    let _ = write!(result, "<a href=\"{}\">", escape_html(&url));
                     in_link = true;
                 }
                 if has_style(&style) {
-                    result.push_str(&format!("<span style=\"{}\">", style_to_inline_css(&style)));
+                    let _ = write!(result, "<span style=\"{}\">", style_to_inline_css(&style));
                     in_span = true;
                 }
             }
@@ -334,14 +336,13 @@ pub fn ansi_to_html(text: &str) -> String {
 /// `ansiLinesToHtml` (`ansi-to-html.ts:295-297`): each line is wrapped in a
 /// div element; an empty line renders as `&nbsp;`.
 pub fn ansi_lines_to_html(lines: &[String]) -> String {
-    lines
-        .iter()
-        .map(|line| {
-            let html = ansi_to_html(line);
-            let html = if html.is_empty() { "&nbsp;" } else { &html };
-            format!("<div class=\"ansi-line\">{html}</div>")
-        })
-        .collect()
+    let mut out = String::new();
+    for line in lines {
+        let html = ansi_to_html(line);
+        let html = if html.is_empty() { "&nbsp;" } else { &html };
+        let _ = write!(out, "<div class=\"ansi-line\">{html}</div>");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -366,7 +367,7 @@ mod tests {
     #[test]
     fn empty_lines_render_as_nbsp() {
         assert_eq!(
-            ansi_lines_to_html(&["".to_string()]),
+            ansi_lines_to_html(&[String::new()]),
             "<div class=\"ansi-line\">&nbsp;</div>"
         );
     }
@@ -466,7 +467,7 @@ mod tests {
         );
         assert_eq!(
             ansi_to_html("\u{1b}[38;5;241mg\u{1b}[0m"),
-            "<span style=\"color:#8e8e8e\">g</span>"
+            "<span style=\"color:#626262\">g</span>"
         );
     }
 }
