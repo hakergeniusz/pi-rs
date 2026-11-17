@@ -924,17 +924,21 @@ impl Tui {
     /// `pi-tui` has no signal watcher, so the host delivers the tick and gets
     /// the re-measured size back to apply to whatever else tracks the
     /// viewport. The call is idempotent: a tick that changes nothing renders
-    /// nothing.
+    /// nothing (the re-measure only invalidates on drift, so a host can
+    /// tick every loop iteration cheaply).
     ///
     /// Cell pixel dimensions are deliberately *not* re-probed. pi caches them
     /// (`terminal-image.ts:41-47`) and only re-queries at start
     /// (`tui.ts:928`); a terminal that changes its cell size tells us with a
     /// CSI 6 reply, which [`Tui::consume_terminal_response`] already handles.
     pub fn apply_resize(&mut self) -> io::Result<TerminalSize> {
+        let before = self.terminal.size()?;
         self.terminal.refresh_size();
         let size = self.terminal.size()?;
-        self.invalidate_components();
-        self.request_render();
+        if size != before {
+            self.invalidate_components();
+            self.request_render();
+        }
         Ok(size)
     }
 
@@ -2922,6 +2926,52 @@ mod tests {
         assert!(
             grid.row_text(0).starts_with('o'),
             "and it repainted: {grid:?}"
+        );
+    }
+
+    /// The host-driven resize tick is inert without drift: the run loop
+    /// polls it every iteration, so a tick that re-measures the same size
+    /// must not invalidate or request a frame.
+    #[test]
+    fn a_resize_tick_without_a_change_is_inert() {
+        let (mut tui, _capture) = tui(&["one"], (10, 5));
+        tui.render_now(false);
+        assert!(!tui.render_requested(), "a rendered frame leaves nothing pending");
+        let size = tui.apply_resize().expect("resize tick");
+        assert_eq!(size.columns, 10, "the size is unchanged");
+        assert!(
+            !tui.render_requested(),
+            "a tick without drift renders nothing"
+        );
+    }
+
+    /// The host-driven tick picks up a changed terminal size: the next
+    /// frame lays out at the new width (upstream's
+    /// `process.stdout.on("resize", …)`; the run loop polls this).
+    #[test]
+    fn a_host_resize_tick_repaints_at_the_new_size() {
+        let (mut tui, capture) = tui(&["one"], (10, 5));
+        tui.render_now(false);
+        tui.terminal_mut().set_queried_size(TerminalSize {
+            columns: 24,
+            rows: 8,
+        });
+        let size = tui.apply_resize().expect("resize tick");
+        assert_eq!(
+            size,
+            TerminalSize {
+                columns: 24,
+                rows: 8
+            },
+            "the tick re-read the modeled size"
+        );
+        assert!(tui.render_requested(), "drift requests a frame");
+        capture.clear();
+        tui.render_now(false);
+        assert_eq!(
+            tui.last_frame_grid().width,
+            24,
+            "the frame is laid out at the new width"
         );
     }
 

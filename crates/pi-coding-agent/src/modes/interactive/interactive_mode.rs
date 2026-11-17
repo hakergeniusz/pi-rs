@@ -5032,6 +5032,11 @@ impl InteractiveMode {
             if self.exiting {
                 break;
             }
+            // The resize tick (`process.stdout.on("resize", …)`): pi-tui
+            // has no signal watcher, so the loop polls the real size every
+            // iteration; the tick is drift-guarded and renders nothing
+            // when nothing changed.
+            let _ = self.tui.apply_resize();
             self.await_stdin(stdin_rx.as_ref());
             self.tui.render_now(false);
         }
