@@ -393,11 +393,8 @@ pub fn get_resolved_theme_colors(
     Ok(colors)
 }
 
-/// `getThemeExportColors` (`theme.ts:849-897`): the theme document's explicit
-/// `export` colors, resolved through `vars` references. `okhsl(...)` values
-/// convert to hex because CSS has no `okhsl()`; hex, `oklch(...)`, and empty
-/// strings pass through (`undefined` for the latter). Unloadable themes and
-/// the system theme carry no export colors.
+/// `getThemeExportColors`'s return shape (`theme.ts:850-855`): the resolved
+/// `pageBg`/`cardBg`/`infoBg` strings, `None` where upstream is `undefined`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ThemeExportColors {
     pub page_bg: Option<String>,
@@ -405,6 +402,11 @@ pub struct ThemeExportColors {
     pub info_bg: Option<String>,
 }
 
+/// `getThemeExportColors` (`theme.ts:849-897`): the theme document's explicit
+/// `export` colors, resolved through `vars` references. `okhsl(...)` values
+/// convert to hex because CSS has no `okhsl()`; hex, `oklch(...)`, and empty
+/// strings pass through (`undefined` for the latter). Unloadable themes and
+/// the system theme carry no export colors.
 pub fn get_theme_export_colors(theme_name: Option<&str>) -> ThemeExportColors {
     let name = export_theme_name(theme_name);
     if name == pi_tui::theme::SYSTEM_THEME_NAME {
