@@ -398,6 +398,34 @@ pub mod app_keys {
     pub const SESSION_DELETE: &str = "app.session.delete";
     /// Remove the selected session without touching its file on disk.
     pub const SESSION_DELETE_NONINVASIVE: &str = "app.session.deleteNoninvasive";
+    /// Open the session tree (`keybindings.ts:80`; unbound by default).
+    pub const SESSION_TREE: &str = "app.session.tree";
+    /// Fork the current session (`keybindings.ts:81`; unbound by default).
+    pub const SESSION_FORK: &str = "app.session.fork";
+    /// Fold a tree branch or move to the previous branch segment
+    /// (`keybindings.ts:83-88`).
+    pub const TREE_FOLD_OR_UP: &str = "app.tree.foldOrUp";
+    /// Unfold a tree branch or move to the next branch segment
+    /// (`keybindings.ts:87-90`).
+    pub const TREE_UNFOLD_OR_DOWN: &str = "app.tree.unfoldOrDown";
+    /// Edit the selected entry's label (`keybindings.ts:91-94`).
+    pub const TREE_EDIT_LABEL: &str = "app.tree.editLabel";
+    /// Toggle the tree's label timestamps (`keybindings.ts:95-98`).
+    pub const TREE_TOGGLE_LABEL_TIMESTAMP: &str = "app.tree.toggleLabelTimestamp";
+    /// Tree filter: the default view (`keybindings.ts:143-146`).
+    pub const TREE_FILTER_DEFAULT: &str = "app.tree.filter.default";
+    /// Tree filter: hide tool results (`keybindings.ts:147-150`).
+    pub const TREE_FILTER_NO_TOOLS: &str = "app.tree.filter.noTools";
+    /// Tree filter: user messages only (`keybindings.ts:151-154`).
+    pub const TREE_FILTER_USER_ONLY: &str = "app.tree.filter.userOnly";
+    /// Tree filter: labeled entries only (`keybindings.ts:155-158`).
+    pub const TREE_FILTER_LABELED_ONLY: &str = "app.tree.filter.labeledOnly";
+    /// Tree filter: show everything (`keybindings.ts:159-162`).
+    pub const TREE_FILTER_ALL: &str = "app.tree.filter.all";
+    /// Cycle the tree filter forward (`keybindings.ts:163-166`).
+    pub const TREE_FILTER_CYCLE_FORWARD: &str = "app.tree.filter.cycleForward";
+    /// Cycle the tree filter backward (`keybindings.ts:167-170`).
+    pub const TREE_FILTER_CYCLE_BACKWARD: &str = "app.tree.filter.cycleBackward";
 
     /// pi's default keys, in `APP_KEYBINDINGS` order.
     pub const DEFAULTS: &[(&str, &[&str])] = &[
@@ -422,6 +450,23 @@ pub mod app_keys {
         (SESSION_RENAME, &["ctrl+r"]),
         (SESSION_DELETE, &["ctrl+d"]),
         (SESSION_DELETE_NONINVASIVE, &["ctrl+backspace"]),
+        // `app.session.tree`/`app.session.fork` are unbound by default
+        // (`keybindings.ts:80-82`); the port reaches them via /tree and /fork.
+        (SESSION_TREE, &[]),
+        (SESSION_FORK, &[]),
+        // The darwin variants swap to alt+first (`keybindings.ts:83-98`); the
+        // port is POSIX-only and ships the non-darwin defaults.
+        (TREE_FOLD_OR_UP, &["ctrl+left", "alt+left"]),
+        (TREE_UNFOLD_OR_DOWN, &["ctrl+right", "alt+right"]),
+        (TREE_EDIT_LABEL, &["shift+l"]),
+        (TREE_TOGGLE_LABEL_TIMESTAMP, &["shift+t"]),
+        (TREE_FILTER_DEFAULT, &["ctrl+d"]),
+        (TREE_FILTER_NO_TOOLS, &["ctrl+t"]),
+        (TREE_FILTER_USER_ONLY, &["ctrl+u"]),
+        (TREE_FILTER_LABELED_ONLY, &["ctrl+l"]),
+        (TREE_FILTER_ALL, &["ctrl+a"]),
+        (TREE_FILTER_CYCLE_FORWARD, &["ctrl+o"]),
+        (TREE_FILTER_CYCLE_BACKWARD, &["shift+ctrl+o"]),
     ];
 
     /// The keys bound to `action` (`keybindings.ts:60-70` getKeys).

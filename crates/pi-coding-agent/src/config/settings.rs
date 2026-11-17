@@ -512,6 +512,68 @@ pub struct BranchSummarySettings {
     pub skip_prompt: bool,
 }
 
+/// The tree selector's display filter (`FilterMode`,
+/// `tree-selector.ts:98`; `getTreeFilterMode`, `settings-manager.ts:1379-1383`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TreeFilterMode {
+    /// Hide settings/bookkeeping entries.
+    #[default]
+    Default,
+    /// Default minus tool results.
+    NoTools,
+    /// Just user messages.
+    UserOnly,
+    /// Just labeled entries.
+    LabeledOnly,
+    /// Show everything.
+    All,
+}
+
+impl TreeFilterMode {
+    /// The wire discriminants, in cycle order
+    /// (`tree-selector.ts:1065-1076`).
+    pub const MODES: [TreeFilterMode; 5] = [
+        TreeFilterMode::Default,
+        TreeFilterMode::NoTools,
+        TreeFilterMode::UserOnly,
+        TreeFilterMode::LabeledOnly,
+        TreeFilterMode::All,
+    ];
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "default" => Some(Self::Default),
+            "no-tools" => Some(Self::NoTools),
+            "user-only" => Some(Self::UserOnly),
+            "labeled-only" => Some(Self::LabeledOnly),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    /// The wire spelling (`settings-manager.ts:1380`, the `valid` list).
+    pub fn as_name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::NoTools => "no-tools",
+            Self::UserOnly => "user-only",
+            Self::LabeledOnly => "labeled-only",
+            Self::All => "all",
+        }
+    }
+
+    /// The `[status]` suffix label (`getStatusLabels`, `tree-selector.ts:650-670`).
+    pub fn status_label(self) -> &'static str {
+        match self {
+            Self::Default => "",
+            Self::NoTools => " [no-tools]",
+            Self::UserOnly => " [user]",
+            Self::LabeledOnly => " [labeled]",
+            Self::All => " [all]",
+        }
+    }
+}
+
 /// What the terminal shows when a fullscreen session ends
 /// (`fullscreenExitOutput`, `settings-defaults.js:62`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1222,6 +1284,27 @@ impl SettingsManager {
         }
     }
 
+    // -- tree ----------------------------------------------------------------
+
+    /// `getTreeFilterMode` (`settings-manager.ts:1379-1383`): an unknown
+    /// mode falls back to the default.
+    pub fn get_tree_filter_mode(&self) -> TreeFilterMode {
+        self.settings
+            .get("treeFilterMode")
+            .and_then(Value::as_str)
+            .and_then(TreeFilterMode::from_name)
+            .unwrap_or_default()
+    }
+
+    /// `setTreeFilterMode` (`settings-manager.ts:1385-1390`): the global
+    /// layer carries the value.
+    pub fn set_tree_filter_mode(&mut self, mode: TreeFilterMode) {
+        self.set_global(
+            "treeFilterMode",
+            Value::String(mode.as_name().to_string()),
+        );
+    }
+
     // -- retry ---------------------------------------------------------------
 
     /// `getRetryEnabled` (`:903-905`).
@@ -1768,5 +1851,41 @@ mod tests {
             manager.get_fullscreen_wheel_scroll_lines(),
             pi_tui::wheel_scroll::WheelScrollLines::Fixed(5.0)
         );
+    }
+
+    /// `getTreeFilterMode` (`settings-manager.ts:1379-1383`): every wire
+    /// spelling parses, an unknown one falls back to the default, and the
+    /// setter round-trips (`setTreeFilterMode`, `:1385-1390`).
+    #[test]
+    fn tree_filter_mode_parses_and_round_trips() {
+        let manager = manager_with_global(&json!({}));
+        assert_eq!(manager.get_tree_filter_mode(), TreeFilterMode::Default);
+        for (name, expected) in [
+            ("default", TreeFilterMode::Default),
+            ("no-tools", TreeFilterMode::NoTools),
+            ("user-only", TreeFilterMode::UserOnly),
+            ("labeled-only", TreeFilterMode::LabeledOnly),
+            ("all", TreeFilterMode::All),
+        ] {
+            let manager = manager_with_global(&json!({ "treeFilterMode": name }));
+            assert_eq!(manager.get_tree_filter_mode(), expected);
+        }
+        let manager = manager_with_global(&json!({ "treeFilterMode": "bogus" }));
+        assert_eq!(manager.get_tree_filter_mode(), TreeFilterMode::Default);
+
+        let mut manager = manager_with_global(&json!({}));
+        manager.set_tree_filter_mode(TreeFilterMode::NoTools);
+        assert_eq!(manager.get_tree_filter_mode(), TreeFilterMode::NoTools);
+    }
+
+    /// `getStatusLabels` (`tree-selector.ts:650-670`): the selector's
+    /// `(n/total)`-line suffixes, keyed by mode.
+    #[test]
+    fn tree_filter_mode_status_labels_match_the_selector() {
+        assert_eq!(TreeFilterMode::Default.status_label(), "");
+        assert_eq!(TreeFilterMode::NoTools.status_label(), " [no-tools]");
+        assert_eq!(TreeFilterMode::UserOnly.status_label(), " [user]");
+        assert_eq!(TreeFilterMode::LabeledOnly.status_label(), " [labeled]");
+        assert_eq!(TreeFilterMode::All.status_label(), " [all]");
     }
 }
