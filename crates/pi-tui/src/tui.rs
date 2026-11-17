@@ -2936,7 +2936,10 @@ mod tests {
     fn a_resize_tick_without_a_change_is_inert() {
         let (mut tui, _capture) = tui(&["one"], (10, 5));
         tui.render_now(false);
-        assert!(!tui.render_requested(), "a rendered frame leaves nothing pending");
+        assert!(
+            !tui.render_requested(),
+            "a rendered frame leaves nothing pending"
+        );
         let size = tui.apply_resize().expect("resize tick");
         assert_eq!(size.columns, 10, "the size is unchanged");
         assert!(

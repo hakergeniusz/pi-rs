@@ -527,8 +527,10 @@ fn a_resize_re_measures_and_repaints_the_whole_frame() {
     tui.render_now(false);
     assert_eq!(tui.full_redraws(), 1);
 
-    // The host applied the new size, then delivered the tick.
-    tui.terminal_mut().override_size(TerminalSize {
+    // The host applied the new size — what the next `refresh_size` will
+    // report — then delivered the tick. `override_size` would write the
+    // cache directly and the drift guard would see no delta.
+    tui.terminal_mut().set_queried_size(TerminalSize {
         columns: 42,
         rows: 6,
     });
