@@ -133,7 +133,10 @@ mod tests {
         let plain = plain_lines(&component, 80);
         assert!(plain[0].contains("[branch]"), "{plain:?}");
         let joined = plain.join("\n");
-        assert!(joined.contains("Branch summary (ctrl+o to expand)"), "{joined}");
+        assert!(
+            joined.contains("Branch summary (ctrl+o to expand)"),
+            "{joined}"
+        );
     }
 
     #[test]

@@ -1299,10 +1299,7 @@ impl SettingsManager {
     /// `setTreeFilterMode` (`settings-manager.ts:1385-1390`): the global
     /// layer carries the value.
     pub fn set_tree_filter_mode(&mut self, mode: TreeFilterMode) {
-        self.set_global(
-            "treeFilterMode",
-            Value::String(mode.as_name().to_string()),
-        );
+        self.set_global("treeFilterMode", Value::String(mode.as_name().to_string()));
     }
 
     // -- retry ---------------------------------------------------------------

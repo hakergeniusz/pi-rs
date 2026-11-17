@@ -21,3 +21,4 @@ pub mod status_indicator;
 pub mod tool_execution;
 pub mod trust_selector;
 pub mod user_message;
+pub mod user_message_selector;

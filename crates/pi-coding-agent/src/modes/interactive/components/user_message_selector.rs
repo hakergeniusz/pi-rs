@@ -49,8 +49,8 @@ impl UserMessageList {
     fn new(messages: Vec<UserMessageItem>, initial_selected_id: Option<&str>) -> Self {
         // Start with the selected message if provided, else the most recent
         // (`user-message-selector.ts:30-36`).
-        let initial_index = initial_selected_id
-            .and_then(|id| messages.iter().position(|message| message.id == id));
+        let initial_index =
+            initial_selected_id.and_then(|id| messages.iter().position(|message| message.id == id));
         let selected_index = initial_index.unwrap_or_else(|| messages.len().saturating_sub(1));
         Self {
             messages,
@@ -122,11 +122,7 @@ impl UserMessageList {
         // Scroll indicator only when the window moved
         // (`user-message-selector.ts:82-85`).
         if start_index > 0 || end_index < self.messages.len() {
-            let scroll_info = format!(
-                "  ({}/{})",
-                self.selected_index + 1,
-                self.messages.len()
-            );
+            let scroll_info = format!("  ({}/{})", self.selected_index + 1, self.messages.len());
             lines.push(theme.fg(ThemeColor::Muted, &scroll_info));
         }
 
@@ -208,7 +204,10 @@ impl Component for UserMessageSelectorComponent {
                 self.message_list.selected_index = page_index;
             }
         } else if keybindings::matches(data, action::SELECT_CONFIRM) {
-            if let Some(message) = self.message_list.messages.get(self.message_list.selected_index)
+            if let Some(message) = self
+                .message_list
+                .messages
+                .get(self.message_list.selected_index)
             {
                 self.events
                     .lock()

@@ -68,6 +68,9 @@ use super::components::status_indicator::{IdleStatus, StatusIndicator};
 use super::components::tool_execution::{ToolExecutionComponent, ToolResultView};
 use super::components::trust_selector::{TrustSelectorComponent, TrustSelectorEvent};
 use super::components::user_message::UserMessageComponent;
+use super::components::user_message_selector::{
+    UserMessageItem, UserMessageSelectorComponent, UserMessageSelectorEvent,
+};
 use super::theme;
 use crate::oauth::{self, AuthSelectorProvider};
 
@@ -322,6 +325,33 @@ enum CompactionOutcome {
     Completed(Box<crate::session::compaction::CompactionResult>),
     Failed(String),
     Cancelled,
+}
+
+/// `AgentSessionRuntime.fork`'s position (`agent-session-runtime.ts:264`):
+/// `"before"` forks from a user message's parent; `"at"` keeps the entry as
+/// the new leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForkPosition {
+    Before,
+    At,
+}
+
+impl ForkPosition {
+    /// The wire discriminant (`position`, `agent-session-runtime.ts:267`).
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::At => "at",
+        }
+    }
+}
+
+/// `AgentSessionRuntime.fork`'s non-error outcomes (`:269-350`): a
+/// `session_before_fork` veto, or the completed fork with the selected
+/// message's text (`selectedText`, `"before"` only).
+enum ForkOutcome {
+    Cancelled,
+    Completed(Option<String>),
 }
 
 /// One compaction attempt on a worker thread (`session.compact`).
@@ -789,6 +819,9 @@ pub struct InteractiveMode {
     /// Events from the mounted `/settings` dialog, same queue pattern.
     settings_selector_events: Option<Arc<Mutex<Vec<SettingsSelectorEvent>>>>,
     session_selector_events: Option<Arc<Mutex<Vec<SessionSelectorEvent>>>>,
+    /// Events from the mounted `/fork` dialog (`UserMessageSelectorComponent`'s
+    /// onSelect/onCancel).
+    user_message_selector_events: Option<Arc<Mutex<Vec<UserMessageSelectorEvent>>>>,
     /// Events from the mounted `/login`//`/logout` selector
     /// (`OAuthSelectorComponent`'s onSelect/onCancel).
     auth_selector_events: Option<Arc<Mutex<Vec<AuthSelectorEvent>>>>,
@@ -995,6 +1028,7 @@ impl InteractiveMode {
             trust_selector_events: None,
             settings_selector_events: None,
             session_selector_events: None,
+            user_message_selector_events: None,
             auth_selector_events: None,
             auth_selector_mode: None,
             pending_auth_type: None,
@@ -1223,6 +1257,15 @@ impl InteractiveMode {
             autocomplete::SlashCommand::new("session", "Show session info and stats"),
             autocomplete::SlashCommand::new("changelog", "Show changelog entries"),
             autocomplete::SlashCommand::new("hotkeys", "Show all keyboard shortcuts"),
+            // `slash-commands.ts:34-35`.
+            autocomplete::SlashCommand::new(
+                "fork",
+                "Create a new fork from a previous user message",
+            ),
+            autocomplete::SlashCommand::new(
+                "clone",
+                "Duplicate the current session at the current position",
+            ),
             // `BUILTIN_SLASH_COMMANDS` (`slash-commands.ts:37-38`); the
             // `/login` argument completions ride
             // `loginCommand.getArgumentCompletions`
@@ -1625,11 +1668,10 @@ impl InteractiveMode {
             AgentMessage::BranchSummary(summary) => {
                 // `case "branchSummary"` (`interactive-mode.ts:4063-4074`).
                 self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
-                let mut row =
-                    super::components::branch_summary::BranchSummaryMessageComponent::new(
-                        &summary.summary,
-                        1,
-                    );
+                let mut row = super::components::branch_summary::BranchSummaryMessageComponent::new(
+                    &summary.summary,
+                    1,
+                );
                 row.set_expanded(self.tool_output_expanded);
                 self.add_to_chat(Box::new(row));
             }
@@ -2062,6 +2104,18 @@ impl InteractiveMode {
         // `/hotkeys` (`interactive-mode.ts:3392-3396`).
         if text == "/hotkeys" {
             self.handle_hotkeys_command();
+            return;
+        }
+        // `/fork` (`interactive-mode.ts:3398-3401`).
+        if text == "/fork" {
+            self.show_user_message_selector();
+            return;
+        }
+        // `/clone` (`interactive-mode.ts:3403-3406`): upstream clears the
+        // editor before awaiting the fork.
+        if text == "/clone" {
+            self.editor_mut().editor.set_text("");
+            self.handle_clone_command();
             return;
         }
         // `/login [provider]` (`interactive-mode.ts:3418-3423`): an empty
@@ -4528,6 +4582,7 @@ impl InteractiveMode {
         self.trust_selector_events = None;
         self.settings_selector_events = None;
         self.session_selector_events = None;
+        self.user_message_selector_events = None;
         self.auth_selector_events = None;
         self.login_prompt_events = None;
         self.login_prompt_provider = None;
@@ -4602,6 +4657,285 @@ impl InteractiveMode {
         for event in events {
             self.handle_session_event(event);
         }
+    }
+
+    // --------------------------------------------------------------
+    // /fork and /clone (`showUserMessageSelector`,
+    // `interactive-mode.ts:5692-5728`, `handleCloneCommand` `:5730-5749`,
+    // and `AgentSessionRuntime.fork`, `agent-session-runtime.ts:262-350`)
+    // --------------------------------------------------------------
+
+    /// `contentText(content, "")` / `extractUserMessageText` for user
+    /// content: the text parts joined with no separator
+    /// (`agent-session-runtime.ts:56-65`).
+    fn user_message_text(content: &pi_ai::types::UserContent) -> String {
+        match content {
+            pi_ai::types::UserContent::Text(text) => text.clone(),
+            pi_ai::types::UserContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    pi_ai::types::InputContent::Text(text) => Some(text.text.clone()),
+                    pi_ai::types::InputContent::Image(_) => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    /// `getUserMessagesForForking` (`agent-session.ts:4342-4357`): every user
+    /// message entry with non-empty text, in file order.
+    fn user_messages_for_forking(&self) -> Vec<UserMessageItem> {
+        let mut items = Vec::new();
+        for entry in self.session.get_entries() {
+            let crate::session::records::SessionEntry::Message(message) = entry else {
+                continue;
+            };
+            let AgentMessage::User(user) = &message.message else {
+                continue;
+            };
+            let text = Self::user_message_text(&user.content);
+            if text.is_empty() {
+                continue;
+            }
+            items.push(UserMessageItem {
+                id: message.base.id.clone(),
+                text,
+            });
+        }
+        items
+    }
+
+    /// `showUserMessageSelector` (`interactive-mode.ts:5692-5728`): the fork
+    /// dialog, preselected on the most recent message; a selection forks and
+    /// puts the message text back into the editor.
+    fn show_user_message_selector(&mut self) {
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let user_messages = self.user_messages_for_forking();
+        if user_messages.is_empty() {
+            self.show_status("No messages to fork from");
+            return;
+        }
+        // `userMessages[userMessages.length - 1]?.entryId` (`:5700`).
+        let initial_selected_id = user_messages.last().map(|message| message.id.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let selector = UserMessageSelectorComponent::new(
+            user_messages,
+            initial_selected_id.as_deref(),
+            Arc::clone(&events),
+        );
+        self.user_message_selector_events = Some(events);
+        self.suspend_editor_with(Box::new(selector));
+    }
+
+    /// Put the editor back after the fork dialog closes.
+    fn close_user_message_selector(&mut self) {
+        if self.suspended_editor.is_none() {
+            return;
+        }
+        self.user_message_selector_events = None;
+        self.restore_editor();
+    }
+
+    /// The `/fork` dialog's events (`showUserMessageSelector`'s callbacks,
+    /// `interactive-mode.ts:5705-5723`).
+    fn handle_user_message_selector_event(&mut self, event: UserMessageSelectorEvent) {
+        match event {
+            UserMessageSelectorEvent::Selected(entry_id) => {
+                self.close_user_message_selector();
+                match self.fork_session(&entry_id, ForkPosition::Before) {
+                    Ok(ForkOutcome::Cancelled) => self.tui.request_render(),
+                    Ok(ForkOutcome::Completed(selected_text)) => {
+                        // `this.editor.setText(result.selectedText ?? "")`
+                        // (`:5714`): the forked session ends before the
+                        // selected message, so its text returns for editing.
+                        let text = selected_text.unwrap_or_default();
+                        self.editor_mut().editor.set_text(&text);
+                        self.show_status("Forked to new session");
+                    }
+                    Err(error) => self.show_error(&error),
+                }
+            }
+            UserMessageSelectorEvent::Cancel => self.close_user_message_selector(),
+        }
+    }
+
+    fn pump_user_message_selector(&mut self) {
+        if self.user_message_selector_events.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .user_message_selector_events
+                .as_ref()
+                .expect("user message selector")
+                .lock()
+                .expect("user message selector events"),
+        );
+        for event in events {
+            self.handle_user_message_selector_event(event);
+        }
+    }
+
+    /// `/clone` (`handleCloneCommand`, `interactive-mode.ts:5730-5749`):
+    /// duplicate the session at the current leaf.
+    fn handle_clone_command(&mut self) {
+        let Some(leaf_id) = self.session.get_leaf_id().map(str::to_string) else {
+            self.show_status("Nothing to clone yet");
+            return;
+        };
+        match self.fork_session(&leaf_id, ForkPosition::At) {
+            Ok(ForkOutcome::Cancelled) => self.tui.request_render(),
+            // `this.editor.setText("")` + "Cloned to new session" (`:5744-5745`).
+            Ok(ForkOutcome::Completed(_)) => {
+                self.editor_mut().editor.set_text("");
+                self.show_status("Cloned to new session");
+            }
+            Err(error) => self.show_error(&error),
+        }
+    }
+
+    /// `AgentSessionRuntime.fork` (`agent-session-runtime.ts:262-350`): copy
+    /// the active path up to `entry_id` into a new session and swap to it.
+    /// `Before` targets a user message (the new session ends at its parent,
+    /// and the message text returns for editing); `At` ends at the entry
+    /// itself. `Completed(Some(text))` carries the selected message's text
+    /// for the editor (`selectedText`, `"before"` only).
+    fn fork_session(
+        &mut self,
+        entry_id: &str,
+        position: ForkPosition,
+    ) -> Result<ForkOutcome, String> {
+        // `emitBeforeFork` (`agent-session-runtime.ts:150-166`): a `cancel`
+        // vote aborts the fork.
+        if self.extension_cancelled(&serde_json::json!({
+            "type": "session_before_fork",
+            "entryId": entry_id,
+            "position": position.as_str(),
+        })) {
+            return Ok(ForkOutcome::Cancelled);
+        }
+
+        let Some(selected_entry) = self.session.get_entry(entry_id) else {
+            return Err("Invalid entry ID for forking".to_string());
+        };
+        let selected_text;
+        let target_leaf_id: Option<String>;
+        match position {
+            ForkPosition::At => {
+                selected_text = None;
+                target_leaf_id = Some(entry_id.to_string());
+            }
+            ForkPosition::Before => {
+                let crate::session::records::SessionEntry::Message(message) = &selected_entry
+                else {
+                    return Err("Invalid entry ID for forking".to_string());
+                };
+                let AgentMessage::User(user) = &message.message else {
+                    return Err("Invalid entry ID for forking".to_string());
+                };
+                selected_text = Some(Self::user_message_text(&user.content));
+                target_leaf_id = selected_entry.parent_id().map(str::to_string);
+            }
+        }
+
+        let session_dir = Some(self.session.get_session_dir().to_path_buf());
+        if self.session.is_persisted() {
+            let Some(current_session_file) = self.session.session_file().map(str::to_string) else {
+                return Err("Persisted session is missing a session file".to_string());
+            };
+            let Some(target_leaf_id) = target_leaf_id else {
+                // `SessionManager.create(cwd, sessionDir)` +
+                // `newSession({ parentSession })` (`:296-310`): forking from
+                // the very first user message starts an empty session.
+                let cwd = self.session.get_cwd().to_path_buf();
+                let options = NewSessionOptions {
+                    parent_session: Some(current_session_file),
+                    ..NewSessionOptions::default()
+                };
+                let manager = SessionManager::create(&cwd, session_dir.as_deref(), &options)
+                    .map_err(|error| error.to_string())?;
+                // `teardownCurrent` settles the active response first
+                // (`:299`), persisting it to the outgoing session.
+                self.abort_active_run();
+                self.fork_swap(manager);
+                return Ok(ForkOutcome::Completed(selected_text));
+            };
+            if !std::path::Path::new(&current_session_file).exists() {
+                return Err(
+                    "This session has not been saved yet. Send a message before cloning or forking it."
+                        .to_string(),
+                );
+            }
+            // `SessionManager.open(currentSessionFile, sessionDir)` +
+            // `createBranchedSession(targetLeafId)` (`:315-319`): the forked
+            // copy is read before the teardown abort appends to the file,
+            // like upstream.
+            let mut forked = SessionManager::open(
+                std::path::Path::new(&current_session_file),
+                session_dir.as_deref(),
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+            forked
+                .create_branched_session(&target_leaf_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Failed to create forked session".to_string())?;
+            self.abort_active_run();
+            self.fork_swap(forked);
+            Ok(ForkOutcome::Completed(selected_text))
+        } else {
+            // The in-memory manager mutates in place (`:333-339`): teardown
+            // first — abort, then `session_shutdown` (its file is
+            // `undefined`, like upstream's non-persisted `getSessionFile()`)
+            // — then a fresh session when forking from the very first user
+            // message, otherwise the branched path.
+            self.abort_active_run();
+            self.emit_extension_shutdown("fork", None);
+            if let Some(target_leaf_id) = target_leaf_id {
+                self.session
+                    .create_branched_session(&target_leaf_id)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                let options = NewSessionOptions {
+                    parent_session: self
+                        .session
+                        .session_file()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    ..NewSessionOptions::default()
+                };
+                self.session
+                    .new_session(&options)
+                    .map_err(|error| error.to_string())?;
+            }
+            self.after_session_store_swap();
+            Ok(ForkOutcome::Completed(selected_text))
+        }
+    }
+
+    /// The persisted fork's swap tail: `session_shutdown` with the
+    /// destination (`teardownCurrent`, `agent-session-runtime.ts:167-175`),
+    /// then the store swap, replay, and footer refresh.
+    fn fork_swap(&mut self, session: SessionManager) {
+        let destination = session
+            .session_file()
+            .map(|path| path.to_string_lossy().into_owned());
+        self.emit_extension_shutdown("fork", destination.as_deref());
+        self.session = session;
+        self.after_session_store_swap();
+    }
+
+    /// The store-swap tail shared by the fork paths: drop the run state, then
+    /// replay the new store's transcript (upstream re-renders inside the
+    /// runtime replacement; the port mirrors `switch_session`'s tail).
+    fn after_session_store_swap(&mut self) {
+        self.active_prompt = None;
+        self.queued_deliveries.clear();
+        self.pending_tools.clear();
+        self.streaming_index = None;
+        self.render_initial_messages();
+        self.refresh_footer();
     }
 
     // --------------------------------------------------------------
@@ -5513,6 +5847,7 @@ impl InteractiveMode {
         self.pump_trust_selector();
         self.pump_settings_selector();
         self.pump_session_selector();
+        self.pump_user_message_selector();
         self.pump_auth_selector();
         self.pump_login_prompt();
         #[cfg(feature = "ext-js")]
@@ -7803,5 +8138,188 @@ export default function (pi) {
         assert!(stored.contains(r#""oauth""#), "{stored}");
 
         mode.shutdown().expect("shutdown");
+    }
+
+    // --------------------------------------------------------------
+    // /fork and /clone (mirrors `interactive-mode-clone-command.test.ts`
+    // and the fork dialog flow in `interactive-mode.ts:5692-5728`)
+    // --------------------------------------------------------------
+
+    /// Two appended messages for the clone fixtures; returns the entry ids.
+    fn seed_two_messages(mode: &mut InteractiveMode) -> (String, String) {
+        let user = mode
+            .session
+            .append_message(AgentMessage::User(pi_ai::types::UserMessage {
+                content: pi_ai::types::UserContent::Text("first message".to_string()),
+                timestamp: 1,
+            }))
+            .expect("append user");
+        let assistant = mode
+            .session
+            .append_message(test_assistant_message("the reply"))
+            .expect("append assistant");
+        (user.base.id.clone(), assistant.base.id.clone())
+    }
+
+    /// A minimal assistant message (the wire fields the renderers read),
+    /// like [`scripted_assistant`] without the stream.
+    fn test_assistant_message(text: &str) -> AgentMessage {
+        serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": text }],
+            "api": "test",
+            "provider": "test",
+            "model": "test-model",
+            "usage": {
+                "input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0,
+                "totalTokens": 2,
+                "cost": { "input": 0, "output": 0, "cacheRead": 0,
+                          "cacheWrite": 0, "total": 0 }
+            },
+            "stopReason": "stop",
+            "timestamp": 1
+        }))
+        .expect("assistant message")
+    }
+
+    /// `/clone` on an empty session: "Nothing to clone yet", no fork
+    /// (`interactive-mode-clone-command.test.ts:51-71`).
+    #[test]
+    fn clone_without_entries_reports_nothing_to_clone() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/clone");
+        mode.tui.render_now(false);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("Nothing to clone yet"), "{plain}");
+        assert!(!plain.contains("Cloned to new session"), "{plain}");
+    }
+
+    /// `/clone` at the leaf duplicates the path into a fresh session
+    /// (`interactive-mode-clone-command.test.ts:23-49`: fork called at the
+    /// leaf with `position: "at"`, "Cloned to new session", no error).
+    #[test]
+    fn clone_copies_the_session_at_the_current_position() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        mode.tui.start().expect("tui start");
+        let (user_id, assistant_id) = seed_two_messages(&mut mode);
+        let old_session_id = mode.session.get_session_id().to_string();
+
+        mode.submit("/clone");
+        mode.tui.render_now(false);
+
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("Cloned to new session"), "{plain}");
+        assert!(!plain.contains("Invalid entry ID"), "{plain}");
+        // The store swapped to a fresh session holding the branched path
+        // (`createBranchedSession`): same entries, new id, leaf kept.
+        assert_ne!(mode.session.get_session_id(), old_session_id);
+        assert_eq!(mode.session.get_entry_count(), 2);
+        assert_eq!(mode.session.get_leaf_id(), Some(assistant_id.as_str()));
+        let ids: Vec<String> = mode
+            .session
+            .get_entries()
+            .iter()
+            .filter_map(|entry| {
+                if entry.id().is_empty() {
+                    None
+                } else {
+                    Some(entry.id().to_string())
+                }
+            })
+            .collect();
+        assert_eq!(ids, vec![user_id, assistant_id]);
+    }
+
+    /// `/fork` with no user messages: the status line, no dialog
+    /// (`showUserMessageSelector`'s empty guard, `interactive-mode.ts:5695-5698`).
+    #[test]
+    fn fork_without_messages_shows_status() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/fork");
+        mode.tui.render_now(false);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("No messages to fork from"), "{plain}");
+        assert!(mode.suspended_editor.is_none(), "no dialog mounted");
+    }
+
+    /// `/fork` mounts the dialog on the newest message, and selecting one
+    /// forks to a session ending at its parent with the text back in the
+    /// editor (`showUserMessageSelector` + the fork callbacks,
+    /// `interactive-mode.ts:5700-5725`).
+    #[test]
+    fn fork_dialog_forks_from_the_selected_user_message() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        mode.tui.start().expect("tui start");
+        let (user_id, _assistant_id) = seed_two_messages(&mut mode);
+
+        mode.submit("/fork");
+        assert!(
+            mode.suspended_editor.is_some(),
+            "the fork dialog occupies the editor slot"
+        );
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("Fork from Message"), "{plain}");
+        assert!(plain.contains("first message"), "{plain}");
+        // The initial selection is the most recent message — the assistant
+        // reply is not forkable, so the user message is last.
+        assert!(plain.contains("Message 1 of 1"), "{plain}");
+
+        mode.user_message_selector_events
+            .as_ref()
+            .expect("selector events")
+            .lock()
+            .expect("selector events")
+            .push(UserMessageSelectorEvent::Selected(user_id.clone()));
+        mode.pump();
+
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("Forked to new session"), "{plain}");
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+        // The fork ends at the user message's parent — the root — so the new
+        // session starts empty, and the message text returns for editing.
+        assert_eq!(mode.session.get_entry_count(), 0);
+        assert!(mode.session.get_leaf_id().is_none());
+        assert_eq!(mode.editor_mut().editor.get_text(), "first message");
+    }
+
+    /// The fork dialog's cancel restores the editor without forking
+    /// (`onCancel` → `done()` + `requestRender`, `interactive-mode.ts:5720-5723`).
+    #[test]
+    fn fork_dialog_cancel_restores_the_editor() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        mode.tui.start().expect("tui start");
+        let (user_id, assistant_id) = seed_two_messages(&mut mode);
+        let old_session_id = mode.session.get_session_id().to_string();
+
+        mode.submit("/fork");
+        assert!(mode.suspended_editor.is_some(), "dialog mounted");
+        mode.user_message_selector_events
+            .as_ref()
+            .expect("selector events")
+            .lock()
+            .expect("selector events")
+            .push(UserMessageSelectorEvent::Cancel);
+        mode.pump();
+
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+        assert!(mode.user_message_selector_events.is_none());
+        assert_eq!(mode.session.get_session_id(), old_session_id);
+        assert_eq!(mode.session.get_entry_count(), 2);
+        assert_eq!(mode.session.get_leaf_id(), Some(assistant_id.as_str()));
+        assert!(
+            mode.session.get_entry(&user_id).is_some(),
+            "the original session is untouched"
+        );
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(!plain.contains("Forked to new session"), "{plain}");
     }
 }
