@@ -3219,7 +3219,7 @@ impl InteractiveMode {
         } else {
             theme::thinking_border_styler(self.thinking_level)
         };
-        self.editor_mut().editor.border_color = styler;
+        self.editor_mut().editor.set_border_color(styler);
         self.tui.request_render();
     }
 
@@ -8663,7 +8663,7 @@ mod tests {
             .push(EditorEventOut::Action(AppAction::CycleThinking));
         mode.pump();
         assert_ne!(mode.thinking_level, start, "the level advanced");
-        let border = mode.editor_mut().editor.border_color.clone();
+        let border = mode.editor_mut().editor.border_color().clone();
         assert_ne!(border("-"), "-", "the border carries a color token");
     }
 
@@ -8682,12 +8682,12 @@ mod tests {
             .expect("editor events")
             .push(EditorEventOut::BashModeChanged);
         mode.pump();
-        let thinking_border = mode.editor_mut().editor.border_color.clone();
+        let thinking_border = mode.editor_mut().editor.border_color().clone();
         let editor = mode.editor_mut();
         editor.set_focused(true);
         let _ = pi_tui::component::Component::handle_input(editor, "!");
         mode.pump();
-        let bash_border = mode.editor_mut().editor.border_color.clone();
+        let bash_border = mode.editor_mut().editor.border_color().clone();
         assert_ne!(
             bash_border("-"),
             thinking_border("-"),
@@ -8699,7 +8699,7 @@ mod tests {
             .expect("editor events")
             .push(EditorEventOut::BashModeChanged);
         mode.pump();
-        let restored = mode.editor_mut().editor.border_color.clone();
+        let restored = mode.editor_mut().editor.border_color().clone();
         assert_eq!(
             restored("-"),
             thinking_border("-"),

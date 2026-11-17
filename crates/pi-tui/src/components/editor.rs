@@ -539,6 +539,17 @@ impl Editor {
         self.placeholder = placeholder;
     }
 
+    /// Swap the border style hook; the chat mode repaints it on thinking
+    /// level and bash-mode changes (`interactive-mode.ts:4700-4707`).
+    pub fn set_border_color(&mut self, color: Style) {
+        self.border_color = color;
+    }
+
+    /// The current border style hook.
+    pub fn border_color(&self) -> &Style {
+        &self.border_color
+    }
+
     /// The horizontal padding the editor renders with.
     pub fn padding_x(&self) -> usize {
         self.padding_x
