@@ -1957,7 +1957,18 @@ impl InteractiveMode {
             let pi_ai::types::AssistantContent::ToolCall(call) = block else {
                 continue;
             };
-            if self.pending_tools.contains_key(&call.id) {
+            if let Some(chat_index) = self
+                .pending_tools
+                .get(&call.id)
+                .map(|pending| pending.chat_index)
+            {
+                // Streaming partials refresh an open row's args
+                // (`interactive-mode.ts:3674-3678`): the first partial
+                // carries empty arguments, and without this the call line
+                // keeps the empty-command placeholder.
+                if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(chat_index) {
+                    component.update_args(serde_json::Value::Object(call.arguments.clone()));
+                }
                 continue;
             }
             let component = ToolExecutionComponent::new(
@@ -8966,6 +8977,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         assert!(mode.agent_run.is_none(), "agent run did not finish");
+    }
+
+    /// Streaming partials refresh an open tool row's args
+    /// (`interactive-mode.ts:3674-3678`): the call line moves off the
+    /// empty-command placeholder once the arguments arrive.
+    #[test]
+    fn streaming_tool_args_refresh_the_call_line() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        mode.tui.start().expect("tui start");
+        let call = |arguments: serde_json::Value| {
+            serde_json::from_value::<pi_ai::types::ToolCall>(serde_json::json!({
+                "id": "call-1", "name": "bash", "arguments": arguments
+            }))
+            .expect("tool call")
+        };
+        let partial = scripted_assistant(
+            &[pi_ai::types::AssistantContent::ToolCall(call(serde_json::json!({
+                "command": ""
+            })))],
+            StopReason::Pending,
+        );
+        mode.start_assistant_stream();
+        mode.update_assistant_stream(&partial);
+        mode.tui.render_now(false);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("$ ..."), "{plain}");
+        let full = scripted_assistant(
+            &[pi_ai::types::AssistantContent::ToolCall(call(
+                serde_json::json!({ "command": "echo hi" }),
+            ))],
+            StopReason::ToolUse,
+        );
+        mode.update_assistant_stream(&full);
+        mode.tui.render_now(false);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("$ echo hi"), "{plain}");
     }
 
     // --------------------------------------------------------------

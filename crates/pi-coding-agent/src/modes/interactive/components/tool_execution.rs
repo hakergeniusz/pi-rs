@@ -109,7 +109,6 @@ pub struct ToolExecutionComponent {
     is_partial: bool,
     execution_started: bool,
     args_complete: bool,
-    args_pending: bool,
     result: Option<ToolResultView>,
     started_at: Option<Instant>,
     renderers: Option<ToolRenderers>,
@@ -139,7 +138,6 @@ impl ToolExecutionComponent {
             is_partial: true,
             execution_started: false,
             args_complete: false,
-            args_pending: false,
             result: None,
             started_at: None,
             renderers,
@@ -154,11 +152,13 @@ impl ToolExecutionComponent {
         &self.tool_call_id
     }
 
-    /// `updateArgs` (`tool-execution.ts:178-182`): applied at the next render
-    /// so a stream of argument deltas runs the renderer once per frame.
+    /// `updateArgs` (`tool-execution.ts:178-182`). Upstream defers the
+    /// rebuild to the next render (`render` applies `argsPending`,
+    /// `tool-execution.ts:237`); the port's `render` is immutable, so the
+    /// rebuild happens here — one per args delta instead of one per frame.
     pub fn update_args(&mut self, args: serde_json::Value) {
         self.args = args;
-        self.args_pending = true;
+        self.update_display();
     }
 
     /// `markExecutionStarted` (`tool-execution.ts:184-188`).
@@ -200,7 +200,6 @@ impl ToolExecutionComponent {
     /// `updateDisplay` (`tool-execution.ts:281-402`): rebuild the box with
     /// the state's background, the call line, and the result body.
     fn update_display(&mut self) {
-        self.args_pending = false;
         let theme = theme::theme();
         let bg_token = if self.is_partial {
             pi_tui::theme::ThemeBg::ToolPendingBg
@@ -377,6 +376,32 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line.contains("read") && line.contains("example.txt")),
+            "lines: {lines:?}"
+        );
+    }
+
+    /// `updateArgs` refreshes the call line (`tool-execution.ts:237`): a
+    /// bash row moves off the empty-command placeholder once the command
+    /// streams in.
+    #[test]
+    fn streamed_args_refresh_the_call_line() {
+        let mut component = ToolExecutionComponent::new(
+            "bash",
+            "call-1",
+            serde_json::json!({ "command": "" }),
+            1,
+            "/tmp",
+            crate::tools::renderers::renderers_for("bash"),
+        );
+        let lines = plain(&component, 60);
+        assert!(
+            lines.iter().any(|line| line.contains("$ ...")),
+            "lines: {lines:?}"
+        );
+        component.update_args(serde_json::json!({ "command": "echo hi" }));
+        let lines = plain(&component, 60);
+        assert!(
+            lines.iter().any(|line| line.contains("$ echo hi")),
             "lines: {lines:?}"
         );
     }
