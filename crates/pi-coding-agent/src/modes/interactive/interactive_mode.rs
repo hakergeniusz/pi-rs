@@ -226,6 +226,10 @@ enum EditorEventOut {
     /// The bash-mode flag flipped (`interactive-mode.ts:3249-3252`); the
     /// mode repaints the editor border.
     BashModeChanged,
+    /// An extension shortcut chord matched (`custom-editor.ts:89-92` —
+    /// the editor checks extension shortcuts first); the payload is the
+    /// resolved key.
+    ExtensionShortcut(String),
 }
 
 /// The editor host: wraps the editor, intercepts app keybindings, embeds the
@@ -236,6 +240,10 @@ enum EditorEventOut {
 struct ChatEditor {
     editor: Editor,
     events: Arc<Mutex<Vec<EditorEventOut>>>,
+    /// The resolved extension shortcut chords the dispatch checks
+    /// (`onExtensionShortcut` upstream — the runner resolution fills this
+    /// after load and after every reload).
+    extension_shortcuts: Arc<Mutex<Vec<String>>>,
     /// `isBashMode` (`interactive-mode.ts:551`): the draft starts with `!`.
     is_bash_mode: bool,
 }
@@ -244,6 +252,7 @@ impl ChatEditor {
     fn new(
         events: Arc<Mutex<Vec<EditorEventOut>>>,
         status: Arc<Mutex<Option<StatusIndicator>>>,
+        extension_shortcuts: Arc<Mutex<Vec<String>>>,
     ) -> Self {
         let mut editor = Editor::new(theme::editor_theme(), EditorOptions::default());
         // pi shows no placeholder in the chat editor.
@@ -277,6 +286,7 @@ impl ChatEditor {
         ChatEditor {
             editor,
             events,
+            extension_shortcuts,
             is_bash_mode: false,
         }
     }
@@ -288,6 +298,24 @@ impl Component for ChatEditor {
     }
 
     fn handle_input(&mut self, data: &str) -> Option<ComponentMutation> {
+        // Extension-registered shortcuts first (`custom-editor.ts:89-92`):
+        // the check runs before every built-in key, and the runner's
+        // conflict resolution has already filtered the reserved chords out.
+        let matched = self
+            .extension_shortcuts
+            .lock()
+            .expect("extension shortcuts")
+            .iter()
+            .find(|key| pi_tui::keys::matches_key(data, key))
+            .cloned();
+        if let Some(key) = matched {
+            self.events
+                .lock()
+                .expect("editor events")
+                .push(EditorEventOut::ExtensionShortcut(key));
+            return Some(ComponentMutation { consume: true });
+        }
+
         // App keybindings first (`custom-editor.ts:104-153`).
         let action = if theme::app_keys::matches(data, theme::app_keys::CLEAR) {
             Some(AppAction::Clear)
@@ -715,8 +743,12 @@ fn bold_text(text: &str) -> String {
 /// in. The extension-registered-shortcuts section (`interactive-mode.ts:7101-7112`)
 /// renders only when the runner reports shortcuts; it lands with the
 /// extension UI (E3).
+///
+/// `extension_shortcuts` carries the resolved extension rows as
+/// `(raw key, description)` — the `/hotkeys` Extensions section
+/// (`interactive-mode.ts:7092-7106`).
 #[allow(clippy::too_many_lines)] // mirrors the TS template literal; split when extending
-fn hotkeys_markdown() -> String {
+fn hotkeys_markdown(extension_shortcuts: &[(String, String)]) -> String {
     // Navigation keybindings
     let cursor_up = theme::key_display_text("tui.editor.cursorUp");
     let cursor_down = theme::key_display_text("tui.editor.cursorDown");
@@ -765,7 +797,7 @@ fn hotkeys_markdown() -> String {
     } else {
         ""
     };
-    format!(
+    let mut hotkeys = format!(
         "
 **Navigation**
 | Key | Action |
@@ -813,7 +845,23 @@ fn hotkeys_markdown() -> String {
 | `!` | Run bash command |
 | `!!` | Run bash command (excluded from context) |
 "
-    )
+    );
+
+    // Extension-registered shortcuts (`interactive-mode.ts:7092-7106`): the
+    // display key capitalizes like upstream's `formatKeyText(…,
+    // { capitalize: true })`, the description defaults to the extension
+    // path.
+    if !extension_shortcuts.is_empty() {
+        hotkeys += "\n**Extensions**\n| Key | Action |\n|-----|--------|\n";
+        for (key, description) in extension_shortcuts {
+            let _ = writeln!(
+                hotkeys,
+                "| `{}` | {description} |",
+                theme::format_chord(key)
+            );
+        }
+    }
+    hotkeys
 }
 
 /// The `modelThinkingLevels` map: `provider/id` → level.
@@ -874,6 +922,10 @@ pub struct InteractiveMode {
     tui: Tui,
     editor_events: Arc<Mutex<Vec<EditorEventOut>>>,
     status_handle: Arc<Mutex<Option<StatusIndicator>>>,
+    /// The resolved extension shortcut chords the editor dispatch checks
+    /// (the mode's half of `onExtensionShortcut` — refilled after load and
+    /// after every reload).
+    editor_extension_shortcuts: Arc<Mutex<Vec<String>>>,
 
     session: SessionManager,
     model: pi_ai::types::Model,
@@ -1092,8 +1144,12 @@ impl InteractiveMode {
 
         let editor_events = Arc::new(Mutex::new(Vec::new()));
         let status_handle: Arc<Mutex<Option<StatusIndicator>>> = Arc::new(Mutex::new(None));
-        let mut editor_host =
-            ChatEditor::new(Arc::clone(&editor_events), Arc::clone(&status_handle));
+        let editor_extension_shortcuts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut editor_host = ChatEditor::new(
+            Arc::clone(&editor_events),
+            Arc::clone(&status_handle),
+            Arc::clone(&editor_extension_shortcuts),
+        );
 
         // `setupAutocompleteProvider` (`interactive-mode.ts:855-871`): the
         // base provider is built once from the builtin commands, the session
@@ -1157,6 +1213,7 @@ impl InteractiveMode {
             tui,
             editor_events,
             status_handle,
+            editor_extension_shortcuts,
             session: std::mem::replace(
                 &mut runtime.session,
                 SessionManager::in_memory(
@@ -1262,7 +1319,91 @@ impl InteractiveMode {
         if let Some(footer) = mode.downcast_tree::<FooterComponent>(HostSlot::Footer) {
             footer.data.auto_compact_enabled = auto_compact;
         }
+        // Extension shortcuts (`setupExtensionShortcuts`,
+        // `interactive-mode.ts:2170/:2381-2432`): resolve against the
+        // resolved keybindings, publish the chords to the editor, and
+        // surface the conflict warnings.
+        #[cfg(feature = "ext-js")]
+        mode.setup_extension_shortcuts();
         mode
+    }
+
+    /// Resolves the extension shortcuts against the port's default
+    /// keybindings and wires the editor dispatch
+    /// (`setupExtensionShortcuts`, `interactive-mode.ts:2381-2432`): the
+    /// chords publish to the shared editor slot, the conflict warnings
+    /// print as `Warning:` lines (the port's loader-line diagnostics
+    /// channel — upstream feeds the `[Extension issues]` banner), and the
+    /// handlers dispatch through the runner on the editor event.
+    #[cfg(feature = "ext-js")]
+    fn setup_extension_shortcuts(&mut self) {
+        let Some(runner) = &self.extension_runner else {
+            return;
+        };
+        let (keys, warnings) = {
+            let mut runner = runner.lock().expect("extension runner mutex poisoned");
+            runner.get_shortcuts(theme::app_keys::DEFAULTS);
+            let keys = runner
+                .shortcuts()
+                .iter()
+                .map(|shortcut| shortcut.key.clone())
+                .collect::<Vec<_>>();
+            let warnings = runner
+                .shortcut_diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>();
+            (keys, warnings)
+        };
+        *self
+            .editor_extension_shortcuts
+            .lock()
+            .expect("extension shortcuts") = keys;
+        for message in &warnings {
+            eprintln!("Warning: {message}");
+        }
+    }
+
+    /// Runs one resolved extension shortcut (`interactive-mode.ts:2425-2431`):
+    /// upstream runs the handler async off the input path and a rejection
+    /// surfaces as `Shortcut handler error: …`; the port dispatches through
+    /// the runner and reports the same text.
+    #[cfg(feature = "ext-js")]
+    fn run_extension_shortcut(&mut self, key: &str) {
+        let Some(runner) = &self.extension_runner else {
+            return;
+        };
+        let result = runner
+            .lock()
+            .expect("extension runner mutex poisoned")
+            .run_shortcut(key);
+        if let Err(error) = result {
+            self.show_error(&format!("Shortcut handler error: {error}"));
+        }
+    }
+
+    /// The `/hotkeys` Extensions rows (`interactive-mode.ts:7098-7105`):
+    /// `(raw key, description ?? extension path)` per resolved shortcut —
+    /// `hotkeys_markdown` applies the capitalize.
+    #[cfg(feature = "ext-js")]
+    fn extension_shortcut_rows(&self) -> Vec<(String, String)> {
+        let Some(runner) = &self.extension_runner else {
+            return Vec::new();
+        };
+        runner
+            .lock()
+            .expect("extension runner mutex poisoned")
+            .shortcuts()
+            .iter()
+            .map(|shortcut| {
+                let description = if shortcut.description.is_empty() {
+                    shortcut.extension_path.clone()
+                } else {
+                    shortcut.description.clone()
+                };
+                (shortcut.key.clone(), description)
+            })
+            .collect()
     }
 
     /// Seed the session scope from the `enabledModels` setting
@@ -4330,7 +4471,15 @@ impl InteractiveMode {
     /// `/hotkeys` (`handleHotkeysCommand`, `interactive-mode.ts:6999-7112`):
     /// every keyboard shortcut, bordered, as markdown.
     fn handle_hotkeys_command(&mut self) {
-        let hotkeys = hotkeys_markdown();
+        // Extension-registered shortcuts (`interactive-mode.ts:7092-7106`):
+        // the display key capitalizes like upstream's `formatKeyText(…,
+        // { capitalize: true })`, the description defaults to the
+        // extension path.
+        #[cfg(feature = "ext-js")]
+        let extension_shortcuts = self.extension_shortcut_rows();
+        #[cfg(not(feature = "ext-js"))]
+        let extension_shortcuts: Vec<(String, String)> = Vec::new();
+        let hotkeys = hotkeys_markdown(&extension_shortcuts);
         self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
         self.add_to_chat(Box::new(super::components::header::DynamicBorder::new()));
         self.add_to_chat(Box::new(Text::new(
@@ -5670,6 +5819,11 @@ impl InteractiveMode {
                 eprintln!("Error: {}", diagnostic.message);
             }
         }
+
+        // Extension shortcuts re-resolve over the re-bound runner
+        // (`setupExtensionShortcuts`, `interactive-mode.ts:6683`).
+        #[cfg(feature = "ext-js")]
+        self.setup_extension_shortcuts();
 
         // `resetApiProviders` + `_buildRuntime` (`agent-session.ts:3850-3862`):
         // the composed catalog recomposes over the reloaded models.json and
@@ -7910,6 +8064,8 @@ impl InteractiveMode {
                 }
                 EditorEventOut::Action(action) => self.handle_action(&action),
                 EditorEventOut::BashModeChanged => self.update_editor_border_color(),
+                #[cfg(feature = "ext-js")]
+                EditorEventOut::ExtensionShortcut(key) => self.run_extension_shortcut(&key),
             }
         }
 
@@ -10427,7 +10583,7 @@ mod tests {
     /// three sections with live bindings filled in.
     #[test]
     fn hotkeys_markdown_lists_the_upstream_sections() {
-        let markdown = hotkeys_markdown();
+        let markdown = hotkeys_markdown(&[]);
         let plain = pi_tui::ansi::strip_terminal_sequences(&markdown);
         assert!(plain.contains("**Navigation**"), "{plain}");
         assert!(plain.contains("**Editing**"), "{plain}");
@@ -10455,6 +10611,51 @@ mod tests {
             plain.contains("| `!!` | Run bash command (excluded from context) |"),
             "{plain}"
         );
+    }
+
+    /// The Extensions section (`interactive-mode.ts:7092-7106`): one row per
+    /// resolved shortcut, the key capitalized, the description defaulting
+    /// to the extension path.
+    #[test]
+    fn hotkeys_markdown_lists_extension_shortcuts() {
+        let rows = vec![
+            ("ctrl+shift+7".to_string(), "Toggle plan mode".to_string()),
+            ("ctrl+q".to_string(), String::new()),
+        ];
+        let markdown = hotkeys_markdown(&rows);
+        let plain = pi_tui::ansi::strip_terminal_sequences(&markdown);
+        assert!(plain.contains("**Extensions**"), "{plain}");
+        assert!(
+            plain.contains("| `Ctrl+Shift+7` | Toggle plan mode |"),
+            "{plain}"
+        );
+        // An empty description falls back to the extension path.
+        assert!(plain.contains("| `Ctrl+Q` | "), "{plain}");
+    }
+
+    /// `custom-editor.ts:89-92`: the editor checks extension shortcuts
+    /// before every built-in key — the matching chord is consumed and
+    /// queued, a non-matching chord reaches the editor untouched.
+    #[test]
+    fn extension_shortcuts_match_before_builtin_keys() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let shortcuts = Arc::new(Mutex::new(vec!["ctrl+q".to_string()]));
+        let mut editor = ChatEditor::new(
+            Arc::clone(&events),
+            Arc::new(Mutex::new(None::<StatusIndicator>)),
+            Arc::clone(&shortcuts),
+        );
+        // Ctrl+Q is the raw control byte 0x11; nothing built-in binds it,
+        // the extension takes it.
+        editor.handle_input("\x11");
+        assert_eq!(
+            events.lock().expect("events").clone(),
+            vec![EditorEventOut::ExtensionShortcut("ctrl+q".to_string())]
+        );
+        // Plain text falls through to the editor.
+        editor.handle_input("x");
+        let drained = events.lock().expect("events").clone();
+        assert_eq!(drained.len(), 1);
     }
 
     /// `/hotkeys` renders the bordered shortcut table.

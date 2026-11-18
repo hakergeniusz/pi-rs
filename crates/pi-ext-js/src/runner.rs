@@ -167,6 +167,9 @@ pub struct ExtensionSnapshot {
     /// Registered flags.
     #[serde(default)]
     pub flags: Vec<FlagSpec>,
+    /// Registered shortcuts.
+    #[serde(default)]
+    pub shortcuts: Vec<ShortcutSpec>,
 }
 
 /// `{name, description}` of one registered command.
@@ -177,6 +180,95 @@ pub struct RegisteredCommandSpec {
     /// The description.
     #[serde(default)]
     pub description: String,
+}
+
+/// `{shortcut, description}` of one registered shortcut (upstream stores
+/// `{shortcut, extensionPath, description?, handler}` — `loader.ts:337`;
+/// the handler stays in the JS-side record, the inspect snapshot carries
+/// the metadata).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShortcutSpec {
+    /// The chord exactly as registered (normalization happens in
+    /// `get_shortcuts`).
+    pub shortcut: String,
+    /// The optional description.
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Extension shortcuts compete with canonical keybinding ids; only the
+/// editor-global actions are reserved — picker-specific bindings are not
+/// (`RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS`, `runner.ts:96-114`).
+const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS: &[&str] = &[
+    "app.interrupt",
+    "app.clear",
+    "app.exit",
+    "app.suspend",
+    "app.thinking.cycle",
+    "app.model.cycleForward",
+    "app.model.cycleBackward",
+    "app.model.select",
+    "app.tools.expand",
+    "app.thinking.toggle",
+    "app.editor.external",
+    "app.message.copy",
+    "app.message.followUp",
+    "tui.input.submit",
+    "tui.select.confirm",
+    "tui.select.cancel",
+    "tui.input.copy",
+    "tui.editor.deleteToLineEnd",
+];
+
+/// One shortcut-conflict warning (a `type: "warning"` `ResourceDiagnostic`
+/// upstream; the runner only produces warnings for shortcuts).
+#[derive(Debug, Clone)]
+pub struct ShortcutDiagnostic {
+    /// The verbatim upstream warning text.
+    pub message: String,
+    /// The owning extension's path.
+    pub path: String,
+}
+
+/// One extension shortcut the resolution accepted (`ExtensionShortcut`
+/// upstream — the port keeps the owning extension's index instead of the
+/// handler closure).
+#[derive(Debug, Clone)]
+pub struct ResolvedShortcut {
+    /// The normalized (lowercased) chord the dispatcher matches against.
+    pub key: String,
+    /// The chord exactly as registered (the JS registry is keyed by it).
+    pub raw_key: String,
+    /// The owning extension's index in the snapshot list.
+    pub ext_index: usize,
+    /// The owning extension's path.
+    pub extension_path: String,
+    /// The optional description.
+    pub description: String,
+}
+
+/// `buildBuiltinKeybindings` (`runner.ts:121-141`): map every chord the
+/// resolved keybindings bind to its action, with `restrictOverride` for
+/// the reserved ids. When two actions bind the same chord, the reserved
+/// action wins so extensions stay blocked regardless of iteration order.
+fn build_builtin_keybindings<'a>(
+    resolved_keybindings: &[(&'a str, &[&'a str])],
+) -> HashMap<String, (&'a str, bool)> {
+    let mut builtins: HashMap<String, (&'a str, bool)> = HashMap::new();
+    for (keybinding, keys) in resolved_keybindings {
+        let restrict_override = RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS.contains(keybinding);
+        for key in *keys {
+            let normalized = key.to_lowercase();
+            let blocked = builtins
+                .get(&normalized)
+                .is_some_and(|&(_, existing_restrict)| existing_restrict && !restrict_override);
+            if blocked {
+                continue;
+            }
+            builtins.insert(normalized, (*keybinding, restrict_override));
+        }
+    }
+    builtins
 }
 
 /// The synthetic path of the native MCP host (`builtin:<name>` synthetic
@@ -287,6 +379,14 @@ pub struct ExtensionRunner {
     /// Whether a `mcp_servers_change` drain is running (a change made by a
     /// handler of the event itself must not recurse).
     mcp_draining: bool,
+    /// The shortcuts the last `get_shortcuts` resolved, in load order with
+    /// per-chord last-wins (`ExtensionShortcut` map upstream — the port
+    /// keeps the ext index instead of the handler closure).
+    resolved_shortcuts: Vec<ResolvedShortcut>,
+    /// The warnings the last `get_shortcuts` produced
+    /// (`ResourceDiagnostic` entries upstream; the runner only emits
+    /// `type: "warning"` diagnostics for shortcuts).
+    shortcut_diagnostics: Vec<ShortcutDiagnostic>,
 }
 
 impl ExtensionRunner {
@@ -309,6 +409,8 @@ impl ExtensionRunner {
             mcp_definitions: HashMap::new(),
             mcp_tool_owners: HashMap::new(),
             mcp_draining: false,
+            resolved_shortcuts: Vec::new(),
+            shortcut_diagnostics: Vec::new(),
         })
     }
 
@@ -969,6 +1071,102 @@ impl ExtensionRunner {
         let id = self.host.session_begin("{}", ContextKind::Command, None)?;
         self.host
             .session_call_command(id, index, &command.name, args)?;
+        self.settle_session(id)?;
+        let outcome = parse_session_outcome(&self.host.session_last(id)?)?;
+        self.end_session(id)?;
+        Self::outcome_result(outcome)?;
+        Ok(true)
+    }
+
+    /// Resolves the extension shortcuts against the resolved keybindings
+    /// (`getShortcuts`, `runner.ts:680-712`): every chord lowercases, a
+    /// reserved built-in blocks the shortcut (skip + warning), a
+    /// non-reserved built-in warns and the extension wins, a later
+    /// extension overrides an earlier one per chord with a warning. The
+    /// warnings stay readable through [`Self::shortcut_diagnostics`] until
+    /// the next call.
+    pub fn get_shortcuts(&mut self, resolved_keybindings: &[(&str, &[&str])]) {
+        self.shortcut_diagnostics.clear();
+        let builtins = build_builtin_keybindings(resolved_keybindings);
+        let mut resolved: Vec<ResolvedShortcut> = Vec::new();
+        for index in 0..self.extensions.len() {
+            let ext = &self.extensions[index];
+            for spec in &ext.shortcuts {
+                let key = spec.shortcut.to_lowercase();
+                match builtins.get(&key) {
+                    Some((_, true)) => {
+                        self.shortcut_diagnostics.push(ShortcutDiagnostic {
+                            message: format!(
+                                "Extension shortcut '{}' from {} conflicts with built-in shortcut. Skipping.",
+                                spec.shortcut, ext.path
+                            ),
+                            path: ext.path.clone(),
+                        });
+                        continue;
+                    }
+                    Some((action, false)) => {
+                        self.shortcut_diagnostics.push(ShortcutDiagnostic {
+                            message: format!(
+                                "Extension shortcut conflict: '{}' is built-in shortcut for {} and {}. Using {}.",
+                                spec.shortcut, action, ext.path, ext.path
+                            ),
+                            path: ext.path.clone(),
+                        });
+                    }
+                    None => {}
+                }
+                let shortcut = ResolvedShortcut {
+                    key: key.clone(),
+                    raw_key: spec.shortcut.clone(),
+                    ext_index: index,
+                    extension_path: ext.path.clone(),
+                    description: spec.description.clone(),
+                };
+                if let Some(existing) = resolved.iter().position(|s| s.key == key) {
+                    self.shortcut_diagnostics.push(ShortcutDiagnostic {
+                        message: format!(
+                            "Extension shortcut conflict: '{}' registered by both {} and {}. Using {}.",
+                            spec.shortcut, resolved[existing].extension_path, ext.path, ext.path
+                        ),
+                        path: ext.path.clone(),
+                    });
+                    resolved[existing] = shortcut;
+                } else {
+                    resolved.push(shortcut);
+                }
+            }
+        }
+        self.resolved_shortcuts = resolved;
+    }
+
+    /// The shortcuts the last [`Self::get_shortcuts`] resolved, in load
+    /// order with per-chord last-wins.
+    pub fn shortcuts(&self) -> &[ResolvedShortcut] {
+        &self.resolved_shortcuts
+    }
+
+    /// The warnings the last [`Self::get_shortcuts`] produced
+    /// (`getShortcutDiagnostics`, `runner.ts:396/:680`).
+    pub fn shortcut_diagnostics(&self) -> &[ShortcutDiagnostic] {
+        &self.shortcut_diagnostics
+    }
+
+    /// Executes a registered shortcut handler (`interactive-mode.ts:2425-2427`
+    /// invokes `handler(ctx)`; the port dispatches the stashed handler
+    /// through the base-ctx session machinery — the same shape the command
+    /// dispatch uses, minus the command-ctx additions). Returns `Ok(false)`
+    /// when no shortcut resolved to `key`.
+    pub fn run_shortcut(&mut self, key: &str) -> Result<bool, JsHostError> {
+        let Some(resolved) = self
+            .resolved_shortcuts
+            .iter()
+            .find(|shortcut| shortcut.key == key)
+        else {
+            return Ok(false);
+        };
+        let (index, raw_key) = (resolved.ext_index, resolved.raw_key.clone());
+        let id = self.host.session_begin("{}", ContextKind::Event, None)?;
+        self.host.session_call_shortcut(id, index, &raw_key)?;
         self.settle_session(id)?;
         let outcome = parse_session_outcome(&self.host.session_last(id)?)?;
         self.end_session(id)?;
@@ -3804,6 +4002,108 @@ export default function (pi) {
         // observable through the entries it would have appended (none).
         assert!(outcome.is_none());
         assert!(runner.core().lock().expect("core").entries.is_empty());
+    }
+
+    // ---- Extension shortcuts (E3 slice 1: `pi.registerShortcut`,
+    // `getShortcuts` conflict resolution, `run_shortcut` dispatch) ----
+
+    #[test]
+    fn shortcuts_resolve_against_builtin_keybindings() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerShortcut("ctrl+d", { description: "shadow exit", handler: () => {} });
+  pi.registerShortcut("CTRL+Shift+P", { description: "shadow cycle", handler: () => {} });
+  pi.registerShortcut("ctrl+shift+7", { description: "clean", handler: () => {} });
+}
+"#;
+        let mut runner = runner_with(&[EXT]);
+        // `app.exit` is in the reserved set — the shortcut is skipped with
+        // a warning; `app.message.dequeue` is not — the extension wins with
+        // a warning; the clean chord resolves and lowercases. (The runner
+        // paths are zero-indexed: `<test-0>`.)
+        let resolved: &[(&str, &[&str])] = &[
+            ("app.exit", &["ctrl+d"]),
+            ("app.message.dequeue", &["ctrl+shift+p"]),
+        ];
+        runner.get_shortcuts(resolved);
+        let shortcuts = runner.shortcuts();
+        assert_eq!(shortcuts.len(), 2);
+        assert_eq!(shortcuts[0].key, "ctrl+shift+p");
+        assert_eq!(shortcuts[0].raw_key, "CTRL+Shift+P");
+        assert_eq!(shortcuts[0].description, "shadow cycle");
+        assert_eq!(shortcuts[1].key, "ctrl+shift+7");
+        assert_eq!(shortcuts[1].extension_path, "<test-0>");
+        let diagnostics = runner.shortcut_diagnostics();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics[0].message,
+            "Extension shortcut 'ctrl+d' from <test-0> conflicts with built-in shortcut. Skipping."
+        );
+        assert_eq!(
+            diagnostics[1].message,
+            "Extension shortcut conflict: 'CTRL+Shift+P' is built-in shortcut for app.message.dequeue and <test-0>. Using <test-0>."
+        );
+    }
+
+    #[test]
+    fn duplicate_shortcut_keys_take_the_last_extension() {
+        const EXT_A: &str = r#"
+export default function (pi) {
+  pi.registerShortcut("ctrl+q", { description: "from-a", handler: () => {} });
+}
+"#;
+        const EXT_B: &str = r#"
+export default function (pi) {
+  pi.registerShortcut("ctrl+q", { description: "from-b", handler: () => {} });
+}
+"#;
+        let mut runner = runner_with(&[EXT_A, EXT_B]);
+        runner.get_shortcuts(&[]);
+        let shortcuts = runner.shortcuts();
+        assert_eq!(shortcuts.len(), 1);
+        assert_eq!(shortcuts[0].extension_path, "<test-1>");
+        assert_eq!(shortcuts[0].description, "from-b");
+        let diagnostics = runner.shortcut_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].message,
+            "Extension shortcut conflict: 'ctrl+q' registered by both <test-0> and <test-1>. Using <test-1>."
+        );
+    }
+
+    #[test]
+    fn run_shortcut_dispatches_the_handler_with_the_base_ctx() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerShortcut("ctrl+shift+7", {
+    description: "fire",
+    handler: (ctx) => pi.appendEntry("shortcut-fired", {
+      hasUi: ctx.hasUI,
+      hasWaitForIdle: typeof ctx.waitForIdle === "function",
+    }),
+  });
+  pi.registerShortcut("ctrl+shift+8", { handler: () => { throw new Error("boom"); } });
+}
+"#;
+        let mut runner = runner_with(&[EXT]);
+        runner.get_shortcuts(&[]);
+        assert!(runner.run_shortcut("ctrl+shift+7").expect("run"));
+        let entries = runner.core().lock().expect("core").entries.clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "shortcut-fired");
+        // The base ctx: `hasUI` reflects the headless runner and the
+        // command-only `waitForIdle` addition stays off the shortcut ctx.
+        assert_eq!(
+            entries[0].1,
+            json!({ "hasUi": false, "hasWaitForIdle": false })
+        );
+        // A handler rejection surfaces through the dispatch outcome — the
+        // same channel the mode maps to `Shortcut handler error: …`.
+        let error = runner.run_shortcut("ctrl+shift+8");
+        assert!(error.is_err(), "{error:?}");
+        assert!(error.unwrap_err().to_string().contains("boom"));
+        // Unknown chords report not-run.
+        assert!(!runner.run_shortcut("ctrl+shift+9").expect("run"));
     }
 
     /// The host shares the runner with the agent loop through

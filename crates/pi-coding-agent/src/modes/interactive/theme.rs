@@ -626,6 +626,28 @@ pub fn format_key_text(key: &str) -> String {
     key.to_string()
 }
 
+/// `formatKeyText(key, { capitalize: true })` (`keybinding-hints.ts:23-31`)
+/// for one raw chord — the extension shortcuts' `/hotkeys` rows
+/// (`interactive-mode.ts:7101-7104`). The darwin `alt` → `option` swap is
+/// out of scope (POSIX-only port).
+pub fn format_chord(key: &str) -> String {
+    key.split('/')
+        .map(|chord| {
+            chord
+                .split('+')
+                .map(|part| match part.chars().next() {
+                    Some(first) => {
+                        first.to_uppercase().collect::<String>() + &part[first.len_utf8()..]
+                    }
+                    None => String::new(),
+                })
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// `keyText` (`keybinding-hints.ts:34-36`): the first bound key of `action`,
 /// or "" when unbound.
 pub fn key_text(action: &str) -> String {

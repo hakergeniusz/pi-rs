@@ -143,6 +143,10 @@ globalThis.__piBeginExtension = function (path) {
     tools: {},
     commands: {},
     flags: {},
+    // The extension shortcuts keyed by the chord exactly as registered
+    // (`loader.ts:337`); normalization and conflict resolution happen in
+    // the runner's getShortcuts.
+    shortcuts: {},
     busSubscriptions: [],
     pendingChanges: [],
     // The virtual-model definitions this extension registered, for cleanup
@@ -279,7 +283,7 @@ globalThis.__piDiscardExtension = function (extIdx) {
       globalThis.__piProviderOAuth.delete(entry.name);
     }
   }
-  globalThis.__piExtensions[extIdx] = { path: ext.path, events: {}, tools: {}, commands: {}, flags: {}, busSubscriptions: [] };
+  globalThis.__piExtensions[extIdx] = { path: ext.path, events: {}, tools: {}, commands: {}, flags: {}, shortcuts: {}, busSubscriptions: [] };
 };
 
 // The extension event bus (core/event-bus.ts:12-33): handlers are wrapped
@@ -407,6 +411,14 @@ globalThis.__piCreateApi = function (extIdx) {
       ext.commands[name] = { name, description: options.description, handler: options.handler };
     },
 
+    registerShortcut(shortcut, options) {
+      assertActive();
+      // Upstream validates nothing here (`loader.ts:330-337`): a malformed
+      // chord simply never matches, and conflicts resolve in the runner's
+      // getShortcuts (reserved built-ins, cross-extension duplicates).
+      ext.shortcuts[shortcut] = { shortcut, handler: options.handler, description: options.description };
+    },
+
     registerFlag(name, options) {
       assertActive();
       if (options.default !== undefined && typeof options.default !== options.type) {
@@ -432,8 +444,12 @@ globalThis.__piCreateApi = function (extIdx) {
       return raw === "" ? undefined : JSON.parse(raw);
     },
 
-    registerShortcut() {
-      throw new Error("pi.registerShortcut is not available in the E1 headless extensions core (E3)");
+    registerShortcut(shortcut, options) {
+      assertActive();
+      // Registration is harmless headless (upstream registers from the
+      // base API in every context; the shortcuts just never fire without
+      // a TUI) — E3 joins it to the supported set.
+      ext.shortcuts[shortcut] = { shortcut, handler: options.handler, description: options.description };
     },
     registerMessageRenderer() {
       throw new Error("pi.registerMessageRenderer is not available in the E1 headless extensions core (E3)");
@@ -1258,6 +1274,22 @@ globalThis.__piSessionCallCommand = function (id, extIdx, name, args) {
     );
 };
 
+// The extension shortcut call (`interactive-mode.ts:2425-2427` invokes
+// `handler(ctx)` on the mode-built base ExtensionContext; the port
+// dispatches the stashed handler with the same base ctx — the command-only
+// additions (waitForIdle, session mutation) stay off it).
+globalThis.__piSessionCallShortcut = function (id, extIdx, key) {
+  const session = globalThis.__piSessions.get(id);
+  session.eventName = `shortcut:${key}`;
+  const shortcut = globalThis.__piExtensions[extIdx].shortcuts[key];
+  Promise.resolve()
+    .then(() => shortcut.handler(session.ctx))
+    .then(
+      () => globalThis.__piSessionSettle(session, { value: undefined }),
+      (error) => globalThis.__piSessionSettle(session, { error: globalThis.__piErrorText(error) }),
+    );
+};
+
 globalThis.__piSessionCallTool = function (id, extIdx, name, toolCallId) {
   const session = globalThis.__piSessions.get(id);
   session.eventName = `tool:${name}`;
@@ -1654,6 +1686,10 @@ globalThis.__piInspect = function () {
       commands: Object.entries(ext.commands).map(([name, command]) => ({
         name,
         description: command.description ?? "",
+      })),
+      shortcuts: Object.entries(ext.shortcuts ?? {}).map(([key, shortcut]) => ({
+        shortcut: key,
+        description: shortcut.description ?? "",
       })),
       flags: Object.entries(ext.flags).map(([name, flag]) => ({
         name,

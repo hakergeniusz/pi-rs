@@ -1044,6 +1044,23 @@ impl JsHost {
         })
     }
 
+    /// Calls one extension shortcut's handler inside a session
+    /// (`__piSessionCallShortcut`); the handler receives the base ctx.
+    pub fn session_call_shortcut(
+        &self,
+        id: u32,
+        index: usize,
+        key: &str,
+    ) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx.globals().get("__piSessionCallShortcut")?;
+            let _: Value = call
+                .call((id, index, key))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
     /// Calls one tool's `execute` inside a session
     /// (`__piSessionCallTool`); the session event holds the tool args.
     pub fn session_call_tool(
