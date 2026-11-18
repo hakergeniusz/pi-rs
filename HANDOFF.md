@@ -2396,6 +2396,71 @@ never saw (`format_push_string` → `write!`, then `write_with_newline` →
 `writeln!`; the `+= &format!(…)` form trips this repo's clippy 1.99).
 After ANY replay, run the full gate, not the targeted subset.
 
+## E3 slice 2: extension markdown transformers (landed on `feat/e3-markdown-transformers`, 2026-11-18)
+
+Commit 7315c8a (12 files, +733/−43), full container gate green (1822
+passed / 0 failed, fmt + clippy + `--no-default-features` check — the
+NDF step is now part of every gate after slice 1's CI catch), CI run
+44343401106.
+
+What landed:
+
+- **Registration** — `pi.registerMarkdownTransformer(transformer, options?)`
+  joins the full AND headless API records
+  (`loader.ts:365-372`: `assertActive()` + replace semantics — a second
+  registration REPLACES the first, no warning; surfaces default to
+  `user`/`assistant`/`assistant-thinking` via
+  `DEFAULT_MARKDOWN_MESSAGE_TYPES`).
+- **Resolution** — `Runner::get_markdown_transformers()` returns the
+  chain in load order as `(ext_index, path, message_types)`
+  (`runner.ts:793-803`); upstream wraps each transformer so unregistered
+  surfaces pass through — the port runs that surface filter at
+  application time.
+- **The synchronous Rust→JS call** — `engine::markdown_transform` /
+  `Runner::markdown_transform` invokes `__piMarkdownTransform(extIdx,
+  markdown, contextJson)` directly: transformers are sync functions, so
+  no session machinery. The context crosses as JSON with `messageId`/
+  `timestamp` ABSENT (not `null`) when undefined (`MarkdownTransformContext`,
+  `types.ts:1573-1582`); a throw and a non-string return both map to
+  `None` — upstream catches around every transformer and keeps the
+  current markdown (`markdown-transform.ts:28-38`).
+- **The render seam** — pi-tui's `MarkdownOptions` gains `transform`
+  (`markdown.ts:289`), applied per render with the content width
+  (`markdown.ts:376`) in `render_lines`. The mode builds one shared
+  `MarkdownTransformCtx` (the chain Arc + the runner) that every markdown
+  component clones; each surface's closure reads its streaming flag per
+  render, so a reused component sees a stream end.
+- **Surfaces wired** (all of upstream's ported set): `user`
+  (user-message.ts:61), `assistant` + `assistant-thinking`
+  (assistant-message.ts:159/:210, the flag synced in `update_content`),
+  `summary` on both collapsible rows — with upstream's header-wrapper
+  shape: transformers see only the summary, Pi's header goes back in
+  front of the transformed markdown per render
+  (compaction-summary-message.ts:64-66; the no-transformer branch keeps
+  the port's combined header+summary text, the identical render),
+  `changelog` on /changelog (interactive-mode.ts:2374). NOT wired: the
+  `custom` surface (custom messages without a renderer and expanded skill
+  blocks — those components are the message-renderer slice) and the
+  built-in mermaid transformer (lovely-mermaid is out of scope; the port
+  renders mermaid blocks as plain code — pre-existing deviation, now
+  visible in the transformer chain).
+- **Lifecycle** — the chain resolves at startup and `/reload`
+  (upstream reads `extensionRunner.getMarkdownTransformers()` live per
+  component; the chain only changes on reload, so the resolved snapshot
+  is behaviorally identical).
+- Tests: 2 in `pi-ext-js` (load order + replace semantics + default
+  surfaces; the sync call with context round-trip, absent-field absence,
+  throw → None, non-string → None), 1 in `pi-coding-agent` (the
+  feature-off ctx is inert). All 4 markdown components + the mode ctx
+  construct with `MarkdownTransformCtx::default()` in their unit tests.
+
+Two serde gotchas found by the tests: the inspect snapshot keys cross
+camelCase (`markdownTransformer`, `messageTypes`) while the Rust structs
+are snake_case — BOTH needed explicit `#[serde(rename)]` (the struct has
+no `rename_all`; the snapshot stays hand-mapped). And clippy's
+`unnecessary_hashes` wants `r"…"` over `r#"…"#` when the fixture has no
+`"` — but a fixture WITH quotes (`["summary"]`) must stay `r#"…"#`.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
