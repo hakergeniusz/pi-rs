@@ -2626,6 +2626,86 @@ one-real-arm match into an `if let` with a fall-through flag. And the
 gate's fmt-write keeps invalidating Edit read-state — re-Read before
 every edit after a gate run.
 
+## E3 slice 5: tool renderers — the resolver chain (landed on `feat/e3-tool-renderers`, 2026-11-18)
+
+`pi.registerToolRenderer` — upstream ground truth `loader.ts:379-383`
+(registration), `runner.ts:804-809` (the resolution chain),
+`interactive-mode.ts:2355-2360` (`getRegisteredToolDefinition`:
+resolvers over the `withBuiltInRenderers` base),
+`core/tools/renderers/index.ts:47-63` (`withBuiltInRenderers`),
+`tool-execution.ts:106-124` (slot getters + `getRenderShell`),
+`:128-144` (the render context), `:146-164` (the generic fallbacks),
+`:299-344` (the call/result slots), `types.ts:488-521` + `:616` +
+`:693` (`ToolRenderContext`, `renderShell`, `ToolRenderers`). Full gate
+1849 passed / 0 failed (FMT/CLIPPY/TEST/FMTCHECK/NDF all 0), CI run on
+the main push.
+
+What landed:
+
+- `pi.registerToolRenderer` in BOTH glue records — `assertActive()`,
+  then `??= []` + push (resolvers ACCUMULATE in registration order and
+  nothing is validated, unlike message renderers' replace); the
+  headless stub registers harmlessly; the inspect snapshot carries
+  `toolRenderers: n` beside the message keys.
+- The resolver chain runs entirely JS-side: `resolve(index)` hands
+  each resolver `next()` in load order; the base is
+  `{renderShell:"default", renderCall: marker, renderResult: marker}`
+  for tools with a Rust built-in and `undefined` for unknown tools
+  (mirroring `withBuiltInRenderers`). The winning object is stashed
+  per-row under a numeric id (`__piToolRendererStash`); the Rust-side
+  verdict classifies each slot builtin/custom/absent via
+  `__piBuiltinRenderSlot` — a marker fn that throws "render Rust-side"
+  if CALLED. First resolver wins and stops the chain, like upstream.
+- `JsToolRenderers` (`components/tool_execution.rs`): the per-row
+  bridge — `render_shell_self`, the custom call/result slots through
+  `__piToolRenderCall`/`__piToolRenderResult` (context built by
+  `__piToolRenderContext`: state, `lastComponent`, `invalidate`,
+  flags), adopting components through the shared `ComponentProxy`;
+  `Drop` releases the stash (`__piToolRendererRelease`).
+- `ToolExecutionComponent` now takes BOTH renderer sources: the Rust
+  `ToolRenderers` fn-ptr struct AND the JS bridge. `renderShell:
+  "self"` rows drop the bg/padding container (plain box). A custom
+  slot that adopts draws the component; a throw or a non-component
+  return takes the GENERIC fallback like upstream's catch
+  (`createCallFallback` → `formatToolCallWithArgs`,
+  `createResultFallback` → the 10-line slice + expand hint) — never
+  back to the tool's built-in renderer.
+- Mode wiring: both row-creation sites resolve through
+  `getRegisteredToolDefinition` semantics — the resolver chain first
+  (with a `has_builtin` flag parameterizing the base), Rust built-ins
+  only when no resolver claimed the slot.
+- The `ToolRenderContext` crossing: args, toolCallId, cwd,
+  executionStarted, argsComplete, isPartial, expanded, showImages,
+  isError, durationMs (absent while partial), outputPad, keyText,
+  keyHint, state, lastComponent.
+
+Tests: 9 new — 6 in `pi-ext-js` (chain passthrough yields builtin
+slots; the first resolver wins and stops the chain; unknown-tool base
+is undefined and `renderShell:"self"` crosses; the call round trip
+with context/state/lastComponent; result options + content crossing; a
+throw falls to `Failed` and release empties the stash) and 3 in
+`pi-coding-agent` (an ext `renderCall` draws the row; a throw takes
+the generic `read path="…"` line, not the built-in; unknown tool with
+and without a resolver).
+
+Deviations/notes:
+
+- A resolver THROW at resolution time falls back to "no js renderers"
+  (the row keeps the Rust built-ins / generic paths) — upstream
+  propagates the throw into row creation.
+- `context.invalidate()` is a no-op: the adopted component's render
+  runs per frame through the proxy, so the upstream invalidate→rebuild
+  loop has no separate path here.
+- `showImages` is always `false` until the image subsystem lands
+  (same deferral as the settings-screen image arms).
+
+Gotchas this slice: the catch fallback must SKIP the Rust built-in
+renderers (they are not the catch target; `formatToolCallWithArgs`
+is). A non-component return counts as failed because upstream's
+`addChild` would throw on it → same catch. And clippy
+`single_match_else` again reshaped both one-real-arm matches into
+if/else.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
