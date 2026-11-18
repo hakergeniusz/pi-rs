@@ -228,7 +228,9 @@ enum EditorEventOut {
     BashModeChanged,
     /// An extension shortcut chord matched (`custom-editor.ts:89-92` —
     /// the editor checks extension shortcuts first); the payload is the
-    /// resolved key.
+    /// resolved key. Feature-gated so the pump's gated match arm keeps the
+    /// match exhaustive without `ext-js`.
+    #[cfg(feature = "ext-js")]
     ExtensionShortcut(String),
 }
 
@@ -301,19 +303,24 @@ impl Component for ChatEditor {
         // Extension-registered shortcuts first (`custom-editor.ts:89-92`):
         // the check runs before every built-in key, and the runner's
         // conflict resolution has already filtered the reserved chords out.
-        let matched = self
-            .extension_shortcuts
-            .lock()
-            .expect("extension shortcuts")
-            .iter()
-            .find(|key| pi_tui::keys::matches_key(data, key))
-            .cloned();
-        if let Some(key) = matched {
-            self.events
+        // Gated with the event variant: without `ext-js` nothing ever
+        // publishes chords (the slot stays empty), so the check is a no-op.
+        #[cfg(feature = "ext-js")]
+        {
+            let matched = self
+                .extension_shortcuts
                 .lock()
-                .expect("editor events")
-                .push(EditorEventOut::ExtensionShortcut(key));
-            return Some(ComponentMutation { consume: true });
+                .expect("extension shortcuts")
+                .iter()
+                .find(|key| pi_tui::keys::matches_key(data, key))
+                .cloned();
+            if let Some(key) = matched {
+                self.events
+                    .lock()
+                    .expect("editor events")
+                    .push(EditorEventOut::ExtensionShortcut(key));
+                return Some(ComponentMutation { consume: true });
+            }
         }
 
         // App keybindings first (`custom-editor.ts:104-153`).
@@ -10636,6 +10643,7 @@ mod tests {
     /// `custom-editor.ts:89-92`: the editor checks extension shortcuts
     /// before every built-in key — the matching chord is consumed and
     /// queued, a non-matching chord reaches the editor untouched.
+    #[cfg(feature = "ext-js")] // the event variant is feature-gated
     #[test]
     fn extension_shortcuts_match_before_builtin_keys() {
         let events = Arc::new(Mutex::new(Vec::new()));
