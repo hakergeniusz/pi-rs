@@ -155,6 +155,10 @@ globalThis.__piBeginExtension = function (path) {
     // The custom entry types this extension registered a renderer for
     // (`loader.ts:373-378` — a plain record, first match wins at lookup).
     entryRenderers: {},
+    // The custom message types this extension registered a renderer for
+    // (`loader.ts:617` — pre-initialized like every record field, so
+    // `registerMessageRenderer` writes straight in, `loader.ts:360-363`).
+    messageRenderers: {},
     busSubscriptions: [],
     pendingChanges: [],
     // The virtual-model definitions this extension registered, for cleanup
@@ -291,7 +295,7 @@ globalThis.__piDiscardExtension = function (extIdx) {
       globalThis.__piProviderOAuth.delete(entry.name);
     }
   }
-  globalThis.__piExtensions[extIdx] = { path: ext.path, events: {}, tools: {}, commands: {}, flags: {}, shortcuts: {}, markdownTransformer: undefined, entryRenderers: {}, busSubscriptions: [] };
+  globalThis.__piExtensions[extIdx] = { path: ext.path, events: {}, tools: {}, commands: {}, flags: {}, shortcuts: {}, markdownTransformer: undefined, entryRenderers: {}, messageRenderers: {}, busSubscriptions: [] };
 };
 
 // The extension event bus (core/event-bus.ts:12-33): handlers are wrapped
@@ -445,6 +449,14 @@ globalThis.__piCreateApi = function (extIdx) {
       (ext.entryRenderers ??= {})[customType] = renderer;
     },
 
+    registerMessageRenderer(customType, renderer) {
+      assertActive();
+      // `loader.ts:360-363`: assertActive, then a straight set — the record
+      // field is pre-initialized (`loader.ts:617`), no `??=` needed, and a
+      // second registration REPLACES the first (Map.set semantics).
+      ext.messageRenderers[customType] = renderer;
+    },
+
     registerFlag(name, options) {
       assertActive();
       if (options.default !== undefined && typeof options.default !== options.type) {
@@ -477,8 +489,12 @@ globalThis.__piCreateApi = function (extIdx) {
       // a TUI) — E3 joins it to the supported set.
       ext.shortcuts[shortcut] = { shortcut, handler: options.handler, description: options.description };
     },
-    registerMessageRenderer() {
-      throw new Error("pi.registerMessageRenderer is not available in the E1 headless extensions core (E3)");
+    registerMessageRenderer(customType, renderer) {
+      assertActive();
+      // Registration is harmless headless (upstream registers from the base
+      // API in every context; nothing renders messages without a TUI) —
+      // E3 slice 4 joins it to the supported set.
+      ext.messageRenderers[customType] = renderer;
     },
     registerMarkdownTransformer(transformer, options) {
       assertActive();
@@ -1417,6 +1433,46 @@ globalThis.__piRenderEntry = function (extIdx, customType, entryJson, optionsJso
   }
 };
 
+// The message renderer call (`addMessageToChat` case "custom",
+// interactive-mode.ts:4032-4048; custom-message.ts rebuild): the FIRST
+// extension with a renderer for the customType runs it (first-wins resolves
+// Rust-side). Same theme + keybinding-hints crossing as entries, with one
+// extra option — `outputPad` (`MessageRenderOptions`, types.ts:1556-1560).
+// The message record crosses with its `role:"custom"` (`core/messages.ts:
+// 46-54`). A renderer throw becomes `{kind:"error"}` — the host falls
+// through to the default box (custom-message.ts:93-95); a renderer
+// returning nothing is `{kind:"none"}`.
+globalThis.__piRenderMessage = function (extIdx, customType, messageJson, optionsJson) {
+  const ext = globalThis.__piExtensions[extIdx];
+  const renderer = ext?.messageRenderers?.[customType];
+  if (renderer === undefined) return undefined;
+  const message = JSON.parse(messageJson);
+  const options = JSON.parse(optionsJson);
+  const theme = {
+    fg: (color, text) => globalThis.__piOps.themeFg(String(color), String(text)),
+    bg: (color, text) => globalThis.__piOps.themeBg(String(color), String(text)),
+  };
+  const keysOf = (keybinding) => globalThis.__piKeybindingKeys(keybinding).join("/");
+  const messageOptions = {
+    expanded: options.expanded === true,
+    outputPad: Number(options.outputPad) || 0,
+    keyText: keysOf,
+    keyHint: (keybinding, description) => theme.fg("dim", keysOf(keybinding)) + theme.fg("muted", ` ${description}`),
+  };
+  try {
+    const component = renderer(message, messageOptions, theme);
+    const handle = globalThis.__piComponentAdopt(component);
+    if (handle === undefined) return undefined;
+    return JSON.stringify({
+      kind: "component",
+      handle,
+      hasInput: typeof component.handleInput === "function",
+    });
+  } catch (error) {
+    return JSON.stringify({ kind: "error", message: error instanceof Error ? error.message : String(error) });
+  }
+};
+
 // The resolved keybindings table (id -> chords) the mode crosses at bind
 // time; `keyText`/`keyHint` read it (`getKeybindings().getKeys` upstream —
 // keybinding-hints.ts:34-44, without the darwin alt swap).
@@ -1834,6 +1890,7 @@ globalThis.__piInspect = function () {
               messageTypes: [...ext.markdownTransformer.messageTypes],
             },
       entryRenderers: Object.keys(ext.entryRenderers ?? {}),
+      messageRenderers: Object.keys(ext.messageRenderers ?? {}),
       flags: Object.entries(ext.flags).map(([name, flag]) => ({
         name,
         description: flag.description ?? "",

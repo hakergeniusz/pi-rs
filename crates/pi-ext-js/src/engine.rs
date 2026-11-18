@@ -1171,6 +1171,56 @@ impl JsHost {
         }
     }
 
+    /// Calls one extension's message renderer for a custom message
+    /// (`__piRenderMessage`): the same adopt-and-report crossing as
+    /// [`Self::render_entry`], with `MessageRenderOptions` carrying
+    /// `outputPad` alongside `expanded` (`types.ts:1556-1560`). A renderer
+    /// throw maps to [`EntryRenderOutcome::Failed`], which the host's
+    /// component turns into the default rendering (`custom-message.ts:93-95`
+    /// — upstream swallows the throw silently).
+    pub fn render_message(
+        &self,
+        ext_index: usize,
+        custom_type: &str,
+        message_json: &str,
+        options_json: &str,
+    ) -> Result<EntryRenderOutcome, JsHostError> {
+        let raw = self
+            .ctx
+            .with(|ctx| -> Result<Option<String>, JsHostError> {
+                let call: Function = ctx.globals().get("__piRenderMessage")?;
+                let result: Option<String> = call
+                    .call((ext_index, custom_type, message_json, options_json))
+                    .map_err(|err| Self::js_error(&ctx, err))?;
+                Ok(result)
+            })?;
+        let Some(raw) = raw else {
+            return Ok(EntryRenderOutcome::None);
+        };
+        let value: Json =
+            serde_json::from_str(&raw).map_err(|err| JsHostError::Job(err.to_string()))?;
+        match value.get("kind").and_then(Json::as_str) {
+            Some("component") => Ok(EntryRenderOutcome::Component {
+                handle: value
+                    .get("handle")
+                    .and_then(Json::as_u64)
+                    .unwrap_or_default() as u32,
+                has_input: value
+                    .get("hasInput")
+                    .and_then(Json::as_bool)
+                    .unwrap_or(false),
+            }),
+            Some("error") => Ok(EntryRenderOutcome::Failed(
+                value
+                    .get("message")
+                    .and_then(Json::as_str)
+                    .unwrap_or("renderer failed")
+                    .to_string(),
+            )),
+            _ => Ok(EntryRenderOutcome::None),
+        }
+    }
+
     /// Renders one adopted component (`__piComponentRender`): the JS
     /// `render(width)` lines cross as JSON. A component throw propagates —
     /// upstream doesn't catch render failures here either.

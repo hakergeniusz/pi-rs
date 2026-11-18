@@ -1,6 +1,7 @@
-//! `CustomEntryComponent` + the component-handle proxy — the port of
-//! `modes/interactive/components/custom-entry.ts` and the Rust half of the
-//! Component bridge over the extension boundary (`tui.ts:124-155`).
+//! `CustomEntryComponent` — the port of
+//! `modes/interactive/components/custom-entry.ts`; the adopted component
+//! rides the shared handle proxy ([`super::component_proxy::ComponentProxy`],
+//! `tui.ts:124-155`).
 //!
 //! Upstream renderers run in-process and return a live `Component`; here
 //! the renderer runs inside the `QuickJS` engine, the returned object is
@@ -15,7 +16,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use pi_tui::component::{Component, ComponentMutation};
+use pi_tui::component::Component;
 use pi_tui::components::box_component::BoxComponent;
 
 use super::super::theme;
@@ -75,6 +76,12 @@ impl CustomEntryComponent {
         }
     }
 
+    /// `setOutputPad` — every change re-renders (`custom-entry.ts:38-41`).
+    pub fn set_output_pad(&mut self, output_pad: usize) {
+        self.output_pad = output_pad;
+        self.rebuild();
+    }
+
     /// `rebuild` (`custom-entry.ts:48-69`): clear, run the renderer through
     /// the engine, adopt its component behind a spacer — or style the throw
     /// into the error box. The runner lock is dropped before the rebuilt
@@ -97,11 +104,11 @@ impl CustomEntryComponent {
 
         match outcome {
             Ok(pi_ext_js::EntryRenderOutcome::Component { handle, has_input }) => {
-                let proxy = ComponentProxy {
-                    runner: Arc::clone(&self.runner),
+                let proxy = super::component_proxy::ComponentProxy::new(
+                    Arc::clone(&self.runner),
                     handle,
                     has_input,
-                };
+                );
                 self.has_content = true;
                 container.add_child(Box::new(pi_tui::components::spacer::Spacer::new(1)));
                 container.add_child(Box::new(proxy));
@@ -148,68 +155,11 @@ impl Component for CustomEntryComponent {
     fn invalidate(&mut self) {
         self.rebuild();
     }
-}
 
-/// The adopted JS component, seen from Rust: only the handle crosses the
-/// boundary. `render`/`handleInput`/`invalidate` translate to the
-/// `__piComponent*` engine calls (`tui.ts:124-155`); dropping the proxy
-/// releases the handle so the JS registry does not leak.
-struct ComponentProxy {
-    runner: Arc<Mutex<pi_ext_js::ExtensionRunner>>,
-    handle: u32,
-    has_input: bool,
-}
-
-impl Drop for ComponentProxy {
-    fn drop(&mut self) {
-        let _ = self
-            .runner
-            .lock()
-            .expect("extension runner mutex poisoned")
-            .component_release(self.handle);
-    }
-}
-
-impl Component for ComponentProxy {
-    fn render(&self, width: usize) -> Vec<String> {
-        match self
-            .runner
-            .lock()
-            .expect("extension runner mutex poisoned")
-            .component_render(self.handle, width)
-        {
-            Ok(lines) => lines,
-            // Upstream lets a component render throw take the frame down;
-            // the port renders the failure in place instead.
-            Err(error) => vec![theme::theme().fg(
-                pi_tui::theme::ThemeColor::Error,
-                &format!("custom entry render failed: {error}"),
-            )],
-        }
-    }
-
-    /// The JS `handleInput(data) === true` decision is the consume bit;
-    /// anything else (no handler, false, unknown handle) forwards the key.
-    fn handle_input(&mut self, data: &str) -> Option<ComponentMutation> {
-        let consumed = self
-            .runner
-            .lock()
-            .expect("extension runner mutex poisoned")
-            .component_handle_input(self.handle, data)
-            .unwrap_or(false);
-        Some(ComponentMutation { consume: consumed })
-    }
-
-    /// Whether the JS component implements `handleInput` (`tui.ts:90`).
-    fn has_input_handler(&self) -> bool {
-        self.has_input
-    }
-
-    fn invalidate(&mut self) {
-        let _ = self
-            .runner
-            .lock()
-            .expect("extension runner mutex poisoned")
-            .component_invalidate(self.handle);
+    /// The mode's expand/output-pad toggles duck-type every chat row with
+    /// a setter upstream (`interactive-mode.ts:4753-4758`, `:5270-5281`);
+    /// the port reaches them through the tree downcast.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 }

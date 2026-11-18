@@ -2040,6 +2040,40 @@ impl InteractiveMode {
         }
     }
 
+    /// `addMessageToChat` case "custom" (`interactive-mode.ts:4032-4048`):
+    /// `display:false` renders nothing; otherwise the FIRST extension
+    /// renderer for the type (resolved here, `:4034`) — or no renderer at
+    /// all — feeds a `CustomMessageComponent`, whose default box always
+    /// shows the message. The row lands at the chat tail: upstream goes
+    /// through `addMessageToChat`, not the splicing `addCustomEntryToChat`.
+    #[cfg(feature = "ext-js")]
+    fn add_custom_message_to_chat(
+        &mut self,
+        message: &pi_agent::CustomMessage,
+        message_id: Option<&str>,
+        timestamp: Option<&str>,
+    ) {
+        if !message.display {
+            return;
+        }
+        let renderer = self.extension_runner.as_ref().and_then(|runner| {
+            let locked = runner.lock().expect("extension runner mutex poisoned");
+            locked
+                .get_message_renderer(&message.custom_type)
+                .map(|ext_index| (std::sync::Arc::clone(runner), ext_index))
+        });
+        let component = super::components::custom_message::CustomMessageComponent::new(
+            renderer,
+            message,
+            self.tool_output_expanded,
+            self.output_pad,
+            self.markdown_transform_ctx.clone(),
+            message_id.map(str::to_string),
+            timestamp.map(str::to_string),
+        );
+        self.add_to_chat(Box::new(component));
+    }
+
     /// `renderSessionEntries` + `renderSessionItems` (`interactive-mode.ts:3437-3464`,
     /// `:3340-3425`): walk session entries and re-create the chat rows. The
     /// compaction summary and its billed-tokens notice come from the
@@ -2047,10 +2081,9 @@ impl InteractiveMode {
     /// `toolResult` messages complete; rows with no result stay pending, like
     /// upstream's `pendingTools` handoff.
     ///
-    /// Deviations: entries with no ported component are skipped —
-    /// `custom_message` and the cache-miss/cache-warm usage notices
-    /// (`showCacheMissNotices` is not ported). `bashExecution` rows likewise
-    /// (upstream's `!` persistence).
+    /// Deviations: entries with no ported component are skipped — the
+    /// cache-miss/cache-warm usage notices (`showCacheMissNotices` is not
+    /// ported). `bashExecution` rows likewise (upstream's `!` persistence).
     fn render_session_entries(
         &mut self,
         entries: &[crate::session::records::SessionEntry],
@@ -2122,6 +2155,24 @@ impl InteractiveMode {
                 #[cfg(feature = "ext-js")]
                 crate::session::records::SessionEntry::Custom(custom) => {
                     self.add_custom_entry_to_chat(custom);
+                }
+                // Custom messages go through the generic message path with
+                // the persisted meta: `sessionEntryToContextMessages`
+                // (`session-manager.ts:453-456`) builds the message, the
+                // meta map carries the entry id + ISO timestamp
+                // (`interactive-mode.ts:4268-4282`), and `renderSessionItems`
+                // passes them to `addMessageToChat` (`:4241-4246`).
+                #[cfg(feature = "ext-js")]
+                crate::session::records::SessionEntry::CustomMessage(custom) => {
+                    for message in crate::session::store::session_entry_to_context_messages(entry) {
+                        if let pi_agent::AgentMessage::Custom(custom_message) = message {
+                            self.add_custom_message_to_chat(
+                                &custom_message,
+                                Some(&custom.base.id),
+                                Some(&custom.base.timestamp),
+                            );
+                        }
+                    }
                 }
                 // `sessionEntryToContextMessages` returns [] for every other
                 // entry type this port models.
@@ -2340,17 +2391,35 @@ impl InteractiveMode {
                 // AgentRun rework (upstream shows them via agent-session
                 // events).
             }
-            // `entry_appended` (`interactive-mode.ts:3569-3576`): only
-            // custom entries reach the chat live — the usage notices and
-            // the compaction rebuild land with the pump's AgentRun rework.
+            // `entry_appended` (`interactive-mode.ts:3569-3587`): custom
+            // entries splice ahead of the streaming row, custom messages
+            // land through `addMessageToChat` (`createCustomMessage` makes
+            // the message, `core/messages.ts:123-137`, ISO → epoch ms, no
+            // persisted meta for live rows) — the usage notices and the
+            // compaction rebuild land with the pump's AgentRun rework.
             #[cfg(feature = "ext-js")]
             AgentEvent::EntryAppended { entry } => {
-                if entry.get("type").and_then(serde_json::Value::as_str) == Some("custom")
+                let entry_type = entry.get("type").and_then(serde_json::Value::as_str);
+                if entry_type == Some("custom")
                     && let Ok(custom) = serde_json::from_value::<crate::session::records::CustomEntry>(
                         entry.clone(),
                     )
                 {
                     self.add_custom_entry_to_chat(&custom);
+                    self.tui.request_render();
+                } else if entry_type == Some("custom_message")
+                    && let Ok(custom) = serde_json::from_value::<
+                        crate::session::records::CustomMessageEntry,
+                    >(entry.clone())
+                {
+                    let message = pi_agent::CustomMessage {
+                        custom_type: custom.custom_type,
+                        content: custom.content,
+                        display: custom.display,
+                        details: custom.details,
+                        timestamp: crate::session::store::iso_to_ms(&custom.base.timestamp),
+                    };
+                    self.add_custom_message_to_chat(&message, None, None);
                     self.tui.request_render();
                 }
             }
@@ -4155,6 +4224,23 @@ impl InteractiveMode {
                     }
                     if let Some(component) = self.downcast_chat::<
                         super::components::branch_summary::BranchSummaryMessageComponent,
+                    >(index)
+                    {
+                        component.set_output_pad(output_pad);
+                    }
+                    // `onOutputPadChange` updates every row with a
+                    // `setOutputPad` (`interactive-mode.ts:5270-5281`) —
+                    // the custom rows both have one.
+                    #[cfg(feature = "ext-js")]
+                    if let Some(component) = self
+                        .downcast_chat::<super::components::custom_entry::CustomEntryComponent>(
+                        index,
+                    ) {
+                        component.set_output_pad(output_pad);
+                    }
+                    #[cfg(feature = "ext-js")]
+                    if let Some(component) = self.downcast_chat::<
+                        super::components::custom_message::CustomMessageComponent,
                     >(index)
                     {
                         component.set_output_pad(output_pad);
@@ -8530,6 +8616,22 @@ impl InteractiveMode {
                     {
                         component.set_expanded(expanded);
                     }
+                    // `setToolOutputExpanded` duck-types every chat child
+                    // with a `setExpanded` (`interactive-mode.ts:4753-4758`)
+                    // — the custom rows both have one.
+                    #[cfg(feature = "ext-js")]
+                    if let Some(component) = self
+                        .downcast_chat::<super::components::custom_entry::CustomEntryComponent>(
+                        index,
+                    ) {
+                        component.set_expanded(expanded);
+                    }
+                    #[cfg(feature = "ext-js")]
+                    if let Some(component) =
+                        self.downcast_chat::<super::components::custom_message::CustomMessageComponent>(index)
+                    {
+                        component.set_expanded(expanded);
+                    }
                 }
                 if let Some(header) = self.downcast_tree::<BuiltInHeader>(HostSlot::Header) {
                     header.set_expanded(expanded);
@@ -10982,6 +11084,148 @@ export default function (pi) {
         };
         mode.render_session_entries(&[SessionEntry::Custom(custom)], false);
         assert_eq!(mode.chat_len(), before);
+        mode.shutdown().expect("shutdown");
+    }
+
+    // ---- E3 slice 4: custom message renderers ----
+
+    /// The `custom_message` record `entry_appended` carries —
+    /// `createCustomMessage` builds the live message from it
+    /// (`interactive-mode.ts:3577-3587`).
+    #[cfg(feature = "ext-js")] // the renderer registry is feature-gated
+    fn custom_message_record(custom_type: &str, display: bool) -> serde_json::Value {
+        serde_json::json!({
+            "type": "custom_message",
+            "id": "m1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "customType": custom_type,
+            "content": "hello body",
+            "display": display,
+            "details": { "k": 7 }
+        })
+    }
+
+    /// `entry_appended` renders a displayed custom message through the
+    /// extension renderer (`interactive-mode.ts:3577-3587` →
+    /// `addMessageToChat` case "custom", `:4032-4048`); `display:false`
+    /// renders nothing.
+    #[cfg(feature = "ext-js")] // the renderer registry is feature-gated
+    #[test]
+    fn custom_message_appended_renders_the_extension_row() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerMessageRenderer("note", (message, options, theme) => ({
+    render: (width) => [theme.fg("error", `msg:${message.customType}:${options.outputPad}:${options.expanded}`)],
+    invalidate: () => {},
+  }));
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture_with_extension(dir.path(), EXT);
+        let before = mode.chat_len();
+
+        mode.handle_agent_event(&AgentEvent::EntryAppended {
+            entry: custom_message_record("note", true),
+        });
+        assert_eq!(mode.chat_len(), before + 1);
+        let chat = mode.chat_mut();
+        let child = chat.get(before).expect("custom message row");
+        let lines = strip_terminal_sequences(&child.render(80).join("\n"));
+        // The record crossed (customType) with the output-pad option; the
+        // theme.fg("error", …) call crossed through the port theme, so the
+        // styled text strips back to the plain content.
+        assert!(lines.contains("msg:note:1:false"), "{lines}");
+
+        // `display:false` appends nothing (`:4033`).
+        mode.handle_agent_event(&AgentEvent::EntryAppended {
+            entry: custom_message_record("note", false),
+        });
+        assert_eq!(mode.chat_len(), before + 1);
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// A message renderer throw falls through to the default box silently —
+    /// unlike the custom ENTRY error box (`custom-message.ts:93-95`) — and
+    /// a type with no renderer takes the same default path (`:4034`).
+    #[cfg(feature = "ext-js")] // the renderer registry is feature-gated
+    #[test]
+    fn custom_message_renderer_failure_takes_the_default_box() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerMessageRenderer("note", () => {
+    throw new Error("boom-message");
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture_with_extension(dir.path(), EXT);
+        let before = mode.chat_len();
+
+        mode.handle_agent_event(&AgentEvent::EntryAppended {
+            entry: custom_message_record("note", true),
+        });
+        assert_eq!(mode.chat_len(), before + 1);
+        let chat = mode.chat_mut();
+        let child = chat.get(before).expect("default box row");
+        let lines = strip_terminal_sequences(&child.render(80).join("\n"));
+        // The default box: the bold [note] label and the content text; the
+        // throw is swallowed (no "renderer failed" row for messages).
+        assert!(lines.contains("[note]"), "{lines}");
+        assert!(lines.contains("hello body"), "{lines}");
+        assert!(!lines.contains("renderer failed"), "{lines}");
+
+        // No renderer for the type: the same default box.
+        mode.handle_agent_event(&AgentEvent::EntryAppended {
+            entry: custom_message_record("other", true),
+        });
+        assert_eq!(mode.chat_len(), before + 2);
+        let chat = mode.chat_mut();
+        let child = chat.get(before + 1).expect("second row");
+        let lines = strip_terminal_sequences(&child.render(80).join("\n"));
+        assert!(lines.contains("[other]"), "{lines}");
+        assert!(lines.contains("hello body"), "{lines}");
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// Replayed custom messages go through the generic message path with
+    /// the persisted meta (`session-manager.ts:453-456`,
+    /// `interactive-mode.ts:4268-4282`): the default box renders, and the
+    /// `custom`-surface markdown transformers see the entry id/timestamp.
+    #[cfg(feature = "ext-js")] // the renderer registry is feature-gated
+    #[test]
+    fn replayed_custom_message_renders_with_transformer_meta() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerMarkdownTransformer(
+    (markdown, context) => markdown + ` @${context.messageId}|${context.timestamp}`,
+    { messageTypes: ["custom"] },
+  );
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture_with_extension(dir.path(), EXT);
+        let before = mode.chat_len();
+        let custom = crate::session::records::CustomMessageEntry {
+            custom_type: "note".to_string(),
+            content: pi_ai::types::UserContent::Text("hello body".to_string()),
+            display: true,
+            details: None,
+            base: crate::session::records::EntryBase {
+                id: "m1".to_string(),
+                parent_id: None,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+            unknown: serde_json::Map::default(),
+        };
+        mode.render_session_entries(&[SessionEntry::CustomMessage(custom)], false);
+        assert_eq!(mode.chat_len(), before + 1);
+        let chat = mode.chat_mut();
+        let child = chat.get(before).expect("default box row");
+        let lines = strip_terminal_sequences(&child.render(80).join("\n"));
+        assert!(lines.contains("[note]"), "{lines}");
+        assert!(lines.contains("hello body"), "{lines}");
+        // The persisted meta crossed to the transformer (live rows carry none).
+        assert!(lines.contains("@m1|2026-01-01T00:00:00Z"), "{lines}");
         mode.shutdown().expect("shutdown");
     }
 
