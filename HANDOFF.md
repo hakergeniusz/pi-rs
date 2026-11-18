@@ -2322,6 +2322,80 @@ can fast-forward to the PRE-fmt-debris tip while the style commit rides
 only the remote branch — merge `--ff-only <gate-branch-tip>` (the commit
 that carries the debris), then push. Hit three times on 2026-11-17.
 
+## E3 slice 1: extension shortcuts (landed on `feat/e3-extension-shortcuts`, 2026-11-18)
+
+First slice of the TUI bridging arc (E3). Commit cd45965 + the follow-up
+`fix(ext)` gating commit; gate green in the container (1819 passed /
+0 failed), CI run 44337077422 — which caught the one check the container
+gate lacked: `cargo check --no-default-features` failed E0004 (the
+`EditorEventOut::ExtensionShortcut` variant was ungated while its pump
+match arm was `#[cfg(feature = "ext-js")]`). Fix: the variant, the
+editor's first-check block, and the dispatch test are all feature-gated
+together; the empty-slot fields stay ungated (no-default builds warn
+`dead_code` on them, which that plain `cargo check` job tolerates — same
+class as the pre-existing `virtual_models::RouteErrorSlot::set` warning).
+
+What landed:
+
+- **Registration, headless included** — `pi.registerShortcut(shortcut, options)`
+  joins the API in both the full and headless glue records
+  (`loader.ts:329-338` — upstream validates *nothing* here; `assertActive()`
+  + a `shortcuts` map entry is the whole surface). The headless stub used to
+  throw "not available until E3"; upstream registers from the base API in all
+  contexts and nothing consumes shortcuts headless, so registration there is
+  harmless.
+- **Conflict resolution** — `Runner::get_shortcuts(&resolved_keybindings)`
+  ports `core/extensions/runner.ts:682-712`: every chord lowercases before
+  matching; chords on the 18
+  `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` ids (`runner.ts:98-141`)
+  are skipped with the verbatim "conflicts with built-in shortcut.
+  Skipping." warning; non-reserved built-ins warn ("Extension shortcut
+  conflict: '{chord}' … Using {path}.") and the **extension wins**; later
+  extensions override earlier per chord (position-preserving replace,
+  warning), exactly `buildBuiltinKeybindings`'s restrictOverride logic.
+- **Dispatch** — the interactive editor checks extension chords **first**,
+  before app keybindings and autocomplete page keys
+  (`custom-editor.ts:24/:90-92`), and fires an editor event the pump maps to
+  `Runner::run_shortcut`: `session_begin(ContextKind::Event)` →
+  `session_call_shortcut` → settle → outcome — the base-ctx session
+  machinery, so the command-only ctx additions (`waitForIdle`, session
+  mutation defaults) stay off the shortcut ctx. A handler rejection
+  surfaces as `Shortcut handler error: …`
+  (`interactive-mode.ts:2428`).
+- **UI plumbing** — setup at startup and re-resolution on `/reload`
+  (`interactive-mode.ts:2170/:2381-2382/:6683`); `/hotkeys` gains the
+  Extensions section with `formatKeyText(key, { capitalize: true })`
+  rendering (`interactive-mode.ts:7094-7104`, ported as
+  `theme::format_chord` over `keybinding-hints.ts:15-28`; the darwin
+  `alt` → `option` swap is out of scope, POSIX-only port).
+- Tests: 3 in `pi-ext-js` (resolution table incl. the reserved skip and
+  the warn-and-win, duplicate-keys-take-the-last-extension, dispatch with
+  the base ctx + appendEntry + error channel + unknown chord → `Ok(false)`);
+  2 in `pi-coding-agent` (the editor matches the extension chord before
+  built-ins — ctrl+q = `\x11` — and falls through otherwise;
+  `/hotkeys` lists the Extensions rows).
+
+Deviations (all deliberate):
+
+1. The resolved keybindings input is the port's default table
+   (`theme::app_keys::DEFAULTS`); upstream passes
+   `this.keybindings.getEffectiveConfig()` — `keybindings.json` overrides
+   are not ported (documented E2-era deviation, unchanged here).
+2. Conflict warnings print as `Warning: …` loader lines
+   (eprintln) instead of upstream's `[Extension issues]` banner — the
+   banner is part of the E3 UI-bridging remainder.
+3. Upstream's TUI shortcut ctx builds `ui`/`hasUI: true`/`mode: "tui"`
+   inline (`interactive-mode.ts:2385+`); the port dispatches through the
+   base event ctx so whatever E2 wiring the session carries applies
+   (headless: `hasUI: false` — asserted in the test).
+
+Process gotcha (second half of the 2026-11-17 lesson): the work-loss
+replay was verified with *targeted* tests only — cargo check + the slice's
+tests — and the full gate then caught two clippy lints the targeted run
+never saw (`format_push_string` → `write!`, then `write_with_newline` →
+`writeln!`; the `+= &format!(…)` form trips this repo's clippy 1.99).
+After ANY replay, run the full gate, not the targeted subset.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).

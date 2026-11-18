@@ -15,7 +15,11 @@ runner with upstream dispatch semantics; upstream's bundled `tool-search`
 extension runs identically) together with the UI-over-protocol wiring
 (dialogs, `user_bash`, context transforms, RPC dialog subprotocol),
 virtual-model routing, models.json custom providers, and the composed
-extension-provider catalog, while the TUI renderer bridging (E3) and the
+extension-provider catalog, and extension-registered keyboard shortcuts
+(`pi.registerShortcut`, resolved against the built-in keybindings like
+upstream and listed under `/hotkeys`), while the rest of the TUI renderer
+bridging (E3: message/tool renderers, markdown transformers, `ctx.ui.custom`,
+editor components, themes) and the
 MCP tool bridge are still landing. See [PLAN.md](PLAN.md) for the
 phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
 
@@ -64,7 +68,7 @@ phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
 | `pi-agent` | `@earendil-works/pi-agent-core` | agent loop with steering/follow-up queues, transcript, events |
 | `pi-tui` | `@earendil-works/pi-tui` | differential renderer, editor, fuzzy/autocomplete, mouse, alt screen, theme |
 | `pi-mcp` | `@earendil-works/pi-mcp` | JSON-RPC types + stdio transport client (HTTP transport + tool bridge pending) |
-| `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, UI dialogs over protocol, `user_bash`, context transforms, RPC dialog subprotocol, virtual-model routing (`tool-search` exit gate green; TUI renderer bridging pending) |
+| `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, UI dialogs over protocol, `user_bash`, context transforms, RPC dialog subprotocol, virtual-model routing, extension keyboard shortcuts (`tool-search` exit gate green; rest of TUI renderer bridging pending) |
 | `pi-codemode` | `@earendil-works/pi-codemode` | stub |
 | `pi-coding-agent` (`pi` binary) | `@earendil-works/pi-coding-agent` | CLI, print/JSON/RPC/interactive modes, session store, tools, auth |
 
