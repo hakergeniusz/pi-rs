@@ -2763,6 +2763,63 @@ Deviations/notes:
   paths that only run with the editor mounted (submits, tree
   navigation after its selector closes) — left as-is.
 
+## User-reported round 3: status-line stacking + /resume appending the transcript (landed on `fix/status-stack-resume-clear`, 2026-11-18)
+
+Two chat-tail bugs, both from missing upstream semantics. Upstream refs:
+`showStatus` (`interactive-mode.ts:3964-3984`),
+`showError`/`showWarning` (`:4809-4819`),
+`renderCurrentSessionState` (`:2337-2347`), `cycleThinkingLevel`
+(`:4711-4721`).
+
+1. **Back-to-back statuses stacked** (user report: cycling the thinking
+   level with Shift+Tab appends one "Thinking level: …" line per
+   press; the harness fills with dozens). Upstream `showStatus`
+   REPLACES the tail pair in place: it remembers
+   `lastStatusText`/`lastStatusSpacer` and, when the chat's last two
+   children are still exactly those objects, sets the text; anything
+   else appended between statuses breaks the identity and the next
+   status appends a fresh pair. The port appended unconditionally.
+   The port tracks the pair by the two rows' heap addresses
+   (`chat_row_addr`, a thin-pointer cast of the child — object identity,
+   immune to the index shifts streaming splices cause); on a match the
+   two tail rows are swapped for a fresh pair via `remove_child` +
+   `add_child` (same rows, same position, same count — observably
+   identical to upstream's `set_text`, and it avoids a `Text`
+   downcast: pi-tui's `as_any_mut` is deliberately closed to
+   ScrollView/ImplicitDocument, so `downcast_chat::<Text>` can never
+   succeed — the port's own components override it, `Text` does not).
+   `last_status_pair` resets at every chat clear (`/new`, tree
+   navigation, session switch). At the same time `show_error` gained
+   upstream's leading `Spacer(1)` + `Error: ` prefix (it lacked both)
+   and `show_warning` the leading spacer (upstream `:4815-4819`);
+   errors/warnings never coalesce, matching upstream.
+2. **In-session `/resume` appended the resumed transcript below the
+   old chat** (found while auditing the status fix; boot-path resume
+   was fine, the dialog path was not). `switch_session` replaced the
+   session and called `render_initial_messages()` without clearing the
+   chat; upstream's resume path reaches
+   `renderCurrentSessionState` (`:2337-2347`) — via
+   `rebindCurrentSession({renderBeforeBind: true})` ← `rebindSession`
+   ← `finishSessionReplacement` (`agent-session-runtime.ts:188-190`)
+   — which `chatContainer.clear()`s (and drops pending/streaming
+   state) before replaying. The port now clears the chat + resets the
+   status pair before the replay, exactly like the tree-navigation
+   path already did.
+
+Tests: 5 new — `consecutive_statuses_replace_the_chat_tail_pair`
+(count fixed at spacer+text, tracked pair keeps matching the tail),
+`interleaved_chat_row_breaks_the_status_pair` (pair + interleaved row
++ fresh pair = +5 rows, new pair matches the tail),
+`thinking_level_cycle_renders_one_status_line` (6 presses of the real
+`cycle_thinking_level` key path → +2 rows total, one visible
+"Thinking level:" line), `show_error_renders_the_prefix_and_never_coalesces`,
+and `resumed_session_replaces_the_previous_transcript` (resume of a
+shorter session into a longer one lands at exactly
+`fresh boot rows + 2`, i.e. REPLACED, plus the pair-identity tail
+assert). Verified with a PTY probe on the fresh binary (synthetic
+HOME; trust-Enter → 6×Shift+Tab → /exit): exactly one "Thinking
+level:" line in the typescript, no panic, EXIT=0.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
