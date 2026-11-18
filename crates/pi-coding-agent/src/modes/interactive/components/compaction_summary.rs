@@ -9,10 +9,14 @@
 //! without row backgrounds).
 
 use pi_tui::component::Component;
-use pi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownOptions};
+use pi_tui::components::markdown::{
+    DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTransform,
+};
 use pi_tui::theme::ThemeColor;
 
 use super::super::theme;
+use super::markdown_transform::MarkdownTransformCtx;
+use std::sync::Arc;
 
 /// The compaction summary row (`compaction-summary-message.ts:12-99`).
 pub struct CompactionSummaryMessageComponent {
@@ -20,6 +24,7 @@ pub struct CompactionSummaryMessageComponent {
     summary: String,
     tokens_before: u64,
     output_pad: usize,
+    transform_ctx: MarkdownTransformCtx,
     /// The expanded body (header + summary); renders at the real width like
     /// upstream's Markdown child.
     markdown: Markdown,
@@ -29,15 +34,22 @@ pub struct CompactionSummaryMessageComponent {
 }
 
 impl CompactionSummaryMessageComponent {
-    pub fn new(summary: &str, tokens_before: u64, output_pad: usize) -> Self {
+    pub fn new(
+        summary: &str,
+        tokens_before: u64,
+        output_pad: usize,
+        transform_ctx: MarkdownTransformCtx,
+    ) -> Self {
         let mut component = Self {
             expanded: false,
             summary: summary.to_string(),
             tokens_before,
             output_pad,
-            markdown: Self::build_markdown(summary, tokens_before, output_pad),
+            transform_ctx,
+            markdown: Self::build_markdown(summary, tokens_before, output_pad, None),
             content: Vec::new(),
         };
+        component.refresh_markdown();
         component.update_display();
         component
     }
@@ -54,14 +66,44 @@ impl CompactionSummaryMessageComponent {
     pub fn set_output_pad(&mut self, output_pad: usize) {
         if self.output_pad != output_pad {
             self.output_pad = output_pad;
-            self.markdown = Self::build_markdown(&self.summary, self.tokens_before, output_pad);
+            self.refresh_markdown();
             self.update_display();
         }
     }
 
+    /// Rebuilds the expanded Markdown child from the current context.
+    fn refresh_markdown(&mut self) {
+        let transform = self
+            .transform_ctx
+            .make("summary", None, None, None)
+            .map(|inner| Self::wrap_with_header(self.tokens_before, inner));
+        self.markdown = Self::build_markdown(
+            &self.summary,
+            self.tokens_before,
+            self.output_pad,
+            transform,
+        );
+    }
+
+    /// The header wrapper (`compaction-summary-message.ts:64-66`):
+    /// transformers see only the summary content, Pi's header goes back in
+    /// front of the transformed markdown per render. `None` (no registered
+    /// transformer) keeps the port's combined header+summary text — the
+    /// identical render.
+    fn wrap_with_header(tokens_before: u64, inner: MarkdownTransform) -> MarkdownTransform {
+        let token_str = crate::modes::interactive::components::footer::format_tokens(tokens_before);
+        let header = format!("**Compacted from {token_str} tokens**\n\n");
+        Arc::new(move |markdown: &str, width: usize| format!("{header}{}", inner(markdown, width)))
+    }
+
     /// The expanded Markdown child: Pi's header, then the summary
-    /// (`compaction-summary-message.ts:49-62`).
-    fn build_markdown(summary: &str, tokens_before: u64, output_pad: usize) -> Markdown {
+    /// (`compaction-summary-message.ts:49-68`).
+    fn build_markdown(
+        summary: &str,
+        tokens_before: u64,
+        output_pad: usize,
+        transform: Option<MarkdownTransform>,
+    ) -> Markdown {
         let theme = theme::theme();
         let token_str = crate::modes::interactive::components::footer::format_tokens(tokens_before);
         let header = format!("**Compacted from {token_str} tokens**\n\n");
@@ -70,7 +112,14 @@ impl CompactionSummaryMessageComponent {
             ..DefaultTextStyle::default()
         };
         Markdown::new(
-            format!("{header}{summary}"),
+            // Without a transform the text is the combined header+summary;
+            // with one, transformers see only the summary and the wrapper
+            // re-adds the header.
+            if transform.is_some() {
+                summary.to_string()
+            } else {
+                format!("{header}{summary}")
+            },
             output_pad,
             0,
             theme::markdown_theme(),
@@ -78,6 +127,7 @@ impl CompactionSummaryMessageComponent {
             MarkdownOptions {
                 preserve_list_markers: true,
                 preserve_backslash_escapes: true,
+                transform,
             },
         )
     }
@@ -149,7 +199,12 @@ mod tests {
 
     #[test]
     fn collapsed_row_labels_the_tokens_and_the_expand_key() {
-        let component = CompactionSummaryMessageComponent::new("summary text", 1234, 1);
+        let component = CompactionSummaryMessageComponent::new(
+            "summary text",
+            1234,
+            1,
+            MarkdownTransformCtx::default(),
+        );
         let plain = plain_lines(&component, 80);
         assert!(plain[0].contains("[compaction]"), "{plain:?}");
         let joined = plain.join("\n");
@@ -161,7 +216,12 @@ mod tests {
 
     #[test]
     fn expanded_row_renders_the_summary_markdown() {
-        let mut component = CompactionSummaryMessageComponent::new("## Goal\nfinish it", 96, 1);
+        let mut component = CompactionSummaryMessageComponent::new(
+            "## Goal\nfinish it",
+            96,
+            1,
+            MarkdownTransformCtx::default(),
+        );
         component.set_expanded(true);
         let joined = plain_lines(&component, 80).join("\n");
         assert!(joined.contains("Compacted from 96 tokens"), "{joined}");
@@ -171,7 +231,8 @@ mod tests {
 
     #[test]
     fn expanding_and_collapsing_toggles_the_body() {
-        let mut component = CompactionSummaryMessageComponent::new("body", 10, 1);
+        let mut component =
+            CompactionSummaryMessageComponent::new("body", 10, 1, MarkdownTransformCtx::default());
         component.set_expanded(true);
         assert!(plain_lines(&component, 80).len() > 3);
         component.set_expanded(false);

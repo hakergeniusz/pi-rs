@@ -12,8 +12,11 @@
 use pi_tui::component::Component;
 use pi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
 use pi_tui::components::text::Text;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::super::theme;
+use super::markdown_transform::MarkdownTransformCtx;
 
 /// One rendered block. `MarkdownSlot` (`assistant-message.ts:23-26`).
 enum Item {
@@ -40,6 +43,13 @@ pub struct AssistantMessageComponent {
     hidden_thinking_label: String,
     output_pad: usize,
     streaming: bool,
+    /// The shared markdown-transform plumbing (`getMarkdownTransformers`
+    /// upstream — the component builds the two surface closures from it).
+    transform_ctx: MarkdownTransformCtx,
+    /// The live `isStreaming` the transform closures read per render
+    /// (`markdown-transform.ts:18` — "read per transform, so a reused
+    /// component sees a stream end").
+    streaming_flag: Arc<AtomicBool>,
 }
 
 /// Spacers go in lazily, right before the next visible block
@@ -53,12 +63,18 @@ fn push_visible(items: &mut Vec<Item>, needs_spacer: &mut bool, item: Item) {
 }
 
 impl AssistantMessageComponent {
-    pub fn new(hide_thinking_block: bool, hidden_thinking_label: &str, output_pad: usize) -> Self {
+    pub fn new(
+        hide_thinking_block: bool,
+        hidden_thinking_label: &str,
+        output_pad: usize,
+        transform_ctx: MarkdownTransformCtx,
+    ) -> Self {
         Self::with_theme(
             hide_thinking_block,
             hidden_thinking_label,
             output_pad,
             theme::markdown_theme(),
+            transform_ctx,
         )
     }
 
@@ -67,6 +83,7 @@ impl AssistantMessageComponent {
         hidden_thinking_label: &str,
         output_pad: usize,
         markdown_theme: MarkdownTheme,
+        transform_ctx: MarkdownTransformCtx,
     ) -> Self {
         AssistantMessageComponent {
             items: Vec::new(),
@@ -75,6 +92,8 @@ impl AssistantMessageComponent {
             hidden_thinking_label: hidden_thinking_label.to_string(),
             output_pad,
             streaming: false,
+            streaming_flag: Arc::new(AtomicBool::new(false)),
+            transform_ctx,
         }
     }
 
@@ -103,6 +122,7 @@ impl AssistantMessageComponent {
     #[allow(clippy::too_many_lines)]
     pub fn update_content(&mut self, message: &pi_ai::types::AssistantMessage, streaming: bool) {
         self.streaming = streaming;
+        self.streaming_flag.store(streaming, Ordering::Relaxed);
 
         let previous = std::mem::take(&mut self.items);
         // Slot candidates from the previous frame, consumed in order.
@@ -138,6 +158,8 @@ impl AssistantMessageComponent {
         let mut items: Vec<Item> = Vec::new();
         let markdown_theme = self.markdown_theme.clone();
         let output_pad = self.output_pad;
+        let transform_ctx = self.transform_ctx.clone();
+        let streaming_flag = Arc::clone(&self.streaming_flag);
         let thinking_style = || {
             let theme = theme::theme();
             DefaultTextStyle {
@@ -166,7 +188,17 @@ impl AssistantMessageComponent {
                                 0,
                                 markdown_theme.clone(),
                                 None,
-                                MarkdownOptions::default(),
+                                MarkdownOptions {
+                                    // The `assistant` surface
+                                    // (`assistant-message.ts:159-165`).
+                                    transform: transform_ctx.make(
+                                        "assistant",
+                                        Some(Arc::clone(&streaming_flag)),
+                                        None,
+                                        None,
+                                    ),
+                                    ..MarkdownOptions::default()
+                                },
                             )
                         };
                         let markdown = next_slot(SlotKind::Text, &text, &build);
@@ -227,7 +259,17 @@ impl AssistantMessageComponent {
                                 0,
                                 markdown_theme.clone(),
                                 Some(thinking_style()),
-                                MarkdownOptions::default(),
+                                MarkdownOptions {
+                                    // The `assistant-thinking` surface
+                                    // (`assistant-message.ts:210-216`).
+                                    transform: transform_ctx.make(
+                                        "assistant-thinking",
+                                        Some(Arc::clone(&streaming_flag)),
+                                        None,
+                                        None,
+                                    ),
+                                    ..MarkdownOptions::default()
+                                },
                             )
                         };
                         let markdown = next_slot(SlotKind::Thinking, &thinking, &build);
@@ -347,7 +389,12 @@ mod tests {
 
     #[test]
     fn renders_text_with_a_leading_spacer() {
-        let mut component = AssistantMessageComponent::new(false, "Thinking...", 1);
+        let mut component = AssistantMessageComponent::new(
+            false,
+            "Thinking...",
+            1,
+            MarkdownTransformCtx::default(),
+        );
         component.update_content(&assistant_text_message("hello there"), false);
         let lines = plain(&component, 40);
         assert_eq!(lines.first().map(String::as_str), Some(""));
@@ -368,7 +415,12 @@ mod tests {
                 text_signature: None,
             }),
         ];
-        let mut visible = AssistantMessageComponent::new(false, "Thinking...", 1);
+        let mut visible = AssistantMessageComponent::new(
+            false,
+            "Thinking...",
+            1,
+            MarkdownTransformCtx::default(),
+        );
         visible.update_content(&message, false);
         assert!(
             plain(&visible, 40)
@@ -376,7 +428,12 @@ mod tests {
                 .any(|line| line.contains("pondering"))
         );
 
-        let mut hidden = AssistantMessageComponent::new(true, "Thought for a bit", 1);
+        let mut hidden = AssistantMessageComponent::new(
+            true,
+            "Thought for a bit",
+            1,
+            MarkdownTransformCtx::default(),
+        );
         hidden.update_content(&message, false);
         let lines = plain(&hidden, 40);
         assert!(!lines.iter().any(|line| line.contains("pondering")));
@@ -385,7 +442,12 @@ mod tests {
 
     #[test]
     fn slots_are_reused_for_the_same_kind() {
-        let mut component = AssistantMessageComponent::new(false, "Thinking...", 1);
+        let mut component = AssistantMessageComponent::new(
+            false,
+            "Thinking...",
+            1,
+            MarkdownTransformCtx::default(),
+        );
         component.update_content(&assistant_text_message("first"), true);
         // Second update with different text keeps the same item shape.
         component.update_content(&assistant_text_message("second"), false);

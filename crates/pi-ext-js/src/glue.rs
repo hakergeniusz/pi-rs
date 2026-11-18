@@ -147,6 +147,11 @@ globalThis.__piBeginExtension = function (path) {
     // (`loader.ts:337`); normalization and conflict resolution happen in
     // the runner's getShortcuts.
     shortcuts: {},
+    // The one markdown transformer this extension registered
+    // (`loader.ts:365-372` — a second registration REPLACES the first),
+    // with the surfaces it runs on (default user/assistant/
+    // assistant-thinking).
+    markdownTransformer: undefined,
     busSubscriptions: [],
     pendingChanges: [],
     // The virtual-model definitions this extension registered, for cleanup
@@ -283,7 +288,7 @@ globalThis.__piDiscardExtension = function (extIdx) {
       globalThis.__piProviderOAuth.delete(entry.name);
     }
   }
-  globalThis.__piExtensions[extIdx] = { path: ext.path, events: {}, tools: {}, commands: {}, flags: {}, shortcuts: {}, busSubscriptions: [] };
+  globalThis.__piExtensions[extIdx] = { path: ext.path, events: {}, tools: {}, commands: {}, flags: {}, shortcuts: {}, markdownTransformer: undefined, busSubscriptions: [] };
 };
 
 // The extension event bus (core/event-bus.ts:12-33): handlers are wrapped
@@ -419,6 +424,17 @@ globalThis.__piCreateApi = function (extIdx) {
       ext.shortcuts[shortcut] = { shortcut, handler: options.handler, description: options.description };
     },
 
+    registerMarkdownTransformer(transformer, options) {
+      assertActive();
+      // One transformer per extension — a second registration REPLACES the
+      // first, no warning (`loader.ts:365-372`). The surfaces default to
+      // the transcript types (`DEFAULT_MARKDOWN_MESSAGE_TYPES`).
+      ext.markdownTransformer = {
+        transformer,
+        messageTypes: new Set(options?.messageTypes ?? ["user", "assistant", "assistant-thinking"]),
+      };
+    },
+
     registerFlag(name, options) {
       assertActive();
       if (options.default !== undefined && typeof options.default !== options.type) {
@@ -454,8 +470,15 @@ globalThis.__piCreateApi = function (extIdx) {
     registerMessageRenderer() {
       throw new Error("pi.registerMessageRenderer is not available in the E1 headless extensions core (E3)");
     },
-    registerMarkdownTransformer() {
-      throw new Error("pi.registerMarkdownTransformer is not available in the E1 headless extensions core (E3)");
+    registerMarkdownTransformer(transformer, options) {
+      assertActive();
+      // Registration is harmless headless (upstream registers from the base
+      // API in every context; nothing transforms markdown without a TUI) —
+      // E3 slice 2 joins it to the supported set.
+      ext.markdownTransformer = {
+        transformer,
+        messageTypes: new Set(options?.messageTypes ?? ["user", "assistant", "assistant-thinking"]),
+      };
     },
     registerEntryRenderer() {
       throw new Error("pi.registerEntryRenderer is not available in the E1 headless extensions core (E3)");
@@ -1290,6 +1313,21 @@ globalThis.__piSessionCallShortcut = function (id, extIdx, key) {
     );
 };
 
+// The markdown transformer call (`markdown-transform.ts:28-38`): a
+// SYNCHRONOUS Rust→JS invocation — the transformers are sync functions, so
+// no session machinery. The context crosses as JSON (parsed here); a
+// non-string return stays `undefined` and the Rust side keeps the current
+// markdown, exactly upstream's `typeof transformed === "string"` check.
+// A transformer throw propagates to the engine's catch (upstream catches
+// around every call and keeps the current markdown).
+globalThis.__piMarkdownTransform = function (extIdx, markdown, contextJson) {
+  const registration = globalThis.__piExtensions[extIdx].markdownTransformer;
+  if (!registration) return undefined;
+  const context = JSON.parse(contextJson);
+  const result = registration.transformer(markdown, context);
+  return typeof result === "string" ? result : undefined;
+};
+
 globalThis.__piSessionCallTool = function (id, extIdx, name, toolCallId) {
   const session = globalThis.__piSessions.get(id);
   session.eventName = `tool:${name}`;
@@ -1691,6 +1729,12 @@ globalThis.__piInspect = function () {
         shortcut: key,
         description: shortcut.description ?? "",
       })),
+      markdownTransformer:
+        ext.markdownTransformer === undefined
+          ? undefined
+          : {
+              messageTypes: [...ext.markdownTransformer.messageTypes],
+            },
       flags: Object.entries(ext.flags).map(([name, flag]) => ({
         name,
         description: flag.description ?? "",

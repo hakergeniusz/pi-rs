@@ -135,14 +135,37 @@ pub struct DefaultTextStyle {
     pub bg_color: Option<Style>,
 }
 
+/// The render-time markdown hook (`markdown.ts:289`): receives the source
+/// and the content width, returns the markdown to render. The interactive
+/// mode chains extension transformers through it (E3 slice 2).
+pub type MarkdownTransform = std::sync::Arc<dyn Fn(&str, usize) -> String + Send + Sync>;
+
 /// pi's `MarkdownOptions` (`markdown.ts:236-249`); only the parts this port
 /// implements.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct MarkdownOptions {
     /// Keep the source markers (`1)`, `*`) instead of normalizing to `.`/`-`.
     pub preserve_list_markers: bool,
     /// Keep `\*` escapes in the output.
     pub preserve_backslash_escapes: bool,
+    /// `transform` (`markdown.ts:289`): applied per render with the content
+    /// width (`markdown.ts:376`), so a reused component sees stream state
+    /// and width changes.
+    pub transform: Option<MarkdownTransform>,
+}
+
+impl std::fmt::Debug for MarkdownOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The transform is a closure — render it as a marker only.
+        f.debug_struct("MarkdownOptions")
+            .field("preserve_list_markers", &self.preserve_list_markers)
+            .field(
+                "preserve_backslash_escapes",
+                &self.preserve_backslash_escapes,
+            )
+            .field("transform", &self.transform.is_some())
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------- inline AST
@@ -1389,8 +1412,14 @@ impl Markdown {
             return Vec::new();
         }
         let content_width = width.saturating_sub(self.padding_x * 2).max(1);
+        // The transform runs before parsing, with the content width
+        // (`markdown.ts:376`).
+        let text = match &self.options.transform {
+            Some(transform) => transform(&self.text, content_width),
+            None => self.text.clone(),
+        };
         // Tabs become three spaces, like pi (`markdown.ts:302`).
-        let normalized = self.text.replace('\t', "   ");
+        let normalized = text.replace('\t', "   ");
         let blocks = parse_blocks(&normalized);
 
         let mut rendered_lines: Vec<String> = Vec::new();

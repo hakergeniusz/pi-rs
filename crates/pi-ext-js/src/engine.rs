@@ -1061,6 +1061,30 @@ impl JsHost {
         })
     }
 
+    /// Runs one extension's markdown transformer synchronously
+    /// (`__piMarkdownTransform`; `markdown-transform.ts:28-38`). The
+    /// context crosses as JSON. Errors and non-string results both map to
+    /// `None` — upstream catches around every transformer and keeps the
+    /// current markdown when the return isn't a string.
+    pub fn markdown_transform(
+        &self,
+        index: usize,
+        markdown: &str,
+        context_json: &str,
+    ) -> Option<String> {
+        self.ctx.with(|ctx| -> Option<String> {
+            let call: Function = match ctx.globals().get("__piMarkdownTransform") {
+                Ok(call) => call,
+                Err(_) => return None,
+            };
+            // A string return converts; `undefined` maps to `None`, and a
+            // non-string return fails the conversion — both keep the
+            // current markdown. A transformer throw errors the call.
+            call.call::<(usize, &str, &str), Option<String>>((index, markdown, context_json))
+                .unwrap_or_default()
+        })
+    }
+
     /// Calls one tool's `execute` inside a session
     /// (`__piSessionCallTool`); the session event holds the tool args.
     pub fn session_call_tool(

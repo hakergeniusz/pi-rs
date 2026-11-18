@@ -10,6 +10,7 @@ use pi_tui::component::Component;
 use pi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownOptions};
 
 use super::super::theme;
+use super::markdown_transform::MarkdownTransformCtx;
 
 /// The user message: markdown padded by one column, on the message
 /// background (`user-message.ts:44-71`).
@@ -19,18 +20,20 @@ pub struct UserMessageComponent {
     text: String,
     output_pad: usize,
     markdown_theme: pi_tui::components::markdown::MarkdownTheme,
+    transform_ctx: MarkdownTransformCtx,
     markdown: Markdown,
 }
 
 impl UserMessageComponent {
-    pub fn new(text: &str, output_pad: usize) -> Self {
-        Self::with_theme(text, output_pad, theme::markdown_theme())
+    pub fn new(text: &str, output_pad: usize, transform_ctx: MarkdownTransformCtx) -> Self {
+        Self::with_theme(text, output_pad, theme::markdown_theme(), transform_ctx)
     }
 
     pub fn with_theme(
         text: &str,
         output_pad: usize,
         markdown_theme: pi_tui::components::markdown::MarkdownTheme,
+        transform_ctx: MarkdownTransformCtx,
     ) -> Self {
         let theme = theme::theme();
         let style = DefaultTextStyle {
@@ -38,11 +41,18 @@ impl UserMessageComponent {
             bg_color: Some(theme.bg_styler(pi_tui::theme::ThemeBg::UserMessageBg)),
             ..DefaultTextStyle::default()
         };
-        let markdown = Self::build_markdown(text, output_pad, markdown_theme.clone(), style);
+        let markdown = Self::build_markdown(
+            text,
+            output_pad,
+            markdown_theme.clone(),
+            style,
+            &transform_ctx,
+        );
         UserMessageComponent {
             text: text.to_string(),
             output_pad,
             markdown_theme,
+            transform_ctx,
             markdown,
         }
     }
@@ -52,6 +62,7 @@ impl UserMessageComponent {
         output_pad: usize,
         markdown_theme: pi_tui::components::markdown::MarkdownTheme,
         style: DefaultTextStyle,
+        transform_ctx: &MarkdownTransformCtx,
     ) -> Markdown {
         Markdown::new(
             text,
@@ -62,6 +73,9 @@ impl UserMessageComponent {
             MarkdownOptions {
                 preserve_list_markers: true,
                 preserve_backslash_escapes: true,
+                // The `user` surface (`user-message.ts:61-65`); user
+                // messages are never streaming.
+                transform: transform_ctx.make("user", None, None, None),
             },
         )
     }
@@ -76,8 +90,13 @@ impl UserMessageComponent {
                 bg_color: Some(theme.bg_styler(pi_tui::theme::ThemeBg::UserMessageBg)),
                 ..DefaultTextStyle::default()
             };
-            self.markdown =
-                Self::build_markdown(&self.text, output_pad, self.markdown_theme.clone(), style);
+            self.markdown = Self::build_markdown(
+                &self.text,
+                output_pad,
+                self.markdown_theme.clone(),
+                style,
+                &self.transform_ctx,
+            );
         }
     }
 }
@@ -99,7 +118,8 @@ mod tests {
 
     #[test]
     fn renders_markdown_on_the_message_background() {
-        let component = UserMessageComponent::new("hello **world**", 1);
+        let component =
+            UserMessageComponent::new("hello **world**", 1, MarkdownTransformCtx::default());
         let lines = component.render(40);
         let plain: Vec<String> = lines
             .iter()

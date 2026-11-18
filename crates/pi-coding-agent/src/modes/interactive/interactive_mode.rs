@@ -933,6 +933,13 @@ pub struct InteractiveMode {
     /// (the mode's half of `onExtensionShortcut` — refilled after load and
     /// after every reload).
     editor_extension_shortcuts: Arc<Mutex<Vec<String>>>,
+    /// The shared markdown-transform plumbing (E3 slice 2): cloned into
+    /// every markdown component so extension transformers run at render
+    /// time (`getMarkdownTransformers` upstream).
+    markdown_transform_ctx: super::components::markdown_transform::MarkdownTransformCtx,
+    /// The shared chain the setup path refills (only with `ext-js`).
+    #[cfg(feature = "ext-js")]
+    markdown_transform_chain: Arc<Mutex<Vec<pi_ext_js::ResolvedMarkdownTransformer>>>,
 
     session: SessionManager,
     model: pi_ai::types::Model,
@@ -1216,11 +1223,26 @@ impl InteractiveMode {
         // settings (`getTuiMode`, default fullscreen).
         let tui_mode = options.tui_mode.unwrap_or_else(|| settings.get_tui_mode());
 
+        // The shared markdown-transform plumbing (E3 slice 2): one context
+        // cloned into every markdown component, the chain refilled at setup
+        // and `/reload` (`getMarkdownTransformers` upstream).
+        #[cfg(feature = "ext-js")]
+        let (markdown_transform_ctx, markdown_transform_chain) =
+            super::components::markdown_transform::MarkdownTransformCtx::for_runner(
+                runtime.extension_runner.clone(),
+            );
+        #[cfg(not(feature = "ext-js"))]
+        let markdown_transform_ctx =
+            super::components::markdown_transform::MarkdownTransformCtx::default();
+
         let mut mode = InteractiveMode {
             tui,
             editor_events,
             status_handle,
             editor_extension_shortcuts,
+            markdown_transform_ctx,
+            #[cfg(feature = "ext-js")]
+            markdown_transform_chain,
             session: std::mem::replace(
                 &mut runtime.session,
                 SessionManager::in_memory(
@@ -1332,6 +1354,11 @@ impl InteractiveMode {
         // surface the conflict warnings.
         #[cfg(feature = "ext-js")]
         mode.setup_extension_shortcuts();
+        // The markdown transformers resolve on the same lifecycle
+        // (`getMarkdownTransformers` reads the runner live upstream; the
+        // chain only changes at load/reload).
+        #[cfg(feature = "ext-js")]
+        mode.setup_markdown_transformers();
         mode
     }
 
@@ -1369,6 +1396,24 @@ impl InteractiveMode {
         for message in &warnings {
             eprintln!("Warning: {message}");
         }
+    }
+
+    /// Refills the shared markdown-transform chain from the runner
+    /// (`getMarkdownTransformers`, `runner.ts:793-803` — load order; the
+    /// surface filter runs at application time).
+    #[cfg(feature = "ext-js")]
+    fn setup_markdown_transformers(&mut self) {
+        let Some(runner) = &self.extension_runner else {
+            return;
+        };
+        let resolved = runner
+            .lock()
+            .expect("extension runner mutex poisoned")
+            .get_markdown_transformers();
+        *self
+            .markdown_transform_chain
+            .lock()
+            .expect("markdown transformers") = resolved;
     }
 
     /// Runs one resolved extension shortcut (`interactive-mode.ts:2425-2431`):
@@ -1897,7 +1942,11 @@ impl InteractiveMode {
         if self.chat_len() > 0 {
             self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
         }
-        self.add_to_chat(Box::new(UserMessageComponent::new(text, self.output_pad)));
+        self.add_to_chat(Box::new(UserMessageComponent::new(
+            text,
+            self.output_pad,
+            self.markdown_transform_ctx.clone(),
+        )));
         self.tui.request_render();
     }
 
@@ -1946,6 +1995,7 @@ impl InteractiveMode {
                             &compaction.summary,
                             compaction.tokens_before as u64,
                             self.output_pad,
+                            self.markdown_transform_ctx.clone(),
                         );
                     row.set_expanded(self.tool_output_expanded);
                     self.add_to_chat(Box::new(row));
@@ -1980,6 +2030,7 @@ impl InteractiveMode {
                         super::components::branch_summary::BranchSummaryMessageComponent::new(
                             &summary.summary,
                             self.output_pad,
+                            self.markdown_transform_ctx.clone(),
                         );
                     row.set_expanded(self.tool_output_expanded);
                     self.add_to_chat(Box::new(row));
@@ -2023,7 +2074,11 @@ impl InteractiveMode {
                     if self.chat_len() > 0 {
                         self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
                     }
-                    self.add_to_chat(Box::new(UserMessageComponent::new(&text, self.output_pad)));
+                    self.add_to_chat(Box::new(UserMessageComponent::new(
+                        &text,
+                        self.output_pad,
+                        self.markdown_transform_ctx.clone(),
+                    )));
                     if populate_history {
                         self.editor_mut().editor.add_to_history(&text);
                     }
@@ -2034,6 +2089,7 @@ impl InteractiveMode {
                     self.hide_thinking_block,
                     "Thinking...",
                     self.output_pad,
+                    self.markdown_transform_ctx.clone(),
                 );
                 component.update_content(assistant, false);
                 self.add_to_chat(Box::new(component));
@@ -2107,6 +2163,7 @@ impl InteractiveMode {
                 let mut row = super::components::branch_summary::BranchSummaryMessageComponent::new(
                     &summary.summary,
                     self.output_pad,
+                    self.markdown_transform_ctx.clone(),
                 );
                 row.set_expanded(self.tool_output_expanded);
                 self.add_to_chat(Box::new(row));
@@ -2123,6 +2180,7 @@ impl InteractiveMode {
             self.hide_thinking_block,
             "Thinking...",
             self.output_pad,
+            self.markdown_transform_ctx.clone(),
         );
         self.streaming_index = Some(self.add_to_chat(Box::new(component)));
         self.tui.request_render();
@@ -3100,6 +3158,7 @@ impl InteractiveMode {
             &result.summary,
             result.tokens_before,
             self.output_pad,
+            self.markdown_transform_ctx.clone(),
         );
         row.set_expanded(self.tool_output_expanded);
         self.add_to_chat(Box::new(row));
@@ -4540,13 +4599,21 @@ impl InteractiveMode {
             0,
         )));
         self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        // The `changelog` surface (`interactive-mode.ts:2374`): the
+        // transformer runs per render, never streaming.
+        let transform = self
+            .markdown_transform_ctx
+            .make("changelog", None, None, None);
         self.add_to_chat(Box::new(pi_tui::components::markdown::Markdown::new(
             changelog_markdown,
             1,
             1,
             theme::markdown_theme(),
             None,
-            pi_tui::components::markdown::MarkdownOptions::default(),
+            pi_tui::components::markdown::MarkdownOptions {
+                transform,
+                ..pi_tui::components::markdown::MarkdownOptions::default()
+            },
         )));
         self.add_to_chat(Box::new(super::components::header::DynamicBorder::new()));
         self.tui.request_render();
@@ -5831,6 +5898,10 @@ impl InteractiveMode {
         // (`setupExtensionShortcuts`, `interactive-mode.ts:6683`).
         #[cfg(feature = "ext-js")]
         self.setup_extension_shortcuts();
+        // The markdown transformers re-resolve with the reloaded runner
+        // (`getMarkdownTransformers` upstream).
+        #[cfg(feature = "ext-js")]
+        self.setup_markdown_transformers();
 
         // `resetApiProviders` + `_buildRuntime` (`agent-session.ts:3850-3862`):
         // the composed catalog recomposes over the reloaded models.json and

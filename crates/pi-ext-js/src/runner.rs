@@ -170,6 +170,10 @@ pub struct ExtensionSnapshot {
     /// Registered shortcuts.
     #[serde(default)]
     pub shortcuts: Vec<ShortcutSpec>,
+    /// The one registered markdown transformer, with its surfaces (the
+    /// transformer fn stays in the JS-side record).
+    #[serde(default, rename = "markdownTransformer")]
+    pub markdown_transformer: Option<MarkdownTransformerSpec>,
 }
 
 /// `{name, description}` of one registered command.
@@ -228,6 +232,32 @@ pub struct ShortcutDiagnostic {
     pub message: String,
     /// The owning extension's path.
     pub path: String,
+}
+
+/// The surfaces of one registered markdown transformer
+/// (`MarkdownTransformerRegistration`, `types.ts:1590-1593`; the
+/// transformer fn stays in the JS-side record keyed by the extension
+/// index).
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarkdownTransformerSpec {
+    /// The `MarkdownMessageType` names the transformer runs on.
+    #[serde(default, rename = "messageTypes")]
+    pub message_types: Vec<String>,
+}
+
+/// One extension markdown transformer, resolved in load order
+/// (`getMarkdownTransformers`, `runner.ts:793-803`: each one leaves
+/// markdown of unregistered surfaces unchanged — the surface check runs at
+/// application time here).
+#[derive(Debug, Clone)]
+pub struct ResolvedMarkdownTransformer {
+    /// The owning extension's index in the snapshot list (the JS-side
+    /// `__piMarkdownTransform` key).
+    pub ext_index: usize,
+    /// The owning extension's path.
+    pub extension_path: String,
+    /// The `MarkdownMessageType` names the transformer runs on.
+    pub message_types: Vec<String>,
 }
 
 /// One extension shortcut the resolution accepted (`ExtensionShortcut`
@@ -1149,6 +1179,41 @@ impl ExtensionRunner {
     /// (`getShortcutDiagnostics`, `runner.ts:396/:680`).
     pub fn shortcut_diagnostics(&self) -> &[ShortcutDiagnostic] {
         &self.shortcut_diagnostics
+    }
+
+    /// The extension markdown transformers in load order
+    /// (`getMarkdownTransformers`, `runner.ts:793-803`). The surface
+    /// filter of upstream's wrap runs at application time
+    /// ([`ResolvedMarkdownTransformer::message_types`]).
+    pub fn get_markdown_transformers(&self) -> Vec<ResolvedMarkdownTransformer> {
+        self.extensions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, extension)| {
+                extension
+                    .markdown_transformer
+                    .as_ref()
+                    .map(|spec| ResolvedMarkdownTransformer {
+                        ext_index: index,
+                        extension_path: extension.path.clone(),
+                        message_types: spec.message_types.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    /// Runs one extension's markdown transformer synchronously
+    /// (`markdown-transform.ts:28-38`; the engine maps throws and
+    /// non-string returns to `None` — keep the current markdown).
+    /// Extension `ext_index` comes from [`Self::get_markdown_transformers`].
+    pub fn markdown_transform(
+        &self,
+        ext_index: usize,
+        markdown: &str,
+        context_json: &str,
+    ) -> Option<String> {
+        self.host
+            .markdown_transform(ext_index, markdown, context_json)
     }
 
     /// Executes a registered shortcut handler (`interactive-mode.ts:2425-2427`
@@ -4104,6 +4169,100 @@ export default function (pi) {
         assert!(error.unwrap_err().to_string().contains("boom"));
         // Unknown chords report not-run.
         assert!(!runner.run_shortcut("ctrl+shift+9").expect("run"));
+    }
+
+    // ---- Markdown transformers (E3 slice 2: `pi.registerMarkdownTransformer`,
+    // `getMarkdownTransformers` load order, the sync `__piMarkdownTransform`
+    // call) ----
+
+    #[test]
+    fn markdown_transformers_resolve_in_load_order_with_replacement() {
+        const EXT_A: &str = r#"
+export default function (pi) {
+  pi.registerMarkdownTransformer((markdown) => markdown);
+  // A second registration REPLACES the first, no warning
+  // (`loader.ts:365-372`), narrowing the surfaces to `summary`.
+  pi.registerMarkdownTransformer((markdown) => markdown, { messageTypes: ["summary"] });
+}
+"#;
+        const EXT_B: &str = r"
+export default function (pi) {
+  pi.registerMarkdownTransformer((markdown) => markdown);
+}
+";
+        const EXT_NONE: &str = r"
+export default function (pi) {}
+";
+        let runner = runner_with(&[EXT_A, EXT_B, EXT_NONE]);
+        let resolved = runner.get_markdown_transformers();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].ext_index, 0);
+        assert_eq!(resolved[0].extension_path, "<test-0>");
+        // The replacement took: only `summary` remains from the first
+        // extension; the second keeps the default transcript surfaces.
+        assert_eq!(resolved[0].message_types, vec!["summary".to_string()]);
+        assert_eq!(
+            resolved[1].message_types,
+            vec![
+                "user".to_string(),
+                "assistant".to_string(),
+                "assistant-thinking".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_transform_runs_and_maps_failures_to_none() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerMarkdownTransformer((markdown, context) => {
+    if (markdown === "throw") throw new Error("nope");
+    if (markdown === "nonstring") return 42;
+    return markdown + "|" + context.messageType + "|" + context.availableWidth +
+      (context.isStreaming ? "|streaming" : "") +
+      (context.messageId === undefined ? "" : "|id:" + context.messageId) +
+      (context.timestamp === undefined ? "" : "|ts:" + context.timestamp);
+  });
+}
+"#;
+        let runner = runner_with(&[EXT]);
+        // The context crosses as JSON; absent optional fields stay absent.
+        let transformed = runner
+            .markdown_transform(
+                0,
+                "hello",
+                r#"{"messageType":"assistant","isStreaming":true,"availableWidth":80}"#,
+            )
+            .expect("transform");
+        assert_eq!(transformed, "hello|assistant|80|streaming");
+        let with_id = runner
+            .markdown_transform(
+                0,
+                "hello",
+                r#"{"messageType":"user","isStreaming":false,"availableWidth":40,"messageId":"m1","timestamp":"2026-01-01"}"#,
+            )
+            .expect("transform");
+        assert_eq!(with_id, "hello|user|40|id:m1|ts:2026-01-01");
+        // A transformer throw keeps the current markdown (`markdown-transform.ts:34-36`).
+        assert!(
+            runner
+                .markdown_transform(
+                    0,
+                    "throw",
+                    r#"{"messageType":"user","isStreaming":false,"availableWidth":10}"#
+                )
+                .is_none()
+        );
+        // A non-string return is ignored the same way.
+        assert!(
+            runner
+                .markdown_transform(
+                    0,
+                    "nonstring",
+                    r#"{"messageType":"user","isStreaming":false,"availableWidth":10}"#
+                )
+                .is_none()
+        );
     }
 
     /// The host shares the runner with the agent loop through

@@ -9,10 +9,14 @@
 //! port renders rows without row backgrounds).
 
 use pi_tui::component::Component;
-use pi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownOptions};
+use pi_tui::components::markdown::{
+    DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTransform,
+};
 use pi_tui::theme::ThemeColor;
+use std::sync::Arc;
 
 use super::super::theme;
+use super::markdown_transform::MarkdownTransformCtx;
 
 /// The branch summary row (`branch-summary-message.ts:20-96`).
 pub struct BranchSummaryMessageComponent {
@@ -21,6 +25,7 @@ pub struct BranchSummaryMessageComponent {
     /// Stored so `setOutputPad` can rebuild the markdown child (upstream
     /// resets the child's padding, `branch-summary-message.ts:42-44`).
     summary: String,
+    transform_ctx: MarkdownTransformCtx,
     /// The expanded body (header + summary); renders at the real width like
     /// upstream's Markdown child.
     markdown: Markdown,
@@ -30,14 +35,16 @@ pub struct BranchSummaryMessageComponent {
 }
 
 impl BranchSummaryMessageComponent {
-    pub fn new(summary: &str, output_pad: usize) -> Self {
+    pub fn new(summary: &str, output_pad: usize, transform_ctx: MarkdownTransformCtx) -> Self {
         let mut component = Self {
             expanded: false,
             output_pad,
             summary: summary.to_string(),
-            markdown: Self::build_markdown(summary, output_pad),
+            transform_ctx,
+            markdown: Self::build_markdown(summary, output_pad, None),
             content: Vec::new(),
         };
+        component.refresh_markdown();
         component.update_display();
         component
     }
@@ -54,15 +61,34 @@ impl BranchSummaryMessageComponent {
     pub fn set_output_pad(&mut self, output_pad: usize) {
         if self.output_pad != output_pad {
             self.output_pad = output_pad;
-            self.markdown = Self::build_markdown(&self.summary, output_pad);
+            self.refresh_markdown();
             self.update_display();
         }
     }
 
+    /// Rebuilds the expanded Markdown child from the current context.
+    fn refresh_markdown(&mut self) {
+        let transform = self
+            .transform_ctx
+            .make("summary", None, None, None)
+            .map(|inner| {
+                let header = "**Branch Summary**\n\n";
+                Arc::new(move |markdown: &str, width: usize| -> String {
+                    format!("{header}{}", inner(markdown, width))
+                }) as MarkdownTransform
+            });
+        self.markdown = Self::build_markdown(&self.summary, self.output_pad, transform);
+    }
+
     /// The expanded Markdown child: Pi's header, then the summary
     /// (`branch-summary-message.ts:55-70`). The transformers see only the
-    /// summary content, not Pi's header.
-    fn build_markdown(summary: &str, output_pad: usize) -> Markdown {
+    /// summary content, not Pi's header; without a transformer the port
+    /// keeps the combined header+summary text — the identical render.
+    fn build_markdown(
+        summary: &str,
+        output_pad: usize,
+        transform: Option<MarkdownTransform>,
+    ) -> Markdown {
         let theme = theme::theme();
         let header = "**Branch Summary**\n\n";
         let style = DefaultTextStyle {
@@ -70,7 +96,11 @@ impl BranchSummaryMessageComponent {
             ..DefaultTextStyle::default()
         };
         Markdown::new(
-            format!("{header}{summary}"),
+            if transform.is_some() {
+                summary.to_string()
+            } else {
+                format!("{header}{summary}")
+            },
             output_pad,
             0,
             theme::markdown_theme(),
@@ -78,6 +108,7 @@ impl BranchSummaryMessageComponent {
             MarkdownOptions {
                 preserve_list_markers: true,
                 preserve_backslash_escapes: true,
+                transform,
             },
         )
     }
@@ -140,7 +171,8 @@ mod tests {
 
     #[test]
     fn collapsed_row_labels_the_expand_key() {
-        let component = BranchSummaryMessageComponent::new("summary text", 1);
+        let component =
+            BranchSummaryMessageComponent::new("summary text", 1, MarkdownTransformCtx::default());
         let plain = plain_lines(&component, 80);
         assert!(plain[0].contains("[branch]"), "{plain:?}");
         let joined = plain.join("\n");
@@ -152,7 +184,11 @@ mod tests {
 
     #[test]
     fn expanded_row_renders_the_summary_markdown() {
-        let mut component = BranchSummaryMessageComponent::new("## Goal\nfinish it", 1);
+        let mut component = BranchSummaryMessageComponent::new(
+            "## Goal\nfinish it",
+            1,
+            MarkdownTransformCtx::default(),
+        );
         component.set_expanded(true);
         let joined = plain_lines(&component, 80).join("\n");
         assert!(joined.contains("Branch Summary"), "{joined}");
@@ -162,7 +198,8 @@ mod tests {
 
     #[test]
     fn expanding_and_collapsing_toggles_the_body() {
-        let mut component = BranchSummaryMessageComponent::new("body", 1);
+        let mut component =
+            BranchSummaryMessageComponent::new("body", 1, MarkdownTransformCtx::default());
         component.set_expanded(true);
         assert!(plain_lines(&component, 80).len() > 3);
         component.set_expanded(false);

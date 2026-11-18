@@ -14,6 +14,7 @@ pub mod extension_editor;
 pub mod extension_selector;
 pub mod footer;
 pub mod header;
+pub mod markdown_transform;
 pub mod model_selector;
 pub mod scoped_models_selector;
 pub mod session_selector;
