@@ -981,6 +981,12 @@ pub struct InteractiveMode {
     compaction_queued: Vec<(String, bool)>,
     /// ctrl+c twice within 500ms exits (`handleCtrlC`).
     last_sigint_time: Option<Instant>,
+    /// The chat-tail status pair's identity (`lastStatusSpacer` +
+    /// `lastStatusText`, `interactive-mode.ts:519-521`): heap addresses of
+    /// the two rows, immune to index shifts from streaming splices.
+    /// Back-to-back `show_status` calls update the pair in place instead of
+    /// stacking rows.
+    last_status_pair: Option<(usize, usize)>,
     /// Spinner-frame pacing, carried across `pump` calls.
     last_spinner_tick: Instant,
     /// ctrl+o state: tool output expansion and the header hints.
@@ -1265,6 +1271,7 @@ impl InteractiveMode {
             streaming_index: None,
             agent_run: None,
             last_sigint_time: None,
+            last_status_pair: None,
             last_spinner_tick: Instant::now(),
             tool_output_expanded: false,
             hide_thinking_block,
@@ -1945,6 +1952,16 @@ impl InteractiveMode {
 
     fn chat_len(&mut self) -> usize {
         self.chat_mut().len()
+    }
+
+    /// A chat row's heap address (upstream's object identity for
+    /// `lastStatusText`/`lastStatusSpacer`): stable across the index shifts
+    /// streaming splices cause.
+    fn chat_row_addr(&mut self, index: usize) -> Option<usize> {
+        let chat = self.chat_mut();
+        chat.get(index).map(|row| {
+            std::ptr::from_ref::<dyn pi_tui::component::Component>(row).cast::<()>() as usize
+        })
     }
 
     fn editor_mut(&mut self) -> &mut ChatEditor {
@@ -4665,6 +4682,7 @@ impl InteractiveMode {
     /// `showWarning` (`interactive-mode.ts:4815-4819`): a warning-colored
     /// line in the chat, prefixed `Warning: ` (`interactive-mode.ts:4818`).
     fn show_warning(&mut self, message: &str) {
+        self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
         self.add_to_chat(Box::new(Text::new(
             theme::theme().fg(
                 pi_tui::theme::ThemeColor::Warning,
@@ -5054,6 +5072,7 @@ impl InteractiveMode {
             Ok(session) => {
                 self.session = session;
                 self.chat_mut().clear();
+                self.last_status_pair = None;
                 self.pending_tools.clear();
                 self.streaming_index = None;
                 self.refresh_footer();
@@ -5449,21 +5468,50 @@ impl InteractiveMode {
         *self.status_handle.lock().expect("status") = indicator;
     }
 
-    /// `showStatus` (`interactive-mode.ts:3964`): a muted line in the chat.
+    /// `showStatus` (`interactive-mode.ts:3964-3984`): a muted line in the
+    /// chat tail — `Spacer(1)` + the message. Back-to-back statuses
+    /// (nothing else added to the chat in between) REPLACE the previous
+    /// pair instead of stacking rows, or thinking-level cycling appends one
+    /// line per press. Upstream checks the object identity of the last two
+    /// children and sets the text in place; the port compares the rows' heap
+    /// addresses and swaps the pair for a fresh one (pi-tui's `as_any_mut`
+    /// is deliberately closed, so there is no `Text` downcast) — same rows,
+    /// same position, same count.
     fn show_status(&mut self, message: &str) {
-        self.add_to_chat(Box::new(Text::new(
+        let len = self.chat_len();
+        if len >= 2
+            && let Some((spacer_addr, text_addr)) = self.last_status_pair
+            && self.chat_row_addr(len - 1) == Some(text_addr)
+            && self.chat_row_addr(len - 2) == Some(spacer_addr)
+        {
+            self.chat_mut().remove_child(len - 2);
+            self.chat_mut().remove_child(len - 2);
+        } else {
+            self.last_status_pair = None;
+        }
+        let spacer_index = self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        let text_index = self.add_to_chat(Box::new(Text::new(
             theme::theme().fg(pi_tui::theme::ThemeColor::Muted, message),
             1,
             0,
         )));
+        self.last_status_pair = Some((
+            self.chat_row_addr(spacer_index).unwrap_or_default(),
+            self.chat_row_addr(text_index).unwrap_or_default(),
+        ));
         self.tui.request_render();
     }
 
-    /// `showError`: a red line in the chat.
+    /// `showError` (`interactive-mode.ts:4809-4813`): a red line in the chat
+    /// — `Spacer(1)` + `Error: ` + the message at the output pad.
     fn show_error(&mut self, message: &str) {
+        self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
         self.add_to_chat(Box::new(Text::new(
-            theme::theme().fg(pi_tui::theme::ThemeColor::Error, message),
-            1,
+            theme::theme().fg(
+                pi_tui::theme::ThemeColor::Error,
+                &format!("Error: {message}"),
+            ),
+            self.output_pad,
             0,
         )));
         self.tui.request_render();
@@ -5989,6 +6037,14 @@ impl InteractiveMode {
                 self.pending_tools.clear();
                 self.streaming_index = None;
                 self.compaction_run = None;
+                // The rebind callback re-renders the CURRENT session state:
+                // `renderCurrentSessionState` clears the chat before replaying
+                // the resumed transcript (`interactive-mode.ts:2337-2347` via
+                // `rebindCurrentSession({renderBeforeBind: true})`), so the
+                // resumed entries REPLACE the old transcript rather than
+                // appending below it.
+                self.chat_mut().clear();
+                self.last_status_pair = None;
                 self.render_initial_messages();
                 self.refresh_footer();
                 self.show_status("Resumed session");
@@ -7364,6 +7420,7 @@ impl InteractiveMode {
                 // Update UI: the transcript replays from the new leaf
                 // (`:5856-5863`).
                 self.chat_mut().clear();
+                self.last_status_pair = None;
                 self.render_initial_messages();
                 if let Some(text) = editor_text
                     && self.editor_mut().editor.get_text().trim().is_empty()
@@ -9840,6 +9897,175 @@ mod tests {
         assert!(plain.contains("done listing"), "{plain}");
     }
 
+    /// Back-to-back statuses REPLACE the chat-tail pair in place
+    /// (`showStatus`'s identity check, `interactive-mode.ts:3964-3984`) —
+    /// the user-reported stacking: every thinking-level press used to append
+    /// another line. The count stays fixed and the tracked pair keeps
+    /// matching the current tail rows.
+    #[test]
+    fn consecutive_statuses_replace_the_chat_tail_pair() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, _capture) = fixture(dir.path(), "unused.txt");
+        let before = mode.chat_len();
+        mode.show_status("Thinking level: minimal");
+        assert_eq!(mode.chat_len(), before + 2, "spacer + text appended");
+        let (_, text_addr) = mode.last_status_pair.expect("pair tracked");
+        let tail_index = mode.chat_len();
+        assert_eq!(
+            mode.chat_row_addr(tail_index - 1),
+            Some(text_addr),
+            "the pair tracks the tail text row"
+        );
+        mode.show_status("Thinking level: low");
+        mode.show_status("Thinking level: medium");
+        assert_eq!(
+            mode.chat_len(),
+            before + 2,
+            "back-to-back statuses replace the pair, not stack rows"
+        );
+        let (spacer_addr, text_addr) = mode.last_status_pair.expect("pair tracked");
+        let tail_index = mode.chat_len();
+        assert_eq!(mode.chat_row_addr(tail_index - 1), Some(text_addr));
+        assert_eq!(mode.chat_row_addr(tail_index - 2), Some(spacer_addr));
+    }
+
+    /// Any other row added to the chat breaks the tail pair: the next status
+    /// appends a fresh pair (upstream compares the object identity of the
+    /// last two children, `interactive-mode.ts:3968-3972`).
+    #[test]
+    fn interleaved_chat_row_breaks_the_status_pair() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, _capture) = fixture(dir.path(), "unused.txt");
+        let before = mode.chat_len();
+        mode.show_status("first");
+        mode.add_to_chat(Box::new(Text::new("interleaved", 1, 0)));
+        mode.show_status("second");
+        assert_eq!(
+            mode.chat_len(),
+            before + 5,
+            "pair (2) + interleaved row (1) + fresh pair (2)"
+        );
+        let (spacer_addr, text_addr) = mode.last_status_pair.expect("pair tracked");
+        let tail_index = mode.chat_len();
+        assert_eq!(mode.chat_row_addr(tail_index - 1), Some(text_addr));
+        assert_eq!(mode.chat_row_addr(tail_index - 2), Some(spacer_addr));
+    }
+
+    /// The user-reported repro through the real key path: cycling the
+    /// thinking level repeatedly appends exactly one status pair
+    /// (`cycleThinkingLevel` → `showStatus`, `interactive-mode.ts:4711-4721`).
+    #[test]
+    fn thinking_level_cycle_renders_one_status_line() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        mode.tui.start().expect("tui start");
+        assert!(mode.model.reasoning, "the fixture model supports thinking");
+        let before = mode.chat_len();
+        for _ in 0..6 {
+            mode.cycle_thinking_level();
+        }
+        mode.tui.render_now(false);
+        assert_eq!(mode.chat_len(), before + 2, "the cycle stacks nothing");
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("Thinking level:"), "{plain}");
+    }
+
+    /// `showError` (`interactive-mode.ts:4809-4813`): a leading spacer, the
+    /// `Error: ` prefix, and — unlike `showStatus` — no coalescing: each
+    /// error appends its own rows.
+    #[test]
+    fn show_error_renders_the_prefix_and_never_coalesces() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture) = fixture(dir.path(), "unused.txt");
+        mode.tui.start().expect("tui start");
+        let before = mode.chat_len();
+        mode.show_error("boom");
+        mode.tui.render_now(false);
+        assert_eq!(mode.chat_len(), before + 2);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("Error: boom"), "{plain}");
+        mode.show_error("again");
+        assert_eq!(mode.chat_len(), before + 4, "errors never coalesce");
+    }
+
+    /// The in-session `/resume` dialog REPLACES the transcript (upstream's
+    /// `renderCurrentSessionState` clears the chat before replaying,
+    /// `interactive-mode.ts:2337-2347` via `rebindCurrentSession`) — the
+    /// resumed entries do not append below the old chat.
+    #[test]
+    fn resumed_session_replaces_the_previous_transcript() {
+        use pi_ai::types::{UserContent, UserMessage};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let make_session = |dir: &std::path::Path, prompts: &[&str]| {
+            let mut session =
+                SessionManager::create(dir, None, &NewSessionOptions::default()).expect("session");
+            for prompt in prompts {
+                session
+                    .append_message(AgentMessage::User(UserMessage {
+                        content: UserContent::Text((*prompt).to_string()),
+                        timestamp: 0,
+                    }))
+                    .expect("append user");
+            }
+            session.session_file().expect("session file").to_path_buf()
+        };
+        let path_a = make_session(dir.path(), &["first session alpha", "first session beta"]);
+        let path_b = make_session(dir.path(), &["second session gamma"]);
+
+        let options = InteractiveOptions {
+            auth_path: Some(dir.path().join("auth.json")),
+            ..InteractiveOptions::default()
+        };
+        let new_stream = || {
+            Arc::new(ScriptedStream {
+                calls: AtomicUsize::new(0),
+                file_path: "unused".to_string(),
+            }) as Arc<dyn pi_agent::types::StreamFn>
+        };
+
+        // The baseline: how many rows a fresh boot of session B replays.
+        let mut runtime_b = test_runtime(dir.path(), new_stream());
+        runtime_b.session = SessionManager::open(&path_b, None, None).expect("reopen b");
+        let mut mode_b = InteractiveMode::new(
+            &mut runtime_b,
+            &options,
+            Box::new(CaptureTerminal::with_size(TerminalSize {
+                columns: 100,
+                rows: 40,
+            })),
+        );
+        mode_b.render_initial_messages();
+        let fresh_b_rows = mode_b.chat_len();
+        assert!(fresh_b_rows > 0, "session b replays its user message");
+
+        // Boot over session A (a longer transcript), then resume B in place.
+        let mut runtime = test_runtime(dir.path(), new_stream());
+        runtime.session = SessionManager::open(&path_a, None, None).expect("reopen a");
+        let mut mode = InteractiveMode::new(
+            &mut runtime,
+            &options,
+            Box::new(CaptureTerminal::with_size(TerminalSize {
+                columns: 100,
+                rows: 40,
+            })),
+        );
+        mode.render_initial_messages();
+        let len_a = mode.chat_len();
+        assert!(len_a > fresh_b_rows, "the fixtures must differ in size");
+
+        mode.switch_session(&path_b);
+        assert_eq!(
+            mode.chat_len(),
+            fresh_b_rows + 2,
+            "the resumed transcript REPLACED the old chat (plus the `Resumed session` status pair)"
+        );
+        let (spacer_addr, text_addr) = mode.last_status_pair.expect("pair tracked");
+        let tail_index = mode.chat_len();
+        assert_eq!(mode.chat_row_addr(tail_index - 1), Some(text_addr));
+        assert_eq!(mode.chat_row_addr(tail_index - 2), Some(spacer_addr));
+    }
+
     #[test]
     fn end_to_end_tool_call_round_trip_renders_like_pi() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -12272,12 +12498,13 @@ export default function (pi) {
         mode.tui.render_now(false);
 
         let plain = strip_terminal_sequences(&capture.output());
+        // `showError` prepends `Error: ` (`interactive-mode.ts:4809-4813`);
+        // at 100 columns the prefixed line wraps, so assert per line.
         assert!(
-            plain.contains(
-                "Wait for the current compaction or tree navigation to finish before navigating the session tree.",
-            ),
+            plain.contains("Error: Wait for the current compaction or tree navigation to finish"),
             "{plain}"
         );
+        assert!(plain.contains(" tree."), "{plain}");
         // The original leaf stands; no navigation started and the editor
         // came back.
         assert_eq!(
