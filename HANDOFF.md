@@ -2547,6 +2547,85 @@ method on the guard). And the gate script must capture clippy/test exit
 codes into files — piping through `tail`/`head` masks them
 (the AGENTS.md rule, rediscovered while assembling this gate).
 
+## E3 slice 4: message renderers for custom messages (landed on `feat/e3-message-renderers`, 2026-11-18)
+
+`pi.registerMessageRenderer` — upstream ground truth `loader.ts:360-363`
+(registration), `runner.ts:782-790` (resolution),
+`interactive-mode.ts:4032-4048` (addMessageToChat case "custom"),
+`custom-message.ts:14-138` (the component), `core/messages.ts:46-54` +
+`:123-137` (the record and the live builder), `types.ts:1556-1560` +
+`:1599-1603` (options + renderer type), `session-manager.ts:439-466`
+(replay projection). Commit 770838a (8 files, +987/−80), full gate
+1840 passed / 0 failed (FMT/CLIPPY/TEST/FMTCHECK/NDF all 0), CI run on
+the main push.
+
+What landed:
+
+- `pi.registerMessageRenderer` in BOTH glue records — the record field
+  is pre-initialized (`loader.ts:617`), so registration is a straight
+  set with REPLACE semantics, no `??=` (unlike `entryRenderers`); the
+  headless stub went from throw to harmless registration; the inspect
+  snapshot carries `messageRenderers` keys beside the entry ones.
+- `Runner::get_message_renderer` (first extension in load order wins) +
+  `render_message` reusing `EntryRenderOutcome`; `__piRenderMessage`
+  crosses the record with its injected `role:"custom"` plus
+  `MessageRenderOptions {expanded, outputPad, keyText, keyHint}` —
+  `outputPad` is the one option entries lack — over the shared ops
+  theme surface and `__piKeybindingKeys`.
+- `CustomMessageComponent` (`components/custom_message.rs`): the fixed
+  leading `Spacer(1)` rides every rebuild (constructor, `:44`); the
+  adopted component replaces the content, and EVERY other outcome — no
+  renderer, `undefined`, a throw, a host-level engine failure — falls
+  through to the default box: bold `[customType]` label in
+  `customMessageLabel`, content as Markdown styled `customMessageText`
+  on the `custom` markdown surface (its first consumer; slice 2 left
+  it unwired). Unlike the custom ENTRIES, a throw is NOT an error box
+  (upstream's catch is silent, `custom-message.ts:93-95`).
+- `ComponentProxy` promoted to shared
+  `components/component_proxy.rs` (entries + messages embed the same
+  bridge; its inline render-failure line became
+  "component render failed: …").
+- Mode wiring: `addMessageToChat` case "custom" (`display:false`
+  renders nothing; the renderer resolves at the mode; the row lands at
+  the chat TAIL — no streaming splice, that is entries-only), the live
+  `entry_appended` arm (`createCustomMessage` ISO→epoch ms, no meta),
+  and the replay `SessionEntry::CustomMessage` arm through
+  `session_entry_to_context_messages` with the persisted meta (entry
+  id + ISO timestamp) crossing to the markdown transformers. The
+  `custom_message` skip is gone from the `render_session_entries`
+  deviation note.
+- Both custom rows joined the duck-typed toggles upstream covers
+  (`setToolOutputExpanded`, `interactive-mode.ts:4753-4758`;
+  `onOutputPadChange`, `:5270-5281`). Slice-3 fixups that fell out:
+  `CustomEntryComponent` gained the missing `set_output_pad`
+  (`custom-entry.ts:38-41`) and both components the missing
+  `as_any_mut` (a missing override makes the tree downcast silently
+  no-op — the AGENTS.md rule, hit again).
+
+Tests: 9 new — 6 in `pi-ext-js` (`messageRendererFirstWins`-style:
+first-wins, none outcomes, throw + adoption rejection, the full
+handle round trip with the record crossing, options/outputPad/
+keybindings, the theme surface) and 3 in `pi-coding-agent` (live
+append renders + `display:false` skips; a throw and a no-renderer
+type both take the default box with no "renderer failed" row; replay
+renders the default box AND the `custom`-surface transformer sees the
+persisted id/timestamp).
+
+Deviations/notes:
+
+- A host-level engine failure in `render_message` falls through to the
+  default box (upstream's host cannot fail the call; entries surface
+  it through the error box, messages match the catch semantics).
+- The keybindings table crossing stays `DEFAULTS` only (unchanged from
+  slice 3).
+
+Gotchas this slice: the `with_bg` bg closure must be `'static` — call
+`theme::theme()` INSIDE the closure, never capture the local handle
+(E0373). clippy `single_match_else` + `match_same_arms` push a
+one-real-arm match into an `if let` with a fall-through flag. And the
+gate's fmt-write keeps invalidating Edit read-state — re-Read before
+every edit after a gate run.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
