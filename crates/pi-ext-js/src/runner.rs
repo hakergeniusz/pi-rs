@@ -180,6 +180,10 @@ pub struct ExtensionSnapshot {
     /// The custom message types this extension registered a renderer for.
     #[serde(default, rename = "messageRenderers")]
     pub message_renderers: Vec<String>,
+    /// How many tool-renderer resolvers this extension registered
+    /// (`toolRenderers`, `loader.ts:379-383` — resolvers accumulate).
+    #[serde(default, rename = "toolRenderers")]
+    pub tool_renderers: u32,
 }
 
 /// `{name, description}` of one registered command.
@@ -269,6 +273,48 @@ pub struct ResolvedMarkdownTransformer {
 /// The embedder-installed `theme.fg`/`theme.bg` mapping
 /// ([`Self::set_theme_surface`]): token name + text in, styled text out.
 pub type ThemeSurfaceFn = std::sync::Arc<dyn Fn(&str, &str) -> String + Send + Sync>;
+
+/// One `ToolRenderers` slot after resolution (`types.ts:693`): the
+/// built-in rendering stays Rust-side (`builtin`), a resolver-supplied fn
+/// is bridged through the stash (`custom`), and `absent` renders the row's
+/// generic fallback (`tool-execution.ts:300-301`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRenderSlot {
+    /// The built-in (or the tool definition's own Rust-side) rendering.
+    Builtin,
+    /// A resolver-supplied function; cross through the stash.
+    Custom,
+    /// No fn at all — the generic fallback.
+    Absent,
+}
+
+/// The winning `ToolRenderers` for one tool row
+/// (`getRegisteredToolDefinition`, `interactive-mode.ts:2356-2360`): the
+/// object is stashed JS-side behind `stash_id` and lives until the row is
+/// dropped ([`Self::tool_renderer_release`]).
+#[derive(Debug, Clone)]
+pub struct ResolvedToolRenderers {
+    /// The stash key for [`Self::tool_render_call`] /
+    /// [`Self::tool_render_result`].
+    pub stash_id: u32,
+    /// `renderShell` (`types.ts:616`): `self` rows draw their own framing.
+    pub render_shell_self: bool,
+    /// The call-line slot.
+    pub render_call: ToolRenderSlot,
+    /// The result-body slot.
+    pub render_result: ToolRenderSlot,
+}
+
+/// What one `resolveToolRenderers` chain produced: the stashed renderers,
+/// nothing (a resolver returned undefined without calling `next` — the row
+/// takes the generic path), or the resolver's failure text (upstream
+/// propagates a throw into row creation; the port falls back).
+#[derive(Debug, Clone)]
+pub enum ToolRenderersOutcome {
+    Renderers(ResolvedToolRenderers),
+    None,
+    Failed(String),
+}
 
 /// What one entry-renderer call produced (`CustomEntryComponent.rebuild`
 /// upstream): the adopted component's handle + input flag, the renderer's
@@ -1301,6 +1347,60 @@ impl ExtensionRunner {
     ) -> Result<EntryRenderOutcome, JsHostError> {
         self.host
             .render_message(ext_index, custom_type, message_json, options_json)
+    }
+
+    /// Runs the tool-renderer resolver chain for one tool name
+    /// (`resolveToolRenderers`, `runner.ts:798-806` — resolvers in load
+    /// order, each receiving `next()`; the base mirrors
+    /// `withBuiltInRenderers` — `has_builtin` decides whether it is the
+    /// built-in marker object or undefined for unknown tools). The winning
+    /// object is stashed per row; release it with
+    /// [`Self::tool_renderer_release`] when the row goes away.
+    pub fn resolve_tool_renderers(
+        &self,
+        tool_name: &str,
+        has_builtin: bool,
+    ) -> Result<ToolRenderersOutcome, JsHostError> {
+        self.host.resolve_tool_renderers(tool_name, has_builtin)
+    }
+
+    /// Calls the stashed renderers' `renderCall`
+    /// (`tool-execution.ts:305`): the engine adopts the returned component
+    /// and reports the outcome. `args_json` is the row's current arguments;
+    /// `context_json` carries the `ToolRenderContext` flags. A renderer
+    /// throw surfaces as [`EntryRenderOutcome::Failed`] and the row falls
+    /// back to the generic call line (`tool-execution.ts:309-313`).
+    pub fn tool_render_call(
+        &self,
+        stash_id: u32,
+        args_json: &str,
+        context_json: &str,
+    ) -> Result<EntryRenderOutcome, JsHostError> {
+        self.host
+            .tool_render_call(stash_id, args_json, context_json)
+    }
+
+    /// Calls the stashed renderers' `renderResult`
+    /// (`tool-execution.ts:326-331`): the result record and the
+    /// `{expanded, isPartial}` options cross beside the context flags. A
+    /// throw falls back to the sliced-output text
+    /// (`tool-execution.ts:335-341`).
+    pub fn tool_render_result(
+        &self,
+        stash_id: u32,
+        args_json: &str,
+        result_json: &str,
+        options_json: &str,
+        context_json: &str,
+    ) -> Result<EntryRenderOutcome, JsHostError> {
+        self.host
+            .tool_render_result(stash_id, args_json, result_json, options_json, context_json)
+    }
+
+    /// Drops one row's stashed renderers (the row's Rust side calls this
+    /// from `Drop` so the JS registry does not leak).
+    pub fn tool_renderer_release(&self, stash_id: u32) -> Result<(), JsHostError> {
+        self.host.tool_renderer_release(stash_id)
     }
 
     /// Renders one adopted component (`custom-entry.ts` embeds it as a
@@ -5574,5 +5674,288 @@ export default function (pi) {
             themed.component_render(handle, 10).expect("render"),
             vec!["<customMessageText>X</customMessageText>".to_string()]
         );
+    }
+
+    // ---- E3 slice 5: tool renderers ----
+
+    /// A passthrough resolver adopts the base verbatim
+    /// (`resolveToolRenderers`, runner.ts:798-806): a known tool's base
+    /// carries the built-in slots (`withBuiltInRenderers`,
+    /// renderers/index.ts:51-63), which cross as the `builtin`
+    /// classification — and a builtin slot never crosses the render
+    /// bridge; the row renders Rust-side.
+    #[test]
+    fn tool_renderer_chain_passthrough_yields_builtin_slots() {
+        const EXT: &str = r"
+export default function (pi) {
+  pi.registerToolRenderer((toolName, next) => next());
+}
+";
+        let runner = runner_with(&[EXT]);
+        let outcome = runner
+            .resolve_tool_renderers("read", true)
+            .expect("resolve");
+        let ToolRenderersOutcome::Renderers(resolved) = outcome else {
+            panic!("expected renderers, got {outcome:?}");
+        };
+        assert_eq!(resolved.render_call, ToolRenderSlot::Builtin);
+        assert_eq!(resolved.render_result, ToolRenderSlot::Builtin);
+        assert!(!resolved.render_shell_self);
+        let outcome = runner
+            .tool_render_call(resolved.stash_id, "{}", "{}")
+            .expect("render call");
+        assert!(matches!(outcome, EntryRenderOutcome::None), "{outcome:?}");
+    }
+
+    /// Resolvers run in load order and the first non-undefined return stops
+    /// the chain (`registerToolRenderer`, loader.ts:379-383;
+    /// `resolveToolRenderers`, runner.ts:798-806) — the second extension's
+    /// throwing resolver must never run, or the resolve would surface its
+    /// failure instead.
+    #[test]
+    fn tool_renderer_first_resolver_wins_and_stops_the_chain() {
+        const EXT_A: &str = r#"
+export default function (pi) {
+  pi.registerToolRenderer((toolName, next) => ({
+    renderCall: (args, theme, context) => ({
+      render: () => ["a-call"],
+      invalidate: () => {},
+    }),
+  }));
+}
+"#;
+        const EXT_B: &str = r#"
+export default function (pi) {
+  pi.registerToolRenderer(() => {
+    throw new Error("chain-reached-b");
+  });
+}
+"#;
+        let runner = runner_with(&[EXT_A, EXT_B]);
+        let outcome = runner
+            .resolve_tool_renderers("synth", false)
+            .expect("resolve");
+        let ToolRenderersOutcome::Renderers(resolved) = outcome else {
+            panic!("expected renderers, got {outcome:?}");
+        };
+        assert_eq!(resolved.render_call, ToolRenderSlot::Custom);
+        assert_eq!(resolved.render_result, ToolRenderSlot::Absent);
+        let outcome = runner
+            .tool_render_call(resolved.stash_id, "{}", "{}")
+            .expect("render call");
+        let EntryRenderOutcome::Component { handle, .. } = outcome else {
+            panic!("expected a component, got {outcome:?}");
+        };
+        assert_eq!(
+            runner.component_render(handle, 40).expect("render"),
+            vec!["a-call".to_string()]
+        );
+    }
+
+    /// An unknown tool's base is undefined (`withBuiltInRenderers` has no
+    /// built-in for it, renderers/index.ts:51-63), so a passthrough
+    /// resolver adopts nothing; `renderShell: "self"` crosses as the
+    /// self-shell flag and an explicit `renderResult: undefined` is the
+    /// absent slot (types.ts:616/:693).
+    #[test]
+    fn tool_renderer_unknown_tool_base_is_undefined_and_shell_self_crosses() {
+        const EXT_PASS: &str = r"
+export default function (pi) {
+  pi.registerToolRenderer((toolName, next) => next());
+}
+";
+        const EXT_SELF: &str = r#"
+export default function (pi) {
+  pi.registerToolRenderer(() => ({
+    renderShell: "self",
+    renderCall: (args) => ({ render: () => ["self-row"], invalidate: () => {} }),
+    renderResult: undefined,
+  }));
+}
+"#;
+        let runner = runner_with(&[EXT_PASS]);
+        let outcome = runner
+            .resolve_tool_renderers("synth", false)
+            .expect("resolve");
+        assert!(matches!(outcome, ToolRenderersOutcome::None), "{outcome:?}");
+        let runner = runner_with(&[EXT_SELF]);
+        let outcome = runner
+            .resolve_tool_renderers("synth", false)
+            .expect("resolve");
+        let ToolRenderersOutcome::Renderers(resolved) = outcome else {
+            panic!("expected renderers, got {outcome:?}");
+        };
+        assert!(resolved.render_shell_self);
+        assert_eq!(resolved.render_call, ToolRenderSlot::Custom);
+        assert_eq!(resolved.render_result, ToolRenderSlot::Absent);
+    }
+
+    /// `renderCall(args, theme, context)` receives the full
+    /// `ToolRenderContext` (tool-execution.ts:122-144): args/cwd/
+    /// toolCallId/outputPad cross Rust-side, and `state` is the row's
+    /// shared object (tool-execution.ts:39/:131) that survives across
+    /// calls — the second call sees the component the first stashed.
+    #[test]
+    fn tool_render_call_round_trip_context_state_and_last_component() {
+        const CONTEXT: &str = r#"{"toolCallId":"call-1","cwd":"/w","executionStarted":true,"argsComplete":true,"isPartial":true,"expanded":false,"showImages":false,"isError":false,"outputPad":3}"#;
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerToolRenderer(() => ({
+    renderCall: (args, theme, context) => {
+      const last = context.state.comp ? "last:same" : "last:none";
+      const component = {
+        render: () => [
+          String(args.k),
+          context.cwd,
+          context.toolCallId,
+          String(context.outputPad),
+          "n=" + String(context.state.n),
+          last,
+        ],
+        invalidate: () => {},
+      };
+      context.state.comp = component;
+      return component;
+    },
+  }));
+}
+"#;
+        let runner = runner_with(&[EXT]);
+        let outcome = runner
+            .resolve_tool_renderers("read", true)
+            .expect("resolve");
+        let ToolRenderersOutcome::Renderers(resolved) = outcome else {
+            panic!("expected renderers, got {outcome:?}");
+        };
+        // First call: the row's state starts empty, so the marker is
+        // "last:none", and the unset `state.n` stringifies as "undefined".
+        let outcome = runner
+            .tool_render_call(resolved.stash_id, r#"{"k":7}"#, CONTEXT)
+            .expect("render call");
+        let EntryRenderOutcome::Component { handle, .. } = outcome else {
+            panic!("expected a component, got {outcome:?}");
+        };
+        assert_eq!(
+            runner.component_render(handle, 40).expect("render"),
+            vec![
+                "7".to_string(),
+                "/w".to_string(),
+                "call-1".to_string(),
+                "3".to_string(),
+                "n=undefined".to_string(),
+                "last:none".to_string()
+            ]
+        );
+        // Second call on the same row: the shared `state` kept the first
+        // call's component, so the marker flips to "last:same" while
+        // everything else renders identically.
+        let outcome = runner
+            .tool_render_call(resolved.stash_id, r#"{"k":7}"#, CONTEXT)
+            .expect("render call");
+        let EntryRenderOutcome::Component { handle, .. } = outcome else {
+            panic!("expected a component, got {outcome:?}");
+        };
+        assert_eq!(
+            runner.component_render(handle, 40).expect("render"),
+            vec![
+                "7".to_string(),
+                "/w".to_string(),
+                "call-1".to_string(),
+                "3".to_string(),
+                "n=undefined".to_string(),
+                "last:same".to_string()
+            ]
+        );
+    }
+
+    /// `renderResult(result, options, theme, context)` receives the tool
+    /// result record and the `{expanded, isPartial}` options beside the
+    /// context flags (tool-execution.ts:326-331).
+    #[test]
+    fn tool_render_result_options_and_content_cross() {
+        const CONTEXT: &str = r#"{"toolCallId":"call-1","cwd":"/w","executionStarted":true,"argsComplete":true,"isPartial":false,"expanded":true,"showImages":false,"isError":false,"outputPad":1}"#;
+        const EXT: &str = r"
+export default function (pi) {
+  pi.registerToolRenderer(() => ({
+    renderResult: (result, options, theme, context) => ({
+      render: () => [
+        String(options.expanded),
+        String(options.isPartial),
+        result.content[0].text,
+        String(context.isError),
+        String(context.isPartial),
+      ],
+      invalidate: () => {},
+    }),
+  }));
+}
+";
+        let runner = runner_with(&[EXT]);
+        let outcome = runner
+            .resolve_tool_renderers("read", true)
+            .expect("resolve");
+        let ToolRenderersOutcome::Renderers(resolved) = outcome else {
+            panic!("expected renderers, got {outcome:?}");
+        };
+        let outcome = runner
+            .tool_render_result(
+                resolved.stash_id,
+                "{}",
+                r#"{"content":[{"type":"text","text":"body text"}],"details":null}"#,
+                r#"{"expanded":true,"isPartial":false}"#,
+                CONTEXT,
+            )
+            .expect("render result");
+        let EntryRenderOutcome::Component { handle, .. } = outcome else {
+            panic!("expected a component, got {outcome:?}");
+        };
+        assert_eq!(
+            runner.component_render(handle, 40).expect("render"),
+            vec![
+                "true".to_string(),
+                "false".to_string(),
+                "body text".to_string(),
+                "false".to_string(),
+                "false".to_string()
+            ]
+        );
+    }
+
+    /// A renderer throw crosses as `Failed(message)` — upstream the catch
+    /// falls back to the generic call line (tool-execution.ts:309-313) —
+    /// and `tool_renderer_release` drops the stash entry, so a later call
+    /// on the released row finds nothing.
+    #[test]
+    fn tool_render_throw_falls_to_failed_and_release_empties_the_stash() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerToolRenderer(() => ({
+    renderCall: () => {
+      throw new Error("boom-call");
+    },
+  }));
+}
+"#;
+        let runner = runner_with(&[EXT]);
+        let outcome = runner
+            .resolve_tool_renderers("read", true)
+            .expect("resolve");
+        let ToolRenderersOutcome::Renderers(resolved) = outcome else {
+            panic!("expected renderers, got {outcome:?}");
+        };
+        let outcome = runner
+            .tool_render_call(resolved.stash_id, "{}", "{}")
+            .expect("render call");
+        let EntryRenderOutcome::Failed(message) = outcome else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert_eq!(message, "boom-call");
+        runner
+            .tool_renderer_release(resolved.stash_id)
+            .expect("release");
+        let outcome = runner
+            .tool_render_call(resolved.stash_id, "{}", "{}")
+            .expect("render call");
+        assert!(matches!(outcome, EntryRenderOutcome::None), "{outcome:?}");
     }
 }

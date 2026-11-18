@@ -457,6 +457,14 @@ globalThis.__piCreateApi = function (extIdx) {
       ext.messageRenderers[customType] = renderer;
     },
 
+    registerToolRenderer(resolver) {
+      assertActive();
+      // `loader.ts:379-383`: assertActive, then `??= []` + push — resolvers
+      // accumulate in registration order and nothing is validated here;
+      // the chain runs at resolve time in load order (`runner.ts:798-806`).
+      (ext.toolRenderers ??= []).push(resolver);
+    },
+
     registerFlag(name, options) {
       assertActive();
       if (options.default !== undefined && typeof options.default !== options.type) {
@@ -512,8 +520,12 @@ globalThis.__piCreateApi = function (extIdx) {
       // API in every context; nothing renders entries without a TUI).
       (ext.entryRenderers ??= {})[customType] = renderer;
     },
-    registerToolRenderer() {
-      throw new Error("pi.registerToolRenderer is not available in the E1 headless extensions core (E3)");
+    registerToolRenderer(resolver) {
+      assertActive();
+      // Registration is harmless headless (upstream registers from the base
+      // API in every context; nothing renders tool rows without a TUI) —
+      // E3 slice 5 joins it to the supported set.
+      (ext.toolRenderers ??= []).push(resolver);
     },
     registerProvider() {
       throw new Error("pi.registerProvider is not available in the E1 headless extensions core (E2)");
@@ -1473,6 +1485,153 @@ globalThis.__piRenderMessage = function (extIdx, customType, messageJson, option
   }
 };
 
+// The tool-renderer bridge (`registerToolRenderer`, loader.ts:379-383;
+// `resolveToolRenderers`, runner.ts:798-806; consumed per row by
+// `getRegisteredToolDefinition`, interactive-mode.ts:2356-2360). The
+// resolver chain runs entirely here: resolvers in extension load order,
+// each receiving `next()` for the remaining chain, and the chain's base is
+// the built-in rendering — which lives Rust-side, so it crosses as the
+// `__piBuiltinRenderSlot` marker (a resolver spreading `next()`'s base
+// keeps the built-in slots, `renderers/index.ts:51-63` upstream merges the
+// same way). The winning ToolRenderers object is stashed per ROW (upstream
+// resolves per `ToolExecutionComponent` construction; `state` is that row's
+// shared renderer state, tool-execution.ts:39/:131). A resolver throw
+// becomes `{kind:"error"}` — upstream would propagate into row creation,
+// the port falls back to the default rendering instead.
+globalThis.__piToolRendererStash = new Map();
+globalThis.__piToolRendererNextId = 1;
+globalThis.__piBuiltinRenderSlot = function () {
+  throw new Error("built-in render slot: render Rust-side");
+};
+globalThis.__piToolRendererRelease = function (id) {
+  globalThis.__piToolRendererStash.delete(id);
+};
+globalThis.__piResolveToolRenderers = function (toolName, hasBuiltin) {
+  const resolvers = [];
+  for (const ext of globalThis.__piExtensions) {
+    if (ext && Array.isArray(ext.toolRenderers)) resolvers.push(...ext.toolRenderers);
+  }
+  const BUILTIN = globalThis.__piBuiltinRenderSlot;
+  // `withBuiltInRenderers` (`renderers/index.ts:51-63`): a known tool's
+  // base merges the built-in slots (the marker here); an unknown tool's
+  // base is undefined — `next()` hands the resolver exactly that.
+  const base = () =>
+    hasBuiltin ? { renderShell: "default", renderCall: BUILTIN, renderResult: BUILTIN } : undefined;
+  const resolve = (index) =>
+    index < resolvers.length ? resolvers[index](toolName, () => resolve(index + 1)) : base();
+  let renderers;
+  try {
+    renderers = resolve(0);
+  } catch (error) {
+    return JSON.stringify({ kind: "error", message: error instanceof Error ? error.message : String(error) });
+  }
+  if (renderers === undefined || renderers === null) return undefined;
+  const slotOf = (fn) => (fn === BUILTIN ? "builtin" : typeof fn === "function" ? "custom" : "absent");
+  const entry = { renderers, state: {}, lastCall: undefined, lastResult: undefined };
+  const id = globalThis.__piToolRendererNextId++;
+  globalThis.__piToolRendererStash.set(id, entry);
+  return JSON.stringify({
+    kind: "renderers",
+    id,
+    renderShell: renderers.renderShell === "self" ? "self" : "default",
+    renderCall: slotOf(renderers.renderCall),
+    renderResult: slotOf(renderers.renderResult),
+  });
+};
+
+// The full `ToolRenderContext` one render call receives
+// (tool-execution.ts:122-144): the Rust side crosses the plain flags, the
+// glue adds the row's shared `state`, the slot's `lastComponent`, the
+// `args`, and the keybinding hints. `invalidate` is the port's one
+// deviation — the adopted component's `render` runs per frame here, so the
+// upstream async-completion invalidations have nothing to force.
+globalThis.__piToolRenderContext = function (entry, contextJson, args, lastComponent) {
+  const flags = JSON.parse(contextJson);
+  const keysOf = (keybinding) => globalThis.__piKeybindingKeys(keybinding).join("/");
+  return {
+    args,
+    toolCallId: flags.toolCallId,
+    invalidate: () => {},
+    lastComponent,
+    state: entry.state,
+    cwd: flags.cwd,
+    executionStarted: flags.executionStarted === true,
+    argsComplete: flags.argsComplete === true,
+    isPartial: flags.isPartial === true,
+    expanded: flags.expanded === true,
+    showImages: flags.showImages === true,
+    isError: flags.isError === true,
+    durationMs: flags.durationMs,
+    outputPad: Number(flags.outputPad) || 0,
+    keyText: keysOf,
+    keyHint: (keybinding, description) => globalThis.__piOps.themeFg("dim", keysOf(keybinding)) + globalThis.__piOps.themeFg("muted", ` ${description}`),
+  };
+};
+
+// One `renderCall` call (`tool-execution.ts:305`: `callRenderer(this.args,
+// theme, this.getRenderContext(this.callRendererComponent))`). The adopted
+// component replaces the call line; a throw is `{kind:"error"}` and the row
+// falls back to the generic line (`tool-execution.ts:309-313`). Builtin and
+// absent slots never cross (undefined).
+globalThis.__piToolRenderCall = function (id, argsJson, contextJson) {
+  const entry = globalThis.__piToolRendererStash.get(id);
+  const fn = entry?.renderers?.renderCall;
+  if (typeof fn !== "function" || fn === globalThis.__piBuiltinRenderSlot) return undefined;
+  const args = JSON.parse(argsJson);
+  const context = globalThis.__piToolRenderContext(entry, contextJson, args, entry.lastCall);
+  try {
+    const component = fn(args, {
+      fg: (color, text) => globalThis.__piOps.themeFg(String(color), String(text)),
+      bg: (color, text) => globalThis.__piOps.themeBg(String(color), String(text)),
+    }, context);
+    entry.lastCall = component;
+    const handle = globalThis.__piComponentAdopt(component);
+    if (handle === undefined) return undefined;
+    return JSON.stringify({
+      kind: "component",
+      handle,
+      hasInput: typeof component.handleInput === "function",
+    });
+  } catch (error) {
+    entry.lastCall = undefined;
+    return JSON.stringify({ kind: "error", message: error instanceof Error ? error.message : String(error) });
+  }
+};
+
+// One `renderResult` call (`tool-execution.ts:326-331`: `resultRenderer({
+// content, details }, { expanded, isPartial }, theme,
+// this.getRenderContext(this.resultRendererComponent))`) — same crossing,
+// with the result record and the options object upstream passes.
+globalThis.__piToolRenderResult = function (id, argsJson, resultJson, optionsJson, contextJson) {
+  const entry = globalThis.__piToolRendererStash.get(id);
+  const fn = entry?.renderers?.renderResult;
+  if (typeof fn !== "function" || fn === globalThis.__piBuiltinRenderSlot) return undefined;
+  const args = JSON.parse(argsJson);
+  const result = JSON.parse(resultJson);
+  const options = JSON.parse(optionsJson);
+  const context = globalThis.__piToolRenderContext(entry, contextJson, args, entry.lastResult);
+  try {
+    const component = fn(result, {
+      expanded: options.expanded === true,
+      isPartial: options.isPartial === true,
+    }, {
+      fg: (color, text) => globalThis.__piOps.themeFg(String(color), String(text)),
+      bg: (color, text) => globalThis.__piOps.themeBg(String(color), String(text)),
+    }, context);
+    entry.lastResult = component;
+    const handle = globalThis.__piComponentAdopt(component);
+    if (handle === undefined) return undefined;
+    return JSON.stringify({
+      kind: "component",
+      handle,
+      hasInput: typeof component.handleInput === "function",
+    });
+  } catch (error) {
+    entry.lastResult = undefined;
+    return JSON.stringify({ kind: "error", message: error instanceof Error ? error.message : String(error) });
+  }
+};
+
 // The resolved keybindings table (id -> chords) the mode crosses at bind
 // time; `keyText`/`keyHint` read it (`getKeybindings().getKeys` upstream —
 // keybinding-hints.ts:34-44, without the darwin alt swap).
@@ -1891,6 +2050,8 @@ globalThis.__piInspect = function () {
             },
       entryRenderers: Object.keys(ext.entryRenderers ?? {}),
       messageRenderers: Object.keys(ext.messageRenderers ?? {}),
+      // Resolvers accumulate (loader.ts:381-382); only the count crosses.
+      toolRenderers: (ext.toolRenderers ?? []).length,
       flags: Object.entries(ext.flags).map(([name, flag]) => ({
         name,
         description: flag.description ?? "",

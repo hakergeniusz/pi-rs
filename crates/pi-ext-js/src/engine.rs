@@ -32,7 +32,9 @@ use crate::exec;
 use crate::mcp_registry::McpRegistry;
 use crate::provider_registry::ProviderRegistry;
 use crate::resolver::{ExtensionLoader, ExtensionResolver};
-use crate::runner::EntryRenderOutcome;
+use crate::runner::{
+    EntryRenderOutcome, ResolvedToolRenderers, ToolRenderSlot, ToolRenderersOutcome,
+};
 
 /// The kind of context a dispatch session uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1219,6 +1221,137 @@ impl JsHost {
             )),
             _ => Ok(EntryRenderOutcome::None),
         }
+    }
+
+    /// Runs one tool row's resolver chain (`__piResolveToolRenderers`):
+    /// the chain and its stash live in the glue; the outcome crosses as
+    /// JSON with the per-slot classification (builtin/custom/absent).
+    pub fn resolve_tool_renderers(
+        &self,
+        tool_name: &str,
+        has_builtin: bool,
+    ) -> Result<ToolRenderersOutcome, JsHostError> {
+        let raw = self
+            .ctx
+            .with(|ctx| -> Result<Option<String>, JsHostError> {
+                let call: Function = ctx.globals().get("__piResolveToolRenderers")?;
+                let result: Option<String> = call
+                    .call((tool_name, has_builtin))
+                    .map_err(|err| Self::js_error(&ctx, err))?;
+                Ok(result)
+            })?;
+        let Some(raw) = raw else {
+            return Ok(ToolRenderersOutcome::None);
+        };
+        let value: Json =
+            serde_json::from_str(&raw).map_err(|err| JsHostError::Job(err.to_string()))?;
+        match value.get("kind").and_then(Json::as_str) {
+            Some("renderers") => {
+                let slot = |key: &str| match value.get(key).and_then(Json::as_str) {
+                    Some("builtin") => ToolRenderSlot::Builtin,
+                    Some("custom") => ToolRenderSlot::Custom,
+                    _ => ToolRenderSlot::Absent,
+                };
+                Ok(ToolRenderersOutcome::Renderers(ResolvedToolRenderers {
+                    stash_id: value.get("id").and_then(Json::as_u64).unwrap_or_default() as u32,
+                    render_shell_self: value.get("renderShell").and_then(Json::as_str)
+                        == Some("self"),
+                    render_call: slot("renderCall"),
+                    render_result: slot("renderResult"),
+                }))
+            }
+            Some("error") => Ok(ToolRenderersOutcome::Failed(
+                value
+                    .get("message")
+                    .and_then(Json::as_str)
+                    .unwrap_or("resolver failed")
+                    .to_string(),
+            )),
+            _ => Ok(ToolRenderersOutcome::None),
+        }
+    }
+
+    /// Calls one row's stashed `renderCall` (`__piToolRenderCall`): the
+    /// same adopt-and-report crossing as [`Self::render_entry`].
+    pub fn tool_render_call(
+        &self,
+        stash_id: u32,
+        args_json: &str,
+        context_json: &str,
+    ) -> Result<EntryRenderOutcome, JsHostError> {
+        let raw = self
+            .ctx
+            .with(|ctx| -> Result<Option<String>, JsHostError> {
+                let call: Function = ctx.globals().get("__piToolRenderCall")?;
+                let result: Option<String> = call
+                    .call((stash_id, args_json, context_json))
+                    .map_err(|err| Self::js_error(&ctx, err))?;
+                Ok(result)
+            })?;
+        Self::tool_slot_outcome(raw)
+    }
+
+    /// Calls one row's stashed `renderResult` (`__piToolRenderResult`).
+    pub fn tool_render_result(
+        &self,
+        stash_id: u32,
+        args_json: &str,
+        result_json: &str,
+        options_json: &str,
+        context_json: &str,
+    ) -> Result<EntryRenderOutcome, JsHostError> {
+        let raw = self
+            .ctx
+            .with(|ctx| -> Result<Option<String>, JsHostError> {
+                let call: Function = ctx.globals().get("__piToolRenderResult")?;
+                let result: Option<String> = call
+                    .call((stash_id, args_json, result_json, options_json, context_json))
+                    .map_err(|err| Self::js_error(&ctx, err))?;
+                Ok(result)
+            })?;
+        Self::tool_slot_outcome(raw)
+    }
+
+    /// The `{kind:"component"|"error"}` mapping shared by the two tool
+    /// slots (undefined — builtin or absent slot, nothing crossed — maps
+    /// to [`EntryRenderOutcome::None`]).
+    fn tool_slot_outcome(raw: Option<String>) -> Result<EntryRenderOutcome, JsHostError> {
+        let Some(raw) = raw else {
+            return Ok(EntryRenderOutcome::None);
+        };
+        let value: Json =
+            serde_json::from_str(&raw).map_err(|err| JsHostError::Job(err.to_string()))?;
+        match value.get("kind").and_then(Json::as_str) {
+            Some("component") => Ok(EntryRenderOutcome::Component {
+                handle: value
+                    .get("handle")
+                    .and_then(Json::as_u64)
+                    .unwrap_or_default() as u32,
+                has_input: value
+                    .get("hasInput")
+                    .and_then(Json::as_bool)
+                    .unwrap_or(false),
+            }),
+            Some("error") => Ok(EntryRenderOutcome::Failed(
+                value
+                    .get("message")
+                    .and_then(Json::as_str)
+                    .unwrap_or("renderer failed")
+                    .to_string(),
+            )),
+            _ => Ok(EntryRenderOutcome::None),
+        }
+    }
+
+    /// Drops one row's stashed renderers (`__piToolRendererRelease`).
+    pub fn tool_renderer_release(&self, stash_id: u32) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx.globals().get("__piToolRendererRelease")?;
+            let _: Value = call
+                .call((stash_id,))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
     }
 
     /// Renders one adopted component (`__piComponentRender`): the JS

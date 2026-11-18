@@ -48,5 +48,6 @@ pub use loader::{ExtensionOrigin, LoadExtensionsResult, discover_and_load, disco
 pub use provider_registry::{RegisteredNativeProvider, RegisteredProvider, RegisteredVirtualModel};
 pub use runner::{
     EntryRenderOutcome, ExtensionRunner, McpServerReport, ProviderStreamOutcome, ResolvedCommand,
-    ResolvedMarkdownTransformer, ToolInfo, UiSink, UserBashDecision,
+    ResolvedMarkdownTransformer, ResolvedToolRenderers, ToolInfo, ToolRenderSlot,
+    ToolRenderersOutcome, UiSink, UserBashDecision,
 };

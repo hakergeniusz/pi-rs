@@ -2074,6 +2074,40 @@ impl InteractiveMode {
         self.add_to_chat(Box::new(component));
     }
 
+    /// `getRegisteredToolDefinition` (`interactive-mode.ts:2356-2360`):
+    /// the tool-renderer resolver chain over the extension runner —
+    /// resolvers in load order, the Rust built-in availability crossing as
+    /// the chain's base. `None` keeps the row on the built-in/generic
+    /// paths; a resolver throw takes the same route (upstream propagates
+    /// it into row creation, the port falls back).
+    #[cfg(feature = "ext-js")]
+    fn resolve_tool_renderers(
+        &self,
+        tool_name: &str,
+    ) -> Option<super::components::tool_execution::JsToolRenderers> {
+        let runner = self.extension_runner.as_ref()?;
+        let has_builtin = crate::tools::renderers::renderers_for(tool_name).is_some();
+        let locked = runner.lock().expect("extension runner mutex poisoned");
+        match locked.resolve_tool_renderers(tool_name, has_builtin) {
+            Ok(pi_ext_js::ToolRenderersOutcome::Renderers(resolved)) => {
+                Some(super::components::tool_execution::JsToolRenderers::new(
+                    std::sync::Arc::clone(runner),
+                    &resolved,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(not(feature = "ext-js"))]
+    fn resolve_tool_renderers(
+        &self,
+        tool_name: &str,
+    ) -> Option<super::components::tool_execution::JsToolRenderers> {
+        let _ = tool_name;
+        None
+    }
+
     /// `renderSessionEntries` + `renderSessionItems` (`interactive-mode.ts:3437-3464`,
     /// `:3340-3425`): walk session entries and re-create the chat rows. The
     /// compaction summary and its billed-tokens notice come from the
@@ -2245,6 +2279,7 @@ impl InteractiveMode {
                         self.output_pad,
                         &self.session.get_cwd().to_string_lossy(),
                         crate::tools::renderers::renderers_for(&call.name),
+                        self.resolve_tool_renderers(&call.name),
                     );
                     tool.set_args_complete();
                     tool.set_expanded(self.tool_output_expanded);
@@ -2357,6 +2392,7 @@ impl InteractiveMode {
                 self.output_pad,
                 &self.session.get_cwd().to_string_lossy(),
                 crate::tools::renderers::renderers_for(&call.name),
+                self.resolve_tool_renderers(&call.name),
             );
             let index = self.add_to_chat(Box::new(component));
             self.pending_tools
@@ -5091,6 +5127,7 @@ impl InteractiveMode {
             self.output_pad,
             &self.session.get_cwd().to_string_lossy(),
             crate::tools::renderers::renderers_for("bash"),
+            None,
         );
         let index = self.add_to_chat(Box::new(component));
         if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
@@ -11226,6 +11263,142 @@ export default function (pi) {
         assert!(lines.contains("hello body"), "{lines}");
         // The persisted meta crossed to the transformer (live rows carry none).
         assert!(lines.contains("@m1|2026-01-01T00:00:00Z"), "{lines}");
+        mode.shutdown().expect("shutdown");
+    }
+
+    // ---- E3 slice 5: tool renderers ----
+
+    /// The resolver chain resolves at row construction
+    /// (`getRegisteredToolDefinition`, `interactive-mode.ts:2356-2360`): a
+    /// resolver-supplied `renderCall` component replaces the built-in call
+    /// line, with the context flags crossing.
+    #[cfg(feature = "ext-js")] // the renderer registry is feature-gated
+    #[test]
+    fn extension_tool_renderer_draws_the_call_line() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerToolRenderer((toolName, next) => {
+    if (toolName === "read") {
+      return {
+        renderCall: (args, theme, context) => ({
+          render: () => ["ext-call:" + args.path + ":" + context.outputPad + ":" + context.cwd],
+          invalidate: () => {},
+        }),
+      };
+    }
+    return next();
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture_with_extension(dir.path(), EXT);
+        let js = mode.resolve_tool_renderers("read");
+        assert!(js.is_some(), "the resolver supplied renderers for read");
+        let component =
+            crate::modes::interactive::components::tool_execution::ToolExecutionComponent::new(
+                "read",
+                "call-1",
+                serde_json::json!({ "path": "/tmp/example.txt" }),
+                1,
+                "/tmp",
+                crate::tools::renderers::renderers_for("read"),
+                js,
+            );
+        let lines = strip_terminal_sequences(&component.render(60).join("\n"));
+        assert!(
+            lines.contains("ext-call:/tmp/example.txt:1:/tmp"),
+            "{lines}"
+        );
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// A custom `renderCall` throw takes the generic line, like upstream's
+    /// catch (`tool-execution.ts:309-313`) — the row still renders.
+    #[cfg(feature = "ext-js")] // the renderer registry is feature-gated
+    #[test]
+    fn extension_tool_renderer_throw_takes_the_generic_line() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerToolRenderer((_toolName, _next) => ({
+    renderCall: () => {
+      throw new Error("boom-call");
+    },
+  }));
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture_with_extension(dir.path(), EXT);
+        let js = mode.resolve_tool_renderers("read");
+        assert!(js.is_some());
+        let component =
+            crate::modes::interactive::components::tool_execution::ToolExecutionComponent::new(
+                "read",
+                "call-1",
+                serde_json::json!({ "path": "/tmp/example.txt" }),
+                1,
+                "/tmp",
+                crate::tools::renderers::renderers_for("read"),
+                js,
+            );
+        let lines = strip_terminal_sequences(&component.render(60).join("\n"));
+        // The generic fallback: the collapsed `formatToolCallWithArgs` line.
+        assert!(lines.contains("read"), "{lines}");
+        assert!(lines.contains(r#"path="/tmp/example.txt""#), "{lines}");
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// A resolver can supply renderers for tools with no Rust built-in
+    /// (`withBuiltInRenderers` base is undefined there —
+    /// `renderers/index.ts:51-63`); without a resolver the row takes the
+    /// generic path.
+    #[cfg(feature = "ext-js")] // the renderer registry is feature-gated
+    #[test]
+    fn unknown_tool_with_and_without_a_resolver() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerToolRenderer((toolName, next) => {
+    if (toolName === "synth") {
+      return {
+        renderCall: () => ({ render: () => ["synth-row"], invalidate: () => {} }),
+      };
+    }
+    return next();
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture_with_extension(dir.path(), EXT);
+        let js = mode.resolve_tool_renderers("synth");
+        assert!(js.is_some(), "the resolver supplied unknown-tool renderers");
+        let component =
+            crate::modes::interactive::components::tool_execution::ToolExecutionComponent::new(
+                "synth",
+                "call-1",
+                serde_json::json!({ "k": 1 }),
+                1,
+                "/tmp",
+                crate::tools::renderers::renderers_for("synth"),
+                js,
+            );
+        let lines = strip_terminal_sequences(&component.render(60).join("\n"));
+        assert!(lines.contains("synth-row"), "{lines}");
+
+        // An unknown tool with no resolver: the generic row.
+        let js = mode.resolve_tool_renderers("other-synth");
+        assert!(js.is_none());
+        let component =
+            crate::modes::interactive::components::tool_execution::ToolExecutionComponent::new(
+                "other-synth",
+                "call-2",
+                serde_json::json!({ "k": 1 }),
+                1,
+                "/tmp",
+                crate::tools::renderers::renderers_for("other-synth"),
+                js,
+            );
+        let lines = strip_terminal_sequences(&component.render(60).join("\n"));
+        assert!(lines.contains("other-synth"), "{lines}");
+        assert!(lines.contains("k=1"), "{lines}");
         mode.shutdown().expect("shutdown");
     }
 

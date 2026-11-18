@@ -5,13 +5,17 @@
 //! Ground truth: `modes/interactive/components/tool-execution.ts`. The
 //! upstream component delegates drawing to the tool's `renderCall`/
 //! `renderResult` functions, which return Components that are mutated in
-//! place across frames (kept via `ToolRenderContext.lastComponent`). This
-//! port's renderers are pure styled-text functions (the text shapes were
-//! ported in P4), so the component owns one `Text` for the call line and one
-//! for the result body, rebuilt on updates — the rendered bytes are the same.
-//! The image-block display of results is deferred with the image work.
+//! place across frames (kept via `ToolRenderContext.lastComponent`). Two
+//! renderer sources feed the slots: the port's built-in renderers are pure
+//! styled-text functions (ported in P4 — one `Text` per slot, rebuilt on
+//! updates, the rendered bytes the same), and resolver-supplied extension
+//! renderers cross the handle bridge as adopted components
+//! ([`super::component_proxy::ComponentProxy`]) with builtin/absent slots
+//! falling back to the text paths (`tool-execution.ts:299-344`). The
+//! image-block display of results is deferred with the image work.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -24,6 +28,83 @@ use pi_tui::mouse::{MouseButton, MouseEvent, MouseEventKind, MouseEventResult};
 use crate::tools::renderers::ToolRenderers;
 
 use super::super::theme;
+
+/// The extension renderer bridge for one row: the stashed
+/// `ToolRenderers` object ([`pi_ext_js::ResolvedToolRenderers`]) resolved
+/// at row construction (`getRegisteredToolDefinition`,
+/// `interactive-mode.ts:2356-2360`). Inert without the extensions feature.
+#[cfg(feature = "ext-js")]
+pub struct JsToolRenderers {
+    runner: Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+    stash_id: u32,
+    /// `renderShell === "self"` (`types.ts:616`): the row draws without the
+    /// box framing.
+    pub(crate) render_shell_self: bool,
+    /// The `renderCall` slot is a resolver-supplied fn.
+    pub(crate) render_call_custom: bool,
+    /// The `renderResult` slot is a resolver-supplied fn.
+    pub(crate) render_result_custom: bool,
+}
+
+#[cfg(feature = "ext-js")]
+impl JsToolRenderers {
+    pub(crate) fn new(
+        runner: Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+        resolved: &pi_ext_js::ResolvedToolRenderers,
+    ) -> Self {
+        Self {
+            runner,
+            stash_id: resolved.stash_id,
+            render_shell_self: resolved.render_shell_self,
+            render_call_custom: resolved.render_call == pi_ext_js::ToolRenderSlot::Custom,
+            render_result_custom: resolved.render_result == pi_ext_js::ToolRenderSlot::Custom,
+        }
+    }
+
+    fn render_call(
+        &self,
+        args_json: &str,
+        context_json: &str,
+    ) -> Result<pi_ext_js::EntryRenderOutcome, pi_ext_js::JsHostError> {
+        self.runner
+            .lock()
+            .expect("extension runner mutex poisoned")
+            .tool_render_call(self.stash_id, args_json, context_json)
+    }
+
+    fn render_result(
+        &self,
+        args_json: &str,
+        result_json: &str,
+        options_json: &str,
+        context_json: &str,
+    ) -> Result<pi_ext_js::EntryRenderOutcome, pi_ext_js::JsHostError> {
+        self.runner
+            .lock()
+            .expect("extension runner mutex poisoned")
+            .tool_render_result(
+                self.stash_id,
+                args_json,
+                result_json,
+                options_json,
+                context_json,
+            )
+    }
+
+    fn release(&self) {
+        let _ = self
+            .runner
+            .lock()
+            .expect("extension runner mutex poisoned")
+            .tool_renderer_release(self.stash_id);
+    }
+}
+
+/// The feature-off shape: the mode always passes `None`, the field type
+/// still exists so the component's signatures stay identical.
+#[cfg(not(feature = "ext-js"))]
+#[derive(Clone, Copy)]
+pub struct JsToolRenderers;
 
 /// What the renderers need to know about the row's live state
 /// (`ToolRenderContext` reduced to what the built-in renderers read).
@@ -112,6 +193,12 @@ pub struct ToolExecutionComponent {
     result: Option<ToolResultView>,
     started_at: Option<Instant>,
     renderers: Option<ToolRenderers>,
+    /// Resolver-supplied renderers (`getRegisteredToolDefinition`); `None`
+    /// keeps the row on the built-in/generic paths.
+    js: Option<JsToolRenderers>,
+    /// `renderShell === "self"`: draw without the box framing
+    /// (`tool-execution.ts:89-101`).
+    render_shell_self: bool,
     /// The rendered box; rebuilt on every display update.
     content_box: BoxComponent,
     /// The expansion a region click asked for; the closure cannot borrow the
@@ -127,6 +214,7 @@ impl ToolExecutionComponent {
         output_pad: usize,
         cwd: &str,
         renderers: Option<ToolRenderers>,
+        js: Option<JsToolRenderers>,
     ) -> Self {
         let mut component = ToolExecutionComponent {
             tool_name: tool_name.to_string(),
@@ -141,6 +229,11 @@ impl ToolExecutionComponent {
             result: None,
             started_at: None,
             renderers,
+            #[cfg(feature = "ext-js")]
+            render_shell_self: js.as_ref().is_some_and(|js| js.render_shell_self),
+            #[cfg(not(feature = "ext-js"))]
+            render_shell_self: false,
+            js,
             content_box: BoxComponent::new(1, 1),
             click_toggle: Arc::new(AtomicBool::new(false)),
         };
@@ -204,17 +297,13 @@ impl ToolExecutionComponent {
     }
 
     /// `updateDisplay` (`tool-execution.ts:281-402`): rebuild the box with
-    /// the state's background, the call line, and the result body.
+    /// the state's background, the call line, and the result body — a
+    /// resolver-supplied component replaces the text child when its slot
+    /// is custom and the bridge succeeds, everything else taking the text
+    /// paths (`tool-execution.ts:299-344`).
+    #[allow(clippy::too_many_lines)] // mirrors the TS updateDisplay; split when extending
     fn update_display(&mut self) {
         let theme = theme::theme();
-        let bg_token = if self.is_partial {
-            pi_tui::theme::ThemeBg::ToolPendingBg
-        } else if self.result.as_ref().is_some_and(|result| result.is_error) {
-            pi_tui::theme::ThemeBg::ToolErrorBg
-        } else {
-            pi_tui::theme::ThemeBg::ToolSuccessBg
-        };
-        let bg = theme.bg_styler(bg_token);
 
         let context = RenderContext {
             cwd: &self.cwd,
@@ -226,50 +315,119 @@ impl ToolExecutionComponent {
             started_at: self.started_at,
         };
 
-        // The call line: the tool's renderer, or the generic fallback
-        // (`formatToolCallWithArgs`).
-        let call_context = crate::tools::renderers::CallContext {
-            theme: &theme,
-            cwd: &self.cwd,
-            expanded: self.expanded,
+        // The bridge inputs: the row's args plus the ToolRenderContext
+        // flags (the glue adds state/lastComponent/invalidate/keyText).
+        #[cfg(feature = "ext-js")]
+        let args_json = serde_json::to_string(&self.args).unwrap_or_else(|_| "{}".to_string());
+        #[cfg(feature = "ext-js")]
+        let context_json = self.build_context_json();
+
+        // The call slot (`tool-execution.ts:299-314`): a custom renderer's
+        // component; a throw takes the generic line like upstream's catch —
+        // never the tool's built-in renderer (`createCallFallback`,
+        // `tool-execution.ts:146-148`).
+        #[cfg_attr(not(feature = "ext-js"), allow(unused_mut))]
+        let mut call_custom_failed = false;
+        #[cfg(feature = "ext-js")]
+        let call_custom = match self.js.as_ref().filter(|js| js.render_call_custom) {
+            Some(js) => {
+                if let Ok(pi_ext_js::EntryRenderOutcome::Component { handle, has_input }) =
+                    js.render_call(&args_json, &context_json)
+                {
+                    Some(Box::new(super::component_proxy::ComponentProxy::new(
+                        Arc::clone(&js.runner),
+                        handle,
+                        has_input,
+                    )) as Box<dyn Component>)
+                } else {
+                    call_custom_failed = true;
+                    None
+                }
+            }
+            None => None,
         };
-        let call_text = match self.renderers {
-            Some(renderers) => (renderers.render_call)(Some(&self.args), &call_context),
-            None => crate::tools::renderers::format_tool_call_with_args(
+        #[cfg(not(feature = "ext-js"))]
+        let call_custom: Option<Box<dyn Component>> = None;
+
+        let call_text = if call_custom_failed {
+            crate::tools::renderers::format_tool_call_with_args(
                 &self.tool_name,
                 Some(&self.args),
                 &theme,
                 self.expanded,
-            ),
+            )
+        } else {
+            match self.renderers {
+                Some(renderers) => {
+                    let call_context = crate::tools::renderers::CallContext {
+                        theme: &theme,
+                        cwd: &self.cwd,
+                        expanded: self.expanded,
+                    };
+                    (renderers.render_call)(Some(&self.args), &call_context)
+                }
+                None => crate::tools::renderers::format_tool_call_with_args(
+                    &self.tool_name,
+                    Some(&self.args),
+                    &theme,
+                    self.expanded,
+                ),
+            }
         };
 
-        // The result body. The renderers take the `AgentToolResult` shape,
-        // rebuilt from the view's text.
-        let result_text = match &self.result {
-            Some(result) => {
-                let agent_result = pi_agent::types::AgentToolResult {
-                    content: vec![pi_ai::types::ContentBlock::Text(
-                        pi_ai::types::TextContent {
-                            text: result.text.clone(),
-                            text_signature: None,
-                        },
-                    )],
-                    details: serde_json::Value::Null,
-                    structured_content: None,
-                    usage: None,
-                    is_error: false,
-                    terminate: false,
-                };
-                let result_context = crate::tools::renderers::ResultContext {
-                    theme: &theme,
-                    cwd: &self.cwd,
-                    expanded: self.expanded,
-                    is_error: result.is_error,
-                    timer_text: context.timer_text(),
-                };
-                match self.renderers {
+        // The result slot (`tool-execution.ts:316-344`): a custom
+        // renderer's component over the `{content, details}` record and the
+        // `{expanded, isPartial}` options; a throw takes the sliced generic
+        // fallback like upstream's catch — never the tool's built-in
+        // renderer (`createResultFallback`, `tool-execution.ts:150-164`).
+        #[cfg_attr(not(feature = "ext-js"), allow(unused_mut))]
+        let mut result_custom_failed = false;
+        #[cfg(feature = "ext-js")]
+        let result_custom = match self.js.as_ref().filter(|js| js.render_result_custom) {
+            Some(js) => match self.result.as_ref() {
+                Some(result) => {
+                    let result_json = serde_json::json!({
+                        "content": [{ "type": "text", "text": result.text }],
+                        "details": serde_json::Value::Null,
+                    })
+                    .to_string();
+                    let options_json = serde_json::json!({
+                        "expanded": self.expanded,
+                        "isPartial": self.is_partial,
+                    })
+                    .to_string();
+                    if let Ok(pi_ext_js::EntryRenderOutcome::Component { handle, has_input }) =
+                        js.render_result(&args_json, &result_json, &options_json, &context_json)
+                    {
+                        Some(Box::new(super::component_proxy::ComponentProxy::new(
+                            Arc::clone(&js.runner),
+                            handle,
+                            has_input,
+                        )) as Box<dyn Component>)
+                    } else {
+                        result_custom_failed = true;
+                        None
+                    }
+                }
+                None => None,
+            },
+            None => None,
+        };
+        #[cfg(not(feature = "ext-js"))]
+        let result_custom: Option<Box<dyn Component>> = None;
+
+        // The text paths: the tool's Rust renderer, or — resolver rows
+        // without the hook — the sliced generic fallback.
+        let result_text = if result_custom_failed {
+            self.sliced_result_fallback(&theme).unwrap_or_default()
+        } else if result_custom.is_none() {
+            match &self.result {
+                Some(result) => match self.renderers {
                     Some(renderers) => {
-                        (renderers.render_result)(Some(&self.args), &agent_result, &result_context)
+                        self.builtin_result_text(&theme, &context, result, renderers)
+                    }
+                    None if self.js.is_some() => {
+                        self.sliced_result_fallback(&theme).unwrap_or_default()
                     }
                     None => {
                         if result.text.is_empty() {
@@ -283,30 +441,172 @@ impl ToolExecutionComponent {
                                 .join("\n")
                         }
                     }
-                }
+                },
+                None => String::new(),
             }
-            None => String::new(),
+        } else {
+            String::new()
         };
 
-        let bg_fn = move |text: &str| bg(text);
-        let mut content_box = BoxComponent::with_bg(self.output_pad.max(1), 1, bg_fn);
+        let mut content_box = if self.render_shell_self {
+            // `renderShell: "self"` rows draw their own framing
+            // (`tool-execution.ts:89-101`) — a plain container, no bg or
+            // padding.
+            BoxComponent::new(0, 0)
+        } else {
+            let bg_token = if self.is_partial {
+                pi_tui::theme::ThemeBg::ToolPendingBg
+            } else if self.result.as_ref().is_some_and(|result| result.is_error) {
+                pi_tui::theme::ThemeBg::ToolErrorBg
+            } else {
+                pi_tui::theme::ThemeBg::ToolSuccessBg
+            };
+            let bg = theme.bg_styler(bg_token);
+            BoxComponent::with_bg(self.output_pad.max(1), 1, move |text: &str| bg(text))
+        };
         // Every displayed child rides a `MouseRegion` whose left click
         // toggles the row's expansion (`tool-execution.ts:116-124`; the
         // wrapping covers the call at `:228`/`:240` and the result at
         // `:235`/`:249`/`:257`/`:264`).
         let click_toggle = Arc::clone(&self.click_toggle);
+        let call_child: Box<dyn Component> = match call_custom {
+            Some(component) => component,
+            None => Box::new(Text::new(call_text, 0, 0)),
+        };
         content_box.add_child(Box::new(MouseRegion::new(
-            Box::new(Text::new(call_text, 0, 0)),
+            call_child,
             Box::new(move |event| toggle_on_left_click(event, &click_toggle)),
         )));
-        if !result_text.is_empty() {
+        let result_child: Option<Box<dyn Component>> = match result_custom {
+            Some(component) => Some(component),
+            None if !result_text.is_empty() => Some(Box::new(Text::new(result_text, 0, 0))),
+            None => None,
+        };
+        if let Some(result_child) = result_child {
             let click_toggle = Arc::clone(&self.click_toggle);
             content_box.add_child(Box::new(MouseRegion::new(
-                Box::new(Text::new(result_text, 0, 0)),
+                result_child,
                 Box::new(move |event| toggle_on_left_click(event, &click_toggle)),
             )));
         }
         self.content_box = content_box;
+    }
+
+    /// The `ToolRenderContext` flags the glue extends with state,
+    /// lastComponent, invalidate, and the keybinding hints
+    /// (`tool-execution.ts:122-144`). `durationMs` stays absent while
+    /// partial (absent, not null); `showImages` is false while the image
+    /// work is deferred.
+    fn build_context_json(&self) -> String {
+        let mut flags = serde_json::Map::new();
+        flags.insert(
+            "toolCallId".to_string(),
+            serde_json::Value::from(self.tool_call_id.as_str()),
+        );
+        flags.insert(
+            "cwd".to_string(),
+            serde_json::Value::from(self.cwd.as_str()),
+        );
+        flags.insert(
+            "executionStarted".to_string(),
+            serde_json::Value::from(self.execution_started),
+        );
+        flags.insert(
+            "argsComplete".to_string(),
+            serde_json::Value::from(self.args_complete),
+        );
+        flags.insert(
+            "isPartial".to_string(),
+            serde_json::Value::from(self.is_partial),
+        );
+        flags.insert(
+            "expanded".to_string(),
+            serde_json::Value::from(self.expanded),
+        );
+        flags.insert("showImages".to_string(), serde_json::Value::from(false));
+        flags.insert(
+            "isError".to_string(),
+            serde_json::Value::from(self.result.as_ref().is_some_and(|result| result.is_error)),
+        );
+        if !self.is_partial
+            && let Some(ms) = self.result.as_ref().and_then(|result| result.duration_ms)
+        {
+            flags.insert("durationMs".to_string(), serde_json::Value::from(ms));
+        }
+        flags.insert(
+            "outputPad".to_string(),
+            serde_json::Value::from(self.output_pad as u64),
+        );
+        serde_json::Value::Object(flags).to_string()
+    }
+
+    /// The Rust renderer's result body — the renderers take the
+    /// `AgentToolResult` shape, rebuilt from the view's text.
+    fn builtin_result_text(
+        &self,
+        theme: &pi_tui::theme::Theme,
+        context: &RenderContext<'_>,
+        result: &ToolResultView,
+        renderers: ToolRenderers,
+    ) -> String {
+        let agent_result = pi_agent::types::AgentToolResult {
+            content: vec![pi_ai::types::ContentBlock::Text(
+                pi_ai::types::TextContent {
+                    text: result.text.clone(),
+                    text_signature: None,
+                },
+            )],
+            details: serde_json::Value::Null,
+            structured_content: None,
+            usage: None,
+            is_error: false,
+            terminate: false,
+        };
+        let result_context = crate::tools::renderers::ResultContext {
+            theme,
+            cwd: &self.cwd,
+            expanded: self.expanded,
+            is_error: result.is_error,
+            timer_text: context.timer_text(),
+        };
+        (renderers.render_result)(Some(&self.args), &agent_result, &result_context)
+    }
+
+    /// `createResultFallback` (`tool-execution.ts:150-164`): the output
+    /// text, sliced to 10 lines when collapsed, with the remaining count
+    /// and the expand key hint. `None` without output — the slot renders
+    /// nothing.
+    fn sliced_result_fallback(&self, theme: &pi_tui::theme::Theme) -> Option<String> {
+        const FALLBACK_PREVIEW_LINES: usize = 10;
+        let result = self.result.as_ref()?;
+        if result.text.is_empty() {
+            return None;
+        }
+        let lines: Vec<&str> = result.text.split('\n').collect();
+        let display_len = if self.expanded {
+            lines.len()
+        } else {
+            lines.len().min(FALLBACK_PREVIEW_LINES)
+        };
+        let mut parts: Vec<String> = lines[..display_len]
+            .iter()
+            .map(|line| theme.fg(pi_tui::theme::ThemeColor::ToolOutput, line))
+            .collect();
+        let remaining = lines.len() - display_len;
+        if remaining > 0 {
+            let key = theme::key_text(theme::app_keys::TOOLS_EXPAND);
+            parts.push(format!(
+                "{} {}{}{}",
+                theme.fg(
+                    pi_tui::theme::ThemeColor::Muted,
+                    &format!("\n... ({remaining} more lines,")
+                ),
+                theme.fg(pi_tui::theme::ThemeColor::Dim, &key),
+                theme.fg(pi_tui::theme::ThemeColor::Muted, " to expand"),
+                theme.fg(pi_tui::theme::ThemeColor::Muted, ")"),
+            ));
+        }
+        Some(parts.join("\n"))
     }
 
     /// Record the execution clock start (`startToolTimer` semantics).
@@ -326,6 +626,18 @@ fn toggle_on_left_click(event: &MouseEvent, flag: &AtomicBool) -> Option<MouseEv
     }
     flag.store(!flag.load(Ordering::Relaxed), Ordering::Relaxed);
     Some(MouseEventResult::handled())
+}
+
+impl Drop for ToolExecutionComponent {
+    fn drop(&mut self) {
+        // Release the row's stashed renderers so the JS registry does not
+        // leak (`__piToolRendererRelease`); the box's proxies drop after —
+        // sequential locks, never held across each other.
+        #[cfg(feature = "ext-js")]
+        if let Some(js) = &self.js {
+            js.release();
+        }
+    }
 }
 
 impl Component for ToolExecutionComponent {
@@ -375,6 +687,7 @@ mod tests {
             1,
             "/tmp",
             crate::tools::renderers::renderers_for("read"),
+            None,
         );
         let lines = plain(&component, 60);
         assert_eq!(lines.first().map(String::as_str), Some(""));
@@ -398,6 +711,7 @@ mod tests {
             1,
             "/tmp",
             crate::tools::renderers::renderers_for("bash"),
+            None,
         );
         let lines = plain(&component, 60);
         assert!(
@@ -421,6 +735,7 @@ mod tests {
             1,
             "/tmp",
             crate::tools::renderers::renderers_for("bash"),
+            None,
         );
         component.update_result(
             ToolResultView {
@@ -466,6 +781,7 @@ mod tests {
             1,
             "/tmp",
             crate::tools::renderers::renderers_for("read"),
+            None,
         );
         assert!(!component.expanded());
         // The box pads one line; the first content row is the call region.
