@@ -2670,6 +2670,11 @@ impl InteractiveMode {
         }
         let thinking_level = self.thinking_level.as_str().to_string();
         let model_id = self.model.id.clone();
+        // The `(provider)` prefix tracks the CURRENT model like `model_id`
+        // does — a stale boot provider survived a `/model` switch (the
+        // footer's `footerData.model.provider` is rebuilt per refresh,
+        // `footer.ts:227-263`).
+        let model_provider = self.model.provider.clone();
         let model_supports_reasoning = self.model.reasoning;
         // The provider count behind the `(provider)` prefix
         // (`updateAvailableProviderCount`, `interactive-mode.ts:5444-5451`).
@@ -2717,6 +2722,7 @@ impl InteractiveMode {
         footer.data.context_percent = context_percent;
         footer.data.thinking_level = thinking_level;
         footer.data.model_id = model_id;
+        footer.data.model_provider = model_provider;
         footer.data.model_supports_reasoning = model_supports_reasoning;
         footer.data.available_provider_count = provider_count;
         footer.data.routed_model_id = routed_model_id;
@@ -3243,20 +3249,14 @@ impl InteractiveMode {
                     }
                 }
             } else {
-                (
-                    model,
-                    self.api_key.clone(),
-                    self.access_token.clone(),
-                    self.thinking_level,
-                )
+                let (api_key, access_token) = self.run_wire_credential();
+                (model, api_key, access_token, self.thinking_level)
             };
         #[cfg(not(feature = "ext-js"))]
-        let (model, api_key, access_token, thinking_level) = (
-            model,
-            self.api_key.clone(),
-            self.access_token.clone(),
-            self.thinking_level,
-        );
+        let (model, api_key, access_token, thinking_level) = {
+            let (api_key, access_token) = self.run_wire_credential();
+            (model, api_key, access_token, self.thinking_level)
+        };
         let stream_fn = Arc::clone(&self.stream_fn);
         let signal = Arc::new(AbortSignal::new());
         let (tx, rx) = std::sync::mpsc::channel::<CompactionOutcome>();
@@ -3684,13 +3684,20 @@ impl InteractiveMode {
     /// mode takes the `bashMode` color; otherwise the border carries the
     /// thinking level's color.
     fn update_editor_border_color(&mut self) {
-        let is_bash_mode = self.editor_mut().is_bash_mode;
+        // `this.editor` stays reachable while a selector occupies the slot —
+        // the settings dialog's arms fire mid-dialog with the editor parked,
+        // so the parked host counts here (`editor_host_mut`).
+        let is_bash_mode = self
+            .editor_host_mut()
+            .is_some_and(|editor| editor.is_bash_mode);
         let styler = if is_bash_mode {
             theme::bash_mode_border_styler()
         } else {
             theme::thinking_border_styler(self.thinking_level)
         };
-        self.editor_mut().editor.set_border_color(styler);
+        if let Some(editor) = self.editor_host_mut() {
+            editor.editor.set_border_color(styler);
+        }
         self.tui.request_render();
     }
 
@@ -4185,12 +4192,13 @@ impl InteractiveMode {
                 // `session.setAutoCompactionEnabled` =
                 // `settingsManager.setCompactionEnabled`
                 // (`agent-session.ts:3417-3419`), then the footer indicator.
+                // No border update — upstream's border refresh belongs to the
+                // per-model thinking arms (`:5208-5219`) only.
                 self.settings.set_compaction_enabled(enabled);
                 if let Some(footer) = self.downcast_tree::<FooterComponent>(HostSlot::Footer) {
                     footer.data.auto_compact_enabled = enabled;
                 }
                 self.tui.request_render();
-                self.update_editor_border_color();
             }
             SettingsSelectorEvent::ShowImagesChange(enabled) => {
                 // `onShowImagesChange` (`interactive-mode.ts:5153-5160`):
@@ -5328,6 +5336,30 @@ impl InteractiveMode {
     /// The turn's run thread: one `run_agent_loop` pass; the retry and
     /// overflow recovery re-runs happen on the UI thread's post-run machine
     /// (`_handlePostAgentRun`), which re-enters here with the same turn.
+    /// The run's wire credential for the CURRENT provider: the stored/env
+    /// ladder (`resolve_wire_credential`), with the `--api-key` flag as the
+    /// runtime override of the provider it was registered for
+    /// (`main.ts:898-906`; request-time `overrides.get(providerId)`,
+    /// `runtime-credentials.ts:14-16`). The boot pair was frozen at
+    /// construction — a `/model` switch to another provider kept streaming
+    /// with the old credential. A virtual selection keeps the frozen pair:
+    /// its routing resolves the routed provider's own credential.
+    fn run_wire_credential(&self) -> (Option<String>, Option<String>) {
+        if crate::virtual_models::is_virtual_model(&self.model) {
+            return (self.api_key.clone(), self.access_token.clone());
+        }
+        let flag_key = crate::oauth::runtime_api_key(&self.model.provider);
+        crate::modes::print_mode::resolve_wire_credential(
+            &self.model.provider,
+            flag_key.as_deref(),
+            &self.auth_path,
+        )
+        .map_or((None, None), |(credential, _)| match credential {
+            crate::modes::print_mode::WireCredential::ApiKey(key) => (Some(key), None),
+            crate::modes::print_mode::WireCredential::AccessToken(token) => (None, Some(token)),
+        })
+    }
+
     fn spawn_run(&mut self, prompts: Vec<AgentMessage>, context: AgentContext) {
         #[cfg(feature = "ext-js")]
         let routing = crate::virtual_models::TurnRouting::install(
@@ -5336,13 +5368,14 @@ impl InteractiveMode {
             self.api_key.clone(),
             &self.session,
         );
+        let (api_key, access_token) = self.run_wire_credential();
         let config = AgentLoopConfig {
             model: self.model.clone(),
             thinking_level: self.thinking_level,
             live_settings: None,
             session_id: None,
-            api_key: self.api_key.clone(),
-            access_token: self.access_token.clone(),
+            api_key,
+            access_token,
             tool_execution: ToolExecutionMode::Parallel,
             hooks: pi_agent::types::ToolCallHooks {
                 before: None,
@@ -7214,8 +7247,7 @@ impl InteractiveMode {
         }
 
         let model = self.model.clone();
-        let api_key = self.api_key.clone();
-        let access_token = self.access_token.clone();
+        let (api_key, access_token) = self.run_wire_credential();
         let thinking_level = self.thinking_level;
         let stream_fn = Arc::clone(&self.stream_fn);
         let reserve_tokens = self
@@ -9400,6 +9432,134 @@ mod tests {
         assert!(
             mode.suspended_editor.is_some(),
             "the settings dialog occupies the editor slot"
+        );
+    }
+
+    /// Toggling Auto-compact fires `AutoCompactChange` mid-dialog — with the
+    /// editor parked in `suspended_editor` (Enter on the empty search box
+    /// activates row 0; the user-reported panic). The border refresh reaches
+    /// the parked host, and the toggle persists.
+    #[test]
+    fn settings_autocompact_change_reaches_the_parked_editor() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, _capture) = fixture(dir.path(), "unused.txt");
+        mode.submit("/settings");
+        assert!(mode.suspended_editor.is_some(), "editor parked");
+        let before = mode.settings.get_compaction_enabled();
+        mode.handle_settings_event(SettingsSelectorEvent::AutoCompactChange(!before));
+        assert_eq!(
+            mode.settings.get_compaction_enabled(),
+            !before,
+            "the toggle persisted"
+        );
+        let border = mode
+            .suspended_editor
+            .as_mut()
+            .and_then(|host| host.as_any_mut())
+            .and_then(|any| any.downcast_mut::<ChatEditor>())
+            .expect("parked editor")
+            .editor
+            .border_color()
+            .clone();
+        assert_eq!(
+            border("-"),
+            theme::thinking_border_styler(mode.thinking_level)("-"),
+            "the parked editor carries the refreshed border"
+        );
+    }
+
+    /// A `/model` switch updates the footer's `(provider)` prefix together
+    /// with the model id (user-reported: the boot provider survived).
+    #[test]
+    fn apply_model_updates_the_footer_provider_prefix() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, _capture) = fixture(dir.path(), "unused.txt");
+        assert_eq!(mode.model.provider, "test");
+        let other = pi_ai::types::Model {
+            id: "b".to_string(),
+            name: "B".to_string(),
+            api: "test".to_string(),
+            provider: "fixtureb".to_string(),
+            reasoning: true,
+            context_window: 200_000,
+            max_tokens: 8192,
+            ..pi_ai::types::Model::default()
+        };
+        mode.apply_model(other).expect("apply");
+        let footer = mode
+            .downcast_tree::<FooterComponent>(HostSlot::Footer)
+            .expect("footer");
+        assert_eq!(footer.data.model_id, "b");
+        assert_eq!(footer.data.model_provider, "fixtureb");
+    }
+
+    /// Removes a runtime override when dropped (panic-safe cleanup of the
+    /// process-global `RUNTIME_API_KEYS`).
+    struct DropFlag(&'static str);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            crate::oauth::remove_runtime_api_key(self.0);
+        }
+    }
+
+    /// The run credential follows the CURRENT provider: the `--api-key`
+    /// runtime override applies to the provider it was registered for
+    /// (`main.ts:898-906`) and a switched-to provider resolves its own
+    /// stored credential (user-reported: requests kept the boot key).
+    #[test]
+    fn run_wire_credential_resolves_the_current_provider() {
+        // Serializes the process-global `RUNTIME_API_KEYS` with the oauth
+        // tests that mutate it.
+        let _rebuild = crate::models_state::REBUILD_LOCK.lock().expect("lock");
+        let _cleanup = DropFlag("groq");
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, _capture) = fixture(dir.path(), "unused.txt");
+        std::fs::write(
+            dir.path().join("auth.json"),
+            serde_json::json!({
+                "groq": {"type": "api_key", "key": "sk-groq-stored"},
+                "anthropic": {"type": "api_key", "key": "sk-anthropic-stored"},
+            })
+            .to_string(),
+        )
+        .expect("auth.json");
+        crate::oauth::set_runtime_api_key("groq", "sk-flag");
+        let model = |provider: &str| pi_ai::types::Model {
+            id: format!("{provider}-m"),
+            name: provider.to_string(),
+            api: "test".to_string(),
+            provider: provider.to_string(),
+            reasoning: true,
+            context_window: 200_000,
+            max_tokens: 8192,
+            ..pi_ai::types::Model::default()
+        };
+        // The boot fixture provider is registered nowhere: no stored
+        // credential, no override, no env mapping.
+        assert_eq!(mode.run_wire_credential(), (None, None));
+        mode.apply_model(model("groq")).expect("apply");
+        let (api_key, access_token) = mode.run_wire_credential();
+        assert_eq!(
+            api_key.as_deref(),
+            Some("sk-flag"),
+            "override for its provider"
+        );
+        assert!(access_token.is_none());
+        mode.apply_model(model("anthropic")).expect("apply");
+        let (api_key, access_token) = mode.run_wire_credential();
+        assert_eq!(
+            api_key.as_deref(),
+            Some("sk-anthropic-stored"),
+            "the switched-to provider's stored credential"
+        );
+        assert!(access_token.is_none());
+        crate::oauth::remove_runtime_api_key("groq");
+        mode.apply_model(model("groq")).expect("apply");
+        let (api_key, _) = mode.run_wire_credential();
+        assert_eq!(
+            api_key.as_deref(),
+            Some("sk-groq-stored"),
+            "the stored credential under the removed override"
         );
     }
 

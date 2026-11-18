@@ -104,6 +104,16 @@ fn has_runtime_api_key(provider_id: &str) -> bool {
         .is_ok_and(|keys| keys.contains_key(provider_id))
 }
 
+/// The runtime override's value for one provider (`overrides.get(providerId)`
+/// at request time, `runtime-credentials.ts:14-16`): the `--api-key` flag
+/// resolves for the provider it was registered for and for no other.
+pub fn runtime_api_key(provider_id: &str) -> Option<String> {
+    RUNTIME_API_KEYS
+        .read()
+        .ok()
+        .and_then(|keys| keys.get(provider_id).cloned())
+}
+
 /// Providers whose API-key auth is configured outside the app — their custom
 /// login flows (the AWS auth-method chooser `amazon-bedrock.ts:13`, the
 /// Google Cloud method select `google-vertex.ts:15`, the Cloudflare account
@@ -1416,5 +1426,18 @@ mod tests {
         let status = provider_auth_status("acme", None, None, &path).expect("status");
         assert_eq!(status.source, Some("stored"));
         drop(dir);
+    }
+
+    /// `runtime_api_key` reads the override's value for the provider it was
+    /// registered for and for no other (`overrides.get(providerId)`,
+    /// `runtime-credentials.ts:14-16`).
+    #[test]
+    fn runtime_api_key_reads_the_registered_provider_only() {
+        let _guard = crate::models_state::REBUILD_LOCK.lock().expect("lock");
+        set_runtime_api_key("getterprov", "sk-getter");
+        assert_eq!(runtime_api_key("getterprov").as_deref(), Some("sk-getter"));
+        assert_eq!(runtime_api_key("getterother"), None);
+        remove_runtime_api_key("getterprov");
+        assert_eq!(runtime_api_key("getterprov"), None);
     }
 }
