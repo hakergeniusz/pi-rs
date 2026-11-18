@@ -312,6 +312,10 @@ fn build_runtime_with_ui(
 
     #[cfg(not(feature = "ext-js"))]
     let _ = ui;
+    // The extension-visible mode string: the port's internal "interactive"
+    // is upstream's "tui" (the context's `mode` field,
+    // `interactive-mode.ts:2764`; print/json/rpc keep their names).
+    let extension_mode = if mode == "interactive" { "tui" } else { mode };
     // Extensions (E2 slice 3). Diagnostics report in order: warnings to
     // stderr, error-level entries abort with the load-failure hint
     // (`main.ts:982-990`).
@@ -323,8 +327,8 @@ fn build_runtime_with_ui(
         &trust_store,
         default_project_trust,
         &startup_settings,
-        mode,
-        ui.map(|sink| (sink, mode.to_string())),
+        extension_mode,
+        ui.map(|sink| (sink, extension_mode.to_string())),
     )?;
     #[cfg(not(feature = "ext-js"))]
     let (extensions, diagnostics) = extensions::load(
@@ -664,6 +668,23 @@ fn run_print(
 /// Interactive mode: the chat TUI. Initial `@file`/message arguments ride
 /// along like upstream's `initialMessage` (P6 part 2).
 fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
+    // The interactive `ctx.ui` bridge (E3 slice 6a): built before
+    // extensions load so a dialog can open during `session_start`
+    // (`createExtensionUIContext`, `interactive-mode.ts:2763-2830`; the
+    // RPC twin wires the same sink at `main.ts:742`'s arm).
+    #[cfg(feature = "ext-js")]
+    let extension_ui = std::sync::Arc::new(
+        pi_coding_agent::modes::interactive::extension_ui::ExtensionUiBridge::new(),
+    );
+    #[cfg(feature = "ext-js")]
+    let mut runtime = build_runtime_with_ui(
+        args,
+        cwd,
+        cwd_string,
+        "interactive",
+        Some(Arc::clone(&extension_ui) as Arc<dyn pi_ext_js::UiSink>),
+    )?;
+    #[cfg(not(feature = "ext-js"))]
     let mut runtime = build_runtime(args, cwd, cwd_string, "interactive")?;
     // The trust ladder resolved once in build_runtime — extensions may have
     // decided through the `project_trust` hook.
@@ -694,6 +715,8 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
         project_trusted,
         extension_cli_paths: args.extensions.clone().unwrap_or_default(),
         no_extensions: args.no_extensions,
+        #[cfg(feature = "ext-js")]
+        extension_ui: Some(extension_ui),
     };
     pi_coding_agent::modes::interactive::interactive_mode::run_interactive_mode(
         &mut runtime,

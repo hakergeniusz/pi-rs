@@ -1,10 +1,11 @@
 //! `ExtensionSelectorComponent` — the generic option dialog.
 //!
 //! Ground truth: `modes/interactive/components/extension-selector.ts`
-//! (1-107). Deviations: the countdown/timeout option and the
-//! tools-expanded passthrough (`opts.onToggleToolsExpanded`) stay unwired —
-//! every built-in caller passes no options, and the full extension-dialog
-//! machinery (pushed dialogs, RPC routing) lands with E3.
+//! (1-107). Deviation: the countdown is pump-driven — the mode owns the
+//! deadline and calls [`Self::set_countdown_seconds`] (upstream arms a
+//! `CountdownTimer` inside the component); the tools-expanded passthrough
+//! (`opts.onToggleToolsExpanded`) stays unwired (it lands with the
+//! tools-expanded surface).
 
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +34,10 @@ pub struct ExtensionSelectorComponent {
     options: Vec<String>,
     selected_index: usize,
     events: Arc<Mutex<Vec<ExtensionSelectorEvent>>>,
+    /// The countdown's seconds for the `(Ns)` title suffix; `None` keeps
+    /// the plain title. The mode drives it (the pump ticks the deadline),
+    /// like the input dialog's countdown.
+    countdown_seconds: Option<u32>,
 }
 
 impl ExtensionSelectorComponent {
@@ -46,7 +51,14 @@ impl ExtensionSelectorComponent {
             options,
             selected_index: 0,
             events,
+            countdown_seconds: None,
         }
+    }
+
+    /// The countdown's title suffix (`extension-selector.ts:65-69`: the
+    /// title re-renders as `"{title} ({s}s)"` each second).
+    pub fn set_countdown_seconds(&mut self, seconds: Option<u32>) {
+        self.countdown_seconds = seconds;
     }
 
     /// The option window, centered on the selection
@@ -89,13 +101,14 @@ impl Component for ExtensionSelectorComponent {
         let mut lines = Vec::new();
         lines.extend(Component::render(&DynamicBorder::new(), width));
         lines.push(String::new());
+        // The countdown re-renders the title as `"{title} ({s}s)"`
+        // (`extension-selector.ts:65-69`).
+        let title = match self.countdown_seconds {
+            Some(seconds) => format!("{} ({}s)", self.title, seconds),
+            None => self.title.clone(),
+        };
         lines.extend(
-            Text::new(
-                theme.fg(ThemeColor::Accent, &theme::bold(&self.title)),
-                1,
-                0,
-            )
-            .render(width),
+            Text::new(theme.fg(ThemeColor::Accent, &theme::bold(&title)), 1, 0).render(width),
         );
         lines.push(String::new());
         lines.extend(self.render_options(width));

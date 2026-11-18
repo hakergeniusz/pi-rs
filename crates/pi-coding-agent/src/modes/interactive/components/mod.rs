@@ -17,6 +17,7 @@ pub mod custom_entry;
 pub mod custom_message;
 pub mod easter_egg_3d;
 pub mod extension_editor;
+pub mod extension_input;
 pub mod extension_selector;
 pub mod footer;
 pub mod header;

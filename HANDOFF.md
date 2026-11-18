@@ -2841,6 +2841,71 @@ upstream `settings-list.ts` found no further divergences (search filter
 empty-search activation, mouse press/click/wheel row mapping, scroll
 indicator, description/hint lines, j/k absence — all verified matching).
 
+## E3 slice 6a: interactive `ctx.ui` dialogs over the bridge (landed on `feat/interactive-ext-ui`, 2026-11-18)
+
+The interactive mode now binds the extension UI surface — the transport
+twin of RPC mode's `RpcUiSink` (`modes/rpc.rs:570-643`) over the
+[`pi_ext_js::UiSink`] seam. Ground truth: `createExtensionUIContext`
+(`interactive-mode.ts:2763-2830`), the dialog mounts
+(`showExtensionSelector`/`showExtensionConfirm`/`showExtensionInput`/
+`showExtensionEditor`/`showExtensionNotify`, `:2858-3071`), and the
+runner's dialog contract (`{value}`, `{confirmed}`, `{cancelled:true}`).
+
+- **`ExtensionUiBridge`** (`modes/interactive/extension_ui.rs`): one Arc
+  serves both sides — the runner's `UiSink` impl registers a one-slot
+  answer channel per dialog request and blocks `wait_response` on it
+  (no timeout: the mode owns the countdown, matching upstream's TUI
+  flow where the dialog promise settles only through the dialog);
+  the mode polls `try_request` per pump and answers via `respond`.
+  Fire-and-forget methods (`notify`, `setStatus`, …) never register a
+  waiter; `wait_response` on one answers the method default
+  (`Value::Null` — the glue parses it into that default).
+- **`run_interactive`** (`main.rs:666`) builds the bridge BEFORE
+  `extensions::load` and hands the same Arc to both (a dialog can open
+  during `session_start`), mirroring the RPC arm at `main.ts:742`. The
+  extension-visible mode string now maps the port's internal
+  "interactive" to upstream's "tui" (`ctx.mode` fidelity).
+- **Mounting** (`mount_extension_ui_request`): select → the generic
+  `ExtensionSelectorComponent`; confirm → the same selector with
+  `"${title}\n${message}"` over Yes/No (`showExtensionConfirm`); input →
+  the NEW `ExtensionInputComponent` port (`extension-input.ts:1-92` —
+  border/title/Input/hints; placeholder deliberately uncrossed upstream);
+  editor → the existing `ExtensionEditorComponent`. The editor-slot swap
+  parks the editor with its text — upstream's `restoreEditor` semantics.
+  `notify` lands as chat lines by type (`show_error`/`show_warning`/
+  `show_status`). Requests that arrive while a dialog is open queue
+  FIFO behind it — the interim answer to upstream's dialog stack
+  (`pushExtensionDialog`, `interactive-mode.ts:2833-2856`) until slice
+  6b lands the stack; the port's single-slot swap means a queued dialog
+  mounts after the previous one closes (same observable order for
+  non-overlapping prompts, which is all the glue can produce today).
+- **Countdown**: `opts.timeout` arms a pump-driven deadline; the mounted
+  selector/input re-renders its title as `"{title} ({s}s)"` per tick
+  (`extension-selector.ts:63-72`/`extension-input.ts:70-74`) and expiry
+  cancels (answers `{cancelled:true}` → the glue's method default).
+  Upstream arms the countdown inside the component (`CountdownTimer`);
+  the port keeps the clock in the mode's pump (25 ms loop) — no thread
+  per dialog.
+- **Known gaps (documented)**: `setStatus` drops (the footer
+  extension-status surface lands with the E3 footer work); the blocked
+  status (`programStatus.setBlocked("extension-dialog", …)`) lands with
+  slice 6b's program-status surface; `onTerminalInput`,
+  widgets, footer/header factories are the later E3 slices.
+
+Tests: 9 new — the bridge transport (dialog answer crosses once /
+fire-and-forget never waits), the `ExtensionInputComponent` port
+(row order, enter submits, escape cancels, countdown suffix), and the
+three e2e round trips (`session_start` handler → `ctx.ui.select` mounts
+the selector over the bridge and the picked option resolves the promise
+via `appendEntry`; `ctx.ui.input` mounts the text dialog and REAL
+keystrokes through the focused slot submit the line; `ctx.ui.notify`
+renders per type). GOTCHA banked the hard way: lifecycle events
+register via `pi.on("session_start", (event, ctx) => …)` — `pi.events.on`
+is the CUSTOM event bus, and `pi.ui` does not exist (the dialogs ride
+the handler's `ctx` parameter) — a wrong surface fails SILENTLY (the
+handler throws, the dispatch reports to the error listener, nothing
+crosses). Gate 1869/0.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
