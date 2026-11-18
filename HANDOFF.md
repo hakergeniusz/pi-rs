@@ -2706,6 +2706,63 @@ is). A non-component return counts as failed because upstream's
 `single_match_else` again reshaped both one-real-arm matches into
 if/else.
 
+## User-reported round 2: settings-dialog Enter panic + stale model-switch provider (landed on `fix/settings-enter-panic-model-switch`, 2026-11-18)
+
+Two user reports, one root class each. Both reproduced on fresh
+binaries with PTY probes (synthetic HOME, EXIT=101 → EXIT=0 after the
+fix), full gate 1853 passed / 0 failed (FMT/CLIPPY/TEST/FMTCHECK/NDF
+all 0), CI on the main push.
+
+1. **Enter on the empty `/settings` search box panicked**
+   (`interactive_mode.rs:1952 "editor host"`). Enter activates the
+   selected row (row 0 = Auto-compact) → `AutoCompactChange` fires
+   mid-dialog, while the selector occupies the editor slot and the
+   editor is parked in `suspended_editor`. The arm carried a
+   `update_editor_border_color()` call → `editor_mut()` →
+   `.expect("editor host")`. Two fixes: the border refresh goes through
+   `editor_host_mut()` (mounted OR parked — upstream's `this.editor`
+   is always reachable, `interactive-mode.ts:4700-4707`), and the
+   spurious call is REMOVED — upstream's `onAutoCompactChange`
+   (`:5149-5152`) is set + footer only; the border refresh belongs to
+   the per-model thinking arms (`:5208-5219`) alone. The other
+   settings arms that touch the editor already used `editor_host_mut()`.
+2. **Model switch kept the boot provider** — two layers:
+   (a) UI: `FooterData.model_provider` was written ONLY at construction
+   (`refresh_footer` updated `model_id` but never the provider), so the
+   `(provider)` prefix showed the boot provider forever
+   (`footer.ts:227-263` rebuilds per refresh upstream). `refresh_footer`
+   now carries it.
+   (b) Wire: `spawn_run` (and the compaction-summary and
+   branch-summary credential pairs) used the FROZEN boot
+   `self.api_key`/`self.access_token` for ANY current model — a
+   `/model` switch to another provider kept streaming with the boot
+   credential. New `run_wire_credential()` resolves the CURRENT
+   provider through the stored/env ladder with the `--api-key` flag as
+   the runtime override of the provider it was registered for
+   (`main.ts:898-906`; new `oauth::runtime_api_key` = upstream's
+   `overrides.get(providerId)`, `runtime-credentials.ts:14-16`); a
+   virtual selection keeps the frozen pair (its routing resolves the
+   routed provider's own credential). Boot behavior is unchanged (the
+   boot provider resolves through the registered flag → same value).
+
+Tests: 4 new — the parked-editor toggle (the panic regression:
+`AutoCompactChange` mid-dialog, toggle persisted, parked editor
+carries the refreshed border), the footer provider prefix after
+`apply_model`, `run_wire_credential` (override for its provider /
+stored credential for the switched-to provider / ladder under the
+removed override, under `REBUILD_LOCK` with a panic-safe drop guard),
+and the `oauth::runtime_api_key` getter.
+
+Deviations/notes:
+
+- Switching to an UNCONFIGURED provider now sends keyless requests
+  (401 from the provider) where before it silently reused the boot
+  key; upstream surfaces a request-setup error instead — a clearer
+  message is a candidate when the request-setup path is reconciled.
+- The remaining hard `editor_mut()` callers are editor-text ops on
+  paths that only run with the editor mounted (submits, tree
+  navigation after its selector closes) — left as-is.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
