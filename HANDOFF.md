@@ -2636,9 +2636,9 @@ resolvers over the `withBuiltInRenderers` base),
 `tool-execution.ts:106-124` (slot getters + `getRenderShell`),
 `:128-144` (the render context), `:146-164` (the generic fallbacks),
 `:299-344` (the call/result slots), `types.ts:488-521` + `:616` +
-`:693` (`ToolRenderContext`, `renderShell`, `ToolRenderers`). Full gate
-1849 passed / 0 failed (FMT/CLIPPY/TEST/FMTCHECK/NDF all 0), CI run on
-the main push.
+`:693` (`ToolRenderContext`, `renderShell`, `ToolRenderers`). Commit
+4f6445b (6 files, +1228/−61), full gate 1849 passed / 0 failed
+(FMT/CLIPPY/TEST/FMTCHECK/NDF all 0), CI run on the main push.
 
 What landed:
 
