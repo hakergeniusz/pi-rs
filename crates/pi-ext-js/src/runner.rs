@@ -174,6 +174,9 @@ pub struct ExtensionSnapshot {
     /// transformer fn stays in the JS-side record).
     #[serde(default, rename = "markdownTransformer")]
     pub markdown_transformer: Option<MarkdownTransformerSpec>,
+    /// The custom entry types this extension registered a renderer for.
+    #[serde(default, rename = "entryRenderers")]
+    pub entry_renderers: Vec<String>,
 }
 
 /// `{name, description}` of one registered command.
@@ -258,6 +261,29 @@ pub struct ResolvedMarkdownTransformer {
     pub extension_path: String,
     /// The `MarkdownMessageType` names the transformer runs on.
     pub message_types: Vec<String>,
+}
+
+/// The embedder-installed `theme.fg`/`theme.bg` mapping
+/// ([`Self::set_theme_surface`]): token name + text in, styled text out.
+pub type ThemeSurfaceFn = std::sync::Arc<dyn Fn(&str, &str) -> String + Send + Sync>;
+
+/// What one entry-renderer call produced (`CustomEntryComponent.rebuild`
+/// upstream): the adopted component's handle + input flag, the renderer's
+/// failure text, or nothing.
+#[derive(Debug, Clone)]
+pub enum EntryRenderOutcome {
+    /// The renderer returned a component; it lives under the handle in the
+    /// JS registry until released.
+    Component {
+        /// The component handle (the `__piComponent*` calls' key).
+        handle: u32,
+        /// Whether the JS component implements `handleInput`.
+        has_input: bool,
+    },
+    /// The renderer threw; the message goes into the host's error box.
+    Failed(String),
+    /// No renderer for the type, or the renderer returned undefined.
+    None,
 }
 
 /// One extension shortcut the resolution accepted (`ExtensionShortcut`
@@ -1216,6 +1242,54 @@ impl ExtensionRunner {
             .markdown_transform(ext_index, markdown, context_json)
     }
 
+    /// The FIRST extension whose renderer handles this custom entry type
+    /// (`getEntryRenderer`, `runner.ts:815-823` — load order wins).
+    pub fn get_entry_renderer(&self, custom_type: &str) -> Option<usize> {
+        self.extensions.iter().position(|extension| {
+            extension
+                .entry_renderers
+                .iter()
+                .any(|registered| registered == custom_type)
+        })
+    }
+
+    /// Calls the entry renderer of extension `ext_index` for one custom
+    /// entry (`addCustomEntryToChat`, `interactive-mode.ts:3986-4007`):
+    /// the engine adopts the returned component and reports the outcome.
+    /// `entry_json` is the raw record; `options_json` carries
+    /// `{expanded}` (the keybinding hints cross through the JS shim).
+    pub fn render_entry(
+        &self,
+        ext_index: usize,
+        custom_type: &str,
+        entry_json: &str,
+        options_json: &str,
+    ) -> Result<EntryRenderOutcome, JsHostError> {
+        self.host
+            .render_entry(ext_index, custom_type, entry_json, options_json)
+    }
+
+    /// Renders one adopted component (`custom-entry.ts` embeds it as a
+    /// child; the handle comes from [`Self::render_entry`]).
+    pub fn component_render(&self, handle: u32, width: usize) -> Result<Vec<String>, JsHostError> {
+        self.host.component_render(handle, width)
+    }
+
+    /// Feeds one key chunk to an adopted component; `true` = consumed.
+    pub fn component_handle_input(&self, handle: u32, data: &str) -> Result<bool, JsHostError> {
+        self.host.component_handle_input(handle, data)
+    }
+
+    /// Invalidates one adopted component (the theme-change hook).
+    pub fn component_invalidate(&self, handle: u32) -> Result<(), JsHostError> {
+        self.host.component_invalidate(handle)
+    }
+
+    /// Drops one adopted component from the JS registry.
+    pub fn component_release(&self, handle: u32) -> Result<(), JsHostError> {
+        self.host.component_release(handle)
+    }
+
     /// Executes a registered shortcut handler (`interactive-mode.ts:2425-2427`
     /// invokes `handler(ctx)`; the port dispatches the stashed handler
     /// through the base-ctx session machinery — the same shape the command
@@ -1358,6 +1432,31 @@ impl ExtensionRunner {
         for listener in &self.error_listeners {
             listener(&extension_error);
         }
+    }
+
+    /// Crosses the resolved keybindings table (id → chords) the extension
+    /// components' `keyText`/`keyHint` read (`getKeybindings()` upstream —
+    /// the port has no `keybindings.json` overrides, so this is the default
+    /// table, serialized by the embedder).
+    pub fn set_app_keybindings(&mut self, keybindings_json: &str) {
+        let value: Json = serde_json::from_str(keybindings_json).unwrap_or(Json::Null);
+        self.core
+            .lock()
+            .expect("host core mutex poisoned")
+            .app_keybindings = value;
+    }
+
+    /// Installs the extension components' theme mapping — the synchronous
+    /// `theme.fg`/`theme.bg` inside renderer calls (`theme.ts:297/:303`).
+    /// The closures read the port's live theme per call, so theme changes
+    /// need no rebind. Without this the identity default renders plain
+    /// text (the headless matrix). The interactive mode calls this even
+    /// though its dialog surface (`set_ui_context`) lands with the
+    /// ui-custom slice — entry renderers style but never prompt.
+    pub fn set_theme_surface(&mut self, fg: ThemeSurfaceFn, bg: ThemeSurfaceFn) {
+        let mut core = self.core.lock().expect("host core mutex poisoned");
+        core.actions.theme_fg = Box::new(move |token, text| fg(token, text));
+        core.actions.theme_bg = Box::new(move |token, text| bg(token, text));
     }
 
     /// Binds the UI surface (`setUIContext`, `runner.ts:570-575`):
@@ -4974,6 +5073,223 @@ export default function (pi) {{
                 .iter()
                 .any(|active| active == "mcp__synth__echo"),
             "hidden tools leave the active set"
+        );
+    }
+
+    // ---- E3 slice 3: entry renderers + component handles ----
+
+    /// The on-disk custom-entry record `__piRenderEntry` JSON.parses and
+    /// hands the renderer (the `data` field feeds the round-trip test).
+    const ENTRY_NOTE: &str = r#"{"type":"custom","id":"e1","timestamp":"2026-01-01T00:00:00Z","customType":"note","data":{"k":1}}"#;
+
+    #[test]
+    fn entry_renderer_first_extension_wins() {
+        const EXT_A: &str = r#"
+export default function (pi) {
+  pi.registerEntryRenderer("note", () => ({
+    render: (width) => ["a-0 w" + width],
+    invalidate: () => {},
+  }));
+}
+"#;
+        const EXT_B: &str = r#"
+export default function (pi) {
+  pi.registerEntryRenderer("note", () => ({
+    render: (width) => ["b-0 w" + width],
+    invalidate: () => {},
+  }));
+}
+"#;
+        let runner = runner_with(&[EXT_A, EXT_B]);
+        // Load order decides (`getEntryRenderer`, runner.ts:815-823).
+        assert_eq!(runner.get_entry_renderer("note"), Some(0));
+        assert_eq!(runner.get_entry_renderer("other"), None);
+        let outcome = runner
+            .render_entry(0, "note", ENTRY_NOTE, r#"{"expanded":true}"#)
+            .expect("render");
+        let EntryRenderOutcome::Component { handle, has_input } = outcome else {
+            panic!("expected a component, got {outcome:?}");
+        };
+        assert!(!has_input);
+        assert_eq!(
+            runner.component_render(handle, 10).expect("render"),
+            vec!["a-0 w10".to_string()]
+        );
+    }
+
+    #[test]
+    fn render_entry_none_without_renderer_and_undefined_result() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerEntryRenderer("note", () => undefined);
+}
+"#;
+        let runner = runner_with(&[EXT]);
+        // A renderer returning undefined adopts nothing (custom-entry.ts
+        // rebuild maps that to the "none" outcome upstream).
+        let outcome = runner
+            .render_entry(0, "note", ENTRY_NOTE, "{}")
+            .expect("render");
+        assert!(matches!(outcome, EntryRenderOutcome::None), "{outcome:?}");
+        // No renderer for the type is the same outcome.
+        let outcome = runner
+            .render_entry(0, "missing", ENTRY_NOTE, "{}")
+            .expect("render");
+        assert!(matches!(outcome, EntryRenderOutcome::None), "{outcome:?}");
+    }
+
+    #[test]
+    fn render_entry_failed_on_renderer_throw_and_adoption_validation() {
+        const EXT_THROW: &str = r#"
+export default function (pi) {
+  pi.registerEntryRenderer("note", () => {
+    throw new Error("boom-renderer");
+  });
+}
+"#;
+        const EXT_NOFN: &str = r#"
+export default function (pi) {
+  // Neither render nor invalidate — adoption rejects it (`tui.ts:124-155`).
+  pi.registerEntryRenderer("note", () => ({}));
+}
+"#;
+        let runner = runner_with(&[EXT_THROW, EXT_NOFN]);
+        // The glue catch maps a renderer throw to {kind:"error",message}
+        // (custom-entry.ts:44-50 renders the failure box upstream).
+        let thrown = runner
+            .render_entry(0, "note", ENTRY_NOTE, "{}")
+            .expect("render");
+        let EntryRenderOutcome::Failed(message) = thrown else {
+            panic!("expected a failure, got {thrown:?}");
+        };
+        assert_eq!(message, "boom-renderer");
+        // The adopt validation throws into the same catch.
+        let rejected = runner
+            .render_entry(1, "note", ENTRY_NOTE, "{}")
+            .expect("render");
+        let EntryRenderOutcome::Failed(message) = rejected else {
+            panic!("expected a failure, got {rejected:?}");
+        };
+        assert_eq!(
+            message,
+            "extension components must implement render(width) and invalidate()"
+        );
+    }
+
+    #[test]
+    fn component_round_trip_render_input_invalidate_release() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerEntryRenderer("note", (entry) => ({
+    render: (width) => ["w:" + width, String(entry.data.k)],
+    invalidate: () => {},
+    handleInput: (data) => data === "yes",
+  }));
+}
+"#;
+        let runner = runner_with(&[EXT]);
+        let outcome = runner
+            .render_entry(0, "note", ENTRY_NOTE, r#"{"expanded":true}"#)
+            .expect("render");
+        let EntryRenderOutcome::Component { handle, has_input } = outcome else {
+            panic!("expected a component, got {outcome:?}");
+        };
+        assert!(has_input);
+        // The width and the parsed entry JSON both crossed the boundary.
+        assert_eq!(
+            runner.component_render(handle, 42).expect("render"),
+            vec!["w:42".to_string(), "1".to_string()]
+        );
+        // `handleInput(data) === true` decides the consume flag
+        // (`__piComponentHandleInput`).
+        assert!(runner.component_handle_input(handle, "yes").expect("input"));
+        assert!(!runner.component_handle_input(handle, "no").expect("input"));
+        runner.component_invalidate(handle).expect("invalidate");
+        runner.component_release(handle).expect("release");
+        // The registry slot is gone: renders come back empty.
+        assert_eq!(
+            runner.component_render(handle, 42).expect("render"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn keytext_and_keyhint_cross_the_app_keybindings() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerEntryRenderer("note", (entry, options) => ({
+    render: () => [
+      options.keyText("pi.editor.submit"),
+      options.keyText("pi.app.unknown"),
+      options.keyHint("pi.app.exit", "quit"),
+    ],
+    invalidate: () => {},
+  }));
+}
+"#;
+        let mut runner = runner_with(&[EXT]);
+        // The keybinding table crosses before the render (`getKeybindings()`
+        // upstream — keybinding-hints.ts:34-44, without the darwin alt swap).
+        runner.set_app_keybindings(
+            r#"{"pi.editor.submit":["enter","alt+enter"],"pi.app.exit":["ctrl+c"]}"#,
+        );
+        let outcome = runner
+            .render_entry(0, "note", ENTRY_NOTE, "{}")
+            .expect("render");
+        let EntryRenderOutcome::Component { handle, .. } = outcome else {
+            panic!("expected a component, got {outcome:?}");
+        };
+        // keyText joins the chords with "/" ("" for unknown ids); keyHint is
+        // fg("dim", keyText) + fg("muted", " " + description) — identity
+        // through the default theme closures.
+        assert_eq!(
+            runner.component_render(handle, 40).expect("render"),
+            vec![
+                "enter/alt+enter".to_string(),
+                String::new(),
+                "ctrl+c quit".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn theme_surface_maps_tokens_for_entry_renderers() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerEntryRenderer("note", (entry, options, theme) => ({
+    render: () => [theme.fg("error", "X")],
+    invalidate: () => {},
+  }));
+}
+"#;
+        // Without a surface the theme closures are identity: the token is
+        // dropped and the text passes through (`theme.ts:297/:303` upstream).
+        let runner = runner_with(&[EXT]);
+        let outcome = runner
+            .render_entry(0, "note", ENTRY_NOTE, "{}")
+            .expect("render");
+        let EntryRenderOutcome::Component { handle, .. } = outcome else {
+            panic!("expected a component, got {outcome:?}");
+        };
+        assert_eq!(
+            runner.component_render(handle, 10).expect("render"),
+            vec!["X".to_string()]
+        );
+        // The installed surface maps the token per call; bg stays identity.
+        let mut themed = runner_with(&[EXT]);
+        themed.set_theme_surface(
+            std::sync::Arc::new(|token: &str, text: &str| format!("<{token}>{text}</{token}>")),
+            std::sync::Arc::new(|_token: &str, text: &str| text.to_string()),
+        );
+        let outcome = themed
+            .render_entry(0, "note", ENTRY_NOTE, "{}")
+            .expect("render");
+        let EntryRenderOutcome::Component { handle, .. } = outcome else {
+            panic!("expected a component, got {outcome:?}");
+        };
+        assert_eq!(
+            themed.component_render(handle, 10).expect("render"),
+            vec!["<error>X</error>".to_string()]
         );
     }
 }

@@ -9,6 +9,8 @@ pub mod assistant_message;
 pub mod auth_selector;
 pub mod branch_summary;
 pub mod compaction_summary;
+#[cfg(feature = "ext-js")]
+pub mod custom_entry;
 pub mod easter_egg_3d;
 pub mod extension_editor;
 pub mod extension_selector;

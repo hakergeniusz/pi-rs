@@ -152,6 +152,9 @@ globalThis.__piBeginExtension = function (path) {
     // with the surfaces it runs on (default user/assistant/
     // assistant-thinking).
     markdownTransformer: undefined,
+    // The custom entry types this extension registered a renderer for
+    // (`loader.ts:373-378` — a plain record, first match wins at lookup).
+    entryRenderers: {},
     busSubscriptions: [],
     pendingChanges: [],
     // The virtual-model definitions this extension registered, for cleanup
@@ -288,7 +291,7 @@ globalThis.__piDiscardExtension = function (extIdx) {
       globalThis.__piProviderOAuth.delete(entry.name);
     }
   }
-  globalThis.__piExtensions[extIdx] = { path: ext.path, events: {}, tools: {}, commands: {}, flags: {}, shortcuts: {}, markdownTransformer: undefined, busSubscriptions: [] };
+  globalThis.__piExtensions[extIdx] = { path: ext.path, events: {}, tools: {}, commands: {}, flags: {}, shortcuts: {}, markdownTransformer: undefined, entryRenderers: {}, busSubscriptions: [] };
 };
 
 // The extension event bus (core/event-bus.ts:12-33): handlers are wrapped
@@ -435,6 +438,13 @@ globalThis.__piCreateApi = function (extIdx) {
       };
     },
 
+    registerEntryRenderer(customType, renderer) {
+      assertActive();
+      // Upstream validates nothing here (`loader.ts:373-378`); the first
+      // extension with a renderer for the type wins at lookup time.
+      (ext.entryRenderers ??= {})[customType] = renderer;
+    },
+
     registerFlag(name, options) {
       assertActive();
       if (options.default !== undefined && typeof options.default !== options.type) {
@@ -480,8 +490,11 @@ globalThis.__piCreateApi = function (extIdx) {
         messageTypes: new Set(options?.messageTypes ?? ["user", "assistant", "assistant-thinking"]),
       };
     },
-    registerEntryRenderer() {
-      throw new Error("pi.registerEntryRenderer is not available in the E1 headless extensions core (E3)");
+    registerEntryRenderer(customType, renderer) {
+      assertActive();
+      // Registration is harmless headless (upstream registers from the base
+      // API in every context; nothing renders entries without a TUI).
+      (ext.entryRenderers ??= {})[customType] = renderer;
     },
     registerToolRenderer() {
       throw new Error("pi.registerToolRenderer is not available in the E1 headless extensions core (E3)");
@@ -1328,6 +1341,91 @@ globalThis.__piMarkdownTransform = function (extIdx, markdown, contextJson) {
   return typeof result === "string" ? result : undefined;
 };
 
+// The adopted component registry (E3 slice 3): Rust proxies hold only the
+// numeric handle; the component object lives here so render, input,
+// invalidate and release cross the boundary. Upstream components implement
+// render(width) -> string[] and invalidate() (`tui.ts:124-155`), with
+// handleInput(data) optional.
+let __piComponentSeq = 0;
+globalThis.__piComponentHandles = new Map();
+
+globalThis.__piComponentAdopt = function (component) {
+  if (component === undefined || component === null) return undefined;
+  if (typeof component.render !== "function" || typeof component.invalidate !== "function") {
+    throw new Error("extension components must implement render(width) and invalidate()");
+  }
+  __piComponentSeq += 1;
+  globalThis.__piComponentHandles.set(__piComponentSeq, component);
+  return __piComponentSeq;
+};
+
+globalThis.__piComponentRender = function (handle, width) {
+  const component = globalThis.__piComponentHandles.get(handle);
+  if (component === undefined) return undefined;
+  return JSON.stringify({ lines: component.render(width) });
+};
+
+globalThis.__piComponentHandleInput = function (handle, data) {
+  const component = globalThis.__piComponentHandles.get(handle);
+  if (component === undefined || typeof component.handleInput !== "function") return undefined;
+  return JSON.stringify({ consume: component.handleInput(data) === true });
+};
+
+globalThis.__piComponentInvalidate = function (handle) {
+  const component = globalThis.__piComponentHandles.get(handle);
+  if (component !== undefined) component.invalidate();
+};
+
+globalThis.__piComponentRelease = function (handle) {
+  globalThis.__piComponentHandles.delete(handle);
+};
+
+// The entry renderer call (`addCustomEntryToChat`, interactive-mode.ts:3986;
+// custom-entry.ts rebuild): the FIRST extension with a renderer for the
+// customType runs it (first-wins resolves Rust-side). The theme object
+// styles synchronously through ops, and keyText/keyHint cross as closures
+// over the app keybindings table (`EntryRenderOptions`, types.ts:1561-1563).
+// A renderer throw becomes `{kind:"error"}` — the host renders the failure
+// box (custom-entry.ts:44-50); a renderer returning nothing is `{kind:"none"}`.
+globalThis.__piRenderEntry = function (extIdx, customType, entryJson, optionsJson) {
+  const ext = globalThis.__piExtensions[extIdx];
+  const renderer = ext?.entryRenderers?.[customType];
+  if (renderer === undefined) return undefined;
+  const entry = JSON.parse(entryJson);
+  const options = JSON.parse(optionsJson);
+  const theme = {
+    fg: (color, text) => globalThis.__piOps.themeFg(String(color), String(text)),
+    bg: (color, text) => globalThis.__piOps.themeBg(String(color), String(text)),
+  };
+  const keysOf = (keybinding) => globalThis.__piKeybindingKeys(keybinding).join("/");
+  const entryOptions = {
+    expanded: options.expanded === true,
+    keyText: keysOf,
+    keyHint: (keybinding, description) => theme.fg("dim", keysOf(keybinding)) + theme.fg("muted", ` ${description}`),
+  };
+  try {
+    const component = renderer(entry, entryOptions, theme);
+    const handle = globalThis.__piComponentAdopt(component);
+    if (handle === undefined) return undefined;
+    return JSON.stringify({
+      kind: "component",
+      handle,
+      hasInput: typeof component.handleInput === "function",
+    });
+  } catch (error) {
+    return JSON.stringify({ kind: "error", message: error instanceof Error ? error.message : String(error) });
+  }
+};
+
+// The resolved keybindings table (id -> chords) the mode crosses at bind
+// time; `keyText`/`keyHint` read it (`getKeybindings().getKeys` upstream —
+// keybinding-hints.ts:34-44, without the darwin alt swap).
+globalThis.__piKeybindingKeys = function (keybinding) {
+  const table = JSON.parse(globalThis.__piOps.getAppKeybindings());
+  const keys = table[keybinding];
+  return Array.isArray(keys) ? keys : [];
+};
+
 globalThis.__piSessionCallTool = function (id, extIdx, name, toolCallId) {
   const session = globalThis.__piSessions.get(id);
   session.eventName = `tool:${name}`;
@@ -1735,6 +1833,7 @@ globalThis.__piInspect = function () {
           : {
               messageTypes: [...ext.markdownTransformer.messageTypes],
             },
+      entryRenderers: Object.keys(ext.entryRenderers ?? {}),
       flags: Object.entries(ext.flags).map(([name, flag]) => ({
         name,
         description: flag.description ?? "",

@@ -32,6 +32,7 @@ use crate::exec;
 use crate::mcp_registry::McpRegistry;
 use crate::provider_registry::ProviderRegistry;
 use crate::resolver::{ExtensionLoader, ExtensionResolver};
+use crate::runner::EntryRenderOutcome;
 
 /// The kind of context a dispatch session uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +81,17 @@ pub struct HostActions {
     pub shutdown: Box<dyn Fn() + Send>,
     /// `ctx.hasPendingMessages()`.
     pub has_pending_messages: Box<dyn Fn() -> bool + Send>,
+    /// `theme.fg(color, text)` for extension components (E3 slice 3):
+    /// identity until the embedder installs the sink-connected mapping —
+    /// headless renderers get plain text.
+    pub theme_fg: ThemeStyler,
+    /// `theme.bg(color, text)`.
+    pub theme_bg: ThemeStyler,
 }
+
+/// One synchronous `theme.fg`/`theme.bg` call
+/// (`theme.ts:297/:303`): token name + text in, styled text out.
+pub type ThemeStyler = Box<dyn Fn(&str, &str) -> String + Send>;
 
 impl Default for HostActions {
     fn default() -> Self {
@@ -94,6 +105,8 @@ impl Default for HostActions {
             abort: Box::new(|| {}),
             shutdown: Box::new(|| {}),
             has_pending_messages: Box::new(|| false),
+            theme_fg: Box::new(|_token, text| text.to_string()),
+            theme_bg: Box::new(|_token, text| text.to_string()),
         }
     }
 }
@@ -108,6 +121,10 @@ pub struct HostCore {
     pub mode: String,
     /// `pi.getSettings()`.
     pub settings: Json,
+    /// The resolved keybindings table (id → chords) the embedder crosses at
+    /// bind time; the extension components' `keyText`/`keyHint` read it
+    /// (`getKeybindings()` upstream).
+    pub app_keybindings: Json,
     /// The active tool names (the runner's loadout state).
     pub active_tools: Vec<String>,
     /// Tool names the runner aggregated (for active-set validation).
@@ -486,6 +503,27 @@ impl JsHost {
             }
             core.ui_requests.push(value);
             id
+        });
+        // The extension components' theme surface (E3 slice 3): synchronous
+        // styling during render — the closures default to identity and the
+        // embedder installs the sink-connected mapping at bind time.
+        op!("themeFg", core, |token: String, text: String| -> String {
+            let guard = core.lock().expect("host core mutex poisoned");
+            (guard.actions.theme_fg)(&token, &text)
+        });
+        op!("themeBg", core, |token: String, text: String| -> String {
+            let guard = core.lock().expect("host core mutex poisoned");
+            (guard.actions.theme_bg)(&token, &text)
+        });
+        // The resolved keybindings table (id → chords) — `getKeys`
+        // upstream (`keybinding-hints.ts:34-36`).
+        op!("getAppKeybindings", core, || -> String {
+            let core = core.lock().expect("host core mutex poisoned");
+            if core.app_keybindings.is_null() {
+                "{}".to_string()
+            } else {
+                serde_json::to_string(&core.app_keybindings).unwrap_or_else(|_| "{}".to_string())
+            }
         });
         op!("providerRegister", core, |name: String,
                                        extension_path: String,
@@ -1082,6 +1120,133 @@ impl JsHost {
             // current markdown. A transformer throw errors the call.
             call.call::<(usize, &str, &str), Option<String>>((index, markdown, context_json))
                 .unwrap_or_default()
+        })
+    }
+
+    /// Calls one extension's entry renderer for a custom session entry
+    /// (`__piRenderEntry`): the renderer runs inside the engine, its
+    /// returned Component is adopted into the handle registry, and the
+    /// outcome crosses as JSON. `undefined` (no renderer, or the renderer
+    /// returned nothing) maps to [`EntryRenderOutcome::None`].
+    pub fn render_entry(
+        &self,
+        ext_index: usize,
+        custom_type: &str,
+        entry_json: &str,
+        options_json: &str,
+    ) -> Result<EntryRenderOutcome, JsHostError> {
+        let raw = self
+            .ctx
+            .with(|ctx| -> Result<Option<String>, JsHostError> {
+                let call: Function = ctx.globals().get("__piRenderEntry")?;
+                let result: Option<String> = call
+                    .call((ext_index, custom_type, entry_json, options_json))
+                    .map_err(|err| Self::js_error(&ctx, err))?;
+                Ok(result)
+            })?;
+        let Some(raw) = raw else {
+            return Ok(EntryRenderOutcome::None);
+        };
+        let value: Json =
+            serde_json::from_str(&raw).map_err(|err| JsHostError::Job(err.to_string()))?;
+        match value.get("kind").and_then(Json::as_str) {
+            Some("component") => Ok(EntryRenderOutcome::Component {
+                handle: value
+                    .get("handle")
+                    .and_then(Json::as_u64)
+                    .unwrap_or_default() as u32,
+                has_input: value
+                    .get("hasInput")
+                    .and_then(Json::as_bool)
+                    .unwrap_or(false),
+            }),
+            Some("error") => Ok(EntryRenderOutcome::Failed(
+                value
+                    .get("message")
+                    .and_then(Json::as_str)
+                    .unwrap_or("renderer failed")
+                    .to_string(),
+            )),
+            _ => Ok(EntryRenderOutcome::None),
+        }
+    }
+
+    /// Renders one adopted component (`__piComponentRender`): the JS
+    /// `render(width)` lines cross as JSON. A component throw propagates —
+    /// upstream doesn't catch render failures here either.
+    pub fn component_render(&self, handle: u32, width: usize) -> Result<Vec<String>, JsHostError> {
+        let raw = self
+            .ctx
+            .with(|ctx| -> Result<Option<String>, JsHostError> {
+                let call: Function = ctx.globals().get("__piComponentRender")?;
+                let result: Option<String> = call
+                    .call((handle, width))
+                    .map_err(|err| Self::js_error(&ctx, err))?;
+                Ok(result)
+            })?;
+        let Some(raw) = raw else {
+            return Ok(Vec::new());
+        };
+        let value: Json =
+            serde_json::from_str(&raw).map_err(|err| JsHostError::Job(err.to_string()))?;
+        Ok(value
+            .get("lines")
+            .and_then(Json::as_array)
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(Json::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Feeds one key chunk to an adopted component
+    /// (`__piComponentHandleInput`): the `{consume}` decision crosses as
+    /// JSON. `undefined` (unknown handle, missing handler) is not-mine.
+    pub fn component_handle_input(&self, handle: u32, data: &str) -> Result<bool, JsHostError> {
+        let raw = self
+            .ctx
+            .with(|ctx| -> Result<Option<String>, JsHostError> {
+                let call: Function = ctx.globals().get("__piComponentHandleInput")?;
+                let result: Option<String> = call
+                    .call((handle, data))
+                    .map_err(|err| Self::js_error(&ctx, err))?;
+                Ok(result)
+            })?;
+        let Some(raw) = raw else {
+            return Ok(false);
+        };
+        let value: Json =
+            serde_json::from_str(&raw).map_err(|err| JsHostError::Job(err.to_string()))?;
+        Ok(value
+            .get("consume")
+            .and_then(Json::as_bool)
+            .unwrap_or(false))
+    }
+
+    /// Invalidates one adopted component (`__piComponentInvalidate`) — the
+    /// theme-change hook.
+    pub fn component_invalidate(&self, handle: u32) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx.globals().get("__piComponentInvalidate")?;
+            let _: Value = call
+                .call((handle,))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
+    /// Drops one adopted component (`__piComponentRelease`) so the JS-side
+    /// registry does not leak handles.
+    pub fn component_release(&self, handle: u32) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx.globals().get("__piComponentRelease")?;
+            let _: Value = call
+                .call((handle,))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
         })
     }
 

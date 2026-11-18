@@ -1348,6 +1348,36 @@ impl InteractiveMode {
         if let Some(footer) = mode.downcast_tree::<FooterComponent>(HostSlot::Footer) {
             footer.data.auto_compact_enabled = auto_compact;
         }
+        // The extension components' theme + keybinding surface (E3 slice 3):
+        // `theme.fg`/`theme.bg` read the live port theme per call — the same
+        // module-singleton behavior as upstream's `theme.ts:297/:303` — so a
+        // `/theme` switch needs no rebind, and the keybindings table feeds
+        // the renderers' `keyText`/`keyHint` (`keybinding-hints.ts:34-44`).
+        #[cfg(feature = "ext-js")]
+        if let Some(runner) = mode.extension_runner.as_ref() {
+            let fg = std::sync::Arc::new(|token: &str, text: &str| {
+                match pi_tui::theme::ThemeColor::from_name(token) {
+                    Some(color) => theme::theme().fg(color, text),
+                    None => text.to_string(),
+                }
+            });
+            let bg = std::sync::Arc::new(|token: &str, text: &str| {
+                match pi_tui::theme::ThemeBg::from_name(token) {
+                    Some(color) => theme::theme().bg(color, text),
+                    None => text.to_string(),
+                }
+            });
+            let keybindings: std::collections::BTreeMap<&str, Vec<&str>> =
+                theme::app_keys::DEFAULTS
+                    .iter()
+                    .map(|(id, keys)| (*id, keys.to_vec()))
+                    .collect();
+            let mut guard = runner.lock().expect("extension runner mutex poisoned");
+            guard.set_theme_surface(fg, bg);
+            guard.set_app_keybindings(
+                &serde_json::to_string(&keybindings).unwrap_or_else(|_| "{}".to_string()),
+            );
+        }
         // Extension shortcuts (`setupExtensionShortcuts`,
         // `interactive-mode.ts:2170/:2381-2432`): resolve against the
         // resolved keybindings, publish the chords to the editor, and
@@ -1960,6 +1990,56 @@ impl InteractiveMode {
         self.tui.request_render();
     }
 
+    /// `addCustomEntryToChat` (`interactive-mode.ts:3986-4007`): the FIRST
+    /// extension with a renderer for the type runs it through the engine;
+    /// without one the entry is skipped entirely, and a renderer that
+    /// produces nothing leaves no row. During a run the row splices ahead
+    /// of the streaming assistant line (`:3997-4003`), shifting the port's
+    /// tracked chat indices one slot down.
+    #[cfg(feature = "ext-js")]
+    fn add_custom_entry_to_chat(&mut self, entry: &crate::session::records::CustomEntry) {
+        let Some(runner) = self.extension_runner.as_ref() else {
+            return;
+        };
+        let ext_index = {
+            let runner = runner.lock().expect("extension runner mutex poisoned");
+            match runner.get_entry_renderer(&entry.custom_type) {
+                Some(index) => index,
+                None => return,
+            }
+        };
+        // The renderer receives the on-disk record — `type` included.
+        let entry_json = {
+            let mut value = serde_json::to_value(entry).expect("custom entry serializes");
+            if let Some(object) = value.as_object_mut() {
+                object.insert("type".to_string(), serde_json::Value::from("custom"));
+            }
+            serde_json::to_string(&value).expect("custom entry serializes")
+        };
+        let component = super::components::custom_entry::CustomEntryComponent::new(
+            std::sync::Arc::clone(runner),
+            ext_index,
+            &entry.custom_type,
+            &entry_json,
+            self.tool_output_expanded,
+            self.output_pad,
+        );
+        if !component.has_content() {
+            return;
+        }
+        if let Some(index) = self.streaming_index {
+            self.chat_mut().insert_child(index, Box::new(component));
+            self.streaming_index = Some(index + 1);
+            for pending in self.pending_tools.values_mut() {
+                if pending.chat_index >= index {
+                    pending.chat_index += 1;
+                }
+            }
+        } else {
+            self.add_to_chat(Box::new(component));
+        }
+    }
+
     /// `renderSessionEntries` + `renderSessionItems` (`interactive-mode.ts:3437-3464`,
     /// `:3340-3425`): walk session entries and re-create the chat rows. The
     /// compaction summary and its billed-tokens notice come from the
@@ -2034,6 +2114,14 @@ impl InteractiveMode {
                         );
                     row.set_expanded(self.tool_output_expanded);
                     self.add_to_chat(Box::new(row));
+                }
+                // `renderSessionEntries` keeps `custom` entries whole
+                // (`interactive-mode.ts:4270-4272`) and
+                // `renderSessionItems` routes them to
+                // `addCustomEntryToChat` (`:4171-4173`).
+                #[cfg(feature = "ext-js")]
+                crate::session::records::SessionEntry::Custom(custom) => {
+                    self.add_custom_entry_to_chat(custom);
                 }
                 // `sessionEntryToContextMessages` returns [] for every other
                 // entry type this port models.
@@ -2241,16 +2329,35 @@ impl InteractiveMode {
             | AgentEvent::AutoRetryEnd { .. }
             | AgentEvent::CompactionStart { .. }
             | AgentEvent::CompactionEnd { .. }
-            | AgentEvent::EntryAppended { .. }
             | AgentEvent::AgentSettled { .. }
             | AgentEvent::QueueUpdate { .. }
             | AgentEvent::ThinkingLevelChanged { .. }
             | AgentEvent::SessionInfoChanged { .. } => {
                 // The final tool result renders with its message end. The
                 // pump drives its runs directly; the retry, compaction,
-                // appended-entry, settled, and queue/level/name-change
-                // displays land with the pump's AgentRun rework (upstream
-                // shows them via agent-session events).
+                // appended-entry usage/compaction displays, settled, and
+                // queue/level/name-change displays land with the pump's
+                // AgentRun rework (upstream shows them via agent-session
+                // events).
+            }
+            // `entry_appended` (`interactive-mode.ts:3569-3576`): only
+            // custom entries reach the chat live — the usage notices and
+            // the compaction rebuild land with the pump's AgentRun rework.
+            #[cfg(feature = "ext-js")]
+            AgentEvent::EntryAppended { entry } => {
+                if entry.get("type").and_then(serde_json::Value::as_str) == Some("custom")
+                    && let Ok(custom) = serde_json::from_value::<crate::session::records::CustomEntry>(
+                        entry.clone(),
+                    )
+                {
+                    self.add_custom_entry_to_chat(&custom);
+                    self.tui.request_render();
+                }
+            }
+            #[cfg(not(feature = "ext-js"))]
+            AgentEvent::EntryAppended { .. } => {
+                // The appended-entry displays land with the pump's AgentRun
+                // rework (upstream shows them via agent-session events).
             }
             AgentEvent::MessageStart { message } => match message {
                 AgentMessage::User(user) => {
@@ -9288,6 +9395,44 @@ mod tests {
         (mode, capture)
     }
 
+    /// A mode whose extension runner has `source` loaded — the constructor's
+    /// extension wiring (theme surface, keybindings, shortcuts) runs over it
+    /// exactly like a real boot with an extensions directory.
+    #[cfg(feature = "ext-js")]
+    fn fixture_with_extension(
+        dir: &std::path::Path,
+        source: &str,
+    ) -> (InteractiveMode, FrameCapture) {
+        let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
+            cwd: dir.to_string_lossy().to_string(),
+            mode: "tui".to_string(),
+            settings: serde_json::json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        runner
+            .load_extension("<test-0>", Some(source))
+            .expect("load");
+        runner.bind().expect("bind");
+        let stream: Arc<dyn pi_agent::types::StreamFn> = Arc::new(ScriptedStream {
+            calls: AtomicUsize::new(0),
+            file_path: "unused".to_string(),
+        });
+        let terminal = CaptureTerminal::with_size(TerminalSize {
+            columns: 100,
+            rows: 40,
+        });
+        let capture = terminal.capture();
+        let options = InteractiveOptions {
+            auth_path: Some(dir.join("auth.json")),
+            ..InteractiveOptions::default()
+        };
+        let mut runtime = test_runtime(dir, stream);
+        runtime.extension_runner = Some(Arc::new(std::sync::Mutex::new(runner)));
+        let mode = InteractiveMode::new(&mut runtime, &options, Box::new(terminal));
+        (mode, capture)
+    }
+
     /// A mode over a capture terminal whose response store the test still
     /// holds: replies pushed after construction drive the theme wire exactly
     /// like a terminal answering the mode's queries.
@@ -10735,6 +10880,109 @@ mod tests {
         editor.handle_input("x");
         let drained = events.lock().expect("events").clone();
         assert_eq!(drained.len(), 1);
+    }
+
+    // ---- E3 slice 3: custom entry renderers ----
+
+    #[cfg(feature = "ext-js")] // the renderer registry is feature-gated
+    fn custom_entry_record(custom_type: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "custom",
+            "id": "e1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "customType": custom_type,
+            "data": { "k": 7 }
+        })
+    }
+
+    /// `entry_appended` renders the custom row through the extension
+    /// renderer (`interactive-mode.ts:3569-3576`): the entry record and the
+    /// theme cross into the JS component, and the row lands in the chat.
+    #[cfg(feature = "ext-js")] // the renderer registry is feature-gated
+    #[test]
+    fn entry_appended_renders_the_extension_custom_row() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerEntryRenderer("note", (entry, options, theme) => ({
+    render: (width) => [theme.fg("error", `note:${entry.data.k}:${options.expanded}`)],
+    invalidate: () => {},
+  }));
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture_with_extension(dir.path(), EXT);
+        let before = mode.chat_len();
+
+        mode.handle_agent_event(&AgentEvent::EntryAppended {
+            entry: custom_entry_record("note"),
+        });
+        assert_eq!(mode.chat_len(), before + 1);
+        let chat = mode.chat_mut();
+        let child = chat.get(before).expect("custom row");
+        let lines = strip_terminal_sequences(&child.render(80).join("\n"));
+        // The theme.fg("error", …) call crossed through the port theme, so
+        // the styled text strips back to the plain content.
+        assert!(lines.contains("note:7:false"), "{lines}");
+
+        // A type with no renderer appends nothing (`:3988-3990`).
+        mode.handle_agent_event(&AgentEvent::EntryAppended {
+            entry: custom_entry_record("unknown-type"),
+        });
+        assert_eq!(mode.chat_len(), before + 1);
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// A renderer throw becomes the host's error box
+    /// (`custom-entry.ts:44-50`, `interactive-mode.ts:3991-3995`).
+    #[cfg(feature = "ext-js")] // the renderer registry is feature-gated
+    #[test]
+    fn custom_entry_renderer_failure_renders_the_error_box() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerEntryRenderer("note", () => {
+    throw new Error("boom-entry");
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture_with_extension(dir.path(), EXT);
+        let before = mode.chat_len();
+
+        mode.handle_agent_event(&AgentEvent::EntryAppended {
+            entry: custom_entry_record("note"),
+        });
+        assert_eq!(mode.chat_len(), before + 1);
+        let chat = mode.chat_mut();
+        let child = chat.get(before).expect("error box row");
+        let lines = strip_terminal_sequences(&child.render(80).join("\n"));
+        assert!(
+            lines.contains("[note] renderer failed: boom-entry"),
+            "{lines}"
+        );
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// Replayed custom entries without an extension runner are skipped
+    /// (`renderSessionEntries` keeps them, but `addCustomEntryToChat`
+    /// returns early — `interactive-mode.ts:3988-3990`).
+    #[test]
+    fn replayed_custom_entry_without_runner_is_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture(dir.path(), "unused.txt");
+        let before = mode.chat_len();
+        let custom = crate::session::records::CustomEntry {
+            custom_type: "note".to_string(),
+            data: Some(serde_json::json!({ "k": 7 })),
+            base: crate::session::records::EntryBase {
+                id: "e1".to_string(),
+                parent_id: None,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+            unknown: serde_json::Map::default(),
+        };
+        mode.render_session_entries(&[SessionEntry::Custom(custom)], false);
+        assert_eq!(mode.chat_len(), before);
+        mode.shutdown().expect("shutdown");
     }
 
     /// `/hotkeys` renders the bordered shortcut table.

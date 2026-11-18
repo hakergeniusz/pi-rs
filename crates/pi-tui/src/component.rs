@@ -176,6 +176,15 @@ impl Container {
         self.children.push(component);
     }
 
+    /// Splice a child in at `index`; the children from there shift down one
+    /// slot (`children.splice(index, 0, component)` upstream — the custom
+    /// entries insert ahead of the streaming row,
+    /// `interactive-mode.ts:3997-4003`).
+    pub fn insert_child(&mut self, index: usize, component: Box<dyn Component>) {
+        let index = index.min(self.children.len());
+        self.children.insert(index, component);
+    }
+
     /// Remove and return the child at `index`; the children after it shift
     /// down one slot.
     pub fn remove_child(&mut self, index: usize) -> Box<dyn Component> {
