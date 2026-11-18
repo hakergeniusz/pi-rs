@@ -464,8 +464,11 @@ impl SelectList {
             } else {
                 step as i64
             };
+            // `getSelectPageIndex` (`keybindings.ts:323-338`) CLAMPS at the
+            // ends — paging past the first/last item parks the selection
+            // there; it does not wrap around.
             let next =
-                (self.selected_index as i64 + delta).rem_euclid(self.filtered_items.len() as i64);
+                (self.selected_index as i64 + delta).clamp(0, self.filtered_items.len() as i64 - 1);
             self.selected_index = next as usize;
             return SelectListAction::SelectionChanged;
         }
@@ -555,6 +558,27 @@ mod tests {
         assert_eq!(list.handle_key("\x1b"), SelectListAction::Cancelled);
         assert_eq!(list.handle_key("\x03"), SelectListAction::Cancelled);
         assert_eq!(list.handle_key("z"), SelectListAction::None);
+    }
+
+    /// Paging past either end PARKS the selection there — `getSelectPageIndex`
+    /// clamps (`keybindings.ts:323-338`); it does not wrap around.
+    #[test]
+    fn page_keys_clamp_at_the_ends() {
+        let mut list = list(5);
+        // At the last item, page-down stays put.
+        list.set_selected_index(2);
+        assert_eq!(
+            list.handle_key("\x1b[6~"),
+            SelectListAction::SelectionChanged
+        );
+        assert_eq!(list.selected_index(), 2);
+        // At the first item, page-up stays put.
+        list.set_selected_index(0);
+        assert_eq!(
+            list.handle_key("\x1b[5~"),
+            SelectListAction::SelectionChanged
+        );
+        assert_eq!(list.selected_index(), 0);
     }
 
     #[test]

@@ -445,7 +445,10 @@ impl SettingsList {
             } else {
                 step as i64
             };
-            let next = (self.selected_index as i64 + delta).rem_euclid(display_count as i64);
+            // `getSelectPageIndex` (`keybindings.ts:323-338`) CLAMPS at the
+            // ends — paging past the first/last item parks the selection
+            // there; it does not wrap around.
+            let next = (self.selected_index as i64 + delta).clamp(0, display_count as i64 - 1);
             self.selected_index = next as usize;
             return SettingsListAction::SelectionChanged;
         }
@@ -976,6 +979,27 @@ mod tests {
             SettingsListAction::SelectionChanged
         );
         assert_eq!(settings.selected_index(), 2);
+        assert_eq!(
+            settings.handle_key("\x1b[5~"),
+            SettingsListAction::SelectionChanged
+        );
+        assert_eq!(settings.selected_index(), 0);
+    }
+
+    /// Paging past either end PARKS the selection there — `getSelectPageIndex`
+    /// clamps (`keybindings.ts:323-338`); it does not wrap around.
+    #[test]
+    fn page_keys_clamp_at_the_ends() {
+        let mut settings = SettingsList::new(items(), 2, SettingsListTheme::default());
+        // At the last item, page-down stays put.
+        settings.set_selected_index(2);
+        assert_eq!(
+            settings.handle_key("\x1b[6~"),
+            SettingsListAction::SelectionChanged
+        );
+        assert_eq!(settings.selected_index(), 2);
+        // At the first item, page-up stays put.
+        settings.set_selected_index(0);
         assert_eq!(
             settings.handle_key("\x1b[5~"),
             SettingsListAction::SelectionChanged
