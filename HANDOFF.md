@@ -2461,6 +2461,92 @@ no `rename_all`; the snapshot stays hand-mapped). And clippy's
 `unnecessary_hashes` wants `r"…"` over `r#"…"#` when the fixture has no
 `"` — but a fixture WITH quotes (`["summary"]`) must stay `r#"…"#`.
 
+## E3 slice 3: entry renderers + component handles + the theme surface (landed on `feat/e3-entry-renderers`, 2026-11-18)
+
+Commit c6a2573 (8 files, +1062/−8), full container gate green (1831
+passed / 0 failed, fmt + clippy + `--no-default-features` check), CI run
+44352380152.
+
+What landed:
+
+- **The component-handle bridge** — upstream renderers return live
+  `Component` objects in-process (`tui.ts:124-155`); the port's JS side
+  keeps an adopted-component registry (`__piComponentHandles`, keyed by a
+  numeric handle) and the Rust side holds only the handle: `render(width)`
+  crosses as `{lines}` JSON, `handleInput(data)` as `{consume}`, and
+  `invalidate`/`release` as ops (`__piComponentAdopt` validates that the
+  object implements `render` + `invalidate` and throws otherwise). The
+  port half is `ComponentProxy` in the new
+  `modes/interactive/components/custom_entry.rs` — `has_input_handler`
+  mirrors the adopted component's `handleInput` presence (`tui.ts:90`),
+  `Drop` releases the handle so the JS registry does not leak.
+- **`pi.registerEntryRenderer(customType, renderer)`** — full AND
+  headless API records (`loader.ts:373-376`: `assertActive()` +
+  `entryRenderers ??= {}` + per-type replace); the inspect snapshot lists
+  the registered types; the runner half is `get_entry_renderer`
+  (FIRST extension in load order wins, `runner.ts:811-823`) +
+  `render_entry` → `EntryRenderOutcome::{Component{handle, has_input},
+  Failed(msg), None}`.
+- **`CustomEntryComponent`** (the `custom-entry.ts` port) — rebuild runs
+  the renderer through the engine with `EntryRenderOptions`
+  (`types.ts:1595-1611`: `expanded` plus the `KeybindingHints`), embeds
+  `Spacer(1)` + the adopted component, maps a renderer throw to the
+  themed error box (`Box(outputPad, 1, customMessageBg)` +
+  `[type] renderer failed: msg` in the error color,
+  `custom-entry.ts:44-50/:57-69` — the spacer rides the error box too),
+  and `invalidate()` re-runs the rebuild so a theme change re-renders
+  with the new mapping.
+- **Mode wiring** — `addCustomEntryToChat`
+  (`interactive-mode.ts:3986-4007`): no renderer → skip entirely; no
+  content → skip; during a run the row splices AHEAD of the streaming row
+  (`:3997-4003`) — pi-tui's `Container` gains `insert_child` (upstream's
+  `children.splice`) and the port shifts its tracked `streaming_index`/
+  `pending_tools` chat indices one slot. Replay keeps `custom` entries
+  whole (`:4270-4272`) and routes them (`:4171-4173`); the live
+  `entry_appended` event grows the custom arm (`:3569-3576`).
+- **The theme surface** — `HostActions` gains `theme_fg`/`theme_bg`
+  closures (identity default — headless renderers get plain text),
+  crossed as the `themeFg`/`themeBg` ops the JS `theme` object calls
+  synchronously during renderer calls (`theme.ts:297/:303`). The mode
+  installs the live mapping at boot: each call maps the token through
+  `ThemeColor::from_name`/`ThemeBg::from_name` and reads the port's
+  `theme::theme()` live, so `/theme` switches need no rebind. The dialog
+  surface (`set_ui_context`) still lands with the ui-custom slice —
+  entry renderers style but never prompt.
+- **`keyText`/`keyHint`** — the mode serializes
+  `theme::app_keys::DEFAULTS` (action id → chords) into a new
+  `getAppKeybindings` op; the JS shim's `keyText` joins the chords with
+  "/" and `keyHint` is `fg("dim", keyText) + fg("muted", " " +
+  description)` (`keybinding-hints.ts:34-44`, without the darwin alt
+  swap — pre-existing port scope).
+- Tests: 6 in `pi-ext-js` (first-wins + width crossing; the none
+  outcomes; throw + adoption-validation failures; the
+  render/input/invalidate/release round-trip with the entry JSON
+  crossing; `keyText`/`keyHint` against a set table; the theme surface
+  before/after install), 3 in `pi-coding-agent` (live append renders the
+  row and an unknown type skips; the error box; replay without a runner
+  skips).
+
+Deviations/notes:
+
+- A JS component's `render` throw propagates upstream (the frame goes
+  down); the port renders `custom entry render failed: …` in the error
+  color instead — the port's render loop cannot propagate.
+- The keybindings table crossing is `DEFAULTS` only — the port's settings
+  do not carry keybinding overrides yet.
+- A host-level engine failure in `render_entry` (upstream's host cannot
+  fail the call) surfaces through the same error box.
+
+Gotchas this slice: two writers on one file — the test-writing subagent
+wrote `runner.rs` from its spawn-time snapshot and silently dropped a
+coordinator edit made after the spawn (`clear_ui_context`); with a
+subagent owning a file, re-apply post-spawn coordinator edits only AFTER
+the subagent's final write. Assignment through a `MutexGuard` field
+needs `let mut guard` (E0596 — the deref-mut assign calls a `&mut self`
+method on the guard). And the gate script must capture clippy/test exit
+codes into files — piping through `tail`/`head` masks them
+(the AGENTS.md rule, rediscovered while assembling this gate).
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
