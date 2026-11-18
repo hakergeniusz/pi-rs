@@ -2820,6 +2820,27 @@ assert). Verified with a PTY probe on the fresh binary (synthetic
 HOME; trust-Enter → 6×Shift+Tab → /exit): exactly one "Thinking
 level:" line in the typescript, no panic, EXIT=0.
 
+## Selector paging clamps instead of wrapping (landed on `fix/settings-page-clamp`, 2026-11-18)
+
+Found while auditing the "settings UI is still buggy" report: both
+selector components paged the highlight with `rem_euclid` (WRAP
+around), while upstream's shared `getSelectPageIndex`
+(`packages/tui/src/keybindings.ts:323-338`) CLAMPS
+`selectedIndex ± pageSize` to `[0, itemCount-1]` — paging past the
+first/last item PARKS the selection there. In the 34-row `/settings`
+dialog (and `/model`, `/resume`, every other select-list), page-down at
+the bottom jumped the highlight to the top in the port. Fixed in
+`pi-tui`'s `settings_list` and `select_list`; keys were already
+upstream-exact (`pageUp`/`pageDown` = `\x1b[5~`/`\x1b[6~`), and the
+mouse wheel + up/down paths already clamped/wrapped to match. A
+clamp-specific test covers both ends in each component (the pre-existing
+page test never crossed an end, so it passed under both behaviors).
+Gate 1860/0. The rest of the settings-dialog interaction audit against
+upstream `settings-list.ts` found no further divergences (search filter
++ selection reset, nav keys reaching the list while searching, space-on-
+empty-search activation, mouse press/click/wheel row mapping, scroll
+indicator, description/hint lines, j/k absence — all verified matching).
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
