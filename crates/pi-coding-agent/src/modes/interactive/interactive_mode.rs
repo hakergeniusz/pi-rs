@@ -13119,10 +13119,10 @@ export default function (pi) {
 
         // The reset restores the base-only chain: re-typing `/` suggests
         // the commands again without the wrapper's item.
-        let backspaces: Vec<pi_tui::stdin_buffer::StdinEvent> = std::iter::repeat(
+        let backspaces: Vec<pi_tui::stdin_buffer::StdinEvent> = std::iter::repeat_n(
             pi_tui::stdin_buffer::StdinEvent::Data("\x7f".to_string()),
+            12,
         )
-        .take(12)
         .collect();
         mode.dispatch_stdin_events(backspaces);
         mode.reset_extension_ui_dialogs();
