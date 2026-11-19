@@ -372,6 +372,218 @@ struct UiSnapshotState {
 #[cfg(feature = "ext-js")]
 const MAX_WIDGET_LINES: usize = 10;
 
+/// One registered autocomplete wrapper (E3 slice 8): the engine-side
+/// chain index (the order `addAutocompleteProvider` registered) and the
+/// `triggerCharacters` the wrapper declared (`setupAutocompleteProvider`'s
+/// union, `interactive-mode.ts:855-864`).
+#[cfg(feature = "ext-js")]
+struct AutocompleteWrapperRecord {
+    index: u32,
+    trigger_characters: Vec<char>,
+}
+
+/// One JS wrapper, seen from Rust (`AutocompleteProviderFactory` wraps the
+/// current provider, `types.ts:144`): `suggest` pre-computes the base
+/// chain's result for the SAME keystroke and crosses it as data
+/// (`__piWrappedSuggest`); a busy engine answers none — a blocking wait
+/// here would freeze the pump that must service a dialog (the 6b deadlock
+/// class). Deviations from the upstream contract: the base adapter's
+/// `getSuggestions` answers with the pre-computed result instead of
+/// re-querying, `shouldTriggerFileCompletion` delegates to the base only,
+/// and the wrapper's `options.signal` is `undefined`.
+#[cfg(feature = "ext-js")]
+struct JsAutocompleteProvider {
+    runner: Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+    index: u32,
+    base: Arc<dyn pi_tui::components::editor::AutocompleteProvider>,
+}
+
+#[cfg(feature = "ext-js")]
+impl pi_tui::components::editor::AutocompleteProvider for JsAutocompleteProvider {
+    fn trigger_characters(&self) -> Vec<char> {
+        self.base.trigger_characters()
+    }
+
+    fn suggest(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+        force: bool,
+    ) -> Option<pi_tui::components::editor::Suggestions> {
+        let base = self.base.suggest(lines, cursor_line, cursor_col, force);
+        let base_json = base
+            .as_ref()
+            .map(|suggestions| {
+                serde_json::json!({
+                    "items": suggestions
+                        .items
+                        .iter()
+                        .map(|item| {
+                            serde_json::json!({
+                                "value": item.value,
+                                "label": item.label,
+                                "description": item.description,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    "prefix": suggestions.prefix,
+                })
+                .to_string()
+            })
+            .unwrap_or_default();
+        let lines_json = serde_json::to_string(lines).unwrap_or_default();
+        let runner = self.runner.try_lock().ok()?;
+        let result =
+            runner.wrapped_suggest(self.index, &base_json, &lines_json, cursor_line, cursor_col, force)?;
+        let value: serde_json::Value = serde_json::from_str(&result).ok()?;
+        let prefix = value
+            .get("prefix")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let items = value
+            .get("items")?
+            .as_array()?
+            .iter()
+            .filter_map(|item| {
+                Some(pi_tui::components::select_list::SelectItem {
+                    value: item.get("value")?.as_str()?.to_string(),
+                    label: item
+                        .get("label")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    description: item
+                        .get("description")
+                        .and_then(serde_json::Value::as_str)
+                        .map(String::from),
+                })
+            })
+            .collect();
+        Some(pi_tui::components::editor::Suggestions { items, prefix })
+    }
+
+    fn should_trigger_file_completion(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+    ) -> bool {
+        self.base
+            .should_trigger_file_completion(lines, cursor_line, cursor_col)
+    }
+
+    fn apply_completion(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+        item: &pi_tui::components::select_list::SelectItem,
+        prefix: &str,
+    ) -> (Vec<String>, usize, usize) {
+        let base = self
+            .base
+            .apply_completion(lines, cursor_line, cursor_col, item, prefix);
+        let base_json = serde_json::json!({
+            "lines": base.0,
+            "cursorLine": base.1,
+            "cursorCol": base.2,
+        })
+        .to_string();
+        let lines_json = serde_json::to_string(lines).unwrap_or_default();
+        let item_json = serde_json::json!({
+            "value": item.value,
+            "label": item.label,
+            "description": item.description,
+        })
+        .to_string();
+        // A busy engine, an absent wrapper `applyCompletion`, or an
+        // unparsable reply keeps the base's application — upstream only
+        // overrides the application when the wrapper defines one
+        // (`autocomplete.ts:283-295`).
+        let Ok(runner) = self.runner.try_lock() else {
+            return base;
+        };
+        let Some(result) = runner.wrapped_apply(
+            self.index,
+            &base_json,
+            &lines_json,
+            cursor_line,
+            cursor_col,
+            &item_json,
+            prefix,
+        ) else {
+            return base;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&result) else {
+            return base;
+        };
+        let Some(parsed) = (|| {
+            let new_lines = value.get("lines")?.as_array()?;
+            let new_lines: Vec<String> = new_lines
+                .iter()
+                .map(|line| line.as_str().map(String::from))
+                .collect::<Option<Vec<_>>>()?;
+            let new_cursor_line = value.get("cursorLine")?.as_u64()? as usize;
+            let new_cursor_col = value.get("cursorCol")?.as_u64()? as usize;
+            Some((new_lines, new_cursor_line, new_cursor_col))
+        })() else {
+            return base;
+        };
+        parsed
+    }
+}
+
+/// The trigger-union wrapper (`setupAutocompleteProvider`'s
+/// `provider.triggerCharacters = [...new Set(...)]`, `interactive-mode.ts
+/// :862-864`): everything delegates; only the trigger characters
+/// override.
+#[cfg(feature = "ext-js")]
+struct ComposedAutocompleteProvider {
+    provider: Arc<dyn pi_tui::components::editor::AutocompleteProvider>,
+    trigger_characters: Vec<char>,
+}
+
+#[cfg(feature = "ext-js")]
+impl pi_tui::components::editor::AutocompleteProvider for ComposedAutocompleteProvider {
+    fn trigger_characters(&self) -> Vec<char> {
+        self.trigger_characters.clone()
+    }
+
+    fn suggest(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+        force: bool,
+    ) -> Option<pi_tui::components::editor::Suggestions> {
+        self.provider.suggest(lines, cursor_line, cursor_col, force)
+    }
+
+    fn should_trigger_file_completion(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+    ) -> bool {
+        self.provider
+            .should_trigger_file_completion(lines, cursor_line, cursor_col)
+    }
+
+    fn apply_completion(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+        item: &pi_tui::components::select_list::SelectItem,
+        prefix: &str,
+    ) -> (Vec<String>, usize, usize) {
+        self.provider
+            .apply_completion(lines, cursor_line, cursor_col, item, prefix)
+    }
+}
+
 /// One terminal-input fold attempt (E3 slice 7): the engine was busy (the
 /// chunk defers to the pump), a listener consumed the chunk, or this is
 /// the transformed chunk the dispatch sees.
@@ -1168,6 +1380,14 @@ pub struct InteractiveMode {
     terminal_input_listeners: usize,
     #[cfg(feature = "ext-js")]
     deferred_terminal_input: Vec<String>,
+    /// The boot-frozen base autocomplete provider the JS wrapper chain
+    /// wraps (`createBaseAutocompleteProvider`'s product; upstream
+    /// re-creates it per setup, E3 slice 8 keeps the boot-frozen base).
+    base_autocomplete_provider: Arc<dyn pi_tui::components::editor::AutocompleteProvider>,
+    /// The registered `addAutocompleteProvider` wrappers, in registration
+    /// order (`autocompleteProviderWrappers`, `interactive-mode.ts:485`).
+    #[cfg(feature = "ext-js")]
+    autocomplete_wrappers: Vec<AutocompleteWrapperRecord>,
     /// The message rows' horizontal padding (`this.outputPad`,
     /// `interactive-mode.ts`), read from `outputPad` at boot and applied by
     /// the output-padding row.
@@ -1403,9 +1623,15 @@ impl InteractiveMode {
             runtime.session.get_cwd().to_path_buf(),
             crate::tools::bash::which("fd"),
         );
+        // The base stays reachable for the wrapper-chain rebuilds (E3
+        // slice 8): upstream re-creates it per `setupAutocompleteProvider`;
+        // the port's base is boot-frozen as before, and the JS wrappers
+        // chain onto this Arc.
+        let base_autocomplete_provider: Arc<dyn pi_tui::components::editor::AutocompleteProvider> =
+            Arc::new(provider);
         editor_host
             .editor
-            .set_autocomplete_provider(Some(Arc::new(provider)));
+            .set_autocomplete_provider(Some(Arc::clone(&base_autocomplete_provider)));
 
         // The header's logo-click queue (`header.onLogoClick`): the callback
         // cannot borrow the mode, so it parks the logo's position here.
@@ -1495,6 +1721,9 @@ impl InteractiveMode {
             terminal_input_listeners: 0,
             #[cfg(feature = "ext-js")]
             deferred_terminal_input: Vec::new(),
+            base_autocomplete_provider,
+            #[cfg(feature = "ext-js")]
+            autocomplete_wrappers: Vec::new(),
             output_pad,
             exiting: false,
             #[cfg(feature = "ext-js")]
@@ -6790,6 +7019,51 @@ impl InteractiveMode {
         snapshot.tools_expanded = self.tool_output_expanded;
     }
 
+    /// `setupAutocompleteProvider` (`interactive-mode.ts:853-867`): the
+    /// base provider wraps L→R through the registered wrappers; a
+    /// non-empty trigger union replaces the provider's own characters
+    /// (`[...new Set(triggerCharacters)]`), first occurrence first. The
+    /// composed provider re-mounts on the editor — mounted or parked,
+    /// like upstream's `defaultEditor` + non-default `this.editor`.
+    #[cfg(feature = "ext-js")]
+    fn rebuild_autocomplete_provider(&mut self) {
+        let mut current: Arc<dyn pi_tui::components::editor::AutocompleteProvider> =
+            Arc::clone(&self.base_autocomplete_provider);
+        let mut union: Vec<char> = Vec::new();
+        for record in &self.autocomplete_wrappers {
+            let Some(runner) = self.extension_runner.as_ref().map(Arc::clone) else {
+                return;
+            };
+            union.extend(record.trigger_characters.iter().copied());
+            current = Arc::new(JsAutocompleteProvider {
+                runner,
+                index: record.index,
+                base: current,
+            });
+        }
+        let composed: Arc<dyn pi_tui::components::editor::AutocompleteProvider> = if union.is_empty()
+        {
+            current
+        } else {
+            let mut unique: Vec<char> = Vec::new();
+            for character in union {
+                if !unique.contains(&character) {
+                    unique.push(character);
+                }
+            }
+            Arc::new(ComposedAutocompleteProvider {
+                provider: current,
+                trigger_characters: unique,
+            })
+        };
+        if let Some(editor) = self.editor_host_mut() {
+            editor
+                .editor
+                .set_autocomplete_provider(Some(Arc::clone(&composed)));
+        }
+        self.tui.request_render();
+    }
+
     /// Where the displaced editor-slot occupant goes (the slot-swap
     /// invariant: `suspended_editor` always holds the `ChatEditor`, so a
     /// built-in selector opened over an open extension dialog never
@@ -9312,6 +9586,28 @@ impl InteractiveMode {
                     self.terminal_input_listeners =
                         request.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
                 }
+                // `addAutocompleteProvider` (`:2799-2802`): the wrapper
+                // joins the chain and the composed provider re-mounts.
+                "addAutocompleteProvider" => {
+                    let index =
+                        request.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+                    let trigger_characters: Vec<char> = request
+                        .get("triggerCharacters")
+                        .and_then(Value::as_array)
+                        .map(|characters| {
+                            characters
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .filter_map(|character| character.chars().next())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.autocomplete_wrappers.push(AutocompleteWrapperRecord {
+                        index,
+                        trigger_characters,
+                    });
+                    self.rebuild_autocomplete_provider();
+                }
                 // The factory adapter's `TUI.showOverlay` surface
                 // (`tui.ts:518/:792-816`).
                 // Deviation: the port tracks these mounts in the same
@@ -10132,6 +10428,16 @@ impl InteractiveMode {
             self.set_extension_footer(None);
             self.set_extension_header(None);
             self.clear_extension_widgets();
+            // `autocompleteProviderWrappers = []` +
+            // `setupAutocompleteProvider()` (`:2609-2611`).
+            if let Some(runner) = self.extension_runner.as_ref() {
+                let _ = runner
+                    .lock()
+                    .expect("extension runner mutex poisoned")
+                    .clear_autocomplete_wrappers();
+            }
+            self.autocomplete_wrappers.clear();
+            self.rebuild_autocomplete_provider();
             self.working_message = None;
             self.working_visible = true;
             self.set_working_indicator(None);
@@ -12741,6 +13047,104 @@ export default function (pi) {
             .editor
             .get_text();
         assert_eq!(text, "z", "the consumed chunk never reached the editor");
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// Autocomplete wrappers (E3 slice 8): `addAutocompleteProvider` arms
+    /// the chain — the wrapper's suggestions (built over the base chain's
+    /// result) open the popup, Tab applies through the chain (the wrapper
+    /// defines no `applyCompletion`, so the base's application runs), and
+    /// `resetExtensionUI` restores the base-only chain.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_ui_autocomplete_wrappers_extend_the_chain() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", (_event, ctx) => {
+    ctx.ui.addAutocompleteProvider((base) => ({
+      triggerCharacters: ["!"],
+      getSuggestions: async (lines, cursorLine, cursorCol, opts) => {
+        const baseResult = await base.getSuggestions(lines, cursorLine, cursorCol, opts);
+        return {
+          items: [
+            { value: "ext-item", label: "ExtItem", description: baseResult ? "base-ok" : "nobase" },
+          ],
+          prefix: "/",
+        };
+      },
+    }));
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        mode.tui.start().expect("tui start");
+        let runner = mode.extension_runner.clone().expect("runner");
+        runner
+            .lock()
+            .expect("runner")
+            .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        mode.pump();
+        assert_eq!(mode.autocomplete_wrappers.len(), 1, "the wrapper registered");
+
+        // Typing `/` at the start of the message triggers the chain: the
+        // wrapper's item opens the popup and the base chain's result
+        // crossed as data (the description proves it was non-null).
+        mode.dispatch_stdin_events(vec![pi_tui::stdin_buffer::StdinEvent::Data(
+            "/".to_string(),
+        )]);
+        let rendered = {
+            let editor = &mut mode.editor_host_mut().expect("editor host").editor;
+            assert!(editor.is_showing_autocomplete(), "the wrapper suggests");
+            pi_tui::ansi::strip_terminal_sequences(&editor.render(100).join("\n"))
+        };
+        assert!(rendered.contains("ExtItem"), "{rendered}");
+        assert!(
+            rendered.contains("base-ok"),
+            "the base chain crossed as data: {rendered}"
+        );
+
+        // Tab applies through the chain: no JS `applyCompletion`, so the
+        // base's slash-command application runs (`/ext-item `).
+        mode.dispatch_stdin_events(vec![pi_tui::stdin_buffer::StdinEvent::Data(
+            "\t".to_string(),
+        )]);
+        let text = mode
+            .editor_host_mut()
+            .expect("editor host")
+            .editor
+            .get_text();
+        assert_eq!(text, "/ext-item ", "the base application completed the token");
+
+        // The reset restores the base-only chain: re-typing `/` suggests
+        // the commands again without the wrapper's item.
+        let backspaces: Vec<pi_tui::stdin_buffer::StdinEvent> = std::iter::repeat(
+            pi_tui::stdin_buffer::StdinEvent::Data("\x7f".to_string()),
+        )
+        .take(12)
+        .collect();
+        mode.dispatch_stdin_events(backspaces);
+        mode.reset_extension_ui_dialogs();
+        assert!(
+            mode.autocomplete_wrappers.is_empty(),
+            "the reset cleared the chain"
+        );
+        mode.dispatch_stdin_events(vec![pi_tui::stdin_buffer::StdinEvent::Data(
+            "/".to_string(),
+        )]);
+        let rendered = {
+            let editor = &mut mode.editor_host_mut().expect("editor host").editor;
+            assert!(
+                editor.is_showing_autocomplete(),
+                "the base chain still suggests after the reset"
+            );
+            pi_tui::ansi::strip_terminal_sequences(&editor.render(100).join("\n"))
+        };
+        assert!(
+            !rendered.contains("ExtItem"),
+            "the reset chain answers without the wrapper: {rendered}"
+        );
         mode.shutdown().expect("shutdown");
     }
 
