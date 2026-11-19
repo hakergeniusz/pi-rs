@@ -6734,13 +6734,14 @@ impl InteractiveMode {
         let Some(runner) = self.extension_runner.as_ref() else {
             return TerminalInputFold::Busy;
         };
-        let Some(mut runner) = runner.try_lock().ok() else {
+        let Some(runner) = runner.try_lock().ok() else {
             return TerminalInputFold::Busy;
         };
+        // A fold error behaves like a consumed chunk — one broken
+        // extension cannot wedge the input path.
         match runner.deliver_terminal_input(data) {
             Ok(Some(transformed)) => TerminalInputFold::Deliver(transformed),
-            Ok(None) => TerminalInputFold::Consumed,
-            Err(_) => TerminalInputFold::Consumed,
+            Ok(None) | Err(_) => TerminalInputFold::Consumed,
         }
     }
 

@@ -4056,7 +4056,9 @@ mod tests {
         }));
         tui.remove_input_listener(id);
         tui.start().unwrap();
-        assert!(tui.handle_input("x"));
+        // The chunk dispatches (unfocused, nothing consumes it) but the
+        // removed listener never sees it.
+        let _ = tui.handle_input("x");
         assert_eq!(*seen.lock().expect("seen"), Vec::<String>::new());
     }
 
