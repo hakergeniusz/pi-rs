@@ -372,6 +372,16 @@ struct UiSnapshotState {
 #[cfg(feature = "ext-js")]
 const MAX_WIDGET_LINES: usize = 10;
 
+/// One terminal-input fold attempt (E3 slice 7): the engine was busy (the
+/// chunk defers to the pump), a listener consumed the chunk, or this is
+/// the transformed chunk the dispatch sees.
+#[cfg(feature = "ext-js")]
+enum TerminalInputFold {
+    Busy,
+    Consumed,
+    Deliver(String),
+}
+
 struct ChatEditor {
     editor: Editor,
     events: Arc<Mutex<Vec<EditorEventOut>>>,
@@ -6627,7 +6637,7 @@ impl InteractiveMode {
         &mut self,
         options: Option<pi_tui::components::loader::LoaderIndicator>,
     ) {
-        self.working_indicator_options = options.clone();
+        self.working_indicator_options.clone_from(&options);
         let mut status = self.status_handle.lock().expect("status");
         if let Some(indicator) = status.as_mut()
             && indicator.kind == StatusKind::Working
@@ -6707,24 +6717,31 @@ impl InteractiveMode {
     #[cfg(feature = "ext-js")]
     fn dispatch_extension_terminal_input(&mut self, data: String) {
         match self.try_terminal_input_fold(&data) {
-            Some(Some(transformed)) => {
+            TerminalInputFold::Deliver(transformed) => {
                 if !transformed.is_empty() {
                     self.tui.handle_input(&transformed);
                 }
             }
-            Some(None) => {}
-            None => self.deferred_terminal_input.push(data),
+            TerminalInputFold::Consumed => {}
+            TerminalInputFold::Busy => self.deferred_terminal_input.push(data),
         }
     }
 
-    /// One fold attempt: `None` = the engine was busy (defer),
-    /// `Some(None)` = a listener consumed the chunk, `Some(Some(data))` =
-    /// what the dispatch sees.
+    /// One fold attempt: the engine was busy (defer), a listener consumed
+    /// the chunk, or this is what the dispatch sees.
     #[cfg(feature = "ext-js")]
-    fn try_terminal_input_fold(&mut self, data: &str) -> Option<Option<String>> {
-        let runner = self.extension_runner.as_ref()?;
-        let mut runner = runner.try_lock().ok()?;
-        Some(runner.deliver_terminal_input(data).ok().flatten())
+    fn try_terminal_input_fold(&mut self, data: &str) -> TerminalInputFold {
+        let Some(runner) = self.extension_runner.as_ref() else {
+            return TerminalInputFold::Busy;
+        };
+        let Some(mut runner) = runner.try_lock().ok() else {
+            return TerminalInputFold::Busy;
+        };
+        match runner.deliver_terminal_input(data) {
+            Ok(Some(transformed)) => TerminalInputFold::Deliver(transformed),
+            Ok(None) => TerminalInputFold::Consumed,
+            Err(_) => TerminalInputFold::Consumed,
+        }
     }
 
     /// The deferred chunks retry each frame (`pump`).
@@ -6737,13 +6754,13 @@ impl InteractiveMode {
         let mut remaining = Vec::new();
         for data in deferred {
             match self.try_terminal_input_fold(&data) {
-                Some(Some(transformed)) => {
+                TerminalInputFold::Deliver(transformed) => {
                     if !transformed.is_empty() {
                         self.tui.handle_input(&transformed);
                     }
                 }
-                Some(None) => {}
-                None => remaining.push(data),
+                TerminalInputFold::Consumed => {}
+                TerminalInputFold::Busy => remaining.push(data),
             }
         }
         self.deferred_terminal_input = remaining;
@@ -9202,25 +9219,27 @@ impl InteractiveMode {
                         .and_then(Value::as_str)
                         .unwrap_or("aboveEditor")
                         .to_string();
-                    let content = if let Some(handle) =
-                        request.get("widgetHandle").and_then(Value::as_u64)
-                    {
-                        Some(ExtensionWidget::Adopted {
+                    let content = request
+                        .get("widgetHandle")
+                        .and_then(Value::as_u64)
+                        .map(|handle| ExtensionWidget::Adopted {
                             handle: handle as u32,
                             has_input: true,
                         })
-                    } else if let Some(lines) = request.get("widgetLines").and_then(Value::as_array)
-                    {
-                        Some(ExtensionWidget::Lines(
-                            lines
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .map(String::from)
-                                .collect(),
-                        ))
-                    } else {
-                        None
-                    };
+                        .or_else(|| {
+                            request
+                                .get("widgetLines")
+                                .and_then(Value::as_array)
+                                .map(|lines| {
+                                    ExtensionWidget::Lines(
+                                        lines
+                                            .iter()
+                                            .filter_map(Value::as_str)
+                                            .map(String::from)
+                                            .collect(),
+                                    )
+                                })
+                        });
                     self.set_extension_widget(&key, content, &placement);
                 }
                 // `setExtensionFooter`/`setExtensionHeader`
@@ -12363,6 +12382,7 @@ export default function (pi) {
   });
   pi.on("session_end", (_event, ctx) => {
     ctx.ui.setWidget("alpha", undefined);
+    ctx.ui.setWidget("beta", undefined);
     pi.appendEntry("cleared", {});
   });
 }
@@ -12577,8 +12597,7 @@ export default function (pi) {
         let footer_component = mode
             .custom_footer
             .as_mut()
-            .map(|chrome| chrome.displaced.as_any_mut())
-            .flatten()
+            .and_then(|chrome| chrome.displaced.as_any_mut())
             .and_then(|any| any.downcast_mut::<FooterComponent>())
             .expect("the builtin footer stays alive");
         footer_component.data.model_id = "switched".to_string();
@@ -12638,7 +12657,7 @@ export default function (pi) {
             .lock()
             .expect("status")
             .as_ref()
-            .map(|indicator| indicator.interval_ms())
+            .map(StatusIndicator::interval_ms)
             .expect("the working indicator is live");
         assert_eq!(interval, 120, "the indicator options reached the loader");
 
@@ -13386,7 +13405,8 @@ export default function (pi) {
         mode.pump();
         mode.tui.render_now(false);
         let plain = strip_terminal_sequences(&capture.output());
-        assert!(plain.contains("Working..."), "{plain}");
+        // `defaultWorkingMessage` (`interactive-mode.ts:505`): "Working".
+        assert!(plain.contains("Working"), "{plain}");
         // Drain the run so the test does not leak a worker thread.
         for _ in 0..400 {
             mode.pump();

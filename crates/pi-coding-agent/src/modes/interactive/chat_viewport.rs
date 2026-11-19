@@ -102,6 +102,7 @@ impl ChatViewport {
 ///
 /// `scrollbar` is the fullscreen-scrollbar setting; the track and thumb
 /// painters come from the active theme (`chat-viewport.js:14-17`).
+#[allow(clippy::too_many_lines)] // mirrors the TS …; split when extending
 pub fn mount(tui: &mut Tui, hosts: Vec<Box<dyn Component>>, scrollbar: Scrollbar) -> ChatViewport {
     assert_eq!(
         hosts.len(),
@@ -443,7 +444,7 @@ mod tests {
                 "pending, status, widgets above, editor, widgets below, footer"
             );
             assert_eq!(
-                dock.entry_options(2).min_size,
+                dock.entry_options(3).min_size,
                 Some(3),
                 "the editor keeps at least three rows"
             );

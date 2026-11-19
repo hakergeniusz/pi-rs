@@ -51,7 +51,7 @@ impl StatusIndicator {
 
     /// The live working indicator's message (`setWorkingMessage`,
     /// `interactive-mode.ts:2781-2786` — upstream calls the loader's
-    /// `setMessage` through the StatusIndicator).
+    /// `setMessage` through the `StatusIndicator`).
     pub fn set_message(&mut self, message: impl Into<String>) {
         self.loader.set_message(message);
     }
