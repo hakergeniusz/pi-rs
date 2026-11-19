@@ -391,6 +391,23 @@ impl PendingTerminalColorQuery {
 /// The TUI. `tui.ts:446-...` (TUI interface) and `tui-main-screen.ts:124`.
 // The booleans mirror upstream TS state flags; the port keeps them one-to-one.
 #[allow(clippy::struct_excessive_bools)]
+/// What an input listener decides for the chunk it saw — the
+/// `TuiInputListener` result (`tui.ts:490-491`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputListenerOutcome {
+    /// No opinion: the chunk flows to the next listener unchanged.
+    Pass,
+    /// The chunk is dropped entirely (`result.consume`).
+    Consume,
+    /// The rest of the chain and the dispatch see this instead
+    /// (`result.data`).
+    Transform(String),
+}
+
+/// pi's `TuiInputListener` (`tui.ts:491`): every non-reply input chunk
+/// runs the registered listeners in order before dispatch.
+pub type InputListener = Box<dyn Fn(&str) -> InputListenerOutcome + Send>;
+
 pub struct Tui {
     terminal: Box<dyn Terminal>,
     children: Vec<Box<dyn Component>>,
@@ -456,6 +473,11 @@ pub struct Tui {
     /// The support query was sent and no reply has arrived yet.
     /// `terminal.ts:183`.
     program_status_query_pending: bool,
+    /// pi's input listeners (`tui.ts:516` `inputListeners`), each with the
+    /// generation id [`Self::add_input_listener`] returned — never reused,
+    /// so an id from a removed listener can never name the next one.
+    input_listeners: Vec<(u64, InputListener)>,
+    input_listener_counter: u64,
 }
 
 /// Options for starting. `tui-alt-screen.ts:270-278`.
@@ -599,6 +621,8 @@ impl Tui {
             program_status: None,
             program_status_supported: false,
             program_status_query_pending: false,
+            input_listeners: Vec::new(),
+            input_listener_counter: 0,
         }
     }
 
@@ -606,6 +630,22 @@ impl Tui {
     /// (`tui-main-screen.ts:535-543`); tests and hosts prefer a callback.
     pub fn set_render_error_handler(&mut self, handler: Box<dyn Fn(String) + Send + Sync>) {
         self.on_render_error = Some(handler);
+    }
+
+    /// pi's `addInputListener` (`tui.ts:974-979`): the listener joins the
+    /// chain every non-reply chunk runs through; the returned id
+    /// unsubscribes via [`Self::remove_input_listener`].
+    pub fn add_input_listener(&mut self, listener: InputListener) -> u64 {
+        self.input_listener_counter += 1;
+        self.input_listeners
+            .push((self.input_listener_counter, listener));
+        self.input_listener_counter
+    }
+
+    /// The unsubscribe `addInputListener` returns (`tui.ts:975-977`).
+    pub fn remove_input_listener(&mut self, id: u64) {
+        self.input_listeners
+            .retain(|(listener_id, _)| *listener_id != id);
     }
 
     /// `tui.ts:1052-1057` (`addChild`).
@@ -2275,6 +2315,35 @@ impl Tui {
         if self.alt_screen_active() && self.handle_alt_viewport_input(data, now_ms) {
             return true;
         }
+        // pi's input listeners (`tui.ts:1095-1108`): the registered
+        // listeners run in order over the current chunk — a `consume` drops
+        // it, a `data` result transforms what the rest of the chain and the
+        // dispatch see, and an empty chunk stops the dispatch. Upstream
+        // interleaves these with the alt screen's listener by registration
+        // time; the port pins the extension listeners after it (extensions
+        // register after boot, which is upstream's order in practice).
+        let listener_data;
+        let data = if self.input_listeners.is_empty() {
+            data
+        } else {
+            let mut current = data.to_string();
+            let mut consumed = false;
+            for (_, listener) in &self.input_listeners {
+                match listener(&current) {
+                    InputListenerOutcome::Consume => {
+                        consumed = true;
+                        break;
+                    }
+                    InputListenerOutcome::Transform(next) => current = next,
+                    InputListenerOutcome::Pass => {}
+                }
+            }
+            if consumed || current.is_empty() {
+                return true;
+            }
+            listener_data = current;
+            listener_data.as_str()
+        };
         if self.consume_cell_size_response(data) {
             return true;
         }
@@ -3885,6 +3954,106 @@ mod tests {
         // Delivery follows: the identity target resolves through the same
         // walk.
         assert!(tui.handle_input("y"));
+    }
+
+    // ------------------------------------------------- input listeners (E3 slice 7)
+
+    /// A component that records every chunk it is handed, shared so the
+    /// assertions can read it without pulling the component out of the tree.
+    struct ListenerProbe(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Component for ListenerProbe {
+        fn render(&self, _width: usize) -> Vec<String> {
+            vec![]
+        }
+
+        fn handle_input(&mut self, data: &str) -> Option<crate::component::ComponentMutation> {
+            self.0.lock().expect("probe").push(data.to_string());
+            Some(crate::component::ComponentMutation { consume: true })
+        }
+    }
+
+    /// pi's listener chain (`tui.ts:1095-1108`): a `data` result transforms
+    /// what the focused component is handed.
+    #[test]
+    fn input_listener_transforms_before_the_dispatch() {
+        let (mut tui, _capture) = tui(&["one"], (10, 5));
+        let probe = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let index = tui.add_child(Box::new(ListenerProbe(std::sync::Arc::clone(&probe))));
+        tui.start().unwrap();
+        tui.set_focus(Some(FocusTarget::Root(index)));
+        tui.add_input_listener(Box::new(|data| {
+            if data == "x" {
+                InputListenerOutcome::Transform("y".to_string())
+            } else {
+                InputListenerOutcome::Pass
+            }
+        }));
+        assert!(tui.handle_input("x"), "the transformed chunk dispatched");
+        assert_eq!(*probe.lock().expect("probe"), ["y"]);
+    }
+
+    /// A `consume` result drops the chunk before anything else sees it.
+    #[test]
+    fn a_consuming_listener_drops_the_chunk() {
+        let (mut tui, _capture) = tui(&["one"], (10, 5));
+        let probe = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let index = tui.add_child(Box::new(ListenerProbe(std::sync::Arc::clone(&probe))));
+        tui.start().unwrap();
+        tui.set_focus(Some(FocusTarget::Root(index)));
+        tui.add_input_listener(Box::new(|_| InputListenerOutcome::Consume));
+        assert!(tui.handle_input("x"));
+        assert_eq!(*probe.lock().expect("probe"), Vec::<String>::new());
+    }
+
+    /// A transform to the empty string stops the dispatch (`tui.ts:1106`).
+    #[test]
+    fn an_empty_transform_drops_the_chunk() {
+        let (mut tui, _capture) = tui(&["one"], (10, 5));
+        let probe = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let index = tui.add_child(Box::new(ListenerProbe(std::sync::Arc::clone(&probe))));
+        tui.start().unwrap();
+        tui.set_focus(Some(FocusTarget::Root(index)));
+        tui.add_input_listener(Box::new(|_| {
+            InputListenerOutcome::Transform(String::new())
+        }));
+        assert!(tui.handle_input("x"));
+        assert_eq!(*probe.lock().expect("probe"), Vec::<String>::new());
+    }
+
+    /// The colour-reply drains run before the listeners
+    /// (`tui.ts:1087-1093`): a reply the TUI consumed never reaches them.
+    #[test]
+    fn listeners_never_see_terminal_replies() {
+        let (mut tui, _capture) = tui(&["one"], (10, 5));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_listener = std::sync::Arc::clone(&seen);
+        tui.add_input_listener(Box::new(move |data| {
+            seen_for_listener.lock().expect("seen").push(data.to_string());
+            InputListenerOutcome::Pass
+        }));
+        tui.start().unwrap();
+        // `start` sent the OSC 7501 support query; its reply is drained by
+        // the matcher before the listener chain runs.
+        assert!(tui.handle_input("\x1b]7501;?\x1b\\"));
+        assert_eq!(*seen.lock().expect("seen"), Vec::<String>::new());
+    }
+
+    /// The unsubscribe `addInputListener` returns: a removed listener stops
+    /// seeing chunks.
+    #[test]
+    fn remove_input_listener_unsubscribes() {
+        let (mut tui, _capture) = tui(&["one"], (10, 5));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_listener = std::sync::Arc::clone(&seen);
+        let id = tui.add_input_listener(Box::new(move |data| {
+            seen_for_listener.lock().expect("seen").push(data.to_string());
+            InputListenerOutcome::Pass
+        }));
+        tui.remove_input_listener(id);
+        tui.start().unwrap();
+        assert!(tui.handle_input("x"));
+        assert_eq!(*seen.lock().expect("seen"), Vec::<String>::new());
     }
 
     // ---------------------------------------------------- program status (OSC 7501)
