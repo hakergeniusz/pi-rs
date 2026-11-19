@@ -1158,8 +1158,28 @@ globalThis.__piCreateUiCtx = function () {
       // editor text synchronously.
       return globalThis.__piOps.editorText();
     },
-    addAutocompleteProvider: () => {
+    addAutocompleteProvider: (factory) => {
       assertActive();
+      if (globalThis.__piOps.mode() !== "tui") {
+        // RPC mode has no editor surface to autocomplete.
+        return;
+      }
+      // `addAutocompleteProvider` (`interactive-mode.ts:2799-2802`): the
+      // factory wraps the current provider once; the wrapper joins the
+      // chain and the count crossing carries its declared
+      // `triggerCharacters` for the host's union. The base adapter's
+      // reads answer from the per-call stash the wrapped suggest/apply
+      // set (see `__piWrappedSuggest`).
+      const wrapper = factory(makeBaseAutocompleteAdapter());
+      if (!wrapper || typeof wrapper.getSuggestions !== "function") {
+        return;
+      }
+      const index = globalThis.__piAutocompleteWrappers.push(wrapper) - 1;
+      queue(
+        "addAutocompleteProvider",
+        { index, triggerCharacters: wrapper.triggerCharacters ?? [] },
+        false,
+      );
     },
     setEditorComponent: () => {
       assertActive();
@@ -1810,6 +1830,60 @@ const makeFooterDataAdapter = () => {
       };
     },
   };
+};
+
+// The autocomplete wrapper chain (E3 slice 8): `AutocompleteProviderFactory`
+// (`types.ts:144`) wraps the current provider once at registration; the
+// wrapper's `getSuggestions` is awaitable upstream (`autocomplete.ts:274-
+// 282`) so the host drives the async call through the job queue. The base
+// provider crosses as an adapter over the per-call stash — the host
+// pre-computes the chain's base result for the SAME keystroke and
+// `__piWrappedSuggest`/`__piWrappedApply` set it before invoking the
+// wrapper (upstream wrappers call `provider.getSuggestions(...)` with the
+// given data; the adapter answers with that pre-computed result — a
+// documented deviation, no re-query crossing).
+globalThis.__piAutocompleteWrappers = [];
+globalThis.__piAutocompleteBase = { suggestions: null, apply: null, shouldTrigger: false };
+globalThis.__piAutocompleteResult = "";
+
+const makeBaseAutocompleteAdapter = () => ({
+  getSuggestions: async () => globalThis.__piAutocompleteBase.suggestions,
+  applyCompletion: (lines, cursorLine, cursorCol) =>
+    globalThis.__piAutocompleteBase.apply ?? { lines, cursorLine, cursorCol },
+  shouldTriggerFileCompletion: () => globalThis.__piAutocompleteBase.shouldTrigger,
+});
+
+globalThis.__piWrappedSuggest = async (index, baseJson, linesJson, cursorLine, cursorCol, force) => {
+  globalThis.__piAutocompleteResult = "";
+  globalThis.__piAutocompleteBase.suggestions =
+    baseJson === "" ? null : JSON.parse(baseJson);
+  const wrapper = globalThis.__piAutocompleteWrappers[index];
+  if (!wrapper || typeof wrapper.getSuggestions !== "function") return;
+  const result = await wrapper.getSuggestions(JSON.parse(linesJson), cursorLine, cursorCol, {
+    force: force === true,
+  });
+  globalThis.__piAutocompleteResult =
+    result === null || result === undefined ? "" : JSON.stringify(result);
+};
+
+globalThis.__piWrappedApply = (index, baseJson, linesJson, cursorLine, cursorCol, itemJson, prefix) => {
+  globalThis.__piAutocompleteResult = "";
+  globalThis.__piAutocompleteBase.apply = baseJson === "" ? null : JSON.parse(baseJson);
+  const wrapper = globalThis.__piAutocompleteWrappers[index];
+  if (!wrapper || typeof wrapper.applyCompletion !== "function") return;
+  const result = wrapper.applyCompletion(
+    JSON.parse(linesJson),
+    cursorLine,
+    cursorCol,
+    JSON.parse(itemJson),
+    prefix,
+  );
+  globalThis.__piAutocompleteResult =
+    result === null || result === undefined ? "" : JSON.stringify(result);
+};
+
+globalThis.__piAutocompleteWrappersClear = function () {
+  globalThis.__piAutocompleteWrappers = [];
 };
 
 // The entry renderer call (`addCustomEntryToChat`, interactive-mode.ts:3986;

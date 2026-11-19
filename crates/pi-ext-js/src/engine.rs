@@ -1291,6 +1291,105 @@ impl JsHost {
         })
     }
 
+    /// Runs one autocomplete wrapper's `getSuggestions` (E3 slice 8; the
+    /// provider is awaitable upstream, `autocomplete.ts:274-282`) — the
+    /// async call settles through the job queue (`drive_jobs`), which is
+    /// safe because nothing here waits on the mode: the base chain's
+    /// result crosses as `base_json` and the wrapper resolves against it.
+    /// `None` = no suggestions (no wrapper, a throw, or an unsettled
+    /// promise).
+    pub fn wrapped_suggest(
+        &self,
+        index: u32,
+        base_json: &str,
+        lines_json: &str,
+        cursor_line: usize,
+        cursor_col: usize,
+        force: bool,
+    ) -> Option<String> {
+        let called = self.ctx.with(|ctx| -> Option<Value> {
+            let call: Function = ctx.globals().get("__piWrappedSuggest").ok()?;
+            call.call((
+                index,
+                base_json,
+                lines_json,
+                cursor_line,
+                cursor_col,
+                force,
+            ))
+            .ok()
+        });
+        if called.is_none() {
+            return None;
+        }
+        if self.drive_jobs().is_err() {
+            return None;
+        }
+        self.take_autocomplete_result()
+    }
+
+    /// Runs one autocomplete wrapper's `applyCompletion`
+    /// (`autocomplete.ts:283-295` — synchronous upstream). `None` falls
+    /// back to the base's application.
+    pub fn wrapped_apply(
+        &self,
+        index: u32,
+        base_json: &str,
+        lines_json: &str,
+        cursor_line: usize,
+        cursor_col: usize,
+        item_json: &str,
+        prefix: &str,
+    ) -> Option<String> {
+        let result = self.ctx.with(|ctx| -> Option<String> {
+            let call: Function = ctx.globals().get("__piWrappedApply").ok()?;
+            call.call((
+                index,
+                base_json,
+                lines_json,
+                cursor_line,
+                cursor_col,
+                item_json,
+                prefix,
+            ))
+            .ok()
+        });
+        if result.is_none() {
+            return None;
+        }
+        if self.drive_jobs().is_err() {
+            return None;
+        }
+        self.take_autocomplete_result()
+    }
+
+    /// Reads and clears the slot `__piWrappedSuggest`/`__piWrappedApply`
+    /// write. An empty string means "no result".
+    fn take_autocomplete_result(&self) -> Option<String> {
+        self.ctx.with(|ctx| {
+            let raw: String = ctx
+                .globals()
+                .get("__piAutocompleteResult")
+                .unwrap_or_default();
+            let _ = ctx.globals().set("__piAutocompleteResult", "");
+            if raw.is_empty() { None } else { Some(raw) }
+        })
+    }
+
+    /// Clears the autocomplete wrapper stash
+    /// (`resetExtensionUI`'s `autocompleteProviderWrappers = []`,
+    /// `interactive-mode.ts:2609`).
+    pub fn clear_autocomplete_wrappers(&self) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx
+                .globals()
+                .get("__piAutocompleteWrappersClear")
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            let _: Value = call.call(()).map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
     /// Calls one extension's entry renderer for a custom session entry
     /// (`__piRenderEntry`): the renderer runs inside the engine, its
     /// returned Component is adopted into the handle registry, and the

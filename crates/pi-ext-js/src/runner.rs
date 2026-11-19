@@ -1716,6 +1716,44 @@ impl ExtensionRunner {
         self.host.notify_footer_branch_change(branch)
     }
 
+    /// Runs one autocomplete wrapper's `getSuggestions` (E3 slice 8): the
+    /// base chain's result crosses as `base_json` and the async call
+    /// settles through the job queue — nothing here waits on the mode.
+    /// `None` = no suggestions.
+    pub fn wrapped_suggest(
+        &self,
+        index: u32,
+        base_json: &str,
+        lines_json: &str,
+        cursor_line: usize,
+        cursor_col: usize,
+        force: bool,
+    ) -> Option<String> {
+        self.host.wrapped_suggest(index, base_json, lines_json, cursor_line, cursor_col, force)
+    }
+
+    /// Runs one autocomplete wrapper's `applyCompletion`. `None` falls
+    /// back to the base's application.
+    pub fn wrapped_apply(
+        &self,
+        index: u32,
+        base_json: &str,
+        lines_json: &str,
+        cursor_line: usize,
+        cursor_col: usize,
+        item_json: &str,
+        prefix: &str,
+    ) -> Option<String> {
+        self.host
+            .wrapped_apply(index, base_json, lines_json, cursor_line, cursor_col, item_json, prefix)
+    }
+
+    /// Clears the autocomplete wrapper stash (`resetExtensionUI`,
+    /// `interactive-mode.ts:2609`).
+    pub fn clear_autocomplete_wrappers(&self) -> Result<(), JsHostError> {
+        self.host.clear_autocomplete_wrappers()
+    }
+
     /// Binds the UI surface (`setUIContext`, `runner.ts:570-575`):
     /// `ctx.mode`/`ctx.hasUI` flip, and every `ctx.ui` request crosses to
     /// the sink. Without this call the runner stays headless.
@@ -3936,6 +3974,83 @@ export default function (pi) {
         assert_eq!(
             runner.deliver_terminal_input("a").expect("fold"),
             Some("a".to_string())
+        );
+    }
+
+    /// Autocomplete wrappers (E3 slice 8): `addAutocompleteProvider` in
+    /// tui mode crosses the wrapper as `{ index, triggerCharacters }`,
+    /// `wrapped_suggest` drives the async `getSuggestions` through the
+    /// job queue with the base chain's result pre-supplied as data,
+    /// `wrapped_apply` round-trips the completion edit, and the reset
+    /// empties the stash.
+    #[test]
+    fn ui_autocomplete_wrappers_suggest_apply_and_clear() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    ctx.ui.addAutocompleteProvider((base) => ({
+      triggerCharacters: ["!"],
+      getSuggestions: async (lines, cursorLine, cursorCol, opts) => {
+        const baseResult = await base.getSuggestions(lines, cursorLine, cursorCol, opts);
+        const items = (baseResult ? baseResult.items : []).concat([
+          { value: "ext", label: "Ext", description: opts.force ? "forced" : undefined },
+        ]);
+        return { items, prefix: "/" };
+      },
+      applyCompletion: (lines, cursorLine, cursorCol, item, prefix) => ({
+        lines: [lines[0] + item.value],
+        cursorLine: 0,
+        cursorCol: cursorCol + item.value.length,
+      }),
+    }));
+  });
+}
+"#;
+        let mut runner = runner_with(&[EXT]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "tui");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        // The registration crossing carries the stash index and the
+        // declared trigger characters (`interactive-mode.ts:2799-2802`).
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0]["method"], "addAutocompleteProvider");
+        assert_eq!(requests[0]["index"], 0);
+        assert_eq!(requests[0]["triggerCharacters"], json!(["!"]));
+
+        // Suggest: the base chain's result crosses as data and the
+        // wrapper merges its item after it; `force` reaches the options.
+        let base = json!({"items": [{"value": "cmd", "label": "Cmd"}], "prefix": "/"}).to_string();
+        let result = runner
+            .wrapped_suggest(0, &base, r#"["/cm"]"#, 0, 3, false)
+            .expect("wrapper result");
+        let result: Json = serde_json::from_str(&result).expect("json");
+        assert_eq!(
+            result["items"],
+            json!([
+                { "value": "cmd", "label": "Cmd" },
+                { "value": "ext", "label": "Ext" }
+            ])
+        );
+        assert_eq!(result["prefix"], "/");
+
+        // Apply: the wrapper edits the editor text through the item
+        // (synchronous upstream, `autocomplete.ts:283-295`).
+        let applied = runner
+            .wrapped_apply(0, "", r#"["/cm"]"#, 0, 3, r#"{"value":"ext","label":"Ext"}"#, "/")
+            .expect("wrapper application");
+        let applied: Json = serde_json::from_str(&applied).expect("json");
+        assert_eq!(applied["lines"], json!(["/cmext"]));
+        assert_eq!(applied["cursorCol"], 6);
+
+        // The reset empties the stash: no wrapper, no result.
+        runner.clear_autocomplete_wrappers().expect("clear");
+        assert_eq!(
+            runner.wrapped_suggest(0, &base, r#"["/cm"]"#, 0, 3, false),
+            None,
+            "the cleared stash leaves nothing to call"
         );
     }
 
