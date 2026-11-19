@@ -1307,19 +1307,28 @@ impl JsHost {
         cursor_col: usize,
         force: bool,
     ) -> Option<String> {
-        let called = self.ctx.with(|ctx| -> Option<Value> {
-            let call: Function = ctx.globals().get("__piWrappedSuggest").ok()?;
-            call.call((
+        let called = self.ctx.with(|ctx| -> bool {
+            // The async call answers a Promise; the Value drops inside the
+            // closure — a borrowed rquickjs type cannot escape `with`
+            // (lifetime invariance).
+            let call: Function = match ctx.globals().get("__piWrappedSuggest") {
+                Ok(call) => call,
+                Err(_) => return false,
+            };
+            let _: Value = match call.call((
                 index,
                 base_json,
                 lines_json,
                 cursor_line,
                 cursor_col,
                 force,
-            ))
-            .ok()
+            )) {
+                Ok(value) => value,
+                Err(_) => return false,
+            };
+            true
         });
-        if called.is_none() {
+        if !called {
             return None;
         }
         if self.drive_jobs().is_err() {
@@ -1341,9 +1350,14 @@ impl JsHost {
         item_json: &str,
         prefix: &str,
     ) -> Option<String> {
-        let result = self.ctx.with(|ctx| -> Option<String> {
-            let call: Function = ctx.globals().get("__piWrappedApply").ok()?;
-            call.call((
+        let called = self.ctx.with(|ctx| -> bool {
+            // The sync call answers `undefined`; coerce to a Value and drop
+            // it inside the closure — the slot carries the result.
+            let call: Function = match ctx.globals().get("__piWrappedApply") {
+                Ok(call) => call,
+                Err(_) => return false,
+            };
+            let _: Value = match call.call((
                 index,
                 base_json,
                 lines_json,
@@ -1351,10 +1365,13 @@ impl JsHost {
                 cursor_col,
                 item_json,
                 prefix,
-            ))
-            .ok()
+            )) {
+                Ok(value) => value,
+                Err(_) => return false,
+            };
+            true
         });
-        if result.is_none() {
+        if !called {
             return None;
         }
         if self.drive_jobs().is_err() {
