@@ -507,7 +507,7 @@ impl pi_tui::components::editor::AutocompleteProvider for JsAutocompleteProvider
         // A busy engine, an absent wrapper `applyCompletion`, or an
         // unparsable reply keeps the base's application — upstream only
         // overrides the application when the wrapper defines one
-        // (`autocomplete.ts:283-295`).
+        // (`autocomplete.ts:283-292`).
         let Ok(runner) = self.runner.try_lock() else {
             return base;
         };

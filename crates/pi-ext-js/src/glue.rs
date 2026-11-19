@@ -1835,7 +1835,7 @@ const makeFooterDataAdapter = () => {
 // The autocomplete wrapper chain (E3 slice 8): `AutocompleteProviderFactory`
 // (`types.ts:144`) wraps the current provider once at registration; the
 // wrapper's `getSuggestions` is awaitable upstream (`autocomplete.ts:274-
-// 282`) so the host drives the async call through the job queue. The base
+// 280`) so the host drives the async call through the job queue. The base
 // provider crosses as an adapter over the per-call stash — the host
 // pre-computes the chain's base result for the SAME keystroke and
 // `__piWrappedSuggest`/`__piWrappedApply` set it before invoking the

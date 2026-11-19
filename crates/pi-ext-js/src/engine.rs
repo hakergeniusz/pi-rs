@@ -1292,7 +1292,7 @@ impl JsHost {
     }
 
     /// Runs one autocomplete wrapper's `getSuggestions` (E3 slice 8; the
-    /// provider is awaitable upstream, `autocomplete.ts:274-282`) — the
+    /// provider is awaitable upstream, `autocomplete.ts:274-280`) — the
     /// async call settles through the job queue (`drive_jobs`), which is
     /// safe because nothing here waits on the mode: the base chain's
     /// result crosses as `base_json` and the wrapper resolves against it.
@@ -1332,7 +1332,7 @@ impl JsHost {
     }
 
     /// Runs one autocomplete wrapper's `applyCompletion`
-    /// (`autocomplete.ts:283-287` — synchronous upstream). `None` falls
+    /// (`autocomplete.ts:283-292` — synchronous upstream). `None` falls
     /// back to the base's application.
     #[allow(clippy::too_many_arguments)] // the crossing protocol + upstream's apply shape
     pub fn wrapped_apply(
