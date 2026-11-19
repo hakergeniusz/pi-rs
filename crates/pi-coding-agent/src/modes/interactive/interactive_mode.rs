@@ -84,6 +84,7 @@ use super::components::user_message_selector::{
     UserMessageItem, UserMessageSelectorComponent, UserMessageSelectorEvent,
 };
 use super::model_catalog_refresh::refresh_model_catalogs;
+use super::program_status::{BlockedStatus, ProgramStatusReporter};
 use super::theme;
 use crate::cli::args::DiagnosticKind;
 use crate::model_resolver::{
@@ -153,6 +154,10 @@ struct ExtensionUiDialogEntry {
     handle: Option<u32>,
     /// The dialog's component while parked; `None` means visible.
     component: Option<Box<dyn Component>>,
+    /// What the dialog blocks the program status on while it shows —
+    /// `pushExtensionDialog`'s `blocked` (`interactive-mode.ts:2833-2837`),
+    /// reported through `showTopExtensionDialog` (`:2853`).
+    blocked: Option<BlockedStatus>,
 }
 
 /// The `ctx.ui` dialog methods the interactive bridge mounts
@@ -1111,6 +1116,10 @@ pub struct InteractiveMode {
     /// rest park in their entries.
     #[cfg(feature = "ext-js")]
     extension_ui_dialogs: Vec<ExtensionUiDialogEntry>,
+    /// The OSC 7501 program status reporter (`interactive-mode.ts:572-576`):
+    /// `working`/`blocked`/`done`/`error` reports ride every agent event and
+    /// the dialogs' `blocked` sources (`program-status-reporter.ts`).
+    program_status: ProgramStatusReporter,
     /// Events from the mounted `/fork` dialog (`UserMessageSelectorComponent`'s
     /// onSelect/onCancel).
     user_message_selector_events: Option<Arc<Mutex<Vec<UserMessageSelectorEvent>>>>,
@@ -1381,6 +1390,7 @@ impl InteractiveMode {
             extension_ui_bridge: options.extension_ui.clone(),
             #[cfg(feature = "ext-js")]
             extension_ui_dialogs: Vec::new(),
+            program_status: ProgramStatusReporter::new(),
             user_message_selector_events: None,
             tree_selector_events: None,
             tree_summary_dialog_events: None,
@@ -1518,6 +1528,12 @@ impl InteractiveMode {
         // chain only changes at load/reload).
         #[cfg(feature = "ext-js")]
         mode.setup_markdown_transformers();
+        // The initial program status report (`interactive-mode.ts:1040`,
+        // `init` after `ui.start()`): an idle report now is re-written once
+        // the terminal confirms OSC 7501 support.
+        let session_name = mode.session.get_session_name();
+        mode.program_status
+            .report(session_name.as_deref(), &mut mode.tui);
         mode
     }
 
@@ -2546,6 +2562,14 @@ impl InteractiveMode {
 
     #[allow(clippy::too_many_lines)]
     fn handle_agent_event(&mut self, event: &AgentEvent) {
+        // `handleEvent`'s preamble (`interactive-mode.ts:3531-3536`): the
+        // program status reporter consumes its event subset first. (The
+        // paired `footer.invalidate()` is a no-op upstream — `footer.ts:85-87`
+        // — and the port's footer recomputes from the session on demand, so
+        // nothing to do for it here.)
+        let session_name = self.session.get_session_name();
+        self.program_status
+            .handle_event(event, session_name.as_deref(), &mut self.tui);
         match event {
             AgentEvent::AgentStart
             | AgentEvent::TurnStart
@@ -6214,6 +6238,12 @@ impl InteractiveMode {
                 self.last_status_pair = None;
                 self.render_initial_messages();
                 self.refresh_footer();
+                // `rebindCurrentSession`'s program-status reset
+                // (`interactive-mode.ts:2222`): the resumed session reports
+                // idle until its own run settles.
+                let session_name = self.session.get_session_name();
+                self.program_status
+                    .reset(session_name.as_deref(), &mut self.tui);
                 self.show_status("Resumed session");
             }
             Err(error) => {
@@ -6321,6 +6351,13 @@ impl InteractiveMode {
         self.cancel_extension_login_flow();
         #[cfg(feature = "ext-js")]
         self.reset_extension_ui_dialogs();
+        // `rebindCurrentSession`'s program-status reset
+        // (`interactive-mode.ts:2222`): forget the previous session's run.
+        {
+            let session_name = self.session.get_session_name();
+            self.program_status
+                .reset(session_name.as_deref(), &mut self.tui);
+        }
 
         // `session.reload` (`agent-session.ts:3838-3849`): the shutdown
         // event, the invalidation, the settings reload, the queue-mode
@@ -8487,8 +8524,19 @@ impl InteractiveMode {
                 }
                 // The custom factory's `tui.requestRender()` adapter.
                 "requestRender" => self.tui.request_render(),
-                // `setStatus` reaches the footer's extension-status surface,
-                // which lands with the E3 footer work.
+                // `setStatus` → `setExtensionStatus` (`interactive-mode.ts:2440-2443`
+                // → `footer-data-provider.ts:146-152`): the glue omits
+                // `statusText` when the extension passed undefined, which
+                // deletes the key.
+                "setStatus" => {
+                    let key = request
+                        .get("statusKey")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let text = request.get("statusText").and_then(Value::as_str);
+                    self.set_extension_status(&key, text);
+                }
                 _ => {}
             }
         }
@@ -8541,6 +8589,12 @@ impl InteractiveMode {
                     last_seconds: None,
                     handle: None,
                     component: Some(Box::new(selector)),
+                    // `showExtensionSelector`'s default blocked
+                    // (`interactive-mode.ts:2864`).
+                    blocked: Some(BlockedStatus {
+                        kind: pi_tui::program_status::ProgramStatusKind::Question,
+                        message: title.to_string(),
+                    }),
                 })
             }
             "confirm" => {
@@ -8565,6 +8619,12 @@ impl InteractiveMode {
                     last_seconds: None,
                     handle: None,
                     component: Some(Box::new(selector)),
+                    // `showExtensionConfirm`'s blocked
+                    // (`interactive-mode.ts:2900-2903`).
+                    blocked: Some(BlockedStatus {
+                        kind: pi_tui::program_status::ProgramStatusKind::Permission,
+                        message: title.to_string(),
+                    }),
                 })
             }
             "input" => {
@@ -8583,6 +8643,12 @@ impl InteractiveMode {
                     last_seconds: None,
                     handle: None,
                     component: Some(Box::new(prompt)),
+                    // `showExtensionInput`'s blocked
+                    // (`interactive-mode.ts:2949`).
+                    blocked: Some(BlockedStatus {
+                        kind: pi_tui::program_status::ProgramStatusKind::Question,
+                        message: title.to_string(),
+                    }),
                 })
             }
             "editor" => {
@@ -8601,6 +8667,12 @@ impl InteractiveMode {
                     last_seconds: None,
                     handle: None,
                     component: Some(Box::new(editor)),
+                    // `showExtensionEditor`'s blocked
+                    // (`interactive-mode.ts:2983`).
+                    blocked: Some(BlockedStatus {
+                        kind: pi_tui::program_status::ProgramStatusKind::Question,
+                        message: title.to_string(),
+                    }),
                 })
             }
             "custom" => {
@@ -8619,6 +8691,10 @@ impl InteractiveMode {
                     last_seconds: None,
                     handle: Some(handle),
                     component: Some(Box::new(component)),
+                    // The inline custom's `options?.blocked`
+                    // (`interactive-mode.ts:3159`); the glue crosses it
+                    // with the overlay slice.
+                    blocked: None,
                 })
             }
             _ => None,
@@ -8643,6 +8719,47 @@ impl InteractiveMode {
         self.park_displaced_occupant(displaced);
         self.extension_ui_dialogs.push(entry);
         self.tui.set_focus(Some(FocusTarget::Id(focused)));
+        self.report_extension_dialog_blocked();
+        self.tui.request_render();
+    }
+
+    /// `showTopExtensionDialog`'s program-status arm
+    /// (`interactive-mode.ts:2847-2855`): the top dialog's `blocked` is the
+    /// reported `extension-dialog` source while it shows; when the editor
+    /// returns the source clears.
+    #[cfg(feature = "ext-js")]
+    fn report_extension_dialog_blocked(&mut self) {
+        let blocked = self
+            .extension_ui_dialogs
+            .last()
+            .and_then(|dialog| dialog.blocked.clone());
+        let session_name = self.session.get_session_name();
+        self.program_status.set_blocked(
+            "extension-dialog",
+            blocked,
+            session_name.as_deref(),
+            &mut self.tui,
+        );
+    }
+
+    /// `setExtensionStatus` (`interactive-mode.ts:2440-2443`) over
+    /// `FooterDataProvider.setExtensionStatus` (`footer-data-provider.ts:146-152`):
+    /// an undefined text deletes the key; every change re-renders.
+    #[cfg(feature = "ext-js")]
+    fn set_extension_status(&mut self, key: &str, text: Option<&str>) {
+        if let Some(footer) = self.downcast_tree::<FooterComponent>(HostSlot::Footer) {
+            match text {
+                Some(text) => {
+                    footer
+                        .data
+                        .extension_statuses
+                        .insert(key.to_string(), text.to_string());
+                }
+                None => {
+                    footer.data.extension_statuses.remove(key);
+                }
+            }
+        }
         self.tui.request_render();
     }
 
@@ -8836,6 +8953,10 @@ impl InteractiveMode {
                 drop(self.replace_editor_slot(editor));
                 self.tui.set_focus(Some(FocusTarget::Id(self.editor_id)));
             }
+            // `showTopExtensionDialog`'s blocked arm (`interactive-mode.ts:2853`):
+            // the newly visible dialog's status, or none when the editor is
+            // back.
+            self.report_extension_dialog_blocked();
             self.tui.request_render();
         }
         drop(entry.component);
@@ -8856,27 +8977,40 @@ impl InteractiveMode {
     /// switches): dispose every open dialog without calling `done()` and
     /// put the editor back. The port answers `cancelled` for the mailbox
     /// kinds so their delivery threads unblock (upstream leaves the
-    /// promises pending — its engine is in-process and threadless).
+    /// promises pending — its engine is in-process and threadless). The
+    /// footer's extension statuses clear unconditionally
+    /// (`interactive-mode.ts:2607-2608`), like upstream's body runs whole.
     #[cfg(feature = "ext-js")]
     fn reset_extension_ui_dialogs(&mut self) {
-        if self.extension_ui_dialogs.is_empty() {
-            return;
-        }
-        for dialog in self.extension_ui_dialogs.drain(..) {
-            if let Some(bridge) = self.extension_ui_bridge.as_ref() {
-                bridge.respond(&dialog.id, &serde_json::json!({ "cancelled": true }));
+        if !self.extension_ui_dialogs.is_empty() {
+            for dialog in self.extension_ui_dialogs.drain(..) {
+                if let Some(bridge) = self.extension_ui_bridge.as_ref() {
+                    bridge.respond(&dialog.id, &serde_json::json!({ "cancelled": true }));
+                }
+                if let Some(handle) = dialog.handle
+                    && let Some(runner) = self.extension_runner.as_ref()
+                {
+                    let _ = runner
+                        .lock()
+                        .expect("extension runner mutex poisoned")
+                        .component_dispose(handle);
+                }
+                drop(dialog.component);
             }
-            if let Some(handle) = dialog.handle
-                && let Some(runner) = self.extension_runner.as_ref()
-            {
-                let _ = runner
-                    .lock()
-                    .expect("extension runner mutex poisoned")
-                    .component_dispose(handle);
-            }
-            drop(dialog.component);
+            self.restore_editor();
+            // `showTopExtensionDialog` with an empty stack
+            // (`interactive-mode.ts:2598`): the `extension-dialog` blocked
+            // source clears.
+            self.report_extension_dialog_blocked();
         }
-        self.restore_editor();
+        // `footerDataProvider.clearExtensionStatuses(); this.footer.invalidate();`
+        // (`interactive-mode.ts:2607-2608`): upstream's `footer.invalidate`
+        // is a no-op (`footer.ts:85-87`); the port's refresh recomputes the
+        // session-derived cells instead.
+        if let Some(footer) = self.downcast_tree::<FooterComponent>(HostSlot::Footer) {
+            footer.data.extension_statuses.clear();
+        }
+        self.refresh_footer();
     }
 
     /// The settled credential (`completeProviderAuthentication`'s storage
@@ -10948,6 +11082,150 @@ export default function (pi) {
         assert!(
             mode.extension_ui_dialogs.is_empty(),
             "notify never mounts a dialog"
+        );
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `ctx.ui.setStatus` feeds the footer's third line
+    /// (`setExtensionStatus`, `interactive-mode.ts:2440-2443`, rendered at
+    /// `footer.ts:289-298`): values render sorted by key, sanitized, and an
+    /// undefined text deletes the key.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_ui_set_status_renders_in_the_footer() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", (_event, ctx) => {
+    ctx.ui.setStatus("beta", "second  status");
+    ctx.ui.setStatus("alpha", "first\tstatus");
+    pi.appendEntry("marked", {});
+  });
+  pi.on("session_end", (_event, ctx) => {
+    ctx.ui.setStatus("alpha", undefined);
+    pi.appendEntry("cleared", {});
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        let runner = mode.extension_runner.clone().expect("runner");
+        // The fire-and-forget statuses queue during the emit; a pump after it
+        // settles drains them into the footer.
+        runner
+            .lock()
+            .expect("runner")
+            .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        mode.pump();
+        let footer = mode
+            .downcast_tree::<FooterComponent>(HostSlot::Footer)
+            .expect("footer");
+        assert_eq!(
+            footer
+                .data
+                .extension_statuses
+                .get("alpha")
+                .map(String::as_str),
+            Some("first\tstatus"),
+            "the raw text is stored unsanitized"
+        );
+        let lines = footer.render_lines(100);
+        assert_eq!(lines.len(), 3, "the status line is appended");
+        assert_eq!(
+            pi_tui::ansi::strip_terminal_sequences(&lines[2]),
+            "first status second status",
+            "sorted by key, tab collapsed"
+        );
+        // An undefined text deletes the key (`footer-data-provider.ts:146-152`).
+        runner
+            .lock()
+            .expect("runner")
+            .emit(&serde_json::json!({ "type": "session_end" }))
+            .expect("emit");
+        mode.pump();
+        let footer = mode
+            .downcast_tree::<FooterComponent>(HostSlot::Footer)
+            .expect("footer");
+        assert!(
+            !footer.data.extension_statuses.contains_key("alpha"),
+            "undefined deletes"
+        );
+        assert_eq!(footer.render_lines(100).len(), 2, "the line disappears");
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// A mounted extension dialog reports the `blocked` program status over
+    /// OSC 7501 (`showExtensionSelector`'s default `blocked` →
+    /// `showTopExtensionDialog`, `interactive-mode.ts:2864-2888/:2853`), and
+    /// closing it reports the resting state again. The sequence reaches the
+    /// terminal writer through the mode's capture terminal.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_dialog_reports_blocked_program_status_over_osc_7501() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (_event, ctx) => {
+    const value = await ctx.ui.select("Pick", ["A", "B"]);
+    pi.appendEntry("picked", { value: value ?? null });
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        mode.tui.start().expect("tui start");
+        // Answer the OSC 7501 negotiation so reports write to the capture.
+        mode.feed_stdin_bytes(b"\x1b]7501;?\x1b\\");
+        let runner = mode.extension_runner.clone().expect("runner");
+        let emitter = std::thread::spawn(move || {
+            runner
+                .lock()
+                .expect("runner")
+                .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+                .expect("emit");
+        });
+        for _ in 0..200 {
+            mode.pump();
+            if !mode.extension_ui_dialogs.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(mode.extension_ui_dialogs.len(), 1, "the select mounted");
+        let written = capture.output();
+        // base64("Pick") = UGljaw== — the dialog title is the blocked message.
+        assert!(
+            written
+                .contains("\x1b]7501;state=blocked:app=pi:kind=question:msg=UGljaw==\x1b\\"),
+            "{written:?}"
+        );
+        // Enter picks the first option; the close clears the source.
+        mode.feed_stdin_bytes(b"\r");
+        mode.pump();
+        emitter.join().expect("emit thread");
+        let written = capture.output();
+        assert!(
+            written.contains("\x1b]7501;state=idle:app=pi\x1b\\"),
+            "the blocked source cleared on close: {written:?}"
+        );
+        let entries = mode
+            .extension_runner
+            .as_ref()
+            .expect("runner")
+            .lock()
+            .expect("runner")
+            .core()
+            .lock()
+            .expect("core")
+            .entries
+            .clone();
+        let picked = entries
+            .iter()
+            .find(|(custom_type, _)| custom_type == "picked")
+            .map(|(_, data)| data.clone());
+        assert_eq!(
+            picked,
+            Some(serde_json::json!({ "value": "A" })),
+            "the dialog still answered"
         );
         mode.shutdown().expect("shutdown");
     }

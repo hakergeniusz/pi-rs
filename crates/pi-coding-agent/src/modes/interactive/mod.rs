@@ -13,4 +13,6 @@ pub mod components;
 pub mod extension_ui;
 pub mod interactive_mode;
 pub mod model_catalog_refresh;
+/// The OSC 7501 program status reporter (`program-status-reporter.ts`).
+pub mod program_status;
 pub mod theme;

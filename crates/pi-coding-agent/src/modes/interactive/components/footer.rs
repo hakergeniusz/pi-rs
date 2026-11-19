@@ -166,6 +166,30 @@ pub fn get_usage_cost_breakdown(
 /// The minimum gap between the stats and the model (`footer.ts:231`).
 const MIN_PADDING: usize = 2;
 
+/// `sanitizeStatusText` (`footer.ts:14-20`): newlines, tabs, and carriage
+/// returns become spaces, runs of spaces collapse, and the edges trim — a
+/// single-line status.
+fn sanitize_status_text(text: &str) -> String {
+    let flattened: String = text
+        .chars()
+        .map(|c| if matches!(c, '\r' | '\n' | '\t') { ' ' } else { c })
+        .collect();
+    let mut out = String::with_capacity(flattened.len());
+    let mut in_space = false;
+    for c in flattened.chars() {
+        if c == ' ' {
+            if !in_space {
+                out.push(' ');
+                in_space = true;
+            }
+        } else {
+            out.push(c);
+            in_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
 /// The data the footer renders, gathered by the interactive loop.
 #[derive(Debug, Clone, Default)]
 pub struct FooterData {
@@ -192,6 +216,14 @@ pub struct FooterData {
     /// The routed response's thinking level, when one was recorded.
     pub routed_thinking_level: Option<String>,
     pub auto_compact_enabled: bool,
+    /// Extension status texts set via `ctx.ui.setStatus()` —
+    /// `FooterDataProvider.extensionStatuses` (`footer-data-provider.ts:103`,
+    /// `:135-137`, `:146-157`). Upstream keeps an insertion-ordered `Map` and
+    /// sorts per render by `localeCompare` (`footer.ts:292-293`); the port's
+    /// `BTreeMap` orders by key instead — identical for the ASCII keys
+    /// extensions use, and the case-folded fallback stands in for the locale
+    /// collation the port carries no ICU for.
+    pub extension_statuses: std::collections::BTreeMap<String, String>,
 }
 
 /// `FooterComponent` (`footer.ts:62-302`).
@@ -253,7 +285,8 @@ impl FooterComponent {
         FooterComponent { data }
     }
 
-    /// `render` (`footer.ts:157-301`): `[pwdLine, statsLine]`.
+    /// `render` (`footer.ts:157-301`): `[pwdLine, statsLine]`, plus the
+    /// extension-status line when one is set (`footer.ts:289-298`).
     #[allow(clippy::too_many_lines)]
     pub fn render_lines(&self, width: usize) -> Vec<String> {
         let theme = theme::theme();
@@ -360,7 +393,28 @@ impl FooterComponent {
             &theme.fg(ThemeColor::Dim, "..."),
             false,
         );
-        vec![pwd_line, format!("{dim_stats_left}{dim_remainder}")]
+        let mut lines = vec![pwd_line, format!("{dim_stats_left}{dim_remainder}")];
+
+        // `footer.ts:289-298`: the extension statuses ride a single extra
+        // line — only when one is set — sorted by key, each value
+        // sanitized, joined with spaces, truncated to the width with the
+        // dim ellipsis like the other footer lines.
+        if !data.extension_statuses.is_empty() {
+            let status_line = data
+                .extension_statuses
+                .values()
+                .map(|text| sanitize_status_text(text))
+                .collect::<Vec<_>>()
+                .join(" ");
+            lines.push(truncate_to_width(
+                &status_line,
+                width,
+                &theme.fg(ThemeColor::Dim, "..."),
+                false,
+            ));
+        }
+
+        lines
     }
 }
 
@@ -582,5 +636,60 @@ mod tests {
         let lines = footer.render_lines(80);
         let plain = pi_tui::ansi::strip_terminal_sequences(&lines[1]);
         assert!(plain.contains("?/0 (auto)"), "{plain}");
+    }
+
+    /// `footer.ts:289-298`: statuses ride a third line, sorted by key,
+    /// sanitized, joined with spaces — and the line exists only when a
+    /// status is set.
+    #[test]
+    fn extension_statuses_render_sorted_sanitized_and_only_when_set() {
+        let plain = FooterData {
+            cwd: "/tmp".to_string(),
+            model_id: "m".to_string(),
+            ..FooterData::default()
+        };
+        // No statuses: exactly the two base lines.
+        let footer = FooterComponent::new(plain.clone());
+        assert_eq!(footer.render_lines(80).len(), 2);
+        // Two statuses render sorted by key ("beta" before "alpha-sort" is
+        // false — alphabetical) with their values joined.
+        let footer = FooterComponent::new(FooterData {
+            extension_statuses: [
+                ("zeta".to_string(), "second status".to_string()),
+                ("alpha".to_string(), "first\tstatus".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..plain.clone()
+        });
+        let lines = footer.render_lines(80);
+        assert_eq!(lines.len(), 3, "the status line is appended");
+        let plain_line = pi_tui::ansi::strip_terminal_sequences(&lines[2]);
+        // Sorted by key: alpha's (sanitized: tab → space) first.
+        assert_eq!(plain_line, "first status second status");
+    }
+
+    /// `footer.ts:14-20`: the sanitizer replaces CR/LF/tab runs with one
+    /// space and trims; `footer.ts:297` truncates a wide line with the dim
+    /// ellipsis.
+    #[test]
+    fn status_lines_sanitize_and_truncate() {
+        assert_eq!(sanitize_status_text("a\r\nb\tc"), "a b c");
+        assert_eq!(sanitize_status_text("  a   b  "), "a b");
+        assert_eq!(sanitize_status_text("\r\n\t"), "");
+        let footer = FooterComponent::new(FooterData {
+            extension_statuses: [(
+                "wide".to_string(),
+                "x".repeat(200),
+            )]
+            .into_iter()
+            .collect(),
+            ..FooterData::default()
+        });
+        let width = 40;
+        let lines = footer.render_lines(width);
+        let plain_line = pi_tui::ansi::strip_terminal_sequences(&lines[2]);
+        assert_eq!(pi_tui::ansi::visible_width(&plain_line), width, "{plain_line}");
+        assert!(plain_line.ends_with("..."), "{plain_line}");
     }
 }
