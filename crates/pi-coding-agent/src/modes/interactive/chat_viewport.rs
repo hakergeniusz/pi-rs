@@ -24,20 +24,23 @@ use pi_tui::tui::Tui;
 
 use super::theme;
 
-/// The flat slot order the six hosts mount in — both in the regular
+/// The flat slot order the eight hosts mount in — both in the regular
 /// renderer's flat child list and inside the viewport's document and dock.
 /// Upstream mounts `documentContainer` (the port keeps the header as its own
 /// slot, folded into the scrolled document in fullscreen),
-/// `pendingMessagesContainer`, `statusContainer` (no widget containers here),
-/// `editorContainer`, and `footerContainer`.
+/// `pendingMessagesContainer`, `statusContainer`, `widgetContainerAbove`
+/// (E3 slice 7), `editorContainer`, `widgetContainerBelow` (E3 slice 7), and
+/// `footerContainer` (`interactive-mode.ts:1023-1031`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostSlot {
     Header = 0,
     Chat = 1,
     Pending = 2,
     Status = 3,
-    Editor = 4,
-    Footer = 5,
+    WidgetAbove = 4,
+    Editor = 5,
+    WidgetBelow = 6,
+    Footer = 7,
 }
 
 impl HostSlot {
@@ -46,9 +49,10 @@ impl HostSlot {
         self as usize
     }
 
-    /// The slot's index inside the dock stack: pending 0, status 1, editor 2,
-    /// footer 3 (`chat-viewport.js:13-22`). Only the four dock slots mount
-    /// there; the header and chat live in the scrolled document instead.
+    /// The slot's index inside the dock stack: pending 0, status 1, widgets
+    /// above 2, editor 3, widgets below 4, footer 5 (`chat-viewport.ts
+    /// :31-38`). Only the six dock slots mount there; the header and chat
+    /// live in the scrolled document instead.
     pub fn dock_index(self) -> usize {
         self.index() - 2
     }
@@ -61,9 +65,10 @@ pub struct ChatViewport {
     root_id: ComponentId,
     /// The transcript `ScrollView` — the layout's primary scroll view.
     transcript_id: ComponentId,
-    /// The dock stack holding the pending, status, editor, and footer hosts.
+    /// The dock stack holding the pending, status, widget, editor, widget,
+    /// and footer hosts.
     dock_id: ComponentId,
-    slot_ids: [ComponentId; 6],
+    slot_ids: [ComponentId; 8],
 }
 
 impl ChatViewport {
@@ -100,16 +105,18 @@ impl ChatViewport {
 pub fn mount(tui: &mut Tui, hosts: Vec<Box<dyn Component>>, scrollbar: Scrollbar) -> ChatViewport {
     assert_eq!(
         hosts.len(),
-        6,
-        "the chat viewport mounts exactly the six flat hosts"
+        8,
+        "the chat viewport mounts exactly the eight flat hosts"
     );
-    let slot_ids: [ComponentId; 6] =
+    let slot_ids: [ComponentId; 8] =
         std::array::from_fn(|index| component_id(hosts[index].as_ref()));
 
     // Take the hosts out from the far end so the flat indices stay stable.
     let mut hosts = hosts;
     let footer = hosts.pop().expect("footer host");
+    let widgets_below = hosts.pop().expect("widgets-below host");
     let editor = hosts.pop().expect("editor host");
+    let widgets_above = hosts.pop().expect("widgets-above host");
     let status = hosts.pop().expect("status host");
     let pending = hosts.pop().expect("pending host");
     let chat = hosts.pop().expect("chat host");
@@ -146,12 +153,13 @@ pub fn mount(tui: &mut Tui, hosts: Vec<Box<dyn Component>>, scrollbar: Scrollbar
     let transcript_box = Box::new(transcript);
     let transcript_id = component_id(transcript_box.as_ref());
 
-    // The dock: pending messages, status, editor, footer
-    // (`chat-viewport.js:13-22`). Every entry shrinks; the editor keeps at
-    // least three rows so its border stays visible while the transcript
-    // takes the rest.
+    // The dock: pending messages, status, widgets above, editor, widgets
+    // below, footer (`chat-viewport.ts:31-38`). Every entry shrinks; the
+    // editor keeps at least three rows so its border stays visible while
+    // the transcript takes the rest; the widget hosts shrink like the
+    // status row.
     let mut dock = VStack::new(Vec::new());
-    for host in [pending, status] {
+    for host in [pending, status, widgets_above] {
         dock.add_child(
             host,
             StackEntryOptions {
@@ -166,6 +174,14 @@ pub fn mount(tui: &mut Tui, hosts: Vec<Box<dyn Component>>, scrollbar: Scrollbar
         StackEntryOptions {
             shrink: Some(1),
             min_size: Some(3),
+            ..StackEntryOptions::default()
+        },
+    );
+    dock.add_child(
+        widgets_below,
+        StackEntryOptions {
+            shrink: Some(1),
+            min_size: Some(0),
             ..StackEntryOptions::default()
         },
     );
@@ -217,11 +233,11 @@ pub fn mount(tui: &mut Tui, hosts: Vec<Box<dyn Component>>, scrollbar: Scrollbar
     }
 }
 
-/// Take the viewport apart and return the six hosts in flat order (header,
-/// chat, pending, status, editor, footer), ready to be re-added as the
-/// regular renderer's root children. The counterpart of upstream rebuilding
-/// the renderer and remounting the same tree (`switchTuiMode`,
-/// `interactive-mode.ts:660-680`).
+/// Take the viewport apart and return the eight hosts in flat order (header,
+/// chat, pending, status, widgets above, editor, widgets below, footer),
+/// ready to be re-added as the regular renderer's root children. The
+/// counterpart of upstream rebuilding the renderer and remounting the same
+/// tree (`switchTuiMode`, `interactive-mode.ts:660-680`).
 pub fn disassemble(viewport: &ChatViewport, tui: &mut Tui) -> Vec<Box<dyn Component>> {
     let _ = viewport;
     tui.clear_alt_screen_root();
@@ -245,8 +261,10 @@ pub fn disassemble(viewport: &ChatViewport, tui: &mut Tui) -> Vec<Box<dyn Compon
         .as_any_mut()
         .and_then(|any| any.downcast_mut::<VStack>())
         .expect("the dock is a VStack");
-    let footer = dock.stack().remove_child(3);
-    let editor = dock.stack().remove_child(2);
+    let footer = dock.stack().remove_child(5);
+    let widgets_below = dock.stack().remove_child(4);
+    let editor = dock.stack().remove_child(3);
+    let widgets_above = dock.stack().remove_child(2);
     let status = dock.stack().remove_child(1);
     let pending = dock.stack().remove_child(0);
 
@@ -265,7 +283,16 @@ pub fn disassemble(viewport: &ChatViewport, tui: &mut Tui) -> Vec<Box<dyn Compon
     let chat = children.pop().expect("chat host");
     let header = children.pop().expect("header host");
 
-    vec![header, chat, pending, status, editor, footer]
+    vec![
+        header,
+        chat,
+        pending,
+        status,
+        widgets_above,
+        editor,
+        widgets_below,
+        footer,
+    ]
 }
 
 #[cfg(test)]
@@ -285,10 +312,19 @@ mod tests {
         }
     }
 
-    /// Six tagged hosts, a fresh capture `Tui`, and the alt screen entered —
-    /// the state [`mount`] expects.
+    /// Eight tagged hosts, a fresh capture `Tui`, and the alt screen entered
+    /// — the state [`mount`] expects.
     fn mounted_tui() -> (Tui, Vec<ComponentId>) {
-        let names = ["header", "chat", "pending", "status", "editor", "footer"];
+        let names = [
+            "header",
+            "chat",
+            "pending",
+            "status",
+            "widgets-above",
+            "editor",
+            "widgets-below",
+            "footer",
+        ];
         let hosts: Vec<Box<dyn Component>> =
             names.iter().map(|name| Box::new(Tag(name)) as _).collect();
         let ids: Vec<ComponentId> = hosts
@@ -346,7 +382,16 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["header", "chat", "pending", "status", "editor", "footer"],
+            [
+                "header",
+                "chat",
+                "pending",
+                "status",
+                "widgets-above",
+                "editor",
+                "widgets-below",
+                "footer",
+            ],
             "the flat order survives the round trip"
         );
         for (host, expected) in hosts.into_iter().zip(expected_ids) {
@@ -392,7 +437,11 @@ mod tests {
                         .and_then(|any| any.downcast_mut::<VStack>())
                 })
                 .expect("the dock is reachable by identity");
-            assert_eq!(dock.stack().len(), 4, "pending, status, editor, footer");
+            assert_eq!(
+                dock.stack().len(),
+                6,
+                "pending, status, widgets above, editor, widgets below, footer"
+            );
             assert_eq!(
                 dock.entry_options(2).min_size,
                 Some(3),
@@ -406,7 +455,9 @@ mod tests {
             HostSlot::Chat,
             HostSlot::Pending,
             HostSlot::Status,
+            HostSlot::WidgetAbove,
             HostSlot::Editor,
+            HostSlot::WidgetBelow,
             HostSlot::Footer,
         ] {
             assert!(

@@ -28,6 +28,43 @@ pub struct StatusIndicator {
 }
 
 impl StatusIndicator {
+    /// `WorkingStatusIndicator` with the extension-driven options (E3
+    /// slice 7): the message rides `workingMessage ?? "Working"` and the
+    /// indicator rides `workingIndicatorOptions` (`interactive-mode.ts
+    /// :2486-2499`).
+    pub fn working_with(
+        message: &str,
+        indicator: Option<pi_tui::components::loader::LoaderIndicator>,
+    ) -> Self {
+        let spinner_theme = theme::theme();
+        let message_theme = theme::theme();
+        StatusIndicator {
+            loader: Loader::new(
+                move |text| spinner_theme.fg(ThemeColor::Accent, text),
+                move |text| message_theme.fg(ThemeColor::Muted, text),
+                message,
+                indicator,
+            ),
+            kind: StatusKind::Working,
+        }
+    }
+
+    /// The live working indicator's message (`setWorkingMessage`,
+    /// `interactive-mode.ts:2781-2786` — upstream calls the loader's
+    /// `setMessage` through the StatusIndicator).
+    pub fn set_message(&mut self, message: impl Into<String>) {
+        self.loader.set_message(message);
+    }
+
+    /// The live working indicator's frames (`setWorkingIndicator`,
+    /// `interactive-mode.ts:2514-2520`).
+    pub fn set_indicator(
+        &mut self,
+        indicator: Option<pi_tui::components::loader::LoaderIndicator>,
+    ) {
+        self.loader.set_indicator(indicator);
+    }
+
     pub fn working(message: &str) -> Self {
         let spinner_theme = theme::theme();
         let message_theme = theme::theme();

@@ -1483,6 +1483,13 @@ impl ExtensionRunner {
         self.host.component_release(handle)
     }
 
+    /// Calls one adopted component's duck-typed `setExpanded` (the custom
+    /// header/footer swap and the tools toggle, E3 slice 7): a no-op when
+    /// the component lacks the method.
+    pub fn component_set_expanded(&self, handle: u32, expanded: bool) -> Result<(), JsHostError> {
+        self.host.component_set_expanded(handle, expanded)
+    }
+
     /// Executes a registered shortcut handler (`interactive-mode.ts:2425-2427`
     /// invokes `handler(ctx)`; the port dispatches the stashed handler
     /// through the base-ctx session machinery — the same shape the command

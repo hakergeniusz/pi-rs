@@ -1238,7 +1238,7 @@ impl JsHost {
             // throw there propagates out of `handleTerminalInput`): the
             // fold keeps the chunk so one broken extension cannot eat the
             // input path.
-            call.call::<&str, Option<String>>(data)
+            call.call::<(&str,), Option<String>>((data,))
                 .unwrap_or_else(|_| Some(data.to_string()))
         })
     }
@@ -1269,6 +1269,23 @@ impl JsHost {
                 .map_err(|err| Self::js_error(&ctx, err))?;
             let _: Value = call
                 .call((branch,))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
+    /// Calls one adopted component's duck-typed `setExpanded` (the custom
+    /// header/footer swap, `interactive-mode.ts:2709-2711`/`:4749-4752`):
+    /// a no-op when the component lacks the method — upstream checks
+    /// `isExpandable` first.
+    pub fn component_set_expanded(&self, handle: u32, expanded: bool) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx
+                .globals()
+                .get("__piComponentSetExpanded")
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            let _: Value = call
+                .call((handle, expanded))
                 .map_err(|err| Self::js_error(&ctx, err))?;
             Ok(())
         })

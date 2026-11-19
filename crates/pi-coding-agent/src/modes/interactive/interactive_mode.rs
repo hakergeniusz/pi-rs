@@ -54,6 +54,7 @@ use super::autocomplete;
 use super::chat_viewport::{self, ChatViewport, HostSlot};
 use super::components::armin::ArminComponent;
 use super::components::assistant_message::AssistantMessageComponent;
+use super::components::component_proxy::ComponentProxy;
 use super::components::auth_selector::{
     AuthSelectorComponent, AuthSelectorEvent, LoginPromptComponent, LoginPromptEvent,
 };
@@ -75,7 +76,7 @@ use super::components::session_selector::{SessionSelectorComponent, SessionSelec
 use super::components::settings_selector::{
     SettingsSelectorComponent, SettingsSelectorConfig, SettingsSelectorEvent,
 };
-use super::components::status_indicator::{IdleStatus, StatusIndicator};
+use super::components::status_indicator::{IdleStatus, StatusIndicator, StatusKind};
 use super::components::tool_execution::{ToolExecutionComponent, ToolResultView};
 use super::components::tree_selector::{TreeSelectorComponent, TreeSelectorEvent};
 use super::components::trust_selector::{TrustSelectorComponent, TrustSelectorEvent};
@@ -334,6 +335,41 @@ enum EditorEventOut {
 /// through a shared queue (the tree cannot be downcast generically, so hosts
 /// publish outward — the probe pattern from the TUI tests). This type itself
 /// opts into downcasting with [`Component::as_any_mut`].
+/// One extension widget (`extensionWidgetsAbove`/`...Below` values, E3
+/// slice 7 — `setExtensionWidget`, `interactive-mode.ts:2538-2578`).
+#[cfg(feature = "ext-js")]
+enum ExtensionWidget {
+    /// String lines the host rebuilds as `Text(line, 1, 0)` rows.
+    Lines(Vec<String>),
+    /// A factory's adopted component; the registry owns the handle.
+    Adopted { handle: u32, has_input: bool },
+}
+
+/// The custom footer/header swap state (`customFooter`/`customHeader`, E3
+/// slice 7): the adopted handle the registry owns and the displaced
+/// built-in component, restored on `undefined`/reset.
+#[cfg(feature = "ext-js")]
+struct ExtensionChrome {
+    handle: u32,
+    displaced: Box<dyn pi_tui::component::Component>,
+}
+
+/// The mode-state snapshot the synchronous ui ops read (E3 slice 7):
+/// `footerData`/`editorText`/`toolsExpanded`. The pump refreshes it each
+/// frame; the runner's closures read it under the mutex.
+#[cfg(feature = "ext-js")]
+#[derive(Default)]
+struct UiSnapshotState {
+    footer: serde_json::Value,
+    editor_text: String,
+    tools_expanded: bool,
+}
+
+/// `InteractiveMode.MAX_WIDGET_LINES` (`interactive-mode.ts:2626`): the
+/// total widget lines one `setWidget` renders.
+#[cfg(feature = "ext-js")]
+const MAX_WIDGET_LINES: usize = 10;
+
 struct ChatEditor {
     editor: Editor,
     events: Arc<Mutex<Vec<EditorEventOut>>>,
@@ -1087,6 +1123,39 @@ pub struct InteractiveMode {
     /// ctrl+o state: tool output expansion and the header hints.
     tool_output_expanded: bool,
     hide_thinking_block: bool,
+    /// The working-status state the extension surfaces drive
+    /// (`workingMessage`/`workingVisible`/`workingIndicatorOptions`/
+    /// `hiddenThinkingLabel`, `interactive-mode.ts:504-507`); the defaults
+    /// live in the setters.
+    working_message: Option<String>,
+    working_visible: bool,
+    working_indicator_options: Option<pi_tui::components::loader::LoaderIndicator>,
+    hidden_thinking_label: String,
+    /// The extension widgets above/below the editor (`setWidget`, E3
+    /// slice 7 — `extensionWidgetsAbove`/`extensionWidgetsBelow`,
+    /// `interactive-mode.ts:602-603`), keyed by the `setWidget` key,
+    /// insertion order preserved.
+    #[cfg(feature = "ext-js")]
+    extension_widgets_above: Vec<(String, ExtensionWidget)>,
+    #[cfg(feature = "ext-js")]
+    extension_widgets_below: Vec<(String, ExtensionWidget)>,
+    /// The custom footer/header swap (`customFooter`/`customHeader`, E3
+    /// slice 7): the adopted handle the registry owns and the displaced
+    /// built-in component.
+    #[cfg(feature = "ext-js")]
+    custom_footer: Option<ExtensionChrome>,
+    #[cfg(feature = "ext-js")]
+    custom_header: Option<ExtensionChrome>,
+    /// The mode-state snapshot the synchronous ui ops read (E3 slice 7):
+    /// refreshed per pump frame, read by the runner's closures.
+    #[cfg(feature = "ext-js")]
+    ui_snapshot: Arc<Mutex<UiSnapshotState>>,
+    /// The terminal-input listener count the crossings sync, and the
+    /// chunks deferred while the engine held the runner mutex (E3 slice 7).
+    #[cfg(feature = "ext-js")]
+    terminal_input_listeners: usize,
+    #[cfg(feature = "ext-js")]
+    deferred_terminal_input: Vec<String>,
     /// The message rows' horizontal padding (`this.outputPad`,
     /// `interactive-mode.ts`), read from `outputPad` at boot and applied by
     /// the output-padding row.
@@ -1396,6 +1465,24 @@ impl InteractiveMode {
             last_spinner_tick: Instant::now(),
             tool_output_expanded: false,
             hide_thinking_block,
+            working_message: None,
+            working_visible: true,
+            working_indicator_options: None,
+            hidden_thinking_label: "Thinking...".to_string(),
+            #[cfg(feature = "ext-js")]
+            extension_widgets_above: Vec::new(),
+            #[cfg(feature = "ext-js")]
+            extension_widgets_below: Vec::new(),
+            #[cfg(feature = "ext-js")]
+            custom_footer: None,
+            #[cfg(feature = "ext-js")]
+            custom_header: None,
+            #[cfg(feature = "ext-js")]
+            ui_snapshot: Arc::new(Mutex::new(UiSnapshotState::default())),
+            #[cfg(feature = "ext-js")]
+            terminal_input_listeners: 0,
+            #[cfg(feature = "ext-js")]
+            deferred_terminal_input: Vec::new(),
             output_pad,
             exiting: false,
             #[cfg(feature = "ext-js")]
@@ -1545,6 +1632,27 @@ impl InteractiveMode {
             guard.set_app_keybindings(
                 &serde_json::to_string(&keybindings).unwrap_or_else(|_| "{}".to_string()),
             );
+            // The mode-state snapshot the synchronous ui queries read (E3
+            // slice 7): footer data, the editor's text, and the tools flag —
+            // closures over the shared snapshot the pump refreshes.
+            let footer_snapshot = Arc::clone(&mode.ui_snapshot);
+            let editor_snapshot = Arc::clone(&mode.ui_snapshot);
+            let tools_snapshot = Arc::clone(&mode.ui_snapshot);
+            guard.set_ui_snapshot_surface(pi_ext_js::UiSnapshotSurface {
+                footer_data: std::sync::Arc::new(move || {
+                    footer_snapshot.lock().expect("ui snapshot").footer.clone()
+                }),
+                editor_text: std::sync::Arc::new(move || {
+                    editor_snapshot
+                        .lock()
+                        .expect("ui snapshot")
+                        .editor_text
+                        .clone()
+                }),
+                tools_expanded: std::sync::Arc::new(move || {
+                    tools_snapshot.lock().expect("ui snapshot").tools_expanded
+                }),
+            });
         }
         // Extension shortcuts (`setupExtensionShortcuts`,
         // `interactive-mode.ts:2170/:2381-2432`): resolve against the
@@ -1699,9 +1807,9 @@ impl InteractiveMode {
             .expect("scoped completion models") = snapshot;
     }
 
-    /// The regular renderer's flat mount: the six hosts in [`HostSlot`] order
-    /// (`interactive-mode.ts` init's `mountInteractiveTui` flat path), focus
-    /// on the editor.
+    /// The regular renderer's flat mount: the eight hosts in [`HostSlot`]
+    /// order (`interactive-mode.ts` init's `mountInteractiveTui` flat path,
+    /// with the widget hosts E3 slice 7 adds), focus on the editor.
     fn mount_flat_tree(
         terminal: Box<dyn pi_tui::terminal::Terminal>,
         version: &str,
@@ -1726,11 +1834,18 @@ impl InteractiveMode {
         tui.add_child(Box::new(pi_tui::component::Container::new()));
         tui.add_child(Box::new(pi_tui::component::Container::new()));
         tui.add_child(Box::new(IdleStatus));
+        // The widget hosts (`widgetContainerAbove`/`widgetContainerBelow`,
+        // `interactive-mode.ts:670-671`) — the above host boots with its
+        // spacer (`renderWidgets()`, `interactive-mode.ts:1004`).
+        let mut widget_above = pi_tui::component::Container::new();
+        widget_above.add_child(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        tui.add_child(Box::new(widget_above));
         // Ids are heap addresses, so the editor's identity is taken once the
         // host is boxed — focus names it across the mode switches.
         let editor_box = Box::new(editor_host);
         let editor_id = component_id(editor_box.as_ref());
         tui.add_child(editor_box);
+        tui.add_child(Box::new(pi_tui::component::Container::new()));
         tui.add_child(Box::new(footer));
         tui.set_focus(Some(FocusTarget::Id(editor_id)));
         (tui, editor_id)
@@ -2447,7 +2562,7 @@ impl InteractiveMode {
             AgentMessage::Assistant(assistant) => {
                 let mut component = AssistantMessageComponent::new(
                     self.hide_thinking_block,
-                    "Thinking...",
+                    &self.hidden_thinking_label,
                     self.output_pad,
                     self.markdown_transform_ctx.clone(),
                 );
@@ -2539,7 +2654,7 @@ impl InteractiveMode {
     fn start_assistant_stream(&mut self) {
         let component = AssistantMessageComponent::new(
             self.hide_thinking_block,
-            "Thinking...",
+            &self.hidden_thinking_label,
             self.output_pad,
             self.markdown_transform_ctx.clone(),
         );
@@ -2915,7 +3030,7 @@ impl InteractiveMode {
         // (`interactive-mode.ts:686`, `:2197`): the footer reads the live
         // gate on every refresh. Read before the tree borrow.
         let auto_compact_enabled = self.settings.get_compaction_enabled();
-        let Some(footer) = self.downcast_tree::<FooterComponent>(HostSlot::Footer) else {
+        let Some(footer) = self.footer_mut() else {
             return;
         };
         footer.data.totals = totals;
@@ -4396,7 +4511,7 @@ impl InteractiveMode {
                 // No border update — upstream's border refresh belongs to the
                 // per-model thinking arms (`:5208-5219`) only.
                 self.settings.set_compaction_enabled(enabled);
-                if let Some(footer) = self.downcast_tree::<FooterComponent>(HostSlot::Footer) {
+                if let Some(footer) = self.footer_mut() {
                     footer.data.auto_compact_enabled = enabled;
                 }
                 self.tui.request_render();
@@ -5643,7 +5758,22 @@ impl InteractiveMode {
             prompts,
             context,
         });
-        self.set_working_status(Some(StatusIndicator::working("Working...")));
+        // `turn_start`'s working gate (`interactive-mode.ts:3553-3560`):
+        // the indicator shows only while `workingVisible`, and an existing
+        // working indicator is kept — its message rides the extension
+        // state (`setWorkingMessage`).
+        let active_working = self
+            .status_handle
+            .lock()
+            .expect("status")
+            .as_ref()
+            .is_some_and(|indicator| indicator.kind == StatusKind::Working);
+        if !self.working_visible {
+            self.set_working_status(None);
+        } else if !active_working {
+            let indicator = self.build_working_status_indicator();
+            self.set_working_status(Some(indicator));
+        }
         self.tui.request_render();
     }
 
@@ -5833,15 +5963,31 @@ impl InteractiveMode {
     }
 
     /// Route decoded events: sequences straight to the TUI, pastes re-wrapped
-    /// with their markers for the editor (`terminal.ts:252-278`).
+    /// with their markers for the editor (`terminal.ts:252-278`). With
+    /// extension terminal-input listeners registered (E3 slice 7) the chunk
+    /// folds through the engine first — a busy engine defers it to a later
+    /// frame rather than blocking the input thread.
     fn dispatch_stdin_events(&mut self, events: Vec<StdinEvent>) {
         for event in events {
             match event {
                 StdinEvent::Data(sequence) => {
+                    #[cfg(feature = "ext-js")]
+                    if self.terminal_input_listeners > 0 {
+                        self.dispatch_extension_terminal_input(sequence);
+                        continue;
+                    }
                     self.tui.handle_input(&sequence);
                 }
                 StdinEvent::Paste(content) => {
                     let wrapped = format!("\x1b[200~{content}\x1b[201~");
+                    // The listeners see the wrapped chunk — the same bytes
+                    // the editor receives (the wrap is the port's
+                    // re-assembly of the decoded paste).
+                    #[cfg(feature = "ext-js")]
+                    if self.terminal_input_listeners > 0 {
+                        self.dispatch_extension_terminal_input(wrapped);
+                        continue;
+                    }
                     self.tui.handle_input(&wrapped);
                 }
             }
@@ -6150,6 +6296,450 @@ impl InteractiveMode {
         self.park_displaced_occupant(displaced);
         self.tui.set_focus(Some(FocusTarget::Id(focused)));
         self.tui.request_render();
+    }
+
+    // --------------------------------------------------------------
+    // Small ctx.ui surfaces (E3 slice 7): widgets, footer/header,
+    // the status family, editor text, tools expansion, terminal input
+    // --------------------------------------------------------------
+
+    /// Swap `component` into a dock or flat slot and return the previous
+    /// occupant — [`Self::replace_editor_slot`] generalized (E3 slice 7's
+    /// footer/header swaps ride it too).
+    fn swap_slot_component(
+        &mut self,
+        slot: HostSlot,
+        component: Box<dyn Component>,
+    ) -> Option<Box<dyn Component>> {
+        let dock_id = self.viewport.as_ref().map(ChatViewport::dock_id);
+        if let Some(dock_id) = dock_id {
+            return self
+                .tui
+                .component_by_id_deep_mut(dock_id)?
+                .as_any_mut()?
+                .downcast_mut::<VStack>()?
+                .stack()
+                .replace_child(slot.dock_index(), component)
+                .into();
+        }
+        Some(self.tui.replace_child(slot.index(), component))
+    }
+
+    /// The built-in footer, mounted or displaced (`this.footer` stays
+    /// reachable while a custom footer occupies the slot, `interactive-mode
+    /// .ts:2682`): the refreshes keep landing so a restore shows current
+    /// data.
+    fn footer_mut(&mut self) -> Option<&mut FooterComponent> {
+        if let Some(footer) = self.downcast_tree::<FooterComponent>(HostSlot::Footer) {
+            return Some(footer);
+        }
+        #[cfg(feature = "ext-js")]
+        if let Some(chrome) = self.custom_footer.as_mut() {
+            return chrome
+                .displaced
+                .as_any_mut()?
+                .downcast_mut::<FooterComponent>();
+        }
+        None
+    }
+
+    /// The built-in header, mounted or displaced — the same story as
+    /// [`Self::footer_mut`].
+    fn header_mut(&mut self) -> Option<&mut BuiltInHeader> {
+        if let Some(header) = self.downcast_tree::<BuiltInHeader>(HostSlot::Header) {
+            return Some(header);
+        }
+        #[cfg(feature = "ext-js")]
+        if let Some(chrome) = self.custom_header.as_mut() {
+            return chrome
+                .displaced
+                .as_any_mut()?
+                .downcast_mut::<BuiltInHeader>();
+        }
+        None
+    }
+
+    /// `setExtensionFooter` (`interactive-mode.ts:2664-2686`): dispose the
+    /// existing custom footer, then swap the slot — the factory's adopted
+    /// component, or the built-in back (`undefined`). The built-in stays
+    /// alive while displaced and keeps taking the refresh writes.
+    #[cfg(feature = "ext-js")]
+    fn set_extension_footer(&mut self, handle: Option<u32>) {
+        if let Some(ExtensionChrome { handle: old, displaced }) = self.custom_footer.take() {
+            // The built-in returns to the slot, pulling the old proxy out;
+            // the dispose lands with neither in the tree (upstream disposes
+            // before the swap).
+            drop(self.swap_slot_component(HostSlot::Footer, displaced));
+            self.dispose_extension_handle(old);
+        }
+        if let Some(handle) = handle
+            && let Some(runner) = self.extension_runner.as_ref().map(Arc::clone)
+        {
+            let proxy = Box::new(ComponentProxy::borrowed(runner, handle, true));
+            if let Some(displaced) = self.swap_slot_component(HostSlot::Footer, proxy) {
+                self.custom_footer = Some(ExtensionChrome { handle, displaced });
+            }
+        }
+        self.tui.request_render();
+    }
+
+    /// `setExtensionHeader` (`interactive-mode.ts:2691-2730`): the same
+    /// swap for the header, with the duck-typed `setExpanded` the mounted
+    /// custom header gets (`isExpandable`, `:2709-2711`).
+    #[cfg(feature = "ext-js")]
+    fn set_extension_header(&mut self, handle: Option<u32>) {
+        if let Some(ExtensionChrome { handle: old, displaced }) = self.custom_header.take() {
+            drop(self.swap_slot_component(HostSlot::Header, displaced));
+            self.dispose_extension_handle(old);
+        }
+        if let Some(handle) = handle
+            && let Some(runner) = self.extension_runner.as_ref().map(Arc::clone)
+        {
+            let proxy = ComponentProxy::borrowed(runner, handle, true);
+            proxy.set_expanded(self.tool_output_expanded);
+            if let Some(displaced) = self.swap_slot_component(HostSlot::Header, Box::new(proxy)) {
+                self.custom_header = Some(ExtensionChrome { handle, displaced });
+            }
+        }
+        self.tui.request_render();
+    }
+
+    /// One adopted component's dispose through the bridge (the
+    /// `dispose?.()` + registry drop, `interactive-mode.ts:2670-2672`).
+    #[cfg(feature = "ext-js")]
+    fn dispose_extension_handle(&mut self, handle: u32) {
+        if let Some(runner) = self.extension_runner.as_ref() {
+            let _ = runner
+                .lock()
+                .expect("extension runner mutex poisoned")
+                .component_dispose(handle);
+        }
+    }
+
+    /// `setExtensionWidget` (`interactive-mode.ts:2538-2578`): the key
+    /// removes from BOTH placements first (a displaced adopted component
+    /// disposes), `None` content removes, and the render follows.
+    #[cfg(feature = "ext-js")]
+    fn set_extension_widget(
+        &mut self,
+        key: &str,
+        content: Option<ExtensionWidget>,
+        placement: &str,
+    ) {
+        for map in [
+            &mut self.extension_widgets_above,
+            &mut self.extension_widgets_below,
+        ] {
+            if let Some(index) = map.iter().position(|(existing, _)| existing == key) {
+                let (_, removed) = map.remove(index);
+                self.dispose_extension_widget(&removed);
+            }
+        }
+        if let Some(content) = content {
+            let target = if placement == "belowEditor" {
+                &mut self.extension_widgets_below
+            } else {
+                &mut self.extension_widgets_above
+            };
+            target.push((key.to_string(), content));
+        }
+        self.render_extension_widgets();
+    }
+
+    /// One widget's teardown (`removeExisting`'s `dispose?.()`,
+    /// `interactive-mode.ts:2544-2548`): an adopted handle disposes through
+    /// the bridge.
+    #[cfg(feature = "ext-js")]
+    fn dispose_extension_widget(&mut self, widget: &ExtensionWidget) {
+        if let ExtensionWidget::Adopted { handle, .. } = widget {
+            self.dispose_extension_handle(*handle);
+        }
+    }
+
+    /// `renderWidgets`/`renderWidgetContainer` (`interactive-mode.ts
+    /// :2631-2659`): rebuild both hosts — the above host renders a spacer
+    /// when empty and a leading one when filled; the below host never
+    /// spacers. Upstream re-adds the same component objects; the port
+    /// rebuilds (Text rows from the stored lines, borrowed views over the
+    /// adopted handle).
+    #[cfg(feature = "ext-js")]
+    fn render_extension_widgets(&mut self) {
+        let above = self.extension_widgets_above.clone();
+        let below = self.extension_widgets_below.clone();
+        let runner = self.extension_runner.clone();
+        let fill = |container: &mut pi_tui::component::Container,
+                    entries: &[(String, ExtensionWidget)],
+                    spacer_when_empty: bool,
+                    leading_spacer: bool| {
+            container.clear();
+            if entries.is_empty() {
+                if spacer_when_empty {
+                    container
+                        .add_child(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+                }
+                return;
+            }
+            if leading_spacer {
+                container.add_child(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+            }
+            for (_, widget) in entries {
+                match widget {
+                    ExtensionWidget::Lines(lines) => {
+                        for line in lines.iter().take(MAX_WIDGET_LINES) {
+                            container.add_child(Box::new(Text::new(line.clone(), 1, 0)));
+                        }
+                        if lines.len() > MAX_WIDGET_LINES {
+                            container.add_child(Box::new(Text::new(
+                                theme::theme()
+                                    .fg(pi_tui::theme::ThemeColor::Muted, "... (widget truncated)"),
+                                1,
+                                0,
+                            )));
+                        }
+                    }
+                    ExtensionWidget::Adopted { handle, has_input } => {
+                        if let Some(runner) = runner.as_ref() {
+                            container.add_child(Box::new(ComponentProxy::borrowed(
+                                Arc::clone(runner),
+                                *handle,
+                                *has_input,
+                            )));
+                        }
+                    }
+                }
+            }
+        };
+        if let Some(container) =
+            self.downcast_tree::<pi_tui::component::Container>(HostSlot::WidgetAbove)
+        {
+            fill(container, &above, true, true);
+        }
+        if let Some(container) =
+            self.downcast_tree::<pi_tui::component::Container>(HostSlot::WidgetBelow)
+        {
+            fill(container, &below, false, false);
+        }
+        self.tui.request_render();
+    }
+
+    /// `clearExtensionWidgets` (`interactive-mode.ts:2580-2590`).
+    #[cfg(feature = "ext-js")]
+    fn clear_extension_widgets(&mut self) {
+        let above = std::mem::take(&mut self.extension_widgets_above);
+        let below = std::mem::take(&mut self.extension_widgets_below);
+        for (_, widget) in above.into_iter().chain(below) {
+            self.dispose_extension_widget(&widget);
+        }
+        self.render_extension_widgets();
+    }
+
+    /// `setWorkingMessage` (`interactive-mode.ts:2781-2786`): the field and
+    /// the live working indicator's message (`undefined` = the default).
+    fn set_working_message(&mut self, message: Option<String>) {
+        self.working_message = message;
+        let mut status = self.status_handle.lock().expect("status");
+        if let Some(indicator) = status.as_mut()
+            && indicator.kind == StatusKind::Working
+        {
+            indicator.set_message(
+                self.working_message
+                    .clone()
+                    .unwrap_or_else(|| "Working".to_string()),
+            );
+        }
+        drop(status);
+        self.tui.request_render();
+    }
+
+    /// `setWorkingVisible` (`interactive-mode.ts:2501-2512`): false clears
+    /// a working indicator, true re-shows one while a run streams.
+    fn set_working_visible(&mut self, visible: bool) {
+        self.working_visible = visible;
+        if !visible {
+            let mut status = self.status_handle.lock().expect("status");
+            if status
+                .as_ref()
+                .is_some_and(|indicator| indicator.kind == StatusKind::Working)
+            {
+                *status = None;
+            }
+            drop(status);
+        } else if self.agent_run.is_some() {
+            let active_working = self
+                .status_handle
+                .lock()
+                .expect("status")
+                .as_ref()
+                .is_some_and(|indicator| indicator.kind == StatusKind::Working);
+            if !active_working {
+                let indicator = self.build_working_status_indicator();
+                *self.status_handle.lock().expect("status") = Some(indicator);
+            }
+        }
+        self.tui.request_render();
+    }
+
+    /// `showWorkingStatusIndicator` (`interactive-mode.ts:2486-2499`): the
+    /// working message (default `Working`) and the indicator options — the
+    /// embedded-border coloring rides the port's decorator.
+    fn build_working_status_indicator(&self) -> StatusIndicator {
+        StatusIndicator::working_with(
+            self.working_message
+                .clone()
+                .unwrap_or_else(|| "Working".to_string()),
+            self.working_indicator_options.clone(),
+        )
+    }
+
+    /// `setWorkingIndicator` (`interactive-mode.ts:2514-2520`): the field
+    /// and the live working indicator's frames.
+    fn set_working_indicator(
+        &mut self,
+        options: Option<pi_tui::components::loader::LoaderIndicator>,
+    ) {
+        self.working_indicator_options = options.clone();
+        let mut status = self.status_handle.lock().expect("status");
+        if let Some(indicator) = status.as_mut()
+            && indicator.kind == StatusKind::Working
+        {
+            indicator.set_indicator(options);
+        }
+        drop(status);
+        self.tui.request_render();
+    }
+
+    /// `setHiddenThinkingLabel` (`interactive-mode.ts:2522-2533`): the
+    /// field and every assistant row's label (`undefined` = the default);
+    /// the streaming row is an assistant row here, so the chat walk covers
+    /// it.
+    fn set_hidden_thinking_label(&mut self, label: Option<String>) {
+        self.hidden_thinking_label = label.unwrap_or_else(|| "Thinking...".to_string());
+        let label = self.hidden_thinking_label.clone();
+        let len = self.chat_len();
+        for index in 0..len {
+            if let Some(row) = self.downcast_chat::<AssistantMessageComponent>(index) {
+                row.set_hidden_thinking_label(&label);
+            }
+        }
+        self.tui.request_render();
+    }
+
+    /// `pasteToEditor` (`interactive-mode.ts:2795`): the text rides the
+    /// bracketed-paste markers through the editor's handleInput.
+    #[cfg(feature = "ext-js")]
+    fn paste_to_editor(&mut self, text: &str) {
+        let wrapped = format!("\x1b[200~{text}\x1b[201~");
+        if let Some(editor) = self.editor_host_mut() {
+            editor.handle_input(&wrapped);
+        }
+        self.tui.request_render();
+    }
+
+    /// `setEditorText` (`interactive-mode.ts:2796`).
+    #[cfg(feature = "ext-js")]
+    fn set_editor_text(&mut self, text: &str) {
+        if let Some(editor) = self.editor_host_mut() {
+            editor.editor.set_text(text);
+        }
+        self.tui.request_render();
+    }
+
+    /// `WorkingIndicatorOptions` (`types.ts:136-141`) off the crossing.
+    #[cfg(feature = "ext-js")]
+    fn loader_indicator_from_json(
+        value: &serde_json::Value,
+    ) -> Option<pi_tui::components::loader::LoaderIndicator> {
+        let frames = value
+            .get("frames")
+            .and_then(serde_json::Value::as_array)
+            .map(|frames| {
+                frames
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            });
+        let interval_ms = value.get("intervalMs").and_then(serde_json::Value::as_u64);
+        if frames.is_none() && interval_ms.is_none() {
+            return None;
+        }
+        Some(pi_tui::components::loader::LoaderIndicator {
+            frames: frames.unwrap_or_default(),
+            interval_ms: interval_ms.unwrap_or(0),
+        })
+    }
+
+    /// The terminal-input listener fold (E3 slice 7): the chunk folds
+    /// through the engine's registered handlers (`tui.ts:1095-1108`); a
+    /// busy engine (settling a dialog holds the runner mutex) defers the
+    /// chunk — the pump retries each frame, upstream-equivalent to the
+    /// single-threaded engine finishing its handler first.
+    #[cfg(feature = "ext-js")]
+    fn dispatch_extension_terminal_input(&mut self, data: String) {
+        match self.try_terminal_input_fold(&data) {
+            Some(Some(transformed)) => {
+                if !transformed.is_empty() {
+                    self.tui.handle_input(&transformed);
+                }
+            }
+            Some(None) => {}
+            None => self.deferred_terminal_input.push(data),
+        }
+    }
+
+    /// One fold attempt: `None` = the engine was busy (defer),
+    /// `Some(None)` = a listener consumed the chunk, `Some(Some(data))` =
+    /// what the dispatch sees.
+    #[cfg(feature = "ext-js")]
+    fn try_terminal_input_fold(&mut self, data: &str) -> Option<Option<String>> {
+        let runner = self.extension_runner.as_ref()?;
+        let mut runner = runner.try_lock().ok()?;
+        runner.deliver_terminal_input(data).ok().flatten()
+    }
+
+    /// The deferred chunks retry each frame (`pump`).
+    #[cfg(feature = "ext-js")]
+    fn pump_deferred_terminal_input(&mut self) {
+        if self.deferred_terminal_input.is_empty() {
+            return;
+        }
+        let deferred = std::mem::take(&mut self.deferred_terminal_input);
+        let mut remaining = Vec::new();
+        for data in deferred {
+            match self.try_terminal_input_fold(&data) {
+                Some(Some(transformed)) => {
+                    if !transformed.is_empty() {
+                        self.tui.handle_input(&transformed);
+                    }
+                }
+                Some(None) => {}
+                None => remaining.push(data),
+            }
+        }
+        self.deferred_terminal_input = remaining;
+    }
+
+    /// The snapshot refresh (E3 slice 7): the footer cells, the editor's
+    /// expanded text, and the tools flag the synchronous ops read — one
+    /// pump frame stale, the mode's own render cadence.
+    #[cfg(feature = "ext-js")]
+    fn refresh_ui_snapshot(&mut self) {
+        let footer_json = self.footer_mut().map(|footer| {
+            serde_json::json!({
+                "gitBranch": footer.data.git_branch,
+                "extensionStatuses": footer.data.extension_statuses,
+                "availableProviderCount": footer.data.available_provider_count,
+            })
+        });
+        let editor_text = self
+            .editor_host_mut()
+            .map_or(String::new(), |editor| editor.editor.get_expanded_text());
+        let mut snapshot = self.ui_snapshot.lock().expect("ui snapshot");
+        if let Some(footer) = footer_json {
+            snapshot.footer = footer;
+        }
+        snapshot.editor_text = editor_text;
+        snapshot.tools_expanded = self.tool_output_expanded;
     }
 
     /// Where the displaced editor-slot occupant goes (the slot-swap
@@ -8567,6 +9157,99 @@ impl InteractiveMode {
                         self.push_extension_dialog_entry(entry);
                     }
                 }
+                // ---- E3 slice 7: the small ctx.ui surfaces ----
+                // `setExtensionWidget` (`interactive-mode.ts:2538-2578`):
+                // lines, an adopted factory component, or removal — the
+                // key spans both placements.
+                "setWidget" => {
+                    let key = request
+                        .get("widgetKey")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let placement = request
+                        .get("widgetPlacement")
+                        .and_then(Value::as_str)
+                        .unwrap_or("aboveEditor")
+                        .to_string();
+                    let content = if let Some(handle) =
+                        request.get("widgetHandle").and_then(Value::as_u64)
+                    {
+                        Some(ExtensionWidget::Adopted {
+                            handle: handle as u32,
+                            has_input: true,
+                        })
+                    } else if let Some(lines) = request.get("widgetLines").and_then(Value::as_array)
+                    {
+                        Some(ExtensionWidget::Lines(
+                            lines
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(String::from)
+                                .collect(),
+                        ))
+                    } else {
+                        None
+                    };
+                    self.set_extension_widget(&key, content, &placement);
+                }
+                // `setExtensionFooter`/`setExtensionHeader`
+                // (`interactive-mode.ts:2664-2730`): a handle mounts the
+                // adopted component, `undefined` restores the built-in.
+                "setFooter" => self.set_extension_footer(
+                    request.get("handle").and_then(Value::as_u64).map(|value| value as u32),
+                ),
+                "setHeader" => self.set_extension_header(
+                    request.get("handle").and_then(Value::as_u64).map(|value| value as u32),
+                ),
+                // The working-status family (`interactive-mode.ts
+                // :2501-2533`, `:2781-2789`).
+                "setWorkingMessage" => self.set_working_message(
+                    request.get("message").and_then(Value::as_str).map(String::from),
+                ),
+                "setWorkingVisible" => self.set_working_visible(
+                    request
+                        .get("visible")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                ),
+                "setWorkingIndicator" => self.set_working_indicator(request
+                    .get("indicator")
+                    .and_then(Self::loader_indicator_from_json)),
+                "setHiddenThinkingLabel" => self.set_hidden_thinking_label(
+                    request.get("label").and_then(Value::as_str).map(String::from),
+                ),
+                // The editor text ops (`:2795-2797`).
+                "pasteToEditor" => {
+                    let text = request
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    self.paste_to_editor(&text);
+                }
+                "set_editor_text" => {
+                    let text = request
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    self.set_editor_text(&text);
+                }
+                // `setToolsExpanded` (`:2823` → `:4745-4761`).
+                "setToolsExpanded" => self.set_tools_expanded(
+                    request
+                        .get("expanded")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                ),
+                // The terminal-input listener count sync (`:2732-2741`).
+                "terminalInputListeners" => {
+                    self.terminal_input_listeners = request
+                        .get("count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                }
                 // The factory adapter's `TUI.showOverlay` surface
                 // (`tui.ts:518/:792-816`).
                 // Deviation: the port tracks these mounts in the same
@@ -9102,7 +9785,7 @@ impl InteractiveMode {
     /// an undefined text deletes the key; every change re-renders.
     #[cfg(feature = "ext-js")]
     fn set_extension_status(&mut self, key: &str, text: Option<&str>) {
-        if let Some(footer) = self.downcast_tree::<FooterComponent>(HostSlot::Footer) {
+        if let Some(footer) = self.footer_mut() {
             match text {
                 Some(text) => {
                     footer
@@ -9371,17 +10054,49 @@ impl InteractiveMode {
         for id in overlay_ids.into_iter().rev() {
             self.remove_extension_overlay(&id);
         }
+        // `clearExtensionTerminalInputListeners` + the footer/header/
+        // widget restores + the working-status resets (`interactive-mode
+        // .ts:2603-2622`).
+        #[cfg(feature = "ext-js")]
+        {
+            if let Some(runner) = self.extension_runner.as_ref() {
+                let _ = runner
+                    .lock()
+                    .expect("extension runner mutex poisoned")
+                    .clear_terminal_input_handlers();
+            }
+            self.terminal_input_listeners = 0;
+            self.deferred_terminal_input.clear();
+            self.set_extension_footer(None);
+            self.set_extension_header(None);
+            self.clear_extension_widgets();
+            self.working_message = None;
+            self.working_visible = true;
+            self.set_working_indicator(None);
+            // The active working indicator's message resets with the
+            // interrupt hint (`:2617-2621`).
+            let mut status = self.status_handle.lock().expect("status");
+            if let Some(indicator) = status.as_mut()
+                && indicator.kind == StatusKind::Working
+            {
+                indicator.set_message(format!(
+                    "Working ({} to interrupt)",
+                    theme::key_text(theme::app_keys::INTERRUPT)
+                ));
+            }
+        }
         // `footerDataProvider.clearExtensionStatuses(); this.footer.invalidate();`
         // (`interactive-mode.ts:2607-2608`): upstream's `footer.invalidate`
         // is a no-op (`footer.ts:85-87`); the port's refresh recomputes the
         // session-derived cells instead.
-        if let Some(footer) = self.downcast_tree::<FooterComponent>(HostSlot::Footer) {
+        if let Some(footer) = self.footer_mut() {
             footer.data.extension_statuses.clear();
         }
         self.refresh_footer();
         // `updateTerminalTitle` (`interactive-mode.ts:2613`): the reload's
         // settings may carry a new session-independent title input.
         self.update_terminal_title();
+        self.set_hidden_thinking_label(None);
     }
 
     /// `updateTerminalTitle` (`interactive-mode.ts:1173-1181`): the app
@@ -9675,6 +10390,11 @@ impl InteractiveMode {
             self.pump_extension_login_select();
             self.pump_extension_oauth_login();
             self.pump_extension_ui();
+            // The deferred terminal-input chunks retry (the engine was
+            // busy at dispatch time), then the ui-op snapshot refreshes
+            // (E3 slice 7).
+            self.pump_deferred_terminal_input();
+            self.refresh_ui_snapshot();
         }
 
         // The 3D easter egg (`playEasterEgg3d`): the header's logo clicks
@@ -9918,41 +10638,76 @@ impl InteractiveMode {
                 }
             }
             AppAction::Dequeue => self.dequeue_queued(),
-            AppAction::ToolsExpand => {
-                self.tool_output_expanded = !self.tool_output_expanded;
-                let expanded = self.tool_output_expanded;
-                let len = self.chat_len();
-                for index in 0..len {
-                    if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
-                        component.set_expanded(expanded);
-                    }
-                    if let Some(component) =
-                        self.downcast_chat::<super::components::compaction_summary::CompactionSummaryMessageComponent>(index)
-                    {
-                        component.set_expanded(expanded);
-                    }
-                    // `setToolOutputExpanded` duck-types every chat child
-                    // with a `setExpanded` (`interactive-mode.ts:4753-4758`)
-                    // — the custom rows both have one.
-                    #[cfg(feature = "ext-js")]
-                    if let Some(component) = self
-                        .downcast_chat::<super::components::custom_entry::CustomEntryComponent>(
-                        index,
-                    ) {
-                        component.set_expanded(expanded);
-                    }
-                    #[cfg(feature = "ext-js")]
-                    if let Some(component) =
-                        self.downcast_chat::<super::components::custom_message::CustomMessageComponent>(index)
-                    {
-                        component.set_expanded(expanded);
-                    }
-                }
-                if let Some(header) = self.downcast_tree::<BuiltInHeader>(HostSlot::Header) {
-                    header.set_expanded(expanded);
-                }
-                self.tui.request_render();
+            // `toggleToolOutputExpansion` (`interactive-mode.ts:4741-4743`).
+            AppAction::ToolsExpand => self.set_tools_expanded(!self.tool_output_expanded),
+        }
+    }
+
+    /// `setToolsExpanded` (`interactive-mode.ts:4745-4761`): the flag, the
+    /// ACTIVE header's `setExpanded` (a custom header duck-types through
+    /// the bridge, `:4749-4752`), every expandable chat row, and the status
+    /// line. The ctrl+o toggle and `ctx.ui.setToolsExpanded` both land
+    /// here.
+    fn set_tools_expanded(&mut self, expanded: bool) {
+        if expanded == self.tool_output_expanded {
+            return;
+        }
+        self.tool_output_expanded = expanded;
+        #[cfg(feature = "ext-js")]
+        let custom_header_active = self.custom_header.is_some();
+        #[cfg(not(feature = "ext-js"))]
+        let custom_header_active = false;
+        if custom_header_active {
+            #[cfg(feature = "ext-js")]
+            if let Some(chrome) = self.custom_header.as_ref() {
+                self.set_custom_header_expanded(chrome.handle, expanded);
             }
+        } else if let Some(header) = self.header_mut() {
+            header.set_expanded(expanded);
+        }
+        let len = self.chat_len();
+        for index in 0..len {
+            if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
+                component.set_expanded(expanded);
+            }
+            if let Some(component) =
+                self.downcast_chat::<super::components::compaction_summary::CompactionSummaryMessageComponent>(index)
+            {
+                component.set_expanded(expanded);
+            }
+            // `setToolOutputExpanded` duck-types every chat child
+            // with a `setExpanded` (`interactive-mode.ts:4753-4758`)
+            // — the custom rows both have one.
+            #[cfg(feature = "ext-js")]
+            if let Some(component) = self
+                .downcast_chat::<super::components::custom_entry::CustomEntryComponent>(
+                index,
+            ) {
+                component.set_expanded(expanded);
+            }
+            #[cfg(feature = "ext-js")]
+            if let Some(component) =
+                self.downcast_chat::<super::components::custom_message::CustomMessageComponent>(index)
+            {
+                component.set_expanded(expanded);
+            }
+        }
+        self.show_status(&format!(
+            "Tool output: {}",
+            if expanded { "expanded" } else { "collapsed" }
+        ));
+        self.tui.request_render();
+    }
+
+    /// The custom header's `setExpanded` through the handle bridge — split
+    /// out so the runner lock never nests under a tree borrow.
+    #[cfg(feature = "ext-js")]
+    fn set_custom_header_expanded(&self, handle: u32, expanded: bool) {
+        if let Some(runner) = self.extension_runner.as_ref() {
+            let _ = runner
+                .lock()
+                .expect("extension runner mutex poisoned")
+                .component_set_expanded(handle, expanded);
         }
     }
 
@@ -11547,6 +12302,421 @@ export default function (pi) {
             3,
             "the remaining status keeps the line"
         );
+        mode.shutdown().expect("shutdown");
+    }
+
+    // --------------------------------------------- small ctx.ui surfaces (E3 slice 7)
+
+    /// `setWidget`'s lines arm (`interactive-mode.ts:2538-2578`): the above
+    /// host leads with a spacer, the below host never spacers, the key
+    /// spans both placements, and `undefined` removes.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_ui_widgets_render_above_and_below_the_editor() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", (_event, ctx) => {
+    ctx.ui.setWidget("alpha", ["one", "two"]);
+    ctx.ui.setWidget("beta", ["three"], { placement: "belowEditor" });
+    pi.appendEntry("marked", {});
+  });
+  pi.on("session_end", (_event, ctx) => {
+    ctx.ui.setWidget("alpha", undefined);
+    pi.appendEntry("cleared", {});
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        let runner = mode.extension_runner.clone().expect("runner");
+        runner
+            .lock()
+            .expect("runner")
+            .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        mode.pump();
+
+        let render_widget_host = |mode: &mut InteractiveMode, slot: HostSlot| {
+            mode.downcast_tree::<pi_tui::component::Container>(slot)
+                .expect("widget host")
+                .render(100)
+        };
+        let above = render_widget_host(&mut mode, HostSlot::WidgetAbove);
+        let above_text: Vec<String> = above
+            .iter()
+            .map(|line| pi_tui::ansi::strip_terminal_sequences(line).trim().to_string())
+            .collect();
+        // `renderWidgetContainer(above)`: the leading spacer then the rows.
+        assert_eq!(
+            above_text,
+            ["", "one", "two"],
+            "the above host leads with a spacer"
+        );
+        let below = render_widget_host(&mut mode, HostSlot::WidgetBelow);
+        let below_text: Vec<String> = below
+            .iter()
+            .map(|line| pi_tui::ansi::strip_terminal_sequences(line).trim().to_string())
+            .collect();
+        assert_eq!(below_text, ["three"], "the below host never spacers");
+
+        // The key removes from both placements; `undefined` removes.
+        runner
+            .lock()
+            .expect("runner")
+            .emit(&serde_json::json!({ "type": "session_end" }))
+            .expect("emit");
+        mode.pump();
+        let above = render_widget_host(&mut mode, HostSlot::WidgetAbove);
+        assert_eq!(above.len(), 1, "the empty above host keeps only its spacer");
+        let below = render_widget_host(&mut mode, HostSlot::WidgetBelow);
+        assert!(below.is_empty(), "the below host renders nothing");
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `setWidget`'s lines cap at `MAX_WIDGET_LINES` with the muted
+    /// truncation line (`interactive-mode.ts:2563-2568`, `:2626`).
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_ui_widgets_cap_at_the_line_limit() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", (_event, ctx) => {
+    ctx.ui.setWidget("long", ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", "l10", "l11", "l12"]);
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        let runner = mode.extension_runner.clone().expect("runner");
+        runner
+            .lock()
+            .expect("runner")
+            .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        mode.pump();
+        let lines = mode
+            .downcast_tree::<pi_tui::component::Container>(HostSlot::WidgetAbove)
+            .expect("widget host")
+            .render(100);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| pi_tui::ansi::strip_terminal_sequences(line).trim().to_string())
+            .collect();
+        assert_eq!(
+            text,
+            ["", "l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", "l10", "... (widget truncated)"],
+            "ten rows plus the muted truncation line, past the leading spacer"
+        );
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `setWidget`'s factory arm (`interactive-mode.ts:2570-2573`): the
+    /// adopted component renders through the borrowed proxy.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_ui_widget_factory_adopts_a_component() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", (_event, ctx) => {
+    ctx.ui.setWidget("clock", (_tui, _theme) => ({
+      render: (width) => ["CLOCK " + String(width)],
+      invalidate: () => {},
+    }));
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        let runner = mode.extension_runner.clone().expect("runner");
+        runner
+            .lock()
+            .expect("runner")
+            .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        mode.pump();
+        let lines = mode
+            .downcast_tree::<pi_tui::component::Container>(HostSlot::WidgetAbove)
+            .expect("widget host")
+            .render(100);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| pi_tui::ansi::strip_terminal_sequences(line).trim().to_string())
+            .collect();
+        assert_eq!(
+            text,
+            ["", "CLOCK 100"],
+            "the adopted widget renders at the host width, past the leading spacer"
+        );
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `setFooter`/`setHeader` (`interactive-mode.ts:2664-2730`): the
+    /// adopted component occupies the slot, the built-ins come back on
+    /// `undefined`, and the displaced built-in keeps taking refresh writes.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_ui_footer_and_header_swap_and_restore() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", (_event, ctx) => {
+    ctx.ui.setFooter((_tui, _theme, footerData) => ({
+      render: (_width) => ["CUSTOM FOOTER " + String(footerData.getGitBranch() === undefined)],
+      invalidate: () => {},
+    }));
+    ctx.ui.setHeader((_tui, _theme) => ({
+      render: (_width) => ["CUSTOM HEADER"],
+      invalidate: () => {},
+    }));
+    pi.appendEntry("marked", {});
+  });
+  pi.on("session_end", (_event, ctx) => {
+    ctx.ui.setFooter(undefined);
+    ctx.ui.setHeader(undefined);
+    pi.appendEntry("cleared", {});
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        let runner = mode.extension_runner.clone().expect("runner");
+        runner
+            .lock()
+            .expect("runner")
+            .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        mode.pump();
+        let footer = mode
+            .downcast_tree::<super::components::component_proxy::ComponentProxy>(HostSlot::Footer)
+            .expect("the custom footer occupies the slot");
+        assert!(
+            pi_tui::ansi::strip_terminal_sequences(&footer.render(100).join("\n"))
+                .contains("CUSTOM FOOTER"),
+            "{:?}",
+            footer.render(100)
+        );
+        let header = mode
+            .downcast_tree::<super::components::component_proxy::ComponentProxy>(HostSlot::Header)
+            .expect("the custom header occupies the slot");
+        assert!(
+            pi_tui::ansi::strip_terminal_sequences(&header.render(100).join("\n"))
+                .contains("CUSTOM HEADER")
+        );
+
+        // The displaced built-ins keep taking the refresh writes — the
+        // restore shows current data.
+        let footer_component = mode
+            .custom_footer
+            .as_mut()
+            .map(|chrome| chrome.displaced.as_any_mut())
+            .flatten()
+            .and_then(|any| any.downcast_mut::<FooterComponent>())
+            .expect("the builtin footer stays alive");
+        footer_component.data.model_id = "switched".to_string();
+
+        runner
+            .lock()
+            .expect("runner")
+            .emit(&serde_json::json!({ "type": "session_end" }))
+            .expect("emit");
+        mode.pump();
+        let footer = mode
+            .downcast_tree::<FooterComponent>(HostSlot::Footer)
+            .expect("the built-in footer is back");
+        assert_eq!(
+            footer.data.model_id, "switched",
+            "the displaced built-in kept taking the writes"
+        );
+        let header = mode
+            .downcast_tree::<BuiltInHeader>(HostSlot::Header)
+            .expect("the built-in header is back");
+        assert!(
+            !header.render(100).join("\n").contains("CUSTOM HEADER"),
+            "the built-in header is back"
+        );
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// The working-status family (`interactive-mode.ts:2501-2533`,
+    /// `:2781-2789`): the message, frames, and visibility drive the live
+    /// indicator, and `setToolsExpanded` carries the flag, the status line,
+    /// and the unchanged-flag no-op (`:4745-4761`).
+    #[test]
+    fn working_status_state_and_tools_expanded_drive_the_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _terminal) = themed_fixture(dir.path());
+        mode.set_working_status(Some(StatusIndicator::working("Working...")));
+
+        mode.set_working_message(Some("Custom".to_string()));
+        let message = mode
+            .status_handle
+            .lock()
+            .expect("status")
+            .as_ref()
+            .map(|indicator| indicator.render_in_border(60))
+            .expect("the working indicator is live");
+        assert!(
+            message.contains("Custom"),
+            "the live indicator shows the working message: {message}"
+        );
+
+        mode.set_working_indicator(Some(pi_tui::components::loader::LoaderIndicator {
+            frames: vec!["x".to_string()],
+            interval_ms: 120,
+        }));
+        let interval = mode
+            .status_handle
+            .lock()
+            .expect("status")
+            .as_ref()
+            .map(|indicator| indicator.interval_ms())
+            .expect("the working indicator is live");
+        assert_eq!(interval, 120, "the indicator options reached the loader");
+
+        // false clears the working indicator; true re-shows one only while
+        // a run streams (`:2503-2510`).
+        mode.set_working_visible(false);
+        assert!(mode.status_handle.lock().expect("status").is_none());
+        mode.set_working_visible(true);
+        assert!(mode.status_handle.lock().expect("status").is_none());
+
+        let before = mode.chat_len();
+        mode.set_tools_expanded(true);
+        assert!(mode.tool_output_expanded);
+        assert_eq!(
+            mode.chat_len(),
+            before + 2,
+            "the status pair appends once"
+        );
+        mode.set_tools_expanded(true);
+        assert_eq!(mode.chat_len(), before + 2, "the unchanged flag is a no-op");
+        let chat = mode.chat_mut().render(100).join("\n");
+        assert!(
+            pi_tui::ansi::strip_terminal_sequences(&chat).contains("Tool output: expanded"),
+            "the status line names the state"
+        );
+        mode.set_tools_expanded(false);
+        assert!(!mode.tool_output_expanded);
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// The terminal-input fold (E3 slice 7): registered listeners transform
+    /// or consume chunks before the editor sees them, and the count sync
+    /// arms the dispatch.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_ui_terminal_input_folds_before_the_editor() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", (_event, ctx) => {
+    ctx.ui.onTerminalInput((data) => (data === "q" ? { data: "z" } : undefined));
+    pi.appendEntry("registered", {});
+  });
+  pi.on("session_end", (_event, ctx) => {
+    ctx.ui.onTerminalInput((data) => (data === "z" ? { consume: true } : undefined));
+    pi.appendEntry("second", {});
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        mode.tui.start().expect("tui start");
+        let runner = mode.extension_runner.clone().expect("runner");
+        runner
+            .lock()
+            .expect("runner")
+            .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        mode.pump();
+        assert_eq!(mode.terminal_input_listeners, 1, "the count sync armed");
+
+        mode.dispatch_stdin_events(vec![pi_tui::stdin_buffer::StdinEvent::Data(
+            "q".to_string(),
+        )]);
+        let text = mode
+            .editor_host_mut()
+            .expect("editor host")
+            .editor
+            .get_text();
+        assert_eq!(text, "z", "the transform reached the editor");
+
+        // The second listener consumes the transformed chunk.
+        runner
+            .lock()
+            .expect("runner")
+            .emit(&serde_json::json!({ "type": "session_end" }))
+            .expect("emit");
+        mode.pump();
+        mode.dispatch_stdin_events(vec![pi_tui::stdin_buffer::StdinEvent::Data(
+            "q".to_string(),
+        )]);
+        let text = mode
+            .editor_host_mut()
+            .expect("editor host")
+            .editor
+            .get_text();
+        assert_eq!(text, "z", "the consumed chunk never reached the editor");
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `resetExtensionUI`'s slice-7 clears (`interactive-mode.ts:2603-2622`):
+    /// the listeners, the footer/header swaps, the widgets, and the working
+    /// state all reset while the deferred chunks drain.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_ui_reset_restores_the_builtins() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", (_event, ctx) => {
+    ctx.ui.setWidget("alpha", ["one"]);
+    ctx.ui.setFooter((_tui, _theme, _footerData) => ({
+      render: (_width) => ["CUSTOM FOOTER"],
+      invalidate: () => {},
+    }));
+    ctx.ui.setHeader((_tui, _theme) => ({
+      render: (_width) => ["CUSTOM HEADER"],
+      invalidate: () => {},
+    }));
+    ctx.ui.onTerminalInput(() => undefined);
+    ctx.ui.setWorkingMessage("Custom");
+    ctx.ui.setHiddenThinkingLabel("custom");
+    pi.appendEntry("marked", {});
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        let runner = mode.extension_runner.clone().expect("runner");
+        runner
+            .lock()
+            .expect("runner")
+            .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        mode.pump();
+        assert_eq!(mode.terminal_input_listeners, 1);
+        assert_eq!(mode.working_message.as_deref(), Some("Custom"));
+        assert_eq!(mode.hidden_thinking_label, "custom");
+        mode.reset_extension_ui_dialogs();
+        assert_eq!(mode.terminal_input_listeners, 0, "the listeners cleared");
+        assert!(
+            mode.deferred_terminal_input.is_empty(),
+            "the deferred chunks drained"
+        );
+        assert!(mode.extension_widgets_above.is_empty());
+        assert!(mode.extension_widgets_below.is_empty());
+        assert!(mode.custom_footer.is_none());
+        assert!(mode.custom_header.is_none());
+        assert!(
+            mode.downcast_tree::<FooterComponent>(HostSlot::Footer)
+                .is_some(),
+            "the built-in footer is back"
+        );
+        assert!(
+            mode.downcast_tree::<BuiltInHeader>(HostSlot::Header).is_some(),
+            "the built-in header is back"
+        );
+        assert_eq!(mode.working_message, None);
+        assert!(mode.working_visible);
+        assert_eq!(mode.hidden_thinking_label, "Thinking...");
         mode.shutdown().expect("shutdown");
     }
 

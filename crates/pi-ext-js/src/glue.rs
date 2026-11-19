@@ -1593,6 +1593,17 @@ globalThis.__piComponentRelease = function (handle) {
   globalThis.__piComponentHandles.delete(handle);
 };
 
+// The custom header/footer swap's duck-typed `setExpanded` (`isExpandable` +
+// `setExpanded(this.toolOutputExpanded)`, `interactive-mode.ts:2709-2711`/
+// `:4749-4752`): a no-op when the component lacks the method — upstream
+// checks for it first.
+globalThis.__piComponentSetExpanded = function (handle, expanded) {
+  const component = globalThis.__piComponentHandles.get(handle);
+  if (component !== undefined && typeof component.setExpanded === "function") {
+    component.setExpanded(expanded === true);
+  }
+};
+
 // The custom dialog's close path (`disposeComponent`,
 // `interactive-mode.ts:3104-3109`): `dispose?.()` with errors swallowed —
 // upstream wraps the call the same way — then the registry entry drops
@@ -1780,7 +1791,9 @@ const makeFooterDataAdapter = () => {
     }
   };
   return {
-    getGitBranch: () => snapshot().gitBranch,
+    // `null` in the JSON snapshot maps to `undefined` like upstream's
+    // absent branch.
+    getGitBranch: () => snapshot().gitBranch ?? undefined,
     getExtensionStatuses: () => {
       const data = snapshot();
       return data.extensionStatuses !== undefined ? data.extensionStatuses : {};
