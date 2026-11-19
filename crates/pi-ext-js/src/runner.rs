@@ -465,6 +465,11 @@ pub struct UiDialogWait {
     sink: std::sync::Arc<dyn UiSink>,
     id: String,
     method: String,
+    /// Whether the delivery opened a `ui_prompt` pair. The dialog methods
+    /// wrap their wait in the pair; the answer-class overlay crossings (E3
+    /// slice 6c — `isHidden`/`isFocused`/`getBounds`) read a value without
+    /// blocking like a dialog, so they open no pair.
+    prompt: bool,
 }
 
 impl UiDialogWait {
@@ -1704,13 +1709,16 @@ impl ExtensionRunner {
 
     /// Drains the engine's `ui_requests` OUTSIDE a dispatch (E3 slice 6b) —
     /// the interactive mode's pump calls this every frame. Fire-and-forget
-    /// requests (`customDone`, `requestRender`) forward to the sink
-    /// immediately; a `customDone` also resolves its custom deferred (the
-    /// result `done()` queued on the crossing) and ends the active custom
-    /// prompt — resolution precedes the pair's end, so `ui_prompt_end`
-    /// precedes the resolved continuation like upstream's `.finally(finish)`
-    /// (`runner.ts:585-611`); dialog methods come back to the caller,
-    /// which delivers them on threads through
+    /// requests (`customDone`, `requestRender`, the overlay writes) forward
+    /// to the sink immediately; a `customDone` also resolves its custom
+    /// deferred (the result `done()` queued on the crossing) and ends the
+    /// active custom prompt — resolution precedes the pair's end, so
+    /// `ui_prompt_end` precedes the resolved continuation like upstream's
+    /// `.finally(finish)` (`runner.ts:585-611`); dialog methods AND the
+    /// answer-class overlay crossings (`overlayIsHidden`/`overlayIsFocused`/
+    /// `overlayGetBounds`, E3 slice 6c — the mode answers from its overlay
+    /// registry like a dialog close) come back to the caller, which delivers
+    /// them on threads through
     /// [`Self::begin_ui_dialog`]/[`Self::complete_ui_dialog`] — the wait
     /// must never hold the runner mutex here, or the pump's component
     /// crossings would stall behind it. Anything returned or forwarded
@@ -1748,6 +1756,13 @@ impl ExtensionRunner {
                     ends += 1;
                 }
                 Some("select" | "confirm" | "input" | "editor") => deferred.push(request.clone()),
+                // The answer-class overlay crossings ride the same deferred
+                // shape: the pump's delivery threads block on the bridge
+                // like a dialog close, and the mode answers on its next
+                // frame (E3 slice 6c).
+                Some("overlayIsHidden" | "overlayIsFocused" | "overlayGetBounds") => {
+                    deferred.push(request.clone());
+                }
                 _ => {
                     if let Some(sink) = self.ui_sink.clone() {
                         sink.request(request);
@@ -1773,7 +1788,9 @@ impl ExtensionRunner {
     /// the promise resolves glue-side when the extension calls `done()`,
     /// and the fire-and-forget `customDone` crossing ends the prompt
     /// ([`Self::service_ui_requests`]) — while the RPC arm keeps the
-    /// blocking pair (rpc-mode answers immediately). Everything else is
+    /// blocking pair (rpc-mode answers immediately). The answer-class
+    /// overlay crossings settle with the method default (they cannot reach
+    /// the mode from a dispatch — see the arm). Everything else is
     /// fire-and-forget.
     ///
     /// The blocking wait runs under the CALLER's mutex tenure: callers
@@ -1797,12 +1814,17 @@ impl ExtensionRunner {
             .to_string();
         match method.as_str() {
             "custom" if request.get("handle").is_some() => {
-                // Interactive `ctx.ui.custom` (E3 slice 6b): the mode
-                // mounts the adopted component; done() queues the result on
-                // the customDone crossing and [`Self::service_ui_requests`]
-                // resolves the deferred. NO blocking wait — the runner mutex
-                // must stay free for the component crossings, and
-                // nothing ever answers this request through the sink.
+                // Interactive `ctx.ui.custom` (E3 slice 6b; the crossing
+                // shapes of `showExtensionCustom`, `interactive-mode.ts
+                // :3074-3178` — the overlay arm rides the same request with
+                // `overlay`/`overlayOptions`/`blocked`, E3 slice 6c): the
+                // mode mounts the adopted component (inline in the editor
+                // slot, or on top via `tui.ts:792-816`'s showOverlay);
+                // done() queues the result on the customDone crossing and
+                // [`Self::service_ui_requests`] resolves the deferred. NO
+                // blocking wait — the runner mutex must stay free for the
+                // component crossings, and nothing ever answers this
+                // request through the sink.
                 self.begin_ui_prompt("custom", None)?;
                 if let Some(sink) = self.ui_sink.clone() {
                     sink.request(request);
@@ -1827,6 +1849,22 @@ impl ExtensionRunner {
                 self.host.resolve_ui(&id, "")?;
                 self.end_ui_prompt()?;
             }
+            // The answer-class overlay crossings made INSIDE a dispatch
+            // cannot reach the mode: the dispatch thread may be the mode's
+            // own pump (a handler awaiting a dialog must be settled before
+            // its `block` decision), so waiting here could deadlock the UI.
+            // Deviation: such a crossing settles with the method default
+            // instead — upstream answers synchronously from the in-process
+            // TUI (`tui.ts:845/:883/:884-887`); the port's reads only
+            // reflect the registry when they arrive through the pump path.
+            "overlayIsHidden" | "overlayIsFocused" | "overlayGetBounds" => {
+                let payload = match method.as_str() {
+                    "overlayIsFocused" => "{\"focused\":false}",
+                    "overlayGetBounds" => "{}",
+                    _ => "{\"hidden\":false}",
+                };
+                self.host.resolve_ui(&id, payload)?;
+            }
             _ => {
                 if let Some(sink) = &self.ui_sink {
                     sink.request(request);
@@ -1842,7 +1880,9 @@ impl ExtensionRunner {
     /// the request, and return a [`UiDialogWait`]; the caller blocks on it
     /// outside the guard and completes through [`Self::complete_ui_dialog`].
     /// While a dialog is up the mutex stays free for component render/input
-    /// crossings, further deliveries, and deadline closes. Non-dialog
+    /// crossings, further deliveries, and deadline closes. The answer-class
+    /// overlay crossings (E3 slice 6c) return a wait with no `ui_prompt`
+    /// pair — they read a value, they do not open a dialog. Non-dialog
     /// requests ride [`Self::deliver_ui_request`] (no wait involved).
     pub fn begin_ui_dialog(&mut self, request: &Json) -> Result<Option<UiDialogWait>, JsHostError> {
         let method = request
@@ -1864,12 +1904,36 @@ impl ExtensionRunner {
                 self.begin_ui_prompt(&method, title.as_deref())?;
                 if let Some(sink) = self.ui_sink.clone() {
                     sink.request(request);
-                    return Ok(Some(UiDialogWait { sink, id, method }));
+                    return Ok(Some(UiDialogWait {
+                        sink,
+                        id,
+                        method,
+                        prompt: true,
+                    }));
                 }
                 // No sink: nothing can ever answer — mirror
                 // [`Self::deliver_ui_request`]'s no-sink arm and close
                 // the prompt pair instead of leaking it.
                 self.end_ui_prompt()?;
+                Ok(None)
+            }
+            "overlayIsHidden" | "overlayIsFocused" | "overlayGetBounds" => {
+                let id = request
+                    .get("id")
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(sink) = self.ui_sink.clone() {
+                    sink.request(request);
+                    return Ok(Some(UiDialogWait {
+                        sink,
+                        id,
+                        method,
+                        prompt: false,
+                    }));
+                }
+                // No sink: no registry could ever answer (a handle only
+                // exists after a showOverlay crossing, which needs one).
                 Ok(None)
             }
             _ => {
@@ -1881,7 +1945,8 @@ impl ExtensionRunner {
 
     /// Completes a dialog delivered through [`Self::begin_ui_dialog`]:
     /// resolves the glue deferred, ends the `ui_prompt` pair, drives jobs
-    /// (the resolved handler's continuation).
+    /// (the resolved handler's continuation). Answer-class overlay crossings
+    /// opened no pair, so they skip the end.
     pub fn complete_ui_dialog(
         &mut self,
         wait: &UiDialogWait,
@@ -1889,7 +1954,9 @@ impl ExtensionRunner {
     ) -> Result<(), JsHostError> {
         let payload = serde_json::to_string(response).unwrap_or_default();
         self.host.resolve_ui(&wait.id, &payload)?;
-        self.end_ui_prompt()?;
+        if wait.prompt {
+            self.end_ui_prompt()?;
+        }
         self.host.drive_jobs()
     }
 
@@ -3489,6 +3556,186 @@ export default function (pi) {
             entries_of(&runner),
             vec![json!({ "type": "picked", "data": "early" })]
         );
+    }
+
+    /// The overlay arm of `ctx.ui.custom` (E3 slice 6c, `interactive-mode.ts
+    /// :3089/:3139-3157`): `overlay: true` crosses the resolved static
+    /// options and the blocked status with the `custom` request, `onHandle`
+    /// fires with an adapter bound to the crossing id whose writes queue
+    /// fire-and-forget crossings, and done() rides the same customDone
+    /// path the inline custom uses.
+    #[test]
+    fn ui_custom_overlay_crosses_options_blocked_and_on_handle() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    let handleActions = 0;
+    const value = await ctx.ui.custom(
+      (_tui, _theme, _kb, done) => ({
+        render: (width) => ["OVERLAY " + width],
+        invalidate: () => {},
+        handleInput: (data) => {
+          if (data === "x") {
+            done("overlay-value");
+            return true;
+          }
+          return false;
+        },
+      }),
+      {
+        overlay: true,
+        overlayOptions: { width: 30, anchor: "bottom-right" },
+        blocked: { kind: "question", message: "Blocking" },
+        onHandle: (handle) => {
+          handleActions += 1;
+          handle.setHidden(true);
+          handle.setHidden(false);
+        },
+      },
+    );
+    pi.appendEntry("picked", String(value));
+    pi.appendEntry("handles", String(handleActions));
+  });
+  pi.on("ui_prompt_start", (event) => pi.appendEntry("prompt-start", event.kind));
+  pi.on("ui_prompt_end", (event) => pi.appendEntry("prompt-end", event.kind));
+}
+"#;
+        let mut runner = runner_with(&[EXT]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "tui");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+
+        // The custom crossing carries the overlay fields; onHandle's writes
+        // crossed right behind it as fire-and-forget requests.
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert_eq!(requests[0]["method"], "custom");
+        assert_eq!(requests[0]["overlay"], true);
+        assert_eq!(requests[0]["overlayOptions"]["width"], 30);
+        assert_eq!(requests[0]["overlayOptions"]["anchor"], "bottom-right");
+        assert_eq!(
+            requests[0]["blocked"],
+            json!({ "kind": "question", "message": "Blocking" })
+        );
+        assert!(requests[0]["id"].is_string());
+        assert_eq!(requests[1]["method"], "overlaySetHidden");
+        assert_eq!(requests[1]["id"], requests[0]["id"]);
+        assert_eq!(requests[1]["hidden"], true);
+        assert_eq!(requests[2]["method"], "overlaySetHidden");
+        assert_eq!(requests[2]["hidden"], false);
+        // The prompt pair opened around the overlay custom like the inline
+        // one (`deliver_ui_request`'s custom arm).
+        assert_eq!(
+            entries_of(&runner),
+            vec![json!({ "type": "prompt-start", "data": "custom" })]
+        );
+
+        // done() closes through the customDone crossing, ending the pair.
+        let handle = requests[0]["handle"].as_u64().expect("adopted handle") as u32;
+        assert!(runner.component_handle_input(handle, "x").expect("input"));
+        let deferred = runner.service_ui_requests().expect("service");
+        assert!(deferred.is_empty());
+        let requests = sink.requests();
+        assert_eq!(requests[3]["method"], "customDone");
+        assert_eq!(requests[3]["id"], requests[0]["id"]);
+        assert_eq!(
+            entries_of(&runner),
+            vec![
+                json!({ "type": "prompt-start", "data": "custom" }),
+                json!({ "type": "prompt-end", "data": "custom" }),
+                json!({ "type": "picked", "data": "overlay-value" }),
+                json!({ "type": "handles", "data": "1" }),
+            ]
+        );
+    }
+
+    /// The answer-class handle reads (`isHidden`/`isFocused`/`getBounds`)
+    /// ride the deferred path: the request comes back from
+    /// [`ExtensionRunner::service_ui_requests`], the delivery thread
+    /// forwards it and waits WITHOUT the runner mutex, and the completion
+    /// resolves the glue deferred without ending a `ui_prompt` pair
+    /// (E3 slice 6c).
+    #[test]
+    fn ui_overlay_answer_class_rides_the_deferred_path_without_a_prompt() {
+        let mut runner = runner_with(&[EXT_UI_PROMPTS]);
+        // A scripted sink whose per-method answer carries the mode's reply.
+        let sink = FakeSink::scripted(&[("overlayIsHidden", json!({ "hidden": true }))]);
+        runner.set_ui_context(sink.clone(), "tui");
+
+        // The glue queues the read under its crossing id; the deferred
+        // registration happens glue-side (`__piUiPending`).
+        runner
+            .core()
+            .lock()
+            .expect("core")
+            .ui_requests
+            .push(json!({ "method": "overlayIsHidden", "id": "ui-7" }));
+        let deferred = runner.service_ui_requests().expect("service");
+        assert_eq!(deferred.len(), 1, "the read waits for the mode");
+        // Forwarded only on the delivery thread's `begin_ui_dialog`.
+        assert!(sink.requests().is_empty());
+
+        let runner = std::sync::Arc::new(std::sync::Mutex::new(runner));
+        let worker_runner = std::sync::Arc::clone(&runner);
+        let worker = std::thread::spawn(move || {
+            let wait = worker_runner
+                .lock()
+                .expect("runner")
+                .begin_ui_dialog(&json!({ "method": "overlayIsHidden", "id": "ui-7" }))
+                .expect("begin")
+                .expect("a wait");
+            let response = wait.wait();
+            worker_runner
+                .lock()
+                .expect("runner")
+                .complete_ui_dialog(&wait, &response)
+                .expect("complete");
+        });
+        worker.join().expect("worker");
+        // The request crossed and the completion resolved the deferred —
+        // with no `ui_prompt` pair around it.
+        assert_eq!(sink.requests().len(), 1);
+        assert_eq!(sink.requests()[0]["method"], "overlayIsHidden");
+        assert_eq!(sink.requests()[0]["id"], "ui-7");
+        let entries = {
+            let runner = runner.lock().expect("runner");
+            entries_of(&runner)
+        };
+        assert!(
+            entries.is_empty(),
+            "no ui_prompt pair for an answer crossing: {entries:?}"
+        );
+    }
+
+    /// An answer-class read made INSIDE a dispatch settles with the method
+    /// default instead of blocking the dispatch thread on the mode — the
+    /// settle path may BE the mode's pump, and blocking there deadlocks the
+    /// UI (Deviation: upstream answers synchronously from the in-process
+    /// TUI, `tui.ts:845/:883/:884-887`).
+    #[test]
+    fn ui_overlay_answer_inside_a_dispatch_settles_with_the_default() {
+        let mut runner = runner_with(&[EXT_UI_PROMPTS]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "tui");
+        // The settle path (`deliver_ui_request`) must answer at once and
+        // must not cross the request toward the mode.
+        runner
+            .deliver_ui_request(&json!({ "method": "overlayGetBounds", "id": "ui-9" }))
+            .expect("deliver");
+        runner
+            .deliver_ui_request(&json!({ "method": "overlayIsFocused", "id": "ui-10" }))
+            .expect("deliver");
+        runner
+            .deliver_ui_request(&json!({ "method": "overlayIsHidden", "id": "ui-11" }))
+            .expect("deliver");
+        assert!(
+            sink.requests().is_empty(),
+            "the reads never cross on the settle path"
+        );
+        let entries = entries_of(&runner);
+        assert!(entries.is_empty(), "no prompt pair: {entries:?}");
     }
 
     /// A sink whose dialog answers block on a gate — for asserting that a

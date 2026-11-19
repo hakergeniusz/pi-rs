@@ -173,6 +173,21 @@ enum ExtensionUiKind {
     Custom,
 }
 
+/// One extension overlay (`extensionOverlays`,
+/// `interactive-mode.ts:590-591`): the crossing id the handle adapter is
+/// bound to, the mounted overlay in the TUI, the adopted component's engine
+/// handle that `disposeComponent` drops, and the numbered program-status
+/// source a blocked overlay holds (`interactive-mode.ts:3094-3096`,
+/// removed at `removeOverlay` `:3113-3120`). Insertion order is opening
+/// order; reset removes newest-first (`:2600-2602`).
+#[cfg(feature = "ext-js")]
+struct ExtensionOverlayEntry {
+    id: String,
+    overlay: pi_tui::tui::OverlayId,
+    component_handle: Option<u32>,
+    blocked_source: Option<String>,
+}
+
 /// The mounted dialog's event mailbox, tagged by component.
 #[cfg(feature = "ext-js")]
 enum ExtensionUiDialogEvents {
@@ -1116,6 +1131,16 @@ pub struct InteractiveMode {
     /// rest park in their entries.
     #[cfg(feature = "ext-js")]
     extension_ui_dialogs: Vec<ExtensionUiDialogEntry>,
+    /// The extension overlays (`extensionOverlays`,
+    /// `interactive-mode.ts:590-591`): overlay-mode customs and the factory
+    /// `tui.showOverlay` surface, removed by `done()`/reset — never by a
+    /// session switch.
+    #[cfg(feature = "ext-js")]
+    extension_overlays: Vec<ExtensionOverlayEntry>,
+    /// Numbers the program-status sources of blocking overlays, so closing
+    /// one keeps the others (`interactive-mode.ts:586`).
+    #[cfg(feature = "ext-js")]
+    next_blocking_overlay_id: u32,
     /// The OSC 7501 program status reporter (`interactive-mode.ts:572-576`):
     /// `working`/`blocked`/`done`/`error` reports ride every agent event and
     /// the dialogs' `blocked` sources (`program-status-reporter.ts`).
@@ -1390,6 +1415,10 @@ impl InteractiveMode {
             extension_ui_bridge: options.extension_ui.clone(),
             #[cfg(feature = "ext-js")]
             extension_ui_dialogs: Vec::new(),
+            #[cfg(feature = "ext-js")]
+            extension_overlays: Vec::new(),
+            #[cfg(feature = "ext-js")]
+            next_blocking_overlay_id: 0,
             program_status: ProgramStatusReporter::new(),
             user_message_selector_events: None,
             tree_selector_events: None,
@@ -1530,10 +1559,12 @@ impl InteractiveMode {
         mode.setup_markdown_transformers();
         // The initial program status report (`interactive-mode.ts:1040`,
         // `init` after `ui.start()`): an idle report now is re-written once
-        // the terminal confirms OSC 7501 support.
+        // the terminal confirms OSC 7501 support. The init title follows
+        // (`interactive-mode.ts:2242`).
         let session_name = mode.session.get_session_name();
         mode.program_status
             .report(session_name.as_deref(), &mut mode.tui);
+        mode.update_terminal_title();
         mode
     }
 
@@ -2581,14 +2612,20 @@ impl InteractiveMode {
             | AgentEvent::CompactionEnd { .. }
             | AgentEvent::AgentSettled { .. }
             | AgentEvent::QueueUpdate { .. }
-            | AgentEvent::ThinkingLevelChanged { .. }
-            | AgentEvent::SessionInfoChanged { .. } => {
+            | AgentEvent::ThinkingLevelChanged { .. } => {
                 // The final tool result renders with its message end. The
                 // pump drives its runs directly; the retry, compaction,
                 // appended-entry usage/compaction displays, settled, and
-                // queue/level/name-change displays land with the pump's
+                // queue/level-change displays land with the pump's
                 // AgentRun rework (upstream shows them via agent-session
                 // events).
+            }
+            // `session_info_changed` (`interactive-mode.ts:3614-3618`): the
+            // title carries the new session name; the paired
+            // `footer.invalidate()` is a no-op upstream (`footer.ts:85-87`).
+            AgentEvent::SessionInfoChanged { .. } => {
+                self.update_terminal_title();
+                self.tui.request_render();
             }
             // `entry_appended` (`interactive-mode.ts:3569-3587`): custom
             // entries splice ahead of the streaming row, custom messages
@@ -8497,18 +8534,146 @@ impl InteractiveMode {
                 // done() closed a custom dialog: the glue resolved its
                 // promise, the close only disposes the component and
                 // re-shows what was under it (`removeExtensionDialog`).
+                // An overlay custom closes through `removeOverlay`
+                // (`showExtensionCustom`'s `close`, `interactive-mode.ts
+                // :3122-3133`) instead of the dialog stack.
                 "customDone" => {
                     let id = request
                         .get("id")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    self.close_extension_ui_dialog_by_id(&id, &serde_json::json!({}));
+                    if self.extension_overlays.iter().any(|entry| entry.id == id) {
+                        self.remove_extension_overlay(&id);
+                    } else {
+                        self.close_extension_ui_dialog_by_id(&id, &serde_json::json!({}));
+                    }
                 }
-                "select" | "confirm" | "input" | "editor" | "custom" => {
+                "select" | "confirm" | "input" | "editor" => {
                     if let Some(entry) = self.extension_dialog_entry(&request) {
                         self.push_extension_dialog_entry(entry);
                     }
+                }
+                // The overlay arm of `showExtensionCustom`
+                // (`interactive-mode.ts:3139-3157`): `blocked` rides the
+                // request, so the mount reports it.
+                "custom" if request.get("overlay").and_then(Value::as_bool) == Some(true) => {
+                    let blocked = request
+                        .get("blocked")
+                        .filter(|value| !value.is_null())
+                        .and_then(Self::blocked_status_from_json);
+                    self.mount_extension_overlay(&request, "overlayOptions", blocked);
+                }
+                "custom" => {
+                    if let Some(entry) = self.extension_dialog_entry(&request) {
+                        self.push_extension_dialog_entry(entry);
+                    }
+                }
+                // The factory adapter's `TUI.showOverlay` surface
+                // (`tui.ts:518/:792-816`).
+                // Deviation: the port tracks these mounts in the same
+                // registry as the custom overlays so a reload disposes
+                // their runner handles; upstream leaves the factory
+                // surface's bookkeeping to the extension's own handle.
+                "showOverlay" => self.mount_extension_overlay(&request, "options", None),
+                // `TUI.hideOverlay()`'s topmost pop (`tui.ts:891-907`).
+                "hideTopOverlay" => self.tui.hide_topmost_overlay(),
+                // The handle's writes (`tui.ts:810-851`): `hide()` removes
+                // this overlay from the TUI — the registry entry stays, so
+                // a later done()/reset still runs `removeOverlay`.
+                "overlayHide" => {
+                    let id = request
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if let Some(overlay) = self.extension_overlay_id(&id) {
+                        self.tui.hide_overlay(overlay);
+                    }
+                }
+                "overlaySetHidden" => {
+                    let id = request
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let hidden = request
+                        .get("hidden")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if let Some(overlay) = self.extension_overlay_id(&id) {
+                        self.tui.set_overlay_hidden(overlay, hidden);
+                    }
+                }
+                "overlayFocus" => {
+                    let id = request
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if let Some(overlay) = self.extension_overlay_id(&id) {
+                        self.tui.focus_overlay(overlay);
+                    }
+                }
+                // The handle's `unfocus(options?)` (`tui.ts:852-879`).
+                // Deviation: an explicit target crosses as "focus nothing" —
+                // component targets have no crossing representation.
+                "overlayUnfocus" => {
+                    let id = request
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let explicit = request
+                        .get("explicit")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if let Some(overlay) = self.extension_overlay_id(&id) {
+                        self.tui
+                            .overlay_unfocus(overlay, explicit.then_some(None));
+                    }
+                }
+                // The handle's reads (`tui.ts:845/:883/:884-887`): the mode
+                // answers from its registry, the delivery thread resolves
+                // the glue deferred.
+                "overlayIsHidden" | "overlayIsFocused" | "overlayGetBounds" => {
+                    let id = request
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let overlay = self.extension_overlay_id(&id);
+                    let response = match method.as_str() {
+                        "overlayIsFocused" => {
+                            serde_json::json!({ "focused": overlay.is_some_and(|o| self.tui.overlay_is_focused(o)) })
+                        }
+                        "overlayGetBounds" => match overlay.and_then(|o| self.tui.overlay_bounds(o)) {
+                            Some(bounds) => serde_json::json!({
+                                "bounds": {
+                                    "row": bounds.row,
+                                    "col": bounds.col,
+                                    "width": bounds.width,
+                                    "height": bounds.height,
+                                }
+                            }),
+                            None => serde_json::json!({}),
+                        },
+                        _ => serde_json::json!({
+                            "hidden": overlay.is_some_and(|o| self.tui.overlay_is_hidden(o).unwrap_or(false))
+                        }),
+                    };
+                    if let Some(bridge) = self.extension_ui_bridge.as_ref() {
+                        bridge.respond(&id, &response);
+                    }
+                }
+                // `ctx.ui.setTitle` (`interactive-mode.ts:2793` →
+                // `terminal.setTitle`, `terminal.ts:600-604`).
+                "setTitle" => {
+                    let title = request
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    self.tui.set_title(title);
                 }
                 // `showExtensionNotify` (`interactive-mode.ts:3061-3071`).
                 "notify" => {
@@ -8698,6 +8863,185 @@ impl InteractiveMode {
                 })
             }
             _ => None,
+        }
+    }
+
+    /// The crossed `OverlayOptions` JSON → the port's options
+    /// (`tui.ts:267-303`): sizes are numbers (cells) or `"N%"` strings
+    /// (percent of the terminal dimension), the anchor names
+    /// [`pi_tui::tui::OverlayAnchor`]'s arms, the margin is one number or a
+    /// `{top,right,bottom,left}` object. Deviation: the `visible` predicate
+    /// cannot cross JSON and never arrives; unknown fields drop.
+    #[cfg(feature = "ext-js")]
+    fn overlay_options_from_json(options: &Value) -> pi_tui::tui::OverlayOptions {
+        use pi_tui::tui::{OverlayAnchor, OverlayMargin, OverlayOptions, SizeValue};
+        let size_value = |value: &Value| -> Option<SizeValue> {
+            if let Some(text) = value.as_str() {
+                let percent = text.strip_suffix('%')?;
+                return percent
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .map(SizeValue::Percent);
+            }
+            value
+                .as_i64()
+                .or_else(|| value.as_f64().map(|f| f as i64))
+                .map(SizeValue::Cells)
+        };
+        let offset = |value: Option<&Value>| value.and_then(Value::as_i64).unwrap_or(0);
+        let mut parsed = OverlayOptions {
+            width: options.get("width").and_then(|v| v.is_null().not().then_some(v)).and_then(|v| size_value(v)),
+            min_width: options.get("minWidth").and_then(Value::as_i64),
+            max_height: options
+                .get("maxHeight")
+                .and_then(|v| v.is_null().not().then_some(v))
+                .and_then(|v| size_value(v)),
+            offset_x: offset(options.get("offsetX")),
+            offset_y: offset(options.get("offsetY")),
+            row: options.get("row").and_then(|v| v.is_null().not().then_some(v)).and_then(|v| size_value(v)),
+            col: options.get("col").and_then(|v| v.is_null().not().then_some(v)).and_then(|v| size_value(v)),
+            non_capturing: options
+                .get("nonCapturing")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            ..OverlayOptions::default()
+        };
+        parsed.anchor = match options.get("anchor").and_then(Value::as_str) {
+            Some("top-left") => OverlayAnchor::TopLeft,
+            Some("top-right") => OverlayAnchor::TopRight,
+            Some("bottom-left") => OverlayAnchor::BottomLeft,
+            Some("bottom-right") => OverlayAnchor::BottomRight,
+            Some("top-center") => OverlayAnchor::TopCenter,
+            Some("bottom-center") => OverlayAnchor::BottomCenter,
+            Some("left-center") => OverlayAnchor::LeftCenter,
+            Some("right-center") => OverlayAnchor::RightCenter,
+            // `"center"` and unknown strings: the default anchor.
+            _ => OverlayAnchor::Center,
+        };
+        if let Some(margin) = options.get("margin").filter(|value| !value.is_null()) {
+            let mut margins = OverlayMargin::default();
+            if let Some(all) = margin.as_i64() {
+                margins.top = Some(all);
+                margins.right = Some(all);
+                margins.bottom = Some(all);
+                margins.left = Some(all);
+            } else if let Some(object) = margin.as_object() {
+                margins.top = object.get("top").and_then(Value::as_i64);
+                margins.right = object.get("right").and_then(Value::as_i64);
+                margins.bottom = object.get("bottom").and_then(Value::as_i64);
+                margins.left = object.get("left").and_then(Value::as_i64);
+            }
+            parsed.margin = margins;
+        }
+        parsed
+    }
+
+    /// The crossed `blocked` JSON → [`BlockedStatus`]
+    /// (`showExtensionCustom`'s `options?.blocked`,
+    /// `interactive-mode.ts:3085`).
+    #[cfg(feature = "ext-js")]
+    fn blocked_status_from_json(value: &Value) -> Option<BlockedStatus> {
+        let kind = match value.get("kind").and_then(Value::as_str) {
+            Some("permission") => pi_tui::program_status::ProgramStatusKind::Permission,
+            Some("question") => pi_tui::program_status::ProgramStatusKind::Question,
+            Some("auth") => pi_tui::program_status::ProgramStatusKind::Auth,
+            _ => return None,
+        };
+        let message = value.get("message").and_then(Value::as_str)?.to_string();
+        Some(BlockedStatus { kind, message })
+    }
+
+    /// The overlay registry's lookup by crossing id.
+    #[cfg(feature = "ext-js")]
+    fn extension_overlay_id(&self, id: &str) -> Option<pi_tui::tui::OverlayId> {
+        self.extension_overlays
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.overlay)
+    }
+
+    /// The overlay mount (`showExtensionCustom`'s overlay arm,
+    /// `interactive-mode.ts:3139-3157`, and the factory `TUI.showOverlay`
+    /// surface, `tui.ts:792-816`): the adopted wrapper mounts through
+    /// `show_overlay` with the crossed options (read from `options_field`)
+    /// and joins the registry; a blocked custom takes a numbered
+    /// `extension-overlay:N` source and reports it for the overlay's
+    /// lifetime.
+    #[cfg(feature = "ext-js")]
+    fn mount_extension_overlay(
+        &mut self,
+        request: &Value,
+        options_field: &str,
+        blocked: Option<BlockedStatus>,
+    ) {
+        let Some(handle) = request.get("handle").and_then(Value::as_u64).map(|h| h as u32)
+        else {
+            return;
+        };
+        let Some(runner) = self.extension_runner.as_ref() else {
+            return;
+        };
+        let id = request
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let component = ExtensionCustomComponent::new(Arc::clone(runner), handle);
+        let options = request
+            .get(options_field)
+            .filter(|value| !value.is_null())
+            .map(Self::overlay_options_from_json);
+        // `overlayHandle = this.ui.showOverlay(c, resolveOptions())`
+        // (`interactive-mode.ts:3153`).
+        let overlay = self.tui.show_overlay(Box::new(component), options);
+        // `overlayStatusSource` (`interactive-mode.ts:3094-3096`): numbered
+        // per blocked overlay, so closing one keeps the others.
+        let blocked_source = blocked.as_ref().map(|_| {
+            let number = self.next_blocking_overlay_id;
+            self.next_blocking_overlay_id += 1;
+            format!("extension-overlay:{number}")
+        });
+        self.extension_overlays.push(ExtensionOverlayEntry {
+            id,
+            overlay,
+            component_handle: Some(handle),
+            blocked_source: blocked_source.clone(),
+        });
+        if let (Some(source), Some(blocked)) = (blocked_source, blocked) {
+            let session_name = self.session.get_session_name();
+            self.program_status
+                .set_blocked(&source, Some(blocked), session_name.as_deref(), &mut self.tui);
+        }
+    }
+
+    /// `removeOverlay` (`interactive-mode.ts:3113-3120`): deleting the
+    /// registry entry FIRST makes a second call a no-op; the overlay itself
+    /// hides (another may have opened above it), the blocked source clears,
+    /// and the component disposes.
+    #[cfg(feature = "ext-js")]
+    fn remove_extension_overlay(&mut self, id: &str) {
+        let Some(index) = self
+            .extension_overlays
+            .iter()
+            .position(|entry| entry.id == id)
+        else {
+            return;
+        };
+        let entry = self.extension_overlays.remove(index);
+        self.tui.hide_overlay(entry.overlay);
+        if let Some(source) = &entry.blocked_source {
+            let session_name = self.session.get_session_name();
+            self.program_status
+                .set_blocked(source, None, session_name.as_deref(), &mut self.tui);
+        }
+        if let Some(handle) = entry.component_handle
+            && let Some(runner) = self.extension_runner.as_ref()
+        {
+            let _ = runner
+                .lock()
+                .expect("extension runner mutex poisoned")
+                .component_dispose(handle);
         }
     }
 
@@ -8974,10 +9318,12 @@ impl InteractiveMode {
 
     /// `resetExtensionUI`'s dialogs arm (`interactive-mode.ts:2592-2600`,
     /// called from init `:643` and `/reload` `:6628` — never on session
-    /// switches): dispose every open dialog without calling `done()` and
-    /// put the editor back. The port answers `cancelled` for the mailbox
-    /// kinds so their delivery threads unblock (upstream leaves the
-    /// promises pending — its engine is in-process and threadless). The
+    /// switches): dispose every open dialog without calling `done()`, and
+    /// remove the extension overlays newest-first — the same way `done()`
+    /// does, leaving the promises pending as for inline dialogs
+    /// (`interactive-mode.ts:2600-2602`). The port answers `cancelled` for
+    /// the mailbox kinds so their delivery threads unblock (upstream leaves
+    /// the promises pending — its engine is in-process and threadless). The
     /// footer's extension statuses clear unconditionally
     /// (`interactive-mode.ts:2607-2608`), like upstream's body runs whole.
     #[cfg(feature = "ext-js")]
@@ -9003,6 +9349,17 @@ impl InteractiveMode {
             // source clears.
             self.report_extension_dialog_blocked();
         }
+        // The overlays, newest first (`interactive-mode.ts:2602`): each
+        // removal hides its own overlay, not the topmost, and leaves the
+        // promise pending like the inline dialogs.
+        let overlay_ids: Vec<String> = self
+            .extension_overlays
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        for id in overlay_ids.into_iter().rev() {
+            self.remove_extension_overlay(&id);
+        }
         // `footerDataProvider.clearExtensionStatuses(); this.footer.invalidate();`
         // (`interactive-mode.ts:2607-2608`): upstream's `footer.invalidate`
         // is a no-op (`footer.ts:85-87`); the port's refresh recomputes the
@@ -9011,6 +9368,28 @@ impl InteractiveMode {
             footer.data.extension_statuses.clear();
         }
         self.refresh_footer();
+        // `updateTerminalTitle` (`interactive-mode.ts:2613`): the reload's
+        // settings may carry a new session-independent title input.
+        self.update_terminal_title();
+    }
+
+    /// `updateTerminalTitle` (`interactive-mode.ts:1173-1181`): the app
+    /// title, the session name, and the cwd's basename, through
+    /// `terminal.setTitle` (`terminal.ts:600-604`).
+    fn update_terminal_title(&mut self) {
+        let cwd = self.session.get_cwd().to_string_lossy().to_string();
+        // `path.basename(cwd)`: an empty string at the filesystem root.
+        let cwd_basename = std::path::Path::new(&cwd)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let title = match self.session.get_session_name() {
+            // `APP_TITLE` (`config.ts:605`): the port has no `piConfigName`
+            // build variant, so the default `π` applies.
+            Some(name) => format!("π - {name} - {cwd_basename}"),
+            None => format!("π - {cwd_basename}"),
+        };
+        self.tui.set_title(&title);
     }
 
     /// The settled credential (`completeProviderAuthentication`'s storage
@@ -11226,6 +11605,197 @@ export default function (pi) {
             picked,
             Some(serde_json::json!({ "value": "A" })),
             "the dialog still answered"
+        );
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `ctx.ui.custom` with `overlay: true` mounts ON TOP of the existing
+    /// content through `show_overlay` (`showExtensionCustom`'s overlay arm,
+    /// `interactive-mode.ts:3089/:3139-3157`) — never through the editor
+    /// slot's dialog stack — and `done()` removes it, clearing its blocked
+    /// program-status source (`removeOverlay`, `:3113-3120`).
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_ui_overlay_custom_mounts_and_done_removes() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (_event, ctx) => {
+    const value = await ctx.ui.custom(
+      (_tui, _theme, _kb, done) => ({
+        render: (width) => ["OVERLAY BODY " + width],
+        invalidate: () => {},
+        handleInput: (data) => {
+          if (data === "x") {
+            done("overlay-value");
+            return true;
+          }
+          return false;
+        },
+      }),
+      {
+        overlay: true,
+        overlayOptions: { width: 40 },
+        blocked: { kind: "question", message: "Blocking" },
+      },
+    );
+    pi.appendEntry("picked", { value: value ?? null });
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        mode.tui.start().expect("tui start");
+        // Answer the OSC 7501 negotiation so reports write to the capture.
+        mode.feed_stdin_bytes(b"\x1b]7501;?\x1b\\");
+        let runner = mode.extension_runner.clone().expect("runner");
+        let emitter = std::thread::spawn(move || {
+            runner
+                .lock()
+                .expect("runner")
+                .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+                .expect("emit");
+        });
+        for _ in 0..200 {
+            mode.pump();
+            if !mode.extension_overlays.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        emitter.join().expect("emit thread");
+        // The overlay registry, not the dialog stack; the editor slot keeps
+        // its occupant.
+        assert_eq!(mode.extension_overlays.len(), 1, "the overlay mounted");
+        assert!(
+            mode.extension_ui_dialogs.is_empty(),
+            "overlays never enter the dialog stack"
+        );
+        assert_eq!(mode.tui.overlay_count(), 1, "mounted in the tui");
+        assert!(mode.suspended_editor.is_none(), "the editor was not parked");
+        // The blocked status rode the request; the numbered source reports
+        // it (base64("Blocking") = QmxvY2tpbmc=).
+        let written = capture.output();
+        assert!(
+            written.contains(
+                "\x1b]7501;state=blocked:app=pi:kind=question:msg=QmxvY2tpbmc=\x1b\\"
+            ),
+            "{written:?}"
+        );
+        // Input reaches the overlay through the captured focus; done()
+        // removes it and clears the source.
+        mode.feed_stdin_bytes(b"x");
+        mode.pump();
+        emitter.join().expect("emit thread");
+        assert!(mode.extension_overlays.is_empty(), "done removed it");
+        assert_eq!(mode.tui.overlay_count(), 0, "the tui dropped the overlay");
+        let written = capture.output();
+        assert!(
+            written.contains("\x1b]7501;state=idle:app=pi\x1b\\"),
+            "the blocked source cleared: {written:?}"
+        );
+        let entries = mode
+            .extension_runner
+            .as_ref()
+            .expect("runner")
+            .lock()
+            .expect("runner")
+            .core()
+            .lock()
+            .expect("core")
+            .entries
+            .clone();
+        let picked = entries
+            .iter()
+            .find(|(custom_type, _)| custom_type == "picked")
+            .map(|(_, data)| data.clone());
+        assert_eq!(
+            picked,
+            Some(serde_json::json!({ "value": "overlay-value" }))
+        );
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// Reset removes the extension overlays NEWEST-FIRST, the same way
+    /// `done()` does, but leaves the promises pending
+    /// (`resetExtensionUI`, `interactive-mode.ts:2600-2602`): no entry is
+    /// appended and no `customDone` ever crosses.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn reset_removes_overlays_newest_first_leaving_promises_pending() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (_event, ctx) => {
+    const first = ctx.ui.custom(
+      (_tui, _theme, _kb, doneA) => ({
+        render: (width) => ["FIRST " + width],
+        invalidate: () => {},
+        handleInput: (data) => {
+          if (data === "a") {
+            doneA("alpha");
+            return true;
+          }
+          return false;
+        },
+      }),
+      { overlay: true, overlayOptions: { width: 20 } },
+    );
+    const second = ctx.ui.custom(
+      (_tui, _theme, _kb, doneB) => ({
+        render: (width) => ["SECOND " + width],
+        invalidate: () => {},
+        handleInput: (data) => {
+          if (data === "b") {
+            doneB("beta");
+            return true;
+          }
+          return false;
+        },
+      }),
+      { overlay: true, overlayOptions: { width: 30 } },
+    );
+    const results = await Promise.all([first, second]);
+    pi.appendEntry("stack", { a: results[0] ?? null, b: results[1] ?? null });
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        let runner = mode.extension_runner.clone().expect("runner");
+        let emitter = std::thread::spawn(move || {
+            runner
+                .lock()
+                .expect("runner")
+                .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+                .expect("emit");
+        });
+        for _ in 0..200 {
+            mode.pump();
+            if mode.extension_overlays.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        emitter.join().expect("emit thread");
+        assert_eq!(mode.extension_overlays.len(), 2, "both overlays mounted");
+        // Reset (the /reload path): both overlays go, newest first.
+        mode.reset_extension_ui_dialogs();
+        assert!(mode.extension_overlays.is_empty(), "both removed");
+        assert_eq!(mode.tui.overlay_count(), 0);
+        // The promises stay pending: no continuation ran, so no entry.
+        let entries = mode
+            .extension_runner
+            .as_ref()
+            .expect("runner")
+            .lock()
+            .expect("runner")
+            .core()
+            .lock()
+            .expect("core")
+            .entries
+            .clone();
+        assert!(
+            !entries.iter().any(|(custom_type, _)| custom_type == "stack"),
+            "the custom promises never resolved: {entries:?}"
         );
         mode.shutdown().expect("shutdown");
     }

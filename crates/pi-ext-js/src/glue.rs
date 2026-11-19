@@ -932,12 +932,13 @@ globalThis.__piCreateUiCtx = function () {
       // wrapper mirrors the ui methods' parseValue, whose extra reaction
       // link orders the resolved continuation behind the ui_prompt_end
       // handlers like upstream's `.finally(finish)` — runner.ts:585-611).
-      // Deviations: `overlay: true` mounts inline for now (the overlay arm
-      // lands with the overlay slice); a done() before the component
-      // crosses resolves directly and without the ui_prompt pair (the pair
-      // is emitted by the runner on the crossing, which never happens);
-      // the result crosses as JSON, so non-serializable values come back
-      // undefined (upstream's in-process TUI keeps them).
+      // Deviations: a done() before the component crosses resolves
+      // directly and without the ui_prompt pair (the pair is emitted by
+      // the runner on the crossing, which never happens); the result
+      // crosses as JSON, so non-serializable values come back undefined
+      // (upstream's in-process TUI keeps them); `overlayOptions` as a
+      // function resolves ONCE here (upstream resolves per mount, and a
+      // static result is the faithful subset over JSON).
       return new Promise((resolve, reject) => {
         let closed = false;
         let requestId;
@@ -962,6 +963,22 @@ globalThis.__piCreateUiCtx = function () {
               return;
             }
             const fields = { handle };
+            // The overlay arm (`interactive-mode.ts:3089/:3139-3157`):
+            // `overlay: true` mounts on top of the existing content, the
+            // resolved static `overlayOptions` cross (falling back to the
+            // component's `width` property like `resolveOptions`'s
+            // `:3149-3151`), and `blocked` rides the request so the mode
+            // reports it for the overlay's lifetime.
+            if (options && options.overlay === true) {
+              fields.overlay = true;
+              const resolved = resolveOverlayOptions(options.overlayOptions);
+              if (resolved !== undefined) {
+                fields.overlayOptions = resolved;
+              } else if (typeof component.width === "number" && component.width > 0) {
+                fields.overlayOptions = { width: component.width };
+              }
+              if (options.blocked !== undefined) fields.blocked = options.blocked;
+            }
             requestId = globalThis.__piOps.uiRequest(JSON.stringify(Object.assign({ method: "custom" }, fields)));
             globalThis.__piUiPending.set(requestId, (payload) => {
               // The `.then` adds the reaction link that keeps the resolved
@@ -970,6 +987,12 @@ globalThis.__piCreateUiCtx = function () {
               // attaches before the handler awaits (runner.ts:585-611).
               Promise.resolve(payload && "value" in payload ? payload.value : undefined).then(resolve);
             });
+            if (options && options.overlay === true && typeof options.onHandle === "function") {
+              // `options.onHandle?.(overlayHandle)` (`interactive-mode.ts
+              // :3157`): the adapter binds the crossing id the mode mounts
+              // under, so visibility control reaches the overlay.
+              options.onHandle(makeOverlayHandle(requestId));
+            }
           })
           .catch((error) => {
             if (!closed) reject(error instanceof Error ? error : new Error(String(error)));
@@ -1499,13 +1522,93 @@ const makeThemeAdapter = () => ({
   inverse: (text) => globalThis.__piOps.themeStyle("inverse", String(text)),
   strikethrough: (text) => globalThis.__piOps.themeStyle("strikethrough", String(text)),
 });
-// The factory's tui adapter: `requestRender` only in this slice — the
-// fire-and-forget request lands on the mode's pump and turns into a
-// render tick. Upstream's TUI (`tui.ts:518+`) carries far more; the rest
-// stays unported.
+// The factory's tui adapter (E3 slices 6b/6c): `requestRender` plus the
+// overlay surface — `showOverlay(component, options?)` and the topmost
+// `hideOverlay()` (`tui.ts:518-519`, `tui.ts:792-816`/`:891-907`). A
+// showOverlay adopts the component engine-side and crosses the static
+// options; the returned handle mirrors `tui.ts:320-338`, its writes
+// fire-and-forget and its reads answer-class crossings the mode resolves
+// from its overlay registry. Deviations: the `visible` predicate cannot
+// cross JSON (static overlay options only), and `unfocus(options)` carries
+// only the "focus nothing" form of an explicit target — component targets
+// have no crossing representation.
+const resolveOverlayOptions = (options) => {
+  const resolved = typeof options === "function" ? options() : options;
+  if (resolved === undefined || resolved === null) return undefined;
+  const fields = {};
+  if (resolved.width !== undefined) fields.width = resolved.width;
+  if (resolved.minWidth !== undefined) fields.minWidth = resolved.minWidth;
+  if (resolved.maxHeight !== undefined) fields.maxHeight = resolved.maxHeight;
+  if (resolved.anchor !== undefined) fields.anchor = resolved.anchor;
+  if (resolved.offsetX !== undefined) fields.offsetX = resolved.offsetX;
+  if (resolved.offsetY !== undefined) fields.offsetY = resolved.offsetY;
+  if (resolved.row !== undefined) fields.row = resolved.row;
+  if (resolved.col !== undefined) fields.col = resolved.col;
+  if (resolved.margin !== undefined) fields.margin = resolved.margin;
+  if (resolved.nonCapturing === true) fields.nonCapturing = true;
+  return fields;
+};
+
+// One answer-class read (`tui.ts:845/:883/:884-887`): the request crosses
+// like a dialog method and the promise resolves when the mode answers —
+// the deferred map below is the same one the dialog methods use.
+const queueOverlayAnswer = (method, fields) => {
+  const id = globalThis.__piOps.uiRequest(JSON.stringify(Object.assign({ method }, fields)));
+  return new Promise((resolve) => {
+    globalThis.__piUiPending.set(id, resolve);
+  });
+};
+
+const makeOverlayHandle = (id) => ({
+  hide: () => {
+    globalThis.__piOps.uiRequest(JSON.stringify({ method: "overlayHide", id }));
+  },
+  setHidden: (hidden) => {
+    globalThis.__piOps.uiRequest(
+      JSON.stringify({ method: "overlaySetHidden", id, hidden: hidden === true }),
+    );
+  },
+  isHidden: () =>
+    queueOverlayAnswer("overlayIsHidden", { id }).then(
+      (payload) => payload !== undefined && payload.hidden === true,
+    ),
+  focus: () => {
+    globalThis.__piOps.uiRequest(JSON.stringify({ method: "overlayFocus", id }));
+  },
+  unfocus: (options) => {
+    globalThis.__piOps.uiRequest(
+      JSON.stringify({ method: "overlayUnfocus", id, explicit: options !== undefined }),
+    );
+  },
+  isFocused: () =>
+    queueOverlayAnswer("overlayIsFocused", { id }).then(
+      (payload) => payload !== undefined && payload.focused === true,
+    ),
+  getBounds: () =>
+    queueOverlayAnswer("overlayGetBounds", { id }).then(
+      (payload) => (payload && payload.bounds ? payload.bounds : undefined),
+    ),
+});
+
 const makeTuiAdapter = () => ({
   requestRender: () => {
     globalThis.__piOps.uiRequest(JSON.stringify({ method: "requestRender" }));
+  },
+  showOverlay: (component, options) => {
+    const handle = globalThis.__piComponentAdopt(component);
+    if (handle === undefined) {
+      throw new Error("showOverlay component must implement render(width) and invalidate()");
+    }
+    const fields = { handle };
+    const resolved = resolveOverlayOptions(options);
+    if (resolved !== undefined) fields.options = resolved;
+    const id = globalThis.__piOps.uiRequest(
+      JSON.stringify(Object.assign({ method: "showOverlay" }, fields)),
+    );
+    return makeOverlayHandle(id);
+  },
+  hideOverlay: () => {
+    globalThis.__piOps.uiRequest(JSON.stringify({ method: "hideTopOverlay" }));
   },
 });
 // The factory's keybindings adapter: `matches` crosses through the

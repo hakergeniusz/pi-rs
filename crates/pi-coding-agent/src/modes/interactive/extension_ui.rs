@@ -87,21 +87,27 @@ impl Default for ExtensionUiBridge {
 impl pi_ext_js::UiSink for ExtensionUiBridge {
     /// Forwards one request toward the mode; dialog methods additionally
     /// register their answer slot (mirrors `RpcUiSink::request`, minus the
-    /// wire write — the channel IS the wire).
+    /// wire write — the channel IS the wire). The answer-class overlay
+    /// crossings (E3 slice 6c) wait the same way — the mode answers from
+    /// its overlay registry like a dialog close.
     fn request(&self, request: &Value) {
         let id = request
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        // Only dialog methods can be waited on (`createDialogPromise`,
-        // rpc-mode.ts:94-145); fire-and-forget requests (`notify`,
-        // `setStatus`, …) register nothing.
-        let is_dialog = matches!(
+        // Only methods with a wait can register a slot (`createDialogPromise`,
+        // rpc-mode.ts:94-145, plus the overlay answer crossings); fire-and-
+        // forget requests (`notify`, `setStatus`, the overlay writes, …)
+        // register nothing.
+        let has_wait = matches!(
             request.get("method").and_then(Value::as_str),
-            Some("select" | "confirm" | "input" | "editor")
+            Some(
+                "select" | "confirm" | "input" | "editor"
+                    | "overlayIsHidden" | "overlayIsFocused" | "overlayGetBounds"
+            )
         );
-        if is_dialog {
+        if has_wait {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             self.pending
                 .lock()
