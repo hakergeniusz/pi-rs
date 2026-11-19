@@ -1315,17 +1315,11 @@ impl JsHost {
                 Ok(call) => call,
                 Err(_) => return false,
             };
-            let _: Value = match call.call((
-                index,
-                base_json,
-                lines_json,
-                cursor_line,
-                cursor_col,
-                force,
-            )) {
-                Ok(value) => value,
-                Err(_) => return false,
-            };
+            let _: Value =
+                match call.call((index, base_json, lines_json, cursor_line, cursor_col, force)) {
+                    Ok(value) => value,
+                    Err(_) => return false,
+                };
             true
         });
         if !called {

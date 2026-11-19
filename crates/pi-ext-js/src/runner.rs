@@ -1729,7 +1729,8 @@ impl ExtensionRunner {
         cursor_col: usize,
         force: bool,
     ) -> Option<String> {
-        self.host.wrapped_suggest(index, base_json, lines_json, cursor_line, cursor_col, force)
+        self.host
+            .wrapped_suggest(index, base_json, lines_json, cursor_line, cursor_col, force)
     }
 
     /// Runs one autocomplete wrapper's `applyCompletion`. `None` falls
@@ -1745,8 +1746,15 @@ impl ExtensionRunner {
         item_json: &str,
         prefix: &str,
     ) -> Option<String> {
-        self.host
-            .wrapped_apply(index, base_json, lines_json, cursor_line, cursor_col, item_json, prefix)
+        self.host.wrapped_apply(
+            index,
+            base_json,
+            lines_json,
+            cursor_line,
+            cursor_col,
+            item_json,
+            prefix,
+        )
     }
 
     /// Clears the autocomplete wrapper stash (`resetExtensionUI`,
@@ -4040,7 +4048,15 @@ export default function (pi) {
         // Apply: the wrapper edits the editor text through the item
         // (synchronous upstream, `autocomplete.ts:283-295`).
         let applied = runner
-            .wrapped_apply(0, "", r#"["/cm"]"#, 0, 3, r#"{"value":"ext","label":"Ext"}"#, "/")
+            .wrapped_apply(
+                0,
+                "",
+                r#"["/cm"]"#,
+                0,
+                3,
+                r#"{"value":"ext","label":"Ext"}"#,
+                "/",
+            )
             .expect("wrapper application");
         let applied: Json = serde_json::from_str(&applied).expect("json");
         assert_eq!(applied["lines"], json!(["/cmext"]));

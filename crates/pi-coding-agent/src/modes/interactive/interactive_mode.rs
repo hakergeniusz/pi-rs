@@ -434,8 +434,14 @@ impl pi_tui::components::editor::AutocompleteProvider for JsAutocompleteProvider
             .unwrap_or_default();
         let lines_json = serde_json::to_string(lines).unwrap_or_default();
         let runner = self.runner.try_lock().ok()?;
-        let result =
-            runner.wrapped_suggest(self.index, &base_json, &lines_json, cursor_line, cursor_col, force)?;
+        let result = runner.wrapped_suggest(
+            self.index,
+            &base_json,
+            &lines_json,
+            cursor_line,
+            cursor_col,
+            force,
+        )?;
         let value: serde_json::Value = serde_json::from_str(&result).ok()?;
         let prefix = value
             .get("prefix")
@@ -7041,21 +7047,21 @@ impl InteractiveMode {
                 base: current,
             });
         }
-        let composed: Arc<dyn pi_tui::components::editor::AutocompleteProvider> = if union.is_empty()
-        {
-            current
-        } else {
-            let mut unique: Vec<char> = Vec::new();
-            for character in union {
-                if !unique.contains(&character) {
-                    unique.push(character);
+        let composed: Arc<dyn pi_tui::components::editor::AutocompleteProvider> =
+            if union.is_empty() {
+                current
+            } else {
+                let mut unique: Vec<char> = Vec::new();
+                for character in union {
+                    if !unique.contains(&character) {
+                        unique.push(character);
+                    }
                 }
-            }
-            Arc::new(ComposedAutocompleteProvider {
-                provider: current,
-                trigger_characters: unique,
-            })
-        };
+                Arc::new(ComposedAutocompleteProvider {
+                    provider: current,
+                    trigger_characters: unique,
+                })
+            };
         if let Some(editor) = self.editor_host_mut() {
             editor
                 .editor
@@ -9589,8 +9595,7 @@ impl InteractiveMode {
                 // `addAutocompleteProvider` (`:2799-2802`): the wrapper
                 // joins the chain and the composed provider re-mounts.
                 "addAutocompleteProvider" => {
-                    let index =
-                        request.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+                    let index = request.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
                     let trigger_characters: Vec<char> = request
                         .get("triggerCharacters")
                         .and_then(Value::as_array)
@@ -13086,7 +13091,11 @@ export default function (pi) {
             .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
             .expect("emit");
         mode.pump();
-        assert_eq!(mode.autocomplete_wrappers.len(), 1, "the wrapper registered");
+        assert_eq!(
+            mode.autocomplete_wrappers.len(),
+            1,
+            "the wrapper registered"
+        );
 
         // Typing `/` at the start of the message triggers the chain: the
         // wrapper's item opens the popup and the base chain's result
@@ -13115,7 +13124,10 @@ export default function (pi) {
             .expect("editor host")
             .editor
             .get_text();
-        assert_eq!(text, "/ext-item ", "the base application completed the token");
+        assert_eq!(
+            text, "/ext-item ",
+            "the base application completed the token"
+        );
 
         // The reset restores the base-only chain: re-typing `/` suggests
         // the commands again without the wrapper's item.
