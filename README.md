@@ -36,9 +36,15 @@ the overlay arm (`ctx.ui.custom {overlay:true}` and the factory's
 `tui.showOverlay` surface with the `OverlayHandle` adapter) over the
 pi-tui overlay machinery, the OSC 7501 program-status reporter
 (working/blocked/done/error/idle with dialog and overlay sources,
-terminal titles) and `ctx.ui.setStatus` footer statuses, while the rest
-of the TUI renderer bridging (E3: widgets, editor components,
-autocomplete, themes) and the MCP tool bridge are still landing. See [PLAN.md](PLAN.md) for the
+terminal titles) and `ctx.ui.setStatus` footer statuses, and the small
+`ctx.ui` surfaces — widgets above/below the editor (`setWidget` lines
+or component factories), custom footer/header factories with the live
+footer-data adapter, the working-status family (`setWorkingMessage`/
+`setWorkingVisible`/`setWorkingIndicator`/`setHiddenThinkingLabel`),
+`pasteToEditor`/`setEditorText`/`getEditorText`, tool-output expansion,
+and `onTerminalInput` — while the rest of the TUI renderer bridging
+(E3: autocomplete wrappers, editor components, themes) and the MCP
+tool bridge are still landing. See [PLAN.md](PLAN.md) for the
 phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
 
 ## What works
@@ -84,9 +90,9 @@ phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
 | `pi-schema` | `@earendil-works/pi-schema` | wire types |
 | `pi-ai` | `@earendil-works/pi-ai` | types, model catalog, provider adapters (SSE streaming) |
 | `pi-agent` | `@earendil-works/pi-agent-core` | agent loop with steering/follow-up queues, transcript, events |
-| `pi-tui` | `@earendil-works/pi-tui` | differential renderer, editor, fuzzy/autocomplete, mouse, alt screen, theme |
+| `pi-tui` | `@earendil-works/pi-tui` | differential renderer, editor, fuzzy/autocomplete, mouse, alt screen, theme, input listeners |
 | `pi-mcp` | `@earendil-works/pi-mcp` | JSON-RPC types + stdio transport client (HTTP transport + tool bridge pending) |
-| `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, UI dialogs over protocol, `user_bash`, context transforms, RPC dialog subprotocol, virtual-model routing, extension keyboard shortcuts + markdown transformers + entry/message/tool renderers and components over the handle bridge, interactive `ctx.ui.custom` + the dialog stack + overlay handles, OSC 7501 program status + `ctx.ui.setStatus`/setTitle (`tool-search` exit gate green; rest of TUI renderer bridging pending) |
+| `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, UI dialogs over protocol, `user_bash`, context transforms, RPC dialog subprotocol, virtual-model routing, extension keyboard shortcuts + markdown transformers + entry/message/tool renderers and components over the handle bridge, interactive `ctx.ui.custom` + the dialog stack + overlay handles, OSC 7501 program status + `ctx.ui.setStatus`/setTitle, the small `ctx.ui` surfaces (widgets, footer/header factories, working-status family, editor text ops, toolsExpanded, onTerminalInput) (`tool-search` exit gate green; autocomplete/editor-component/themes bridging pending) |
 | `pi-codemode` | `@earendil-works/pi-codemode` | stub |
 | `pi-coding-agent` (`pi` binary) | `@earendil-works/pi-coding-agent` | CLI, print/JSON/RPC/interactive modes, session store, tools, auth |
 

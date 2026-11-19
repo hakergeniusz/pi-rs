@@ -3089,6 +3089,113 @@ rides the custom request; handle writes queue behind it) and the
 answer-class paths (deferred without a prompt pair; in-dispatch
 defaults). Gate 1906/0.
 
+## 2026-11-19 — E3 slice 7: the small ctx.ui surfaces
+
+Serial implementation (the slice-7 subagent spawn failed twice on
+account-wide concurrency — "user concurrency limit exceeded", then
+"Start Plan is busy"; fell back per the standing pattern). Branch
+`feat/e3-slice7-ui-surfaces` off 77f3f34; commits cc73377 (pi-tui) +
+fed29eb (crossings) + 2a50175 (mode wiring) + e272816/… gate rounds.
+Ground-truth fix first: the shared clone had drifted to master (the
+extension UI lives under `core/extensions/` there) — v1.5.2 re-checked
+out into `~/tmp-11-18/pi-152`, `/tmp/pi` repointed; AT THE TAG the big
+file is `modes/interactive/interactive-mode.ts`.
+
+- **pi-tui input listeners** (`tui.ts:490-491/:516/:974-979/:1095-1108`):
+  `Tui::add_input_listener`/`remove_input_listener` (generation ids,
+  never reused); the chain runs every non-reply chunk after the
+  terminal-reply drains and the alt-screen arm — `consume` drops,
+  `data` transforms what the rest of the chain and the dispatch see, an
+  empty transform stops the dispatch. Deviation: upstream interleaves
+  extension listeners with the alt screen's by registration time; the
+  port pins the extension listeners after it (extensions register after
+  boot — upstream's order in practice).
+- **Crossings** (`createExtensionUIContext`, `interactive-mode.ts
+  :2773-2824`): `setWidget` (lines / adopted factory component /
+  removal — the key spans both placements), `setFooter`/`setHeader`
+  (adopted factories; `undefined` restores), the status family
+  (`setWorkingMessage`/`setWorkingVisible`/`setWorkingIndicator`/
+  `setHiddenThinkingLabel`), `pasteToEditor` (its own crossing now —
+  the old `setEditorText` delegation dropped the bracketed-paste wrap),
+  `setEditorText` (wire name `set_editor_text`, kept for the RPC
+  clients), `setToolsExpanded`, and `onTerminalInput` (handler stash +
+  a `terminalInputListeners` count sync + the unsubscribe closure).
+  RPC mode keeps its old shapes (factories dropped, footer/header
+  no-ops) — `custom`'s `mode() !== "tui"` guard pattern.
+- **Synchronous reads**: upstream's `getEditorText`/`getToolsExpanded`
+  and the custom footer's `ReadonlyFooterDataProvider`
+  (`footer-data-provider.ts:385-390`) return values synchronously — the
+  port serves them from `UiSnapshotSurface` (runner closures over a
+  mode-side `UiSnapshotState` the pump refreshes each frame; the same
+  shape as the theme surface). Deviation: the read is ≤1 pump frame
+  stale; `getGitBranch` maps the JSON `null` to `undefined`;
+  `onBranchChange` stashes hooks + `notify_footer_branch_change`
+  fires them, but the port has no git watcher yet (static-at-boot
+  branch) so the hooks never fire until one lands.
+- **Widgets**: the registry (`extension_widgets_above`/`_below`, keyed
+  insertion order) renders into two hosts that the flat mount (now
+  EIGHT root children — `HostSlot::WidgetAbove=4`/`WidgetBelow=6`) and
+  the fullscreen dock (`chat-viewport.ts:31-38`, dock entries shrink 1 /
+  minSize 0) both carry; the above host leads with a spacer and keeps
+  one when empty, the below host never spacers (`renderWidgets`
+  seeds it at boot, `:1004`). Lines cap at `MAX_WIDGET_LINES = 10`
+  (`:2626`) plus the muted "... (widget truncated)" line. Deviation:
+  upstream re-adds the same component objects per `renderWidgets`; the
+  port rebuilds — Text rows from the stored lines, borrowed
+  `ComponentProxy` views over the adopted handle (`owns_handle: false`
+  so the per-render rebuild never releases; the registry disposes on
+  removal like `removeExisting`'s `dispose?.()`).
+- **Footer/header swap**: `swap_slot_component` generalizes
+  `replace_editor_slot` (flat root index / dock entry); the displaced
+  built-ins keep taking the refresh writes (`footer_mut`/`header_mut`
+  resolve mounted-or-displaced — upstream's `this.footer` stays
+  reachable, `:2682`), and the restore shows current data. The custom
+  header's duck-typed `setExpanded` crosses as `component_set_expanded`
+  (the glue no-ops when the component lacks the method — `isExpandable`
+  at call time, `:2709-2711`/`:4749-4752`); `setToolsExpanded` is the
+  ctrl+o toggle refactor + the `showStatus` line upstream adds
+  (`:4760`) and an unchanged-flag early return.
+- **Status family**: `working_message`/`working_visible`/
+  `working_indicator_options`/`hidden_thinking_label` drive
+  `StatusIndicator::working_with`/`set_message`/`set_indicator` (the
+  live indicator rides the editor border decorator as before) and every
+  assistant row's label (both construction sites take the field now).
+  The spawn site gates on `workingVisible` like `turn_start`
+  (`:3553-3560`) and keeps an existing working indicator; the default
+  message is upstream's `"Working"` (`:505`) — the port's old
+  `"Working..."` string is gone.
+- **Terminal input**: the fold runs through
+  `Runner::deliver_terminal_input` (`__piTerminalInputFold` — the same
+  chain semantics as `tui.ts:1095-1108`); the input path `try_lock`s
+  the runner mutex and DEFERS the chunk to the pump when the engine is
+  busy (blocking would freeze the pump that must service a dialog — the
+  6b deadlock class). Deviations: a listener throw no longer propagates
+  (upstream lets it out of `handleTerminalInput`); the listeners see the
+  port's DECODED sequences and the re-wrapped paste chunk (upstream
+  listeners see raw stdin bytes).
+- **Reset** (`resetExtensionUI`, `:2603-2622`): the listeners clear
+  (engine stash + flag + deferred), the footer/header restore, the
+  widgets clear, the working state resets (message with the interrupt
+  hint via `key_text("app.interrupt")`), and the hidden-thinking label
+  returns to `"Thinking..."`.
+
+Tests: pi-tui 5 (transform-before-dispatch, consume, empty transform,
+terminal replies never reach the listeners, unsubscribe);
+pi-ext-js 4 (the one-way crossings in call order with `undefined`
+resets, the widget factory adoption, the footer/header factories +
+snapshot reads + sync queries, the terminal-input fold with count
+syncs); pi-coding-agent 6 (widgets above/below + removal, the
+`MAX_WIDGET_LINES` cap, the factory widget, the footer/header swap with
+displaced-writes + restore, the working-status state + tools-expanded
+no-op/status line, the terminal-input fold before the editor, the
+reset restoring the built-ins). Gate green in 4 rounds (r1: the
+`struct_excessive_bools` allow above `pub struct Tui` displaced by the
+type insertion + UiSnapshotSurface export + borrow shapes; r2:
+option_option → a `TerminalInputFold` enum + lints + two real test
+truths — the dock's editor entry moved to index 3 and the
+`defaultWorkingMessage` string; r3: fold-arm merge + an unsubscribe
+test's bool assert). Test totals: 1922 workspace tests, 0 failed.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
