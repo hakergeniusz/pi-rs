@@ -49,6 +49,9 @@ pub mod layout;
 pub mod mouse;
 /// Oklab and OKHSL <-> sRGB conversion for theme math.
 pub mod oklab;
+/// Program Status Protocol (OSC 7501): encode, query, and reply detection
+/// (port of `program-status.ts`).
+pub mod program_status;
 /// stdin reassembly: complete sequences from chunked input, bracketed pastes.
 pub mod stdin_buffer;
 /// The `system` theme: pi colors derived from the terminal's own theme.

@@ -447,6 +447,15 @@ pub struct Tui {
     pub(crate) alt_root: Option<usize>,
     /// The primary scroll view of the last alt-screen layout pass.
     alt_primary_scroll_view: Option<ComponentId>,
+    /// Latest program status (OSC 7501), kept across [`Self::stop`] so
+    /// [`Self::start_with`] can report it again. `terminal.ts:179`.
+    program_status: Option<crate::program_status::ProgramStatus>,
+    /// Whether the terminal confirmed OSC 7501 support since the last
+    /// [`Self::stop`], or `PI_PROGRAM_STATUS=1`. `terminal.ts:181`.
+    program_status_supported: bool,
+    /// The support query was sent and no reply has arrived yet.
+    /// `terminal.ts:183`.
+    program_status_query_pending: bool,
 }
 
 /// Options for starting. `tui-alt-screen.ts:270-278`.
@@ -587,6 +596,9 @@ impl Tui {
             alt_screen: None,
             alt_root: None,
             alt_primary_scroll_view: None,
+            program_status: None,
+            program_status_supported: false,
+            program_status_query_pending: false,
         }
     }
 
@@ -814,6 +826,7 @@ impl Tui {
         // cursor is hidden. It is one `CSI 16 t`, and `query_cell_size`
         // swallows it when the terminal draws no images.
         self.query_cell_size()?;
+        self.query_program_status()?;
         self.request_render();
         Ok(())
     }
@@ -833,6 +846,18 @@ impl Tui {
     /// `tui.ts:970-980`.
     pub fn stop(&mut self, options: TuiStopOptions) -> io::Result<()> {
         self.stopped = true;
+        // Remove the status while stopped, for example after exit or while
+        // suspended; a later `start_with` reports it again (`terminal.ts:486-490`).
+        if self.program_status_supported && self.program_status.is_some() {
+            let _ = self.terminal.write(&crate::program_status::format_program_status(
+                &crate::program_status::ProgramStatus {
+                    state: crate::program_status::ProgramStatusState::Clear,
+                    ..crate::program_status::ProgramStatus::default()
+                },
+            ));
+        }
+        self.program_status_supported = false;
+        self.program_status_query_pending = false;
         // `tui.ts:973-975`: the mode is dropped first, before the trailing
         // newline `beforeTerminalStop` writes.
         if self.color_scheme_notifications {
@@ -1616,9 +1641,100 @@ impl Tui {
     }
 
     /// The last rendered bounds of a visible overlay. `tui.ts:310-312`.
+    ///
+    /// Upstream's handle `getBounds` (`tui.ts:884-887`) additionally returns
+    /// `undefined` when the overlay is gone or currently hidden/size-excluded;
+    /// the visibility gate here matches it for the handle surface.
     pub fn overlay_bounds(&self, id: OverlayId) -> Option<OverlayBounds> {
         let index = self.find_overlay(id)?;
+        if !self.is_overlay_visible(&self.overlays[index]) {
+            return None;
+        }
         self.overlays[index].bounds
+    }
+
+    /// The handle's `isHidden` (`tui.ts:845`): whether the overlay is
+    /// temporarily hidden. `None` when the id is stale (the overlay is gone).
+    pub fn overlay_is_hidden(&self, id: OverlayId) -> Option<bool> {
+        let index = self.find_overlay(id)?;
+        Some(self.overlays[index].hidden)
+    }
+
+    /// The handle's `isFocused` (`tui.ts:883`): whether this overlay
+    /// currently holds focus. Ids are generation based, so a stale overlay
+    /// never reports a newer one's focus.
+    pub fn overlay_is_focused(&self, id: OverlayId) -> bool {
+        matches!(
+            self.focused,
+            Some(FocusTarget::Overlay(focused)) if focused.generation == id.generation
+        )
+    }
+
+    /// The handle's `unfocus` (`tui.ts:852-879`): release focus to the next
+    /// visible capturing overlay or the overlay's pre-focus, or to an explicit
+    /// target when provided.
+    ///
+    /// `target` mirrors the optional `unfocusOptions` argument: `None` is no
+    /// argument (auto fallback), `Some(target)` is `{ target }` where the inner
+    /// `Option` is upstream's `Component | null`.
+    pub fn overlay_unfocus(&mut self, id: OverlayId, target: Option<Option<FocusTarget>>) {
+        let Some(index) = self.find_overlay(id) else {
+            return;
+        };
+        let entry_id = self.overlays[index].id();
+        let pre_focus = self.overlays[index].pre_focus;
+        let is_focused = self.overlay_is_focused(id);
+        // `hasPendingRestore` (`tui.ts:854-856`): the focus-restore state
+        // names this overlay and is still active.
+        let pending_restore = match self.overlay_focus_restore {
+            OverlayFocusRestoreState::Eligible { overlay } | OverlayFocusRestoreState::Blocked { overlay, .. }
+                if overlay.generation == id.generation =>
+            {
+                Some(overlay)
+            }
+            _ => None,
+        };
+        if !is_focused && pending_restore.is_none() {
+            return;
+        }
+        // The blocked arm (`tui.ts:857-874`): focus sits on the component that
+        // stole it, so unfocus either retargets the resume or drops the state.
+        if let OverlayFocusRestoreState::Blocked {
+            overlay,
+            blocked_by,
+            ..
+        } = self.overlay_focus_restore
+            && overlay.generation == id.generation
+            && self.focused_id == Some(blocked_by)
+        {
+            match target {
+                Some(explicit) => {
+                    self.overlay_focus_restore = OverlayFocusRestoreState::Blocked {
+                        overlay: entry_id,
+                        blocked_by,
+                        resume: OverlayFocusResume::FocusTarget(explicit),
+                    };
+                }
+                None => self.clear_overlay_focus_restore(),
+            }
+            self.request_render();
+            return;
+        }
+        self.clear_overlay_focus_restore_for(entry_id);
+        if is_focused || target.is_some() {
+            // `fallbackTarget` (`tui.ts:877-879`): the topmost visible overlay
+            // other than this one, else this overlay's pre-focus.
+            let top_visible = self
+                .topmost_visible_overlay()
+                .map(|top_index| self.overlays[top_index].id())
+                .filter(|top_id| top_id.generation != id.generation);
+            let focus_target = match target {
+                Some(explicit) => explicit,
+                None => top_visible.map(FocusTarget::Overlay).or(pre_focus),
+            };
+            self.set_focus(focus_target);
+        }
+        self.request_render();
     }
 
     // ------------------------------------------------- terminal queries (A.4)
@@ -1661,6 +1777,9 @@ impl Tui {
     /// Returns true when the reply belonged to a terminal query and must not
     /// reach the keyboard handler.
     pub fn consume_terminal_response(&mut self, data: &str) -> bool {
+        if self.consume_program_status_reply(data) {
+            return true;
+        }
         if self.consume_cell_size_response(data) {
             return true;
         }
@@ -1980,6 +2099,95 @@ impl Tui {
         self.terminal.write(crate::terminal_colors::CELL_SIZE_QUERY)
     }
 
+    /// The OSC 7501 negotiation at terminal setup (`queryAndEnableKittyProtocol`'s
+    /// program-status arm, `terminal.ts:308-313`, called from `start()`:295-306):
+    /// `PI_PROGRAM_STATUS=1` forces support on and skips the query, `0` skips
+    /// the query and keeps support off, and the unset default sends the query
+    /// whose reply (`Tui::consume_program_status_reply`) turns support on.
+    /// The stored status re-reports once support is known (`terminal.ts:313`).
+    ///
+    /// Deviation: upstream parses the reply inside `ProcessTerminal`'s stdin
+    /// buffer (`terminal.ts:252-260`); the port's stdin path routes every
+    /// sequence through [`Self::handle_input`], so the flag and the query live
+    /// on the `Tui` and the negotiation rides [`Self::start_with`]'s setup
+    /// phase — the same place the mode-2031/cell-size queries go out. The
+    /// upstream DA1 sentinel that clears a pending query for non-supporting
+    /// terminals has no counterpart here (the port sends no kitty/DA query
+    /// block), so the pending flag simply waits for a reply or the next
+    /// [`Self::stop`].
+    fn query_program_status(&mut self) -> io::Result<()> {
+        let override_value = std::env::var("PI_PROGRAM_STATUS").ok();
+        self.program_status_supported = override_value.as_deref() == Some("1");
+        self.program_status_query_pending =
+            !matches!(override_value.as_deref(), Some("1") | Some("0"));
+        if self.program_status_query_pending {
+            self.terminal
+                .write(crate::program_status::PROGRAM_STATUS_QUERY)?;
+        }
+        self.write_program_status();
+        Ok(())
+    }
+
+    /// `setTitle`, `terminal.ts:600-604`: OSC `0;title` BEL. A BEL or ESC in
+    /// the title would end the sequence early and send the rest to the
+    /// terminal as escape sequences (session names come from session files),
+    /// so control characters are replaced.
+    pub fn set_title(&mut self, title: &str) {
+        let _ = self.terminal.write(&format!(
+            "\x1b]0;{}\x07",
+            crate::program_status::replace_control_characters(title)
+        ));
+    }
+
+    /// `setProgramStatus`, `terminal.ts:606-610`: store the status unless it
+    /// clears it, and write it only to a terminal that confirmed support.
+    pub fn set_program_status(&mut self, status: crate::program_status::ProgramStatus) {
+        self.program_status = if status.state == crate::program_status::ProgramStatusState::Clear {
+            None
+        } else {
+            Some(status.clone())
+        };
+        if self.program_status_supported {
+            let _ = self
+                .terminal
+                .write(&crate::program_status::format_program_status(&status));
+        }
+    }
+
+    /// `writeProgramStatus`, `terminal.ts:611-615`: re-report the stored
+    /// status when support is confirmed or the terminal restarts.
+    fn write_program_status(&mut self) {
+        if self.program_status_supported
+            && let Some(status) = &self.program_status
+        {
+            let _ = self
+                .terminal
+                .write(&crate::program_status::format_program_status(status));
+        }
+    }
+
+    /// `terminal.ts:252-260`: an OSC 7501 reply confirms support (once per
+    /// negotiation) and re-reports the stored status; the reply never reaches
+    /// the input dispatch. Returns whether the sequence was one.
+    fn consume_program_status_reply(&mut self, data: &str) -> bool {
+        if !crate::program_status::is_program_status_reply(data) {
+            return false;
+        }
+        if self.program_status_query_pending {
+            self.program_status_query_pending = false;
+            self.program_status_supported = true;
+            self.write_program_status();
+        }
+        true
+    }
+
+    /// Whether the terminal answered [`crate::program_status::PROGRAM_STATUS_QUERY`]
+    /// (or `PI_PROGRAM_STATUS=1` set it). Tests and hosts read it; writers
+    /// gate through [`Self::set_program_status`].
+    pub fn program_status_supported(&self) -> bool {
+        self.program_status_supported
+    }
+
     /// `tui.ts:527` (`hasOverlayEntries`).
     pub fn has_overlays(&self) -> bool {
         !self.overlays.is_empty()
@@ -2050,8 +2258,12 @@ impl Tui {
         }
         // `handleTerminalInput`, `tui.ts:1045-1050`: the colour-query replies
         // are drained before the input listeners, and the cell-size reply
-        // after them (`:1067-1070`).
-        if self.consume_color_scheme_report(data) || self.consume_terminal_color_response(data) {
+        // after them (`:1067-1070`). The OSC 7501 reply goes first —
+        // `terminal.ts:252-260` parses it before any keyboard dispatch.
+        if self.consume_program_status_reply(data)
+            || self.consume_color_scheme_report(data)
+            || self.consume_terminal_color_response(data)
+        {
             return true;
         }
         // pi's input listeners run before the focused component
@@ -3671,5 +3883,157 @@ mod tests {
         // Delivery follows: the identity target resolves through the same
         // walk.
         assert!(tui.handle_input("y"));
+    }
+
+    // ---------------------------------------------------- program status (OSC 7501)
+
+    /// `terminal.ts:308-313`: the query goes out at setup and stays pending;
+    /// `terminal.ts:252-260`: the reply flips support on and re-reports.
+    #[test]
+    fn program_status_reply_confirms_support_and_reports() {
+        let (mut tui, capture) = tui(&["base"], (20, 6));
+        capture.clear();
+        // Without support nothing is written.
+        tui.set_program_status(crate::program_status::ProgramStatus {
+            state: crate::program_status::ProgramStatusState::Working,
+            app: Some("pi".to_string()),
+            ..crate::program_status::ProgramStatus::default()
+        });
+        assert_eq!(capture.output(), "");
+        // The reply (as a terminal would answer the setup query) turns it on
+        // through the input path, and the stored status re-reports at once.
+        assert!(
+            tui.handle_input("\x1b]7501;?\x1b\\"),
+            "the reply is consumed"
+        );
+        assert!(tui.program_status_supported());
+        let written = capture.output();
+        assert!(written.contains("\x1b]7501;state=working:app=pi\x1b\\"), "{written}");
+        // A later status writes immediately.
+        capture.clear();
+        tui.set_program_status(crate::program_status::ProgramStatus {
+            state: crate::program_status::ProgramStatusState::Done,
+            app: Some("pi".to_string()),
+            ..crate::program_status::ProgramStatus::default()
+        });
+        assert!(capture.output().contains("\x1b]7501;state=done:app=pi\x1b\\"));
+    }
+
+    /// `terminal.ts:486-490`: stopping removes the status and forgets support,
+    /// so a restart re-queries.
+    #[test]
+    fn stop_clears_the_program_status() {
+        let (mut tui, capture) = tui(&["base"], (20, 6));
+        tui.handle_input("\x1b]7501;?\x07");
+        tui.set_program_status(crate::program_status::ProgramStatus {
+            state: crate::program_status::ProgramStatusState::Working,
+            ..crate::program_status::ProgramStatus::default()
+        });
+        capture.clear();
+        tui.stop(TuiStopOptions::default()).unwrap();
+        assert!(capture.output().contains("\x1b]7501;state=clear\x1b\\"));
+        assert!(!tui.program_status_supported());
+    }
+
+    /// The OSC 7501 reply is consumed by the poll path too, and a non-reply
+    /// falls through.
+    #[test]
+    fn poll_path_consumes_the_program_status_reply() {
+        let (mut tui, _capture) = tui(&["base"], (20, 6));
+        assert!(tui.consume_terminal_response("\x1b]7501;?\x1b\\"));
+        assert!(tui.program_status_supported());
+        assert!(!tui.consume_terminal_response("\x1b]11;rgb:0000/0000/0000\x1b\\"));
+    }
+
+    /// `terminal.ts:600-604`: the title writes as OSC 0 BEL with control
+    /// characters replaced.
+    #[test]
+    fn set_title_writes_osc_0_with_control_characters_replaced() {
+        let (mut tui, capture) = tui(&["base"], (20, 6));
+        capture.clear();
+        tui.set_title("π - name - proj");
+        assert_eq!(capture.output(), "\x1b]0;π - name - proj\x07");
+        capture.clear();
+        tui.set_title("evil\x1b]0;x\x07title");
+        assert_eq!(capture.output(), "\x1b]0;evil ]0;x title\x07");
+    }
+
+    // ------------------------------------------------- overlay handle surface
+
+    /// `tui.ts:845/:883/:884`: `isHidden`, `isFocused`, and the visibility
+    /// gate on `getBounds`.
+    #[test]
+    fn overlay_handle_accessors_read_hidden_focus_and_bounds() {
+        let (mut tui, _capture) = tui(&["base"], (20, 6));
+        let id = tui.show_overlay(
+            Box::new(Static(&["OV"])),
+            Some(OverlayOptions {
+                width: Some(SizeValue::Cells(4)),
+                ..OverlayOptions::default()
+            }),
+        );
+        tui.render_now(false);
+        assert_eq!(tui.overlay_is_hidden(id), Some(false));
+        assert!(tui.overlay_is_focused(id), "a capturing overlay took focus");
+        assert!(tui.overlay_bounds(id).is_some(), "bounds recorded");
+        tui.set_overlay_hidden(id, true);
+        assert_eq!(tui.overlay_is_hidden(id), Some(true));
+        assert!(!tui.overlay_is_focused(id), "hiding released focus");
+        assert!(tui.overlay_bounds(id).is_none(), "hidden: no bounds");
+        tui.hide_overlay(id);
+        assert_eq!(tui.overlay_is_hidden(id), None, "stale id");
+        assert!(!tui.overlay_is_focused(id));
+    }
+
+    /// `tui.ts:852-881`: unfocus on a focused overlay falls to the topmost
+    /// other visible overlay, or the pre-focus; with an explicit target it
+    /// focuses exactly that (or nothing).
+    #[test]
+    fn overlay_unfocus_restores_the_fallback_chain() {
+        let (mut tui, _capture) = tui(&["base"], (20, 6));
+        tui.set_focus(Some(FocusTarget::Root(0)));
+        let first = tui.show_overlay(Box::new(Static(&["ONE"])), None);
+        let second = tui.show_overlay(Box::new(Static(&["TWO"])), None);
+        assert!(
+            tui.overlay_is_focused(second),
+            "the topmost overlay holds focus"
+        );
+        // Auto unfocus of the top falls to the topmost OTHER overlay.
+        tui.overlay_unfocus(second, None);
+        assert!(tui.overlay_is_focused(first));
+        assert!(!tui.overlay_is_focused(second));
+        // Explicit null target: focus nothing.
+        tui.overlay_unfocus(first, Some(None));
+        assert_eq!(tui.focused_target(), None);
+        // Unfocus on a non-focused overlay without a pending restore is a
+        // no-op (`tui.ts:856`).
+        let third = tui.show_overlay(Box::new(Static(&["THREE"])), None);
+        tui.overlay_unfocus(first, None);
+        assert!(tui.overlay_is_focused(third), "unmoved");
+    }
+
+    /// `tui.ts:857-874`: while a restore is blocked on this overlay, unfocus
+    /// with an explicit target re-arms the resume; without one it clears.
+    #[test]
+    fn overlay_unfocus_retargets_a_blocked_restore() {
+        let (mut tui, _capture) = tui(&["base"], (20, 6));
+        tui.set_focus(Some(FocusTarget::Root(0)));
+        let overlay = tui.show_overlay(Box::new(Static(&["OV"])), None);
+        assert_eq!(tui.focused_target(), Some(FocusTarget::Overlay(overlay)));
+        // Focus a root child: the overlay's restore is now blocked by it.
+        tui.set_focus(Some(FocusTarget::Root(0)));
+        assert!(matches!(
+            tui.overlay_focus_restore_state(),
+            OverlayFocusRestoreState::Blocked { .. }
+        ));
+        // Unfocus with an explicit target: the resume retargets to it.
+        tui.overlay_unfocus(overlay, Some(None));
+        assert!(matches!(
+            tui.overlay_focus_restore_state(),
+            OverlayFocusRestoreState::Blocked {
+                resume: OverlayFocusResume::FocusTarget(None),
+                ..
+            }
+        ));
     }
 }
