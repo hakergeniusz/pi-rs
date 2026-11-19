@@ -283,6 +283,19 @@ pub struct ResolvedMarkdownTransformer {
 /// ([`Self::set_theme_surface`]): token name + text in, styled text out.
 pub type ThemeSurfaceFn = std::sync::Arc<dyn Fn(&str, &str) -> String + Send + Sync>;
 
+/// The embedder-installed mode-state reads the synchronous ui queries
+/// serve ([`Self::set_ui_snapshot_surface`], E3 slice 7): one JSON footer
+/// snapshot `{gitBranch, extensionStatuses, availableProviderCount}`, the
+/// editor's expanded text, and the tool-expansion flag.
+pub struct UiSnapshotSurface {
+    /// `footerData` op — the custom footer factory's data adapter reads.
+    pub footer_data: std::sync::Arc<dyn Fn() -> Json + Send + Sync>,
+    /// `editorText` op — `ctx.ui.getEditorText()`.
+    pub editor_text: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
+    /// `toolsExpanded` op — `ctx.ui.getToolsExpanded()`.
+    pub tools_expanded: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
 /// One `ToolRenderers` slot after resolution (`types.ts:693`): the
 /// built-in rendering stays Rust-side (`builtin`), a resolver-supplied fn
 /// is bridged through the stash (`custom`), and `absent` renders the row's
@@ -1655,6 +1668,45 @@ impl ExtensionRunner {
     pub fn set_style_surface(&mut self, style: ThemeSurfaceFn) {
         let mut core = self.core.lock().expect("host core mutex poisoned");
         core.actions.theme_style = Box::new(move |method, text| style(method, text));
+    }
+
+    /// Installs the mode-state snapshot the synchronous ui reads serve (E3
+    /// slice 7): the `footerData`/`editorText`/`toolsExpanded` ops call
+    /// these closures, so `ctx.ui.getEditorText()`/`getToolsExpanded()` and
+    /// the custom footer's data adapter read the mode's live state without
+    /// a blocking round-trip. The mode refreshes the shared snapshots each
+    /// pump frame; without this the defaults read null/""/false (the
+    /// headless matrix).
+    pub fn set_ui_snapshot_surface(&mut self, snapshot: UiSnapshotSurface) {
+        let mut core = self.core.lock().expect("host core mutex poisoned");
+        core.actions.ui_snapshot.footer_data = Box::new(move || (snapshot.footer_data)());
+        core.actions.ui_snapshot.editor_text = Box::new(move || (snapshot.editor_text)());
+        core.actions.ui_snapshot.tools_expanded = Box::new(move || (snapshot.tools_expanded)());
+    }
+
+    /// Folds one terminal input chunk through the extension-registered
+    /// listeners (`__piTerminalInputFold`; the `inputListeners` chain,
+    /// `tui.ts:1095-1108`). `None` means the chunk is dropped. The mode
+    /// calls this from its input path — with a `try_lock` on the runner
+    /// mutex, deferring instead of blocking: an engine busy settling a
+    /// dialog holds the mutex, and blocking the input thread here would
+    /// freeze the pump that must service that dialog (the 6b deadlock
+    /// class).
+    pub fn deliver_terminal_input(&self, data: &str) -> Result<Option<String>, JsHostError> {
+        Ok(self.host.terminal_input_fold(data))
+    }
+
+    /// Clears the extension-registered terminal input listeners
+    /// (`resetExtensionUI`'s `clearExtensionTerminalInputListeners`,
+    /// `interactive-mode.ts:2750-2753`).
+    pub fn clear_terminal_input_handlers(&self) -> Result<(), JsHostError> {
+        self.host.clear_terminal_input_handlers()
+    }
+
+    /// Fires the custom footer's `onBranchChange` callbacks — the mode
+    /// calls it when the git branch it shows flips. Fire-and-forget.
+    pub fn notify_footer_branch_change(&self, branch: &str) -> Result<(), JsHostError> {
+        self.host.notify_footer_branch_change(branch)
     }
 
     /// Binds the UI surface (`setUIContext`, `runner.ts:570-575`):
@@ -3648,6 +3700,232 @@ export default function (pi) {
                 json!({ "type": "picked", "data": "overlay-value" }),
                 json!({ "type": "handles", "data": "1" }),
             ]
+        );
+    }
+
+    // ------------------------------------------------- small ctx.ui surfaces (E3 slice 7)
+
+    /// The one-way status/widget/editor-text crossings queue in call order
+    /// with the shapes the mode's pump arms read (`createExtensionUIContext`,
+    /// `interactive-mode.ts:2773-2824`); `undefined` resets ride as absent
+    /// fields.
+    #[test]
+    fn ui_small_surfaces_cross_in_call_order() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    ctx.ui.setWorkingMessage("Compacting");
+    ctx.ui.setWorkingMessage(undefined);
+    ctx.ui.setWorkingVisible(false);
+    ctx.ui.setWorkingIndicator({ frames: ["|", "/"], intervalMs: 120 });
+    ctx.ui.setWorkingIndicator(undefined);
+    ctx.ui.setHiddenThinkingLabel("hidden");
+    ctx.ui.setHiddenThinkingLabel(undefined);
+    ctx.ui.setWidget("alpha", ["one", "two"], { placement: "belowEditor" });
+    ctx.ui.setWidget("alpha", undefined);
+    ctx.ui.setToolsExpanded(true);
+    ctx.ui.pasteToEditor("pasted");
+    ctx.ui.setEditorText("draft");
+  });
+}
+"#;
+        let mut runner = runner_with(&[EXT]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "tui");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 12, "{requests:?}");
+        assert_eq!(requests[0]["method"], "setWorkingMessage");
+        assert_eq!(requests[0]["message"], "Compacting");
+        assert_eq!(requests[1]["method"], "setWorkingMessage");
+        assert!(requests[1].get("message").is_none(), "undefined resets");
+        assert_eq!(requests[2]["method"], "setWorkingVisible");
+        assert_eq!(requests[2]["visible"], false);
+        assert_eq!(requests[3]["method"], "setWorkingIndicator");
+        assert_eq!(
+            requests[3]["indicator"],
+            json!({ "frames": ["|", "/"], "intervalMs": 120 })
+        );
+        assert_eq!(requests[4]["method"], "setWorkingIndicator");
+        assert!(requests[4].get("indicator").is_none());
+        assert_eq!(requests[5]["method"], "setHiddenThinkingLabel");
+        assert_eq!(requests[5]["label"], "hidden");
+        assert_eq!(requests[6]["method"], "setHiddenThinkingLabel");
+        assert!(requests[6].get("label").is_none());
+        assert_eq!(requests[7]["method"], "setWidget");
+        assert_eq!(requests[7]["widgetKey"], "alpha");
+        assert_eq!(requests[7]["widgetLines"], json!(["one", "two"]));
+        assert_eq!(requests[7]["widgetPlacement"], "belowEditor");
+        assert_eq!(requests[8]["method"], "setWidget");
+        assert!(requests[8].get("widgetLines").is_none(), "undefined removes");
+        assert_eq!(requests[9]["method"], "setToolsExpanded");
+        assert_eq!(requests[9]["expanded"], true);
+        assert_eq!(requests[10]["method"], "pasteToEditor");
+        assert_eq!(requests[10]["text"], "pasted");
+        assert_eq!(requests[11]["method"], "set_editor_text");
+        assert_eq!(requests[11]["text"], "draft");
+    }
+
+    /// `setWidget`'s factory arm (`interactive-mode.ts:2570-2573`): the
+    /// factory runs at set time with the factory adapters, its component
+    /// is adopted, and the handle crosses for the mode's widget registry.
+    #[test]
+    fn ui_set_widget_factory_adopts_a_component() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    ctx.ui.setWidget("clock", (_tui, _theme) => ({
+      render: (width) => ["WIDGET " + String(width)],
+      invalidate: () => {},
+    }));
+  });
+}
+"#;
+        let mut runner = runner_with(&[EXT]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "tui");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0]["method"], "setWidget");
+        assert_eq!(requests[0]["widgetKey"], "clock");
+        assert!(requests[0].get("widgetLines").is_none());
+        let handle = requests[0]["widgetHandle"].as_u64().expect("adopted") as u32;
+        assert_eq!(
+            runner.component_render(handle, 20).expect("render"),
+            ["WIDGET 20"]
+        );
+    }
+
+    /// `setFooter`/`setHeader` (`interactive-mode.ts:2664-2730`): the
+    /// factories run at set time, the footer's data adapter reads the
+    /// snapshot surface synchronously, the synchronous ui queries answer
+    /// from it too, and `undefined` restores the built-ins (no handle
+    /// crosses).
+    #[test]
+    fn ui_footer_and_header_factories_adopt_and_read_the_snapshot() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    ctx.ui.setFooter((_tui, _theme, footerData) => ({
+      render: (_width) => [
+        "FOOTER " + String(footerData.getGitBranch()) + "/" + String(footerData.getAvailableProviderCount()),
+      ],
+      invalidate: () => {},
+    }));
+    ctx.ui.setHeader((_tui, _theme) => ({
+      render: (_width) => ["HEADER"],
+      invalidate: () => {},
+    }));
+    ctx.ui.setFooter(undefined);
+    ctx.ui.setHeader(undefined);
+    pi.appendEntry("editor", ctx.ui.getEditorText());
+    pi.appendEntry("expanded", String(ctx.ui.getToolsExpanded()));
+  });
+}
+"#;
+        let mut runner = runner_with(&[EXT]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "tui");
+        runner.set_ui_snapshot_surface(UiSnapshotSurface {
+            footer_data: std::sync::Arc::new(|| {
+                json!({
+                    "gitBranch": "main",
+                    "extensionStatuses": {},
+                    "availableProviderCount": 3
+                })
+            }),
+            editor_text: std::sync::Arc::new(|| "draft text".to_string()),
+            tools_expanded: std::sync::Arc::new(|| true),
+        });
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 4, "{requests:?}");
+        assert_eq!(requests[0]["method"], "setFooter");
+        let handle = requests[0]["handle"].as_u64().expect("adopted") as u32;
+        assert_eq!(
+            runner.component_render(handle, 20).expect("render"),
+            ["FOOTER main/3"]
+        );
+        assert_eq!(requests[1]["method"], "setHeader");
+        assert!(requests[1]["handle"].is_u64());
+        assert_eq!(requests[2]["method"], "setFooter");
+        assert!(requests[2].get("handle").is_none(), "restore is bare");
+        assert_eq!(requests[3]["method"], "setHeader");
+        assert!(requests[3].get("handle").is_none());
+        assert_eq!(
+            entries_of(&runner),
+            vec![
+                json!({ "type": "editor", "data": "draft text" }),
+                json!({ "type": "expanded", "data": "true" }),
+            ]
+        );
+    }
+
+    /// `onTerminalInput` (`interactive-mode.ts:2732-2741` + the fold,
+    /// `tui.ts:1095-1108`): handlers register in order, the count syncs to
+    /// the mode, the fold chains transforms and consume, the unsubscribe
+    /// drops one handler, and the reset clears the rest.
+    #[test]
+    fn ui_terminal_input_folds_through_registered_handlers() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    globalThis.__unsub = [
+      ctx.ui.onTerminalInput((data) => (data === "a" ? { data: "b" } : undefined)),
+      ctx.ui.onTerminalInput((data) => (data === "b" ? { consume: true } : undefined)),
+    ];
+  });
+  pi.on("session_shutdown", async () => {
+    const unsubscribe = globalThis.__unsub.pop();
+    if (unsubscribe) unsubscribe();
+  });
+}
+"#;
+        let mut runner = runner_with(&[EXT]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "tui");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert_eq!(requests[0]["method"], "terminalInputListeners");
+        assert_eq!(requests[0]["count"], 1);
+        assert_eq!(requests[1]["count"], 2);
+
+        // The fold chains the transform into the consumer.
+        assert_eq!(
+            runner.deliver_terminal_input("a").expect("fold"),
+            None,
+            "the transform fed the consumer, which consumed"
+        );
+        assert_eq!(
+            runner.deliver_terminal_input("x").expect("fold"),
+            Some("x".to_string()),
+            "both listeners pass it through"
+        );
+
+        // The unsubscribe drops the consumer; the transform survives.
+        runner
+            .emit(&json!({ "type": "session_shutdown" }))
+            .expect("emit");
+        assert_eq!(
+            runner.deliver_terminal_input("a").expect("fold"),
+            Some("b".to_string())
+        );
+
+        // The reset clears what is left.
+        runner.clear_terminal_input_handlers().expect("clear");
+        assert_eq!(
+            runner.deliver_terminal_input("a").expect("fold"),
+            Some("a".to_string())
         );
     }
 

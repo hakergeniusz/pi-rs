@@ -1005,9 +1005,26 @@ globalThis.__piCreateUiCtx = function () {
       if (notifyType !== undefined) fields.notifyType = notifyType;
       queue("notify", fields, false);
     },
-    onTerminalInput: () => {
+    onTerminalInput: (handler) => {
       assertActive();
-      return () => {};
+      // `addExtensionTerminalInputListener` (`interactive-mode.ts:2732`):
+      // the handler joins the fold chain, the count syncs to the mode, and
+      // the return unsubscribes.
+      globalThis.__piTerminalInputHandlers.push(handler);
+      queue(
+        "terminalInputListeners",
+        { count: globalThis.__piTerminalInputHandlers.length },
+        false,
+      );
+      return () => {
+        const index = globalThis.__piTerminalInputHandlers.indexOf(handler);
+        if (index !== -1) globalThis.__piTerminalInputHandlers.splice(index, 1);
+        queue(
+          "terminalInputListeners",
+          { count: globalThis.__piTerminalInputHandlers.length },
+          false,
+        );
+      };
     },
     setStatus: (statusKey, statusText) => {
       assertActive();
@@ -1015,32 +1032,109 @@ globalThis.__piCreateUiCtx = function () {
       if (statusText !== undefined) fields.statusText = statusText;
       queue("setStatus", fields, false);
     },
-    setWorkingMessage: () => {
+    setWorkingMessage: (message) => {
       assertActive();
+      // `undefined` resets to the default (`interactive-mode.ts:2781-2786`).
+      const fields = {};
+      if (message !== undefined) fields.message = message;
+      queue("setWorkingMessage", fields, false);
     },
-    setWorkingVisible: () => {
+    setWorkingVisible: (visible) => {
       assertActive();
+      queue("setWorkingVisible", { visible: visible === true }, false);
     },
-    setWorkingIndicator: () => {
+    setWorkingIndicator: (options) => {
       assertActive();
+      // `WorkingIndicatorOptions` (`types.ts:136-141`): frames cross as
+      // strings, `intervalMs` as a number; `undefined` clears the override.
+      const fields = {};
+      if (options !== undefined) {
+        const indicator = {};
+        if (options.frames !== undefined) {
+          indicator.frames = options.frames.map((frame) => String(frame));
+        }
+        if (options.intervalMs !== undefined) indicator.intervalMs = options.intervalMs;
+        fields.indicator = indicator;
+      }
+      queue("setWorkingIndicator", fields, false);
     },
-    setHiddenThinkingLabel: () => {
+    setHiddenThinkingLabel: (label) => {
       assertActive();
+      // `undefined` resets to the default (`interactive-mode.ts:2522-2524`).
+      const fields = {};
+      if (label !== undefined) fields.label = label;
+      queue("setHiddenThinkingLabel", fields, false);
     },
-    setWidget: (widgetKey, widgetLines, options) => {
+    setWidget: (widgetKey, content, options) => {
       assertActive();
-      // Component factories are not supported in RPC mode.
-      if (widgetLines === undefined || Array.isArray(widgetLines)) {
-        const fields = { widgetKey, widgetLines };
-        if (options && options.placement !== undefined) fields.widgetPlacement = options.placement;
+      const fields = { widgetKey };
+      if (options && options.placement !== undefined) fields.widgetPlacement = options.placement;
+      if (globalThis.__piOps.mode() === "tui") {
+        // `setExtensionWidget` (`interactive-mode.ts:2538-2578`): string
+        // arrays cross as lines (the host builds the same `Container` +
+        // `Text(line, 1, 0)` stack), a factory runs at set time with the
+        // factory adapters and its component is adopted like the custom
+        // dialog's, and `undefined` removes the key from both placements.
+        if (content === undefined) {
+          // Removal: no content crosses.
+        } else if (Array.isArray(content)) {
+          fields.widgetLines = content.map((line) => String(line));
+        } else {
+          const component = content(makeTuiAdapter(), makeThemeAdapter());
+          const handle = globalThis.__piComponentAdopt(component);
+          if (handle === undefined) {
+            throw new Error("widget factory returned no component");
+          }
+          fields.widgetHandle = handle;
+        }
         queue("setWidget", fields, false);
+      } else {
+        // Component factories are not supported in RPC mode.
+        if (content === undefined || Array.isArray(content)) {
+          fields.widgetLines = content;
+          queue("setWidget", fields, false);
+        }
       }
     },
-    setFooter: () => {
+    setFooter: (factory) => {
       assertActive();
+      const fields = {};
+      if (globalThis.__piOps.mode() !== "tui") {
+        // RPC mode has no footer surface to swap.
+        queue("setFooter", fields, false);
+        return;
+      }
+      // `setExtensionFooter` (`interactive-mode.ts:2664-2686`): the factory
+      // gets `(tui, theme, footerData)`; `undefined` restores the built-in.
+      if (factory !== undefined) {
+        const component = factory(makeTuiAdapter(), makeThemeAdapter(), makeFooterDataAdapter());
+        const handle = globalThis.__piComponentAdopt(component);
+        if (handle === undefined) {
+          throw new Error("footer factory returned no component");
+        }
+        fields.handle = handle;
+      }
+      queue("setFooter", fields, false);
     },
-    setHeader: () => {
+    setHeader: (factory) => {
       assertActive();
+      const fields = {};
+      if (globalThis.__piOps.mode() !== "tui") {
+        // RPC mode has no header surface to swap.
+        queue("setHeader", fields, false);
+        return;
+      }
+      // `setExtensionHeader` (`interactive-mode.ts:2691-2730`): the factory
+      // gets `(tui, theme)`; `undefined` restores the built-in.
+      if (factory !== undefined) {
+        const component = factory(makeTuiAdapter(), makeThemeAdapter());
+        const handle = globalThis.__piComponentAdopt(component);
+        if (handle === undefined) {
+          throw new Error("header factory returned no component");
+        }
+        fields.handle = handle;
+      }
+      queue("setHeader", fields, false);
     },
     setTitle: (title) => {
       assertActive();
@@ -1048,7 +1142,10 @@ globalThis.__piCreateUiCtx = function () {
     },
     pasteToEditor: (text) => {
       assertActive();
-      live.setEditorText(text);
+      // `pasteToEditor` (`interactive-mode.ts:2795`): the text rides the
+      // bracketed-paste markers through the editor's handleInput — NOT
+      // setText (paste content lands as one paste block).
+      queue("pasteToEditor", { text }, false);
     },
     setEditorText: (text) => {
       assertActive();
@@ -1056,7 +1153,10 @@ globalThis.__piCreateUiCtx = function () {
     },
     getEditorText: () => {
       assertActive();
-      return "";
+      // `editor.getExpandedText?.() ?? editor.getText()`
+      // (`interactive-mode.ts:2797`): the snapshot op reads the mode's
+      // editor text synchronously.
+      return globalThis.__piOps.editorText();
     },
     addAutocompleteProvider: () => {
       assertActive();
@@ -1082,10 +1182,13 @@ globalThis.__piCreateUiCtx = function () {
     },
     getToolsExpanded: () => {
       assertActive();
-      return false;
+      // `toolOutputExpanded` (`interactive-mode.ts:2822`): the snapshot op
+      // reads the mode's flag synchronously.
+      return globalThis.__piOps.toolsExpanded() === "true";
     },
-    setToolsExpanded: () => {
+    setToolsExpanded: (expanded) => {
       assertActive();
+      queue("setToolsExpanded", { expanded: expanded === true }, false);
     },
   };
 
@@ -1620,6 +1723,81 @@ const makeKeybindingsAdapter = () => ({
     globalThis.__piOps.keybindingMatch(String(data), String(action)) === "true",
   getKeys: (keybinding) => globalThis.__piKeybindingKeys(keybinding),
 });
+
+// The extension-registered terminal input listeners (E3 slice 7):
+// `ctx.ui.onTerminalInput(handler)` (`interactive-mode.ts:2779`) stashes
+// the handler here in registration order; the mode folds each input chunk
+// through `__piTerminalInputFold` before dispatch (the `inputListeners`
+// chain, `tui.ts:1095-1108`). The count syncs to the mode after every
+// mutation so its pump knows whether the round-trip is worth doing.
+globalThis.__piTerminalInputHandlers = [];
+globalThis.__piTerminalInputFold = function (data) {
+  let current = data;
+  for (const handler of globalThis.__piTerminalInputHandlers) {
+    let result;
+    try {
+      result = handler(current);
+    } catch (error) {
+      // Upstream lets a listener throw out of `handleTerminalInput`; the
+      // port keeps the chunk so one broken extension cannot eat the
+      // input path (documented deviation).
+      continue;
+    }
+    if (result && result.consume) return null;
+    if (result && result.data !== undefined) current = String(result.data);
+  }
+  return current;
+};
+globalThis.__piTerminalInputClear = function () {
+  globalThis.__piTerminalInputHandlers = [];
+};
+
+// The custom footer's branch-change callbacks (E3 slice 7): the footer
+// data provider's git watcher (`footer-data-provider.ts`) fires them when
+// the branch flips; the mode notifies through `__piFooterBranchNotify`.
+globalThis.__piFooterBranchHooks = [];
+globalThis.__piFooterBranchNotify = function (branch) {
+  for (const hook of [...globalThis.__piFooterBranchHooks]) {
+    try {
+      hook(branch);
+    } catch (error) {
+      /* ignore hook errors */
+    }
+  }
+};
+
+// The custom footer factory's data adapter (E3 slice 7, `setExtensionFooter`'s
+// third argument — `interactive-mode.ts:2666`): the reads are the
+// `ReadonlyFooterDataProvider` pick (`footer-data-provider.ts:385-390`),
+// served synchronously from the mode's snapshot op; `onBranchChange`
+// stashes the callback and returns its unsubscribe.
+const makeFooterDataAdapter = () => {
+  const snapshot = () => {
+    try {
+      return JSON.parse(globalThis.__piOps.footerData()) || {};
+    } catch (error) {
+      return {};
+    }
+  };
+  return {
+    getGitBranch: () => snapshot().gitBranch,
+    getExtensionStatuses: () => {
+      const data = snapshot();
+      return data.extensionStatuses !== undefined ? data.extensionStatuses : {};
+    },
+    getAvailableProviderCount: () => {
+      const data = snapshot();
+      return typeof data.availableProviderCount === "number" ? data.availableProviderCount : 0;
+    },
+    onBranchChange: (handler) => {
+      globalThis.__piFooterBranchHooks.push(handler);
+      return () => {
+        const index = globalThis.__piFooterBranchHooks.indexOf(handler);
+        if (index !== -1) globalThis.__piFooterBranchHooks.splice(index, 1);
+      };
+    },
+  };
+};
 
 // The entry renderer call (`addCustomEntryToChat`, interactive-mode.ts:3986;
 // custom-entry.ts rebuild): the FIRST extension with a renderer for the

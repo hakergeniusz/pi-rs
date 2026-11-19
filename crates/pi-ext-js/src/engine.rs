@@ -99,6 +99,38 @@ pub struct HostActions {
     /// the port's matcher; the default answers false because the headless
     /// matrix never invokes factories.
     pub keybinding_match: KeybindingMatcher,
+    /// The mode-side UI snapshot (E3 slice 7): footer data, the editor's
+    /// text, and the tool-expansion flag, read synchronously by the
+    /// `footerData`/`editorText`/`toolsExpanded` ops. The embedder
+    /// installs closures over shared snapshots the mode refreshes each
+    /// pump frame; the default reads empty/null/false because the
+    /// headless matrix has no mode behind it.
+    pub ui_snapshot: UiSnapshot,
+}
+
+/// The synchronous mode-state reads the `footerData`/`editorText`/
+/// `toolsExpanded` ops serve (E3 slice 7): a JSON footer snapshot, the
+/// editor's text, and the tool-expansion flag.
+pub struct UiSnapshot {
+    /// `getGitBranch()`/`getExtensionStatuses()`/
+    /// `getAvailableProviderCount()` (`footer-data-provider.ts:385-390`):
+    /// one JSON object `{gitBranch, extensionStatuses,
+    /// availableProviderCount}`.
+    pub footer_data: Box<dyn Fn() -> Json + Send>,
+    /// `editor.getExpandedText()` (`interactive-mode.ts:2797`).
+    pub editor_text: Box<dyn Fn() -> String + Send>,
+    /// `toolOutputExpanded` (`interactive-mode.ts:2822`).
+    pub tools_expanded: Box<dyn Fn() -> bool + Send>,
+}
+
+impl Default for UiSnapshot {
+    fn default() -> Self {
+        Self {
+            footer_data: Box::new(|| Json::Null),
+            editor_text: Box::new(String::new),
+            tools_expanded: Box::new(|| false),
+        }
+    }
 }
 
 /// One synchronous `theme.fg`/`theme.bg` call
@@ -125,6 +157,7 @@ impl Default for HostActions {
             theme_bg: Box::new(|_token, text| text.to_string()),
             theme_style: Box::new(|_method, text| text.to_string()),
             keybinding_match: Box::new(|_data, _action| false),
+            ui_snapshot: UiSnapshot::default(),
         }
     }
 }
@@ -569,6 +602,28 @@ impl JsHost {
                 "{}".to_string()
             } else {
                 serde_json::to_string(&core.app_keybindings).unwrap_or_else(|_| "{}".to_string())
+            }
+        });
+        // The mode-state snapshot the synchronous ui reads serve (E3
+        // slice 7): the custom footer factory's data adapter, the
+        // `getEditorText` query, and the `getToolsExpanded` query. The
+        // embedder installs closures over shared snapshots the mode
+        // refreshes; the defaults read null/""/false (headless matrix).
+        op!("footerData", core, || -> String {
+            let guard = core.lock().expect("host core mutex poisoned");
+            serde_json::to_string(&(guard.actions.ui_snapshot.footer_data)())
+                .unwrap_or_else(|_| "null".to_string())
+        });
+        op!("editorText", core, || -> String {
+            let guard = core.lock().expect("host core mutex poisoned");
+            (guard.actions.ui_snapshot.editor_text)()
+        });
+        op!("toolsExpanded", core, || -> String {
+            let guard = core.lock().expect("host core mutex poisoned");
+            if (guard.actions.ui_snapshot.tools_expanded)() {
+                "true".to_string()
+            } else {
+                "false".to_string()
             }
         });
         op!("providerRegister", core, |name: String,
@@ -1166,6 +1221,56 @@ impl JsHost {
             // current markdown. A transformer throw errors the call.
             call.call::<(usize, &str, &str), Option<String>>((index, markdown, context_json))
                 .unwrap_or_default()
+        })
+    }
+
+    /// Folds one terminal input chunk through the extension-registered
+    /// listeners (`__piTerminalInputFold`; the `inputListeners` chain,
+    /// `tui.ts:1095-1108`). `None` means the chunk is dropped — a listener
+    /// consumed it, or a transform emptied it.
+    pub fn terminal_input_fold(&self, data: &str) -> Option<String> {
+        self.ctx.with(|ctx| {
+            let call: Function = match ctx.globals().get("__piTerminalInputFold") {
+                Ok(call) => call,
+                Err(_) => return Some(data.to_string()),
+            };
+            // A listener throw is a port-side deviation from upstream (a
+            // throw there propagates out of `handleTerminalInput`): the
+            // fold keeps the chunk so one broken extension cannot eat the
+            // input path.
+            call.call::<&str, Option<String>>(data)
+                .unwrap_or_else(|_| Some(data.to_string()))
+        })
+    }
+
+    /// Clears the extension-registered terminal input listeners
+    /// (`resetExtensionUI`'s `clearExtensionTerminalInputListeners`,
+    /// `interactive-mode.ts:2750-2753`).
+    pub fn clear_terminal_input_handlers(&self) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx
+                .globals()
+                .get("__piTerminalInputClear")
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            let _: Value = call.call(()).map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
+    /// Fires the custom footer's `onBranchChange` callbacks (the
+    /// footer-data provider's watcher, crossed through the
+    /// `__piFooterBranchHooks` stash). Fire-and-forget: a callback error
+    /// does not fail the notify.
+    pub fn notify_footer_branch_change(&self, branch: &str) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx
+                .globals()
+                .get("__piFooterBranchNotify")
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            let _: Value = call
+                .call((branch,))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
         })
     }
 
