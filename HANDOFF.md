@@ -3018,6 +3018,77 @@ ALPHA); a session switch leaves the dialog pending and answerable;
 plus the component's own crossing test (`render_and_input_cross_through_the_runner`).
 Gate 1877/0.
 
+## E3 slice 6c: overlays + OSC 7501 program status + footer setStatus (landed on `feat/e3-slice6c-overlays`, 2026-11-19)
+
+Three surfaces in one slice. Ground truth: `program-status-reporter.ts`
+(whole), `program-status.ts` (whole), `terminal.ts:600-616` + the
+`programStatusSupported` detection, `tui.ts:267-338/792-907`,
+`interactive-mode.ts:2440-2443/2593-2616/2833-2856/3074-3178`,
+`footer.ts:14-18/286-300`, `footer-data-provider.ts:103-158`. The
+authoring subagent died to a quota limit with all four layers written
+but never compiled; the coordinator salvaged (see the fix commit) — the
+lesson from the reload round held: every layer was structurally
+complete, the failures were compile/test-level only.
+
+- **OSC 7501 program status** (`pi-tui` `program_status.rs` +
+  `terminal.rs` `set_title`/`set_program_status`, `tui.rs` query/reply):
+  `\x1b]7501;state=…:app=…:kind=…:msg=<base64>\x1b\\`, msg
+  utf8-truncated to 2048 bytes with control characters replaced; the
+  query rides the setup phase and the reply arms `programStatusSupported`
+  — gated on `program_status_query_pending` (an unstarted `Tui` ignores
+  the reply; tests must `start()` first). `ProgramStatusReporter`
+  (`modes/interactive/program_status.rs`) wires `handleEvent` into
+  `handle_agent_event`: working during runs/compaction, blocked while
+  dialogs/overlays wait (`extension-dialog`, `extension-overlay:N`
+  sources, most-recent wins), done/error (first line)/idle after settle,
+  session name in working/done messages, JSON-keyed dedupe. Deviation:
+  upstream keys runResult on `message_end`'s assistant stopReason; the
+  port's run tail/pump event set feeds the same observable states.
+  `reset()` rides `switch_session` + `/reload`; `ctx.ui.setTitle` + the
+  init/session-change title (OSC 0) land here too.
+- **Footer extension statuses**: `footer.rs` gains
+  `extension_statuses: BTreeMap` + the third line (sorted by key with
+  the localeCompare convention — lowercase compare + byte tiebreak,
+  `sanitizeStatusText` collapses `\r\n\t` and space runs, dim-ellipsis
+  truncate); `ctx.ui.setStatus(key, undefined)` deletes; cleared by the
+  reset path.
+- **Overlays**: the glue `tui` adapter gains `showOverlay`/`hideOverlay`
+  and a `makeOverlayHandle` adapter (writes fire-and-forget:
+  `overlayHide`/`overlaySetHidden`/`overlayFocus`/`overlayUnfocus` — an
+  explicit unfocus target crosses as "focus nothing"; reads are
+  answer-class crossings). `ctx.ui.custom`'s `overlay: true` arm
+  resolves `overlayOptions` ONCE glue-side (static fields only — the
+  `visible` predicate cannot cross JSON; `{width: c.width}` fallback),
+  carries `blocked`, and fires `onHandle` with the handle bound to the
+  crossing id. The mode's `extension_overlays` registry mounts via
+  `show_overlay`, `customDone` routes overlay ids to `removeOverlay`
+  (delete first = idempotent, then hide + clear the source + dispose),
+  and the factory `tui.showOverlay` surface shares the registry so
+  `/reload` disposes the handles. Answer-class reads
+  (`overlayIsHidden`/`overlayIsFocused`/`overlayGetBounds`) ride the
+  dialog mailbox — `service_ui_requests` defers them, the pump's
+  delivery threads wait WITHOUT the runner mutex, the pump answers from
+  the registry through `bridge.respond`, and the completion skips the
+  `ui_prompt` pair (`UiDialogWait.prompt`); reads made INSIDE a dispatch
+  settle with method defaults (upstream answers synchronously — the
+  dispatch thread may be the pump). Reset removes overlays newest-first
+  leaving promises pending (`:2600-2602`); session switches never do.
+
+Tests: 29 new — pi-tui: the 7501 formatter (root record, app regex,
+kind gating, control replacement, byte-limit truncation with a test
+base64 decoder), reply matcher accept/reject, the query/reply support
+flip + re-report, stop clears, and the overlay handle surface
+(accessors + the unfocus fallback chain + blocked-restore retarget).
+pi-coding-agent: the reporter state machine (run lifecycle, error first
+line, compaction, blocked sources last-wins, dedupe), the footer status
+line (sorted/sanitized/only-when-set + delete), setStatus through the
+bridge, the dialog blocked status over OSC 7501, and the overlay custom
+(mount in the tui — never the dialog stack — blocked source numbering,
+done removes). pi-ext-js: the overlay crossing (options/blocked/onHandle
+rides the custom request; handle writes queue behind it) and the
+answer-class paths (deferred without a prompt pair; in-dispatch
+defaults). Gate 1906/0.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
