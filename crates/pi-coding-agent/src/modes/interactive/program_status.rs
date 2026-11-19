@@ -12,7 +12,7 @@
 //!
 //! Deviations: upstream holds a `getTerminal`/`getSessionName` closure pair;
 //! the port's reporter is a plain struct whose calls take the session name
-//! and the [`pi_tui::Tui`] (the mode's terminal lives inside the `Tui`, and
+//! and the [`pi_tui::tui::Tui`] (the mode's terminal lives inside the `Tui`, and
 //! borrows cannot be captured in fields), and the `blocked` map is a
 //! `Vec` in insertion order — delete-then-push preserves upstream's
 //! most-recent-wins rule without an order-preserving map crate. The
@@ -24,7 +24,7 @@
 use pi_agent::agent_message::AgentMessage;
 use pi_agent::events::{AgentEvent, CompactionReason};
 use pi_tui::program_status::{ProgramStatus, ProgramStatusKind, ProgramStatusState};
-use pi_tui::Tui;
+use pi_tui::tui::Tui;
 
 /// `BlockedStatus`, `program-status-reporter.ts:5`: what a blocked dialog
 /// waits for, reported as the program status `kind` and `message`.
@@ -96,12 +96,7 @@ impl ProgramStatusReporter {
 
     /// `handleEvent`, `program-status-reporter.ts:35-77`. Unhandled events
     /// return without reporting, exactly like upstream's `default` arm.
-    pub fn handle_event(
-        &mut self,
-        event: &AgentEvent,
-        session_name: Option<&str>,
-        tui: &mut Tui,
-    ) {
+    pub fn handle_event(&mut self, event: &AgentEvent, session_name: Option<&str>, tui: &mut Tui) {
         match event {
             AgentEvent::AgentStart => {
                 self.run_active = true;
@@ -229,20 +224,20 @@ impl ProgramStatusReporter {
     /// `report`, `program-status-reporter.ts:95-101`: dedupe by serialized
     /// status, then write through the terminal.
     pub fn report(&mut self, session_name: Option<&str>, tui: &mut Tui) {
-        let mut status = self.current_status();
+        let mut status = self.current_status(session_name);
         status.app = Some(crate::config::APP_NAME.to_string());
         let key = dedupe_key(&status);
         if self.last_report.as_deref() == Some(key.as_str()) {
             return;
         }
         self.last_report = Some(key);
-        tui.set_program_status(status);
+        tui.set_program_status(&status);
     }
 
     /// `currentStatus`, `program-status-reporter.ts:103-110`: blocked
     /// last-wins, then compacting, then the run or resting status. `working`
     /// and `done` carry the session name.
-    fn current_status(&self) -> ProgramStatus {
+    fn current_status(&self, session_name: Option<&str>) -> ProgramStatus {
         if let Some((_, blocked)) = self.blocked.last() {
             return ProgramStatus {
                 state: ProgramStatusState::Blocked,
@@ -299,8 +294,9 @@ mod tests {
         });
         let handle = terminal.clone();
         let mut tui = Tui::new(Box::new(terminal));
-        // The negotiation reply, as the terminal would send it after the
-        // setup query (`terminal.ts:252-260`).
+        // `start` sends the setup query; the negotiation reply, as the
+        // terminal would send it, flips support on (`terminal.ts:252-260`).
+        tui.start().expect("tui start");
         tui.handle_input("\x1b]7501;?\x1b\\");
         (tui, handle)
     }
@@ -332,7 +328,10 @@ mod tests {
 
     /// The last write, which every reporting call leaves behind.
     fn last_report_of(terminal: &CaptureTerminal) -> String {
-        terminal.last_written().expect("a report was written")
+        terminal
+            .capture()
+            .last_frame()
+            .expect("a report was written")
     }
 
     /// `handleEvent`'s run lifecycle: working during the run, done with the
@@ -390,11 +389,7 @@ mod tests {
             None,
             &mut tui,
         );
-        reporter.handle_event(
-            &AgentEvent::AgentSettled { aborted: false },
-            None,
-            &mut tui,
-        );
+        reporter.handle_event(&AgentEvent::AgentSettled { aborted: false }, None, &mut tui);
         let report = last_report_of(&terminal);
         assert!(report.contains("state=error"), "{report}");
         // base64("provider down") — the first line only.
@@ -464,22 +459,24 @@ mod tests {
         let mut reporter = ProgramStatusReporter::new();
         reporter.handle_event(&AgentEvent::AgentStart, Some("s"), &mut tui);
         let before = terminal
-            .last_written()
+            .capture()
+            .last_frame()
             .expect("agent_start wrote the working status");
         reporter.handle_event(&AgentEvent::TurnStart, Some("s"), &mut tui);
         assert_eq!(
-            terminal.last_written(),
+            terminal.capture().last_frame(),
             Some(before.clone()),
             "an unhandled event (turn_start) writes nothing"
         );
         reporter.reset(Some("s"), &mut tui);
         let after = terminal
-            .last_written()
+            .capture()
+            .last_frame()
             .expect("reset writes the idle status");
         assert!(after != before, "reset changed the report");
         reporter.reset(Some("s"), &mut tui);
         assert_eq!(
-            terminal.last_written(),
+            terminal.capture().last_frame(),
             Some(after),
             "an identical report writes nothing"
         );

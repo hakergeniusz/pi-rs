@@ -3562,7 +3562,7 @@ export default function (pi) {
     /// :3089/:3139-3157`): `overlay: true` crosses the resolved static
     /// options and the blocked status with the `custom` request, `onHandle`
     /// fires with an adapter bound to the crossing id whose writes queue
-    /// fire-and-forget crossings, and done() rides the same customDone
+    /// fire-and-forget crossings, and `done()` rides the same customDone
     /// path the inline custom uses.
     #[test]
     fn ui_custom_overlay_crosses_options_blocked_and_on_handle() {

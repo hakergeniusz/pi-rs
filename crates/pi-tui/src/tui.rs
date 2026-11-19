@@ -849,12 +849,14 @@ impl Tui {
         // Remove the status while stopped, for example after exit or while
         // suspended; a later `start_with` reports it again (`terminal.ts:486-490`).
         if self.program_status_supported && self.program_status.is_some() {
-            let _ = self.terminal.write(&crate::program_status::format_program_status(
-                &crate::program_status::ProgramStatus {
-                    state: crate::program_status::ProgramStatusState::Clear,
-                    ..crate::program_status::ProgramStatus::default()
-                },
-            ));
+            let _ = self
+                .terminal
+                .write(&crate::program_status::format_program_status(
+                    &crate::program_status::ProgramStatus {
+                        state: crate::program_status::ProgramStatusState::Clear,
+                        ..crate::program_status::ProgramStatus::default()
+                    },
+                ));
         }
         self.program_status_supported = false;
         self.program_status_query_pending = false;
@@ -1687,7 +1689,8 @@ impl Tui {
         // `hasPendingRestore` (`tui.ts:854-856`): the focus-restore state
         // names this overlay and is still active.
         let pending_restore = match self.overlay_focus_restore {
-            OverlayFocusRestoreState::Eligible { overlay } | OverlayFocusRestoreState::Blocked { overlay, .. }
+            OverlayFocusRestoreState::Eligible { overlay }
+            | OverlayFocusRestoreState::Blocked { overlay, .. }
                 if overlay.generation == id.generation =>
             {
                 Some(overlay)
@@ -2118,8 +2121,7 @@ impl Tui {
     fn query_program_status(&mut self) -> io::Result<()> {
         let override_value = std::env::var("PI_PROGRAM_STATUS").ok();
         self.program_status_supported = override_value.as_deref() == Some("1");
-        self.program_status_query_pending =
-            !matches!(override_value.as_deref(), Some("1") | Some("0"));
+        self.program_status_query_pending = !matches!(override_value.as_deref(), Some("1" | "0"));
         if self.program_status_query_pending {
             self.terminal
                 .write(crate::program_status::PROGRAM_STATUS_QUERY)?;
@@ -2141,7 +2143,7 @@ impl Tui {
 
     /// `setProgramStatus`, `terminal.ts:606-610`: store the status unless it
     /// clears it, and write it only to a terminal that confirmed support.
-    pub fn set_program_status(&mut self, status: crate::program_status::ProgramStatus) {
+    pub fn set_program_status(&mut self, status: &crate::program_status::ProgramStatus) {
         self.program_status = if status.state == crate::program_status::ProgramStatusState::Clear {
             None
         } else {
@@ -2150,7 +2152,7 @@ impl Tui {
         if self.program_status_supported {
             let _ = self
                 .terminal
-                .write(&crate::program_status::format_program_status(&status));
+                .write(&crate::program_status::format_program_status(status));
         }
     }
 
@@ -3894,7 +3896,7 @@ mod tests {
         let (mut tui, capture) = tui(&["base"], (20, 6));
         capture.clear();
         // Without support nothing is written.
-        tui.set_program_status(crate::program_status::ProgramStatus {
+        tui.set_program_status(&crate::program_status::ProgramStatus {
             state: crate::program_status::ProgramStatusState::Working,
             app: Some("pi".to_string()),
             ..crate::program_status::ProgramStatus::default()
@@ -3908,15 +3910,22 @@ mod tests {
         );
         assert!(tui.program_status_supported());
         let written = capture.output();
-        assert!(written.contains("\x1b]7501;state=working:app=pi\x1b\\"), "{written}");
+        assert!(
+            written.contains("\x1b]7501;state=working:app=pi\x1b\\"),
+            "{written}"
+        );
         // A later status writes immediately.
         capture.clear();
-        tui.set_program_status(crate::program_status::ProgramStatus {
+        tui.set_program_status(&crate::program_status::ProgramStatus {
             state: crate::program_status::ProgramStatusState::Done,
             app: Some("pi".to_string()),
             ..crate::program_status::ProgramStatus::default()
         });
-        assert!(capture.output().contains("\x1b]7501;state=done:app=pi\x1b\\"));
+        assert!(
+            capture
+                .output()
+                .contains("\x1b]7501;state=done:app=pi\x1b\\")
+        );
     }
 
     /// `terminal.ts:486-490`: stopping removes the status and forgets support,
@@ -3925,7 +3934,7 @@ mod tests {
     fn stop_clears_the_program_status() {
         let (mut tui, capture) = tui(&["base"], (20, 6));
         tui.handle_input("\x1b]7501;?\x07");
-        tui.set_program_status(crate::program_status::ProgramStatus {
+        tui.set_program_status(&crate::program_status::ProgramStatus {
             state: crate::program_status::ProgramStatusState::Working,
             ..crate::program_status::ProgramStatus::default()
         });
@@ -4020,8 +4029,11 @@ mod tests {
         tui.set_focus(Some(FocusTarget::Root(0)));
         let overlay = tui.show_overlay(Box::new(Static(&["OV"])), None);
         assert_eq!(tui.focused_target(), Some(FocusTarget::Overlay(overlay)));
-        // Focus a root child: the overlay's restore is now blocked by it.
-        tui.set_focus(Some(FocusTarget::Root(0)));
+        // A SECOND root child: focusing it is a steal (the overlay's
+        // pre-focus chain holds only the first child), so the overlay's
+        // restore parks on it.
+        tui.add_child(Box::new(Static(&["OTHER"])));
+        tui.set_focus(Some(FocusTarget::Root(1)));
         assert!(matches!(
             tui.overlay_focus_restore_state(),
             OverlayFocusRestoreState::Blocked { .. }

@@ -89,8 +89,8 @@ pub fn is_program_status_reply(sequence: &str) -> bool {
     };
     // `[^\x07\x1b]*(?:\x07|\x1b\\)$`: the body runs to the FIRST BEL or ESC,
     // and what follows from there must be exactly the terminator.
-    match rest.find(|c| c == '\x07' || c == '\x1b') {
-        Some(index) => rest[index..] == "\x07" || rest[index..] == "\x1b\\",
+    match rest.find(['\x07', '\x1b']) {
+        Some(index) => rest[index..] == *"\x07" || rest[index..] == *"\x1b\\",
         None => false,
     }
 }
@@ -267,7 +267,9 @@ mod tests {
         let encoded = format_program_status(&status);
         assert!(encoded.contains("state=error"), "{encoded}");
         // The cleaned text has no BEL/ESC left to break the sequence open.
-        let body = encoded.trim_start_matches("\x1b]7501;").trim_end_matches("\x1b\\");
+        let body = encoded
+            .trim_start_matches("\x1b]7501;")
+            .trim_end_matches("\x1b\\");
         assert!(!body.contains('\x07'), "{encoded}");
         assert!(!body.contains('\x1b'), "{encoded}");
     }
@@ -303,6 +305,10 @@ mod tests {
         let mut buffer = 0u32;
         let mut bits = 0u32;
         for c in encoded.bytes() {
+            // The encoder pads with `=`; padding carries no bits.
+            if c == b'=' {
+                break;
+            }
             let value = ALPHABET
                 .iter()
                 .position(|&a| a == c)
@@ -321,7 +327,9 @@ mod tests {
     fn reply_matcher_accepts_the_query_reply_shape() {
         assert!(is_program_status_reply("\x1b]7501;?\x1b\\"));
         assert!(is_program_status_reply("\x1b]7501;?state=idle\x07"));
-        assert!(is_program_status_reply("\x1b]7501;?state=idle:app=pi\x1b\\"));
+        assert!(is_program_status_reply(
+            "\x1b]7501;?state=idle:app=pi\x1b\\"
+        ));
     }
 
     #[test]
@@ -339,6 +347,6 @@ mod tests {
         assert_eq!(replace_control_characters("a\r\n\tb"), "a b");
         assert_eq!(replace_control_characters("a\x1b]0;x\x07b"), "a ]0;x b");
         assert_eq!(replace_control_characters("ab"), "ab");
-        assert_eq!(replace_control_characters("\x7f\x9f"), " ");
+        assert_eq!(replace_control_characters("\x7f\u{9f}"), " ");
     }
 }

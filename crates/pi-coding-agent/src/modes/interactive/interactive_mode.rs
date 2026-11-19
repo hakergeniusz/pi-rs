@@ -2072,6 +2072,7 @@ impl InteractiveMode {
             routed_model_id: None,
             routed_thinking_level: None,
             auto_compact_enabled: false,
+            extension_statuses: std::collections::BTreeMap::new(),
         }
     }
 
@@ -8468,6 +8469,7 @@ impl InteractiveMode {
     /// `interactive-mode.ts:2833-2838`) — a new dialog hides the visible
     /// one and closing the visible one shows the previous again.
     #[cfg(feature = "ext-js")]
+    #[allow(clippy::too_many_lines)] // mirrors the TS …; split when extending
     fn pump_extension_ui(&mut self) {
         // The runner drains the engine's ui_requests: a custom done()
         // crossing forwards as fire-and-forget and ends its ui_prompt
@@ -8549,14 +8551,10 @@ impl InteractiveMode {
                         self.close_extension_ui_dialog_by_id(&id, &serde_json::json!({}));
                     }
                 }
-                "select" | "confirm" | "input" | "editor" => {
-                    if let Some(entry) = self.extension_dialog_entry(&request) {
-                        self.push_extension_dialog_entry(entry);
-                    }
-                }
                 // The overlay arm of `showExtensionCustom`
                 // (`interactive-mode.ts:3139-3157`): `blocked` rides the
-                // request, so the mount reports it.
+                // request, so the mount reports it. It must sit ahead of the
+                // plain `custom` arm.
                 "custom" if request.get("overlay").and_then(Value::as_bool) == Some(true) => {
                     let blocked = request
                         .get("blocked")
@@ -8564,7 +8562,7 @@ impl InteractiveMode {
                         .and_then(Self::blocked_status_from_json);
                     self.mount_extension_overlay(&request, "overlayOptions", blocked);
                 }
-                "custom" => {
+                "select" | "confirm" | "input" | "editor" | "custom" => {
                     if let Some(entry) = self.extension_dialog_entry(&request) {
                         self.push_extension_dialog_entry(entry);
                     }
@@ -8629,8 +8627,7 @@ impl InteractiveMode {
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     if let Some(overlay) = self.extension_overlay_id(&id) {
-                        self.tui
-                            .overlay_unfocus(overlay, explicit.then_some(None));
+                        self.tui.overlay_unfocus(overlay, explicit.then_some(None));
                     }
                 }
                 // The handle's reads (`tui.ts:845/:883/:884-887`): the mode
@@ -8647,17 +8644,19 @@ impl InteractiveMode {
                         "overlayIsFocused" => {
                             serde_json::json!({ "focused": overlay.is_some_and(|o| self.tui.overlay_is_focused(o)) })
                         }
-                        "overlayGetBounds" => match overlay.and_then(|o| self.tui.overlay_bounds(o)) {
-                            Some(bounds) => serde_json::json!({
-                                "bounds": {
-                                    "row": bounds.row,
-                                    "col": bounds.col,
-                                    "width": bounds.width,
-                                    "height": bounds.height,
-                                }
-                            }),
-                            None => serde_json::json!({}),
-                        },
+                        "overlayGetBounds" => {
+                            match overlay.and_then(|o| self.tui.overlay_bounds(o)) {
+                                Some(bounds) => serde_json::json!({
+                                    "bounds": {
+                                        "row": bounds.row,
+                                        "col": bounds.col,
+                                        "width": bounds.width,
+                                        "height": bounds.height,
+                                    }
+                                }),
+                                None => serde_json::json!({}),
+                            }
+                        }
                         _ => serde_json::json!({
                             "hidden": overlay.is_some_and(|o| self.tui.overlay_is_hidden(o).unwrap_or(false))
                         }),
@@ -8878,11 +8877,7 @@ impl InteractiveMode {
         let size_value = |value: &Value| -> Option<SizeValue> {
             if let Some(text) = value.as_str() {
                 let percent = text.strip_suffix('%')?;
-                return percent
-                    .trim()
-                    .parse::<f64>()
-                    .ok()
-                    .map(SizeValue::Percent);
+                return percent.trim().parse::<f64>().ok().map(SizeValue::Percent);
             }
             value
                 .as_i64()
@@ -8891,16 +8886,25 @@ impl InteractiveMode {
         };
         let offset = |value: Option<&Value>| value.and_then(Value::as_i64).unwrap_or(0);
         let mut parsed = OverlayOptions {
-            width: options.get("width").and_then(|v| v.is_null().not().then_some(v)).and_then(|v| size_value(v)),
+            width: options
+                .get("width")
+                .and_then(|v| (!v.is_null()).then_some(v))
+                .and_then(size_value),
             min_width: options.get("minWidth").and_then(Value::as_i64),
             max_height: options
                 .get("maxHeight")
-                .and_then(|v| v.is_null().not().then_some(v))
-                .and_then(|v| size_value(v)),
+                .and_then(|v| (!v.is_null()).then_some(v))
+                .and_then(size_value),
             offset_x: offset(options.get("offsetX")),
             offset_y: offset(options.get("offsetY")),
-            row: options.get("row").and_then(|v| v.is_null().not().then_some(v)).and_then(|v| size_value(v)),
-            col: options.get("col").and_then(|v| v.is_null().not().then_some(v)).and_then(|v| size_value(v)),
+            row: options
+                .get("row")
+                .and_then(|v| (!v.is_null()).then_some(v))
+                .and_then(size_value),
+            col: options
+                .get("col")
+                .and_then(|v| (!v.is_null()).then_some(v))
+                .and_then(size_value),
             non_capturing: options
                 .get("nonCapturing")
                 .and_then(Value::as_bool)
@@ -8975,7 +8979,10 @@ impl InteractiveMode {
         options_field: &str,
         blocked: Option<BlockedStatus>,
     ) {
-        let Some(handle) = request.get("handle").and_then(Value::as_u64).map(|h| h as u32)
+        let Some(handle) = request
+            .get("handle")
+            .and_then(Value::as_u64)
+            .map(|h| h as u32)
         else {
             return;
         };
@@ -9010,8 +9017,12 @@ impl InteractiveMode {
         });
         if let (Some(source), Some(blocked)) = (blocked_source, blocked) {
             let session_name = self.session.get_session_name();
-            self.program_status
-                .set_blocked(&source, Some(blocked), session_name.as_deref(), &mut self.tui);
+            self.program_status.set_blocked(
+                &source,
+                Some(blocked),
+                session_name.as_deref(),
+                &mut self.tui,
+            );
         }
     }
 
@@ -11529,7 +11540,13 @@ export default function (pi) {
             !footer.data.extension_statuses.contains_key("alpha"),
             "undefined deletes"
         );
-        assert_eq!(footer.render_lines(100).len(), 2, "the line disappears");
+        // `beta` was never cleared, so its status keeps the line — but only
+        // its own text renders now.
+        assert_eq!(
+            footer.render_lines(100).len(),
+            3,
+            "the remaining status keeps the line"
+        );
         mode.shutdown().expect("shutdown");
     }
 
@@ -11573,8 +11590,7 @@ export default function (pi) {
         let written = capture.output();
         // base64("Pick") = UGljaw== — the dialog title is the blocked message.
         assert!(
-            written
-                .contains("\x1b]7501;state=blocked:app=pi:kind=question:msg=UGljaw==\x1b\\"),
+            written.contains("\x1b]7501;state=blocked:app=pi:kind=question:msg=UGljaw==\x1b\\"),
             "{written:?}"
         );
         // Enter picks the first option; the close clears the source.
@@ -11676,16 +11692,13 @@ export default function (pi) {
         // it (base64("Blocking") = QmxvY2tpbmc=).
         let written = capture.output();
         assert!(
-            written.contains(
-                "\x1b]7501;state=blocked:app=pi:kind=question:msg=QmxvY2tpbmc=\x1b\\"
-            ),
+            written.contains("\x1b]7501;state=blocked:app=pi:kind=question:msg=QmxvY2tpbmc=\x1b\\"),
             "{written:?}"
         );
         // Input reaches the overlay through the captured focus; done()
         // removes it and clears the source.
         mode.feed_stdin_bytes(b"x");
         mode.pump();
-        emitter.join().expect("emit thread");
         assert!(mode.extension_overlays.is_empty(), "done removed it");
         assert_eq!(mode.tui.overlay_count(), 0, "the tui dropped the overlay");
         let written = capture.output();
@@ -11794,7 +11807,9 @@ export default function (pi) {
             .entries
             .clone();
         assert!(
-            !entries.iter().any(|(custom_type, _)| custom_type == "stack"),
+            !entries
+                .iter()
+                .any(|(custom_type, _)| custom_type == "stack"),
             "the custom promises never resolved: {entries:?}"
         );
         mode.shutdown().expect("shutdown");

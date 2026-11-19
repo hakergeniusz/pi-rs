@@ -103,8 +103,13 @@ impl pi_ext_js::UiSink for ExtensionUiBridge {
         let has_wait = matches!(
             request.get("method").and_then(Value::as_str),
             Some(
-                "select" | "confirm" | "input" | "editor"
-                    | "overlayIsHidden" | "overlayIsFocused" | "overlayGetBounds"
+                "select"
+                    | "confirm"
+                    | "input"
+                    | "editor"
+                    | "overlayIsHidden"
+                    | "overlayIsFocused"
+                    | "overlayGetBounds"
             )
         );
         if has_wait {

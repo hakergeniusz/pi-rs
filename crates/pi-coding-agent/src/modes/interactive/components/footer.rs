@@ -172,7 +172,13 @@ const MIN_PADDING: usize = 2;
 fn sanitize_status_text(text: &str) -> String {
     let flattened: String = text
         .chars()
-        .map(|c| if matches!(c, '\r' | '\n' | '\t') { ' ' } else { c })
+        .map(|c| {
+            if matches!(c, '\r' | '\n' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let mut out = String::with_capacity(flattened.len());
     let mut in_space = false;
@@ -400,14 +406,14 @@ impl FooterComponent {
         // sanitized, joined with spaces, truncated to the width with the
         // dim ellipsis like the other footer lines.
         if !data.extension_statuses.is_empty() {
-            let status_line = data
+            let extension_line = data
                 .extension_statuses
                 .values()
                 .map(|text| sanitize_status_text(text))
                 .collect::<Vec<_>>()
                 .join(" ");
             lines.push(truncate_to_width(
-                &status_line,
+                &extension_line,
                 width,
                 &theme.fg(ThemeColor::Dim, "..."),
                 false,
@@ -678,18 +684,19 @@ mod tests {
         assert_eq!(sanitize_status_text("  a   b  "), "a b");
         assert_eq!(sanitize_status_text("\r\n\t"), "");
         let footer = FooterComponent::new(FooterData {
-            extension_statuses: [(
-                "wide".to_string(),
-                "x".repeat(200),
-            )]
-            .into_iter()
-            .collect(),
+            extension_statuses: [("wide".to_string(), "x".repeat(200))]
+                .into_iter()
+                .collect(),
             ..FooterData::default()
         });
         let width = 40;
         let lines = footer.render_lines(width);
         let plain_line = pi_tui::ansi::strip_terminal_sequences(&lines[2]);
-        assert_eq!(pi_tui::ansi::visible_width(&plain_line), width, "{plain_line}");
+        assert_eq!(
+            pi_tui::ansi::visible_width(&plain_line),
+            width,
+            "{plain_line}"
+        );
         assert!(plain_line.ends_with("..."), "{plain_line}");
     }
 }
