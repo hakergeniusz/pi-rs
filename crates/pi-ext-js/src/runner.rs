@@ -3766,7 +3766,10 @@ export default function (pi) {
         assert_eq!(requests[7]["widgetLines"], json!(["one", "two"]));
         assert_eq!(requests[7]["widgetPlacement"], "belowEditor");
         assert_eq!(requests[8]["method"], "setWidget");
-        assert!(requests[8].get("widgetLines").is_none(), "undefined removes");
+        assert!(
+            requests[8].get("widgetLines").is_none(),
+            "undefined removes"
+        );
         assert_eq!(requests[9]["method"], "setToolsExpanded");
         assert_eq!(requests[9]["expanded"], true);
         assert_eq!(requests[10]["method"], "pasteToEditor");

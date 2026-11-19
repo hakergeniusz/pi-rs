@@ -388,9 +388,6 @@ impl PendingTerminalColorQuery {
         self.delivery != TerminalColorDelivery::Done
     }
 }
-/// The TUI. `tui.ts:446-...` (TUI interface) and `tui-main-screen.ts:124`.
-// The booleans mirror upstream TS state flags; the port keeps them one-to-one.
-#[allow(clippy::struct_excessive_bools)]
 /// What an input listener decides for the chunk it saw — the
 /// `TuiInputListener` result (`tui.ts:490-491`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,6 +405,9 @@ pub enum InputListenerOutcome {
 /// runs the registered listeners in order before dispatch.
 pub type InputListener = Box<dyn Fn(&str) -> InputListenerOutcome + Send>;
 
+/// The TUI. `tui.ts:446-...` (TUI interface) and `tui-main-screen.ts:124`.
+// The booleans mirror upstream TS state flags; the port keeps them one-to-one.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Tui {
     terminal: Box<dyn Terminal>,
     children: Vec<Box<dyn Component>>,
@@ -4014,9 +4014,7 @@ mod tests {
         let index = tui.add_child(Box::new(ListenerProbe(std::sync::Arc::clone(&probe))));
         tui.start().unwrap();
         tui.set_focus(Some(FocusTarget::Root(index)));
-        tui.add_input_listener(Box::new(|_| {
-            InputListenerOutcome::Transform(String::new())
-        }));
+        tui.add_input_listener(Box::new(|_| InputListenerOutcome::Transform(String::new())));
         assert!(tui.handle_input("x"));
         assert_eq!(*probe.lock().expect("probe"), Vec::<String>::new());
     }
@@ -4029,7 +4027,10 @@ mod tests {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_for_listener = std::sync::Arc::clone(&seen);
         tui.add_input_listener(Box::new(move |data| {
-            seen_for_listener.lock().expect("seen").push(data.to_string());
+            seen_for_listener
+                .lock()
+                .expect("seen")
+                .push(data.to_string());
             InputListenerOutcome::Pass
         }));
         tui.start().unwrap();
@@ -4047,7 +4048,10 @@ mod tests {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_for_listener = std::sync::Arc::clone(&seen);
         let id = tui.add_input_listener(Box::new(move |data| {
-            seen_for_listener.lock().expect("seen").push(data.to_string());
+            seen_for_listener
+                .lock()
+                .expect("seen")
+                .push(data.to_string());
             InputListenerOutcome::Pass
         }));
         tui.remove_input_listener(id);

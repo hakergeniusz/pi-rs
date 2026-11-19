@@ -49,5 +49,5 @@ pub use provider_registry::{RegisteredNativeProvider, RegisteredProvider, Regist
 pub use runner::{
     EntryRenderOutcome, ExtensionRunner, McpServerReport, ProviderStreamOutcome, ResolvedCommand,
     ResolvedMarkdownTransformer, ResolvedToolRenderers, ToolInfo, ToolRenderSlot,
-    ToolRenderersOutcome, UiSink, UserBashDecision,
+    ToolRenderersOutcome, UiSink, UiSnapshotSurface, UserBashDecision,
 };

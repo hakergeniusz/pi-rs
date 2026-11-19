@@ -54,10 +54,11 @@ use super::autocomplete;
 use super::chat_viewport::{self, ChatViewport, HostSlot};
 use super::components::armin::ArminComponent;
 use super::components::assistant_message::AssistantMessageComponent;
-use super::components::component_proxy::ComponentProxy;
 use super::components::auth_selector::{
     AuthSelectorComponent, AuthSelectorEvent, LoginPromptComponent, LoginPromptEvent,
 };
+#[cfg(feature = "ext-js")]
+use super::components::component_proxy::ComponentProxy;
 use super::components::easter_egg_3d::{EasterEgg3d, EasterEggHandle, play_easter_egg_3d};
 #[cfg(feature = "ext-js")]
 use super::components::extension_custom::ExtensionCustomComponent;
@@ -338,6 +339,7 @@ enum EditorEventOut {
 /// One extension widget (`extensionWidgetsAbove`/`...Below` values, E3
 /// slice 7 — `setExtensionWidget`, `interactive-mode.ts:2538-2578`).
 #[cfg(feature = "ext-js")]
+#[derive(Clone)]
 enum ExtensionWidget {
     /// String lines the host rebuilds as `Text(line, 1, 0)` rows.
     Lines(Vec<String>),
@@ -6330,8 +6332,14 @@ impl InteractiveMode {
     /// .ts:2682`): the refreshes keep landing so a restore shows current
     /// data.
     fn footer_mut(&mut self) -> Option<&mut FooterComponent> {
-        if let Some(footer) = self.downcast_tree::<FooterComponent>(HostSlot::Footer) {
-            return Some(footer);
+        // The probe-then-return shape: returning the first borrow directly
+        // would pin it to the function's lifetime and collide with the
+        // displaced-chrome borrow below.
+        if self
+            .downcast_tree::<FooterComponent>(HostSlot::Footer)
+            .is_some()
+        {
+            return self.downcast_tree::<FooterComponent>(HostSlot::Footer);
         }
         #[cfg(feature = "ext-js")]
         if let Some(chrome) = self.custom_footer.as_mut() {
@@ -6346,8 +6354,11 @@ impl InteractiveMode {
     /// The built-in header, mounted or displaced — the same story as
     /// [`Self::footer_mut`].
     fn header_mut(&mut self) -> Option<&mut BuiltInHeader> {
-        if let Some(header) = self.downcast_tree::<BuiltInHeader>(HostSlot::Header) {
-            return Some(header);
+        if self
+            .downcast_tree::<BuiltInHeader>(HostSlot::Header)
+            .is_some()
+        {
+            return self.downcast_tree::<BuiltInHeader>(HostSlot::Header);
         }
         #[cfg(feature = "ext-js")]
         if let Some(chrome) = self.custom_header.as_mut() {
@@ -6365,7 +6376,11 @@ impl InteractiveMode {
     /// alive while displaced and keeps taking the refresh writes.
     #[cfg(feature = "ext-js")]
     fn set_extension_footer(&mut self, handle: Option<u32>) {
-        if let Some(ExtensionChrome { handle: old, displaced }) = self.custom_footer.take() {
+        if let Some(ExtensionChrome {
+            handle: old,
+            displaced,
+        }) = self.custom_footer.take()
+        {
             // The built-in returns to the slot, pulling the old proxy out;
             // the dispose lands with neither in the tree (upstream disposes
             // before the swap).
@@ -6388,7 +6403,11 @@ impl InteractiveMode {
     /// custom header gets (`isExpandable`, `:2709-2711`).
     #[cfg(feature = "ext-js")]
     fn set_extension_header(&mut self, handle: Option<u32>) {
-        if let Some(ExtensionChrome { handle: old, displaced }) = self.custom_header.take() {
+        if let Some(ExtensionChrome {
+            handle: old,
+            displaced,
+        }) = self.custom_header.take()
+        {
             drop(self.swap_slot_component(HostSlot::Header, displaced));
             self.dispose_extension_handle(old);
         }
@@ -6426,14 +6445,26 @@ impl InteractiveMode {
         content: Option<ExtensionWidget>,
         placement: &str,
     ) {
-        for map in [
-            &mut self.extension_widgets_above,
-            &mut self.extension_widgets_below,
-        ] {
-            if let Some(index) = map.iter().position(|(existing, _)| existing == key) {
-                let (_, removed) = map.remove(index);
-                self.dispose_extension_widget(&removed);
-            }
+        // The key removes from BOTH placements (`removeExisting`); the
+        // removals collect first so the disposes run without a live
+        // borrow of either map.
+        let mut displaced: Vec<ExtensionWidget> = Vec::new();
+        if let Some(index) = self
+            .extension_widgets_above
+            .iter()
+            .position(|(existing, _)| existing == key)
+        {
+            displaced.push(self.extension_widgets_above.remove(index).1);
+        }
+        if let Some(index) = self
+            .extension_widgets_below
+            .iter()
+            .position(|(existing, _)| existing == key)
+        {
+            displaced.push(self.extension_widgets_below.remove(index).1);
+        }
+        for widget in &displaced {
+            self.dispose_extension_widget(widget);
         }
         if let Some(content) = content {
             let target = if placement == "belowEditor" {
@@ -6474,8 +6505,7 @@ impl InteractiveMode {
             container.clear();
             if entries.is_empty() {
                 if spacer_when_empty {
-                    container
-                        .add_child(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+                    container.add_child(Box::new(pi_tui::components::spacer::Spacer::new(1)));
                 }
                 return;
             }
@@ -6694,7 +6724,7 @@ impl InteractiveMode {
     fn try_terminal_input_fold(&mut self, data: &str) -> Option<Option<String>> {
         let runner = self.extension_runner.as_ref()?;
         let mut runner = runner.try_lock().ok()?;
-        runner.deliver_terminal_input(data).ok().flatten()
+        Some(runner.deliver_terminal_input(data).ok().flatten())
     }
 
     /// The deferred chunks retry each frame (`pump`).
@@ -9197,15 +9227,24 @@ impl InteractiveMode {
                 // (`interactive-mode.ts:2664-2730`): a handle mounts the
                 // adopted component, `undefined` restores the built-in.
                 "setFooter" => self.set_extension_footer(
-                    request.get("handle").and_then(Value::as_u64).map(|value| value as u32),
+                    request
+                        .get("handle")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as u32),
                 ),
                 "setHeader" => self.set_extension_header(
-                    request.get("handle").and_then(Value::as_u64).map(|value| value as u32),
+                    request
+                        .get("handle")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as u32),
                 ),
                 // The working-status family (`interactive-mode.ts
                 // :2501-2533`, `:2781-2789`).
                 "setWorkingMessage" => self.set_working_message(
-                    request.get("message").and_then(Value::as_str).map(String::from),
+                    request
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                 ),
                 "setWorkingVisible" => self.set_working_visible(
                     request
@@ -9213,11 +9252,16 @@ impl InteractiveMode {
                         .and_then(Value::as_bool)
                         .unwrap_or(true),
                 ),
-                "setWorkingIndicator" => self.set_working_indicator(request
-                    .get("indicator")
-                    .and_then(Self::loader_indicator_from_json)),
+                "setWorkingIndicator" => self.set_working_indicator(
+                    request
+                        .get("indicator")
+                        .and_then(Self::loader_indicator_from_json),
+                ),
                 "setHiddenThinkingLabel" => self.set_hidden_thinking_label(
-                    request.get("label").and_then(Value::as_str).map(String::from),
+                    request
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                 ),
                 // The editor text ops (`:2795-2797`).
                 "pasteToEditor" => {
@@ -9245,10 +9289,8 @@ impl InteractiveMode {
                 ),
                 // The terminal-input listener count sync (`:2732-2741`).
                 "terminalInputListeners" => {
-                    self.terminal_input_listeners = request
-                        .get("count")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as usize;
+                    self.terminal_input_listeners =
+                        request.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
                 }
                 // The factory adapter's `TUI.showOverlay` surface
                 // (`tui.ts:518/:792-816`).
@@ -10679,15 +10721,14 @@ impl InteractiveMode {
             // with a `setExpanded` (`interactive-mode.ts:4753-4758`)
             // — the custom rows both have one.
             #[cfg(feature = "ext-js")]
-            if let Some(component) = self
-                .downcast_chat::<super::components::custom_entry::CustomEntryComponent>(
-                index,
-            ) {
+            if let Some(component) =
+                self.downcast_chat::<super::components::custom_entry::CustomEntryComponent>(index)
+            {
                 component.set_expanded(expanded);
             }
             #[cfg(feature = "ext-js")]
-            if let Some(component) =
-                self.downcast_chat::<super::components::custom_message::CustomMessageComponent>(index)
+            if let Some(component) = self
+                .downcast_chat::<super::components::custom_message::CustomMessageComponent>(index)
             {
                 component.set_expanded(expanded);
             }
@@ -12344,7 +12385,11 @@ export default function (pi) {
         let above = render_widget_host(&mut mode, HostSlot::WidgetAbove);
         let above_text: Vec<String> = above
             .iter()
-            .map(|line| pi_tui::ansi::strip_terminal_sequences(line).trim().to_string())
+            .map(|line| {
+                pi_tui::ansi::strip_terminal_sequences(line)
+                    .trim()
+                    .to_string()
+            })
             .collect();
         // `renderWidgetContainer(above)`: the leading spacer then the rows.
         assert_eq!(
@@ -12355,7 +12400,11 @@ export default function (pi) {
         let below = render_widget_host(&mut mode, HostSlot::WidgetBelow);
         let below_text: Vec<String> = below
             .iter()
-            .map(|line| pi_tui::ansi::strip_terminal_sequences(line).trim().to_string())
+            .map(|line| {
+                pi_tui::ansi::strip_terminal_sequences(line)
+                    .trim()
+                    .to_string()
+            })
             .collect();
         assert_eq!(below_text, ["three"], "the below host never spacers");
 
@@ -12400,11 +12449,28 @@ export default function (pi) {
             .render(100);
         let text: Vec<String> = lines
             .iter()
-            .map(|line| pi_tui::ansi::strip_terminal_sequences(line).trim().to_string())
+            .map(|line| {
+                pi_tui::ansi::strip_terminal_sequences(line)
+                    .trim()
+                    .to_string()
+            })
             .collect();
         assert_eq!(
             text,
-            ["", "l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", "l10", "... (widget truncated)"],
+            [
+                "",
+                "l1",
+                "l2",
+                "l3",
+                "l4",
+                "l5",
+                "l6",
+                "l7",
+                "l8",
+                "l9",
+                "l10",
+                "... (widget truncated)"
+            ],
             "ten rows plus the muted truncation line, past the leading spacer"
         );
         mode.shutdown().expect("shutdown");
@@ -12440,7 +12506,11 @@ export default function (pi) {
             .render(100);
         let text: Vec<String> = lines
             .iter()
-            .map(|line| pi_tui::ansi::strip_terminal_sequences(line).trim().to_string())
+            .map(|line| {
+                pi_tui::ansi::strip_terminal_sequences(line)
+                    .trim()
+                    .to_string()
+            })
             .collect();
         assert_eq!(
             text,
@@ -12486,7 +12556,7 @@ export default function (pi) {
             .expect("emit");
         mode.pump();
         let footer = mode
-            .downcast_tree::<super::components::component_proxy::ComponentProxy>(HostSlot::Footer)
+            .downcast_tree::<ComponentProxy>(HostSlot::Footer)
             .expect("the custom footer occupies the slot");
         assert!(
             pi_tui::ansi::strip_terminal_sequences(&footer.render(100).join("\n"))
@@ -12495,7 +12565,7 @@ export default function (pi) {
             footer.render(100)
         );
         let header = mode
-            .downcast_tree::<super::components::component_proxy::ComponentProxy>(HostSlot::Header)
+            .downcast_tree::<ComponentProxy>(HostSlot::Header)
             .expect("the custom header occupies the slot");
         assert!(
             pi_tui::ansi::strip_terminal_sequences(&header.render(100).join("\n"))
@@ -12582,11 +12652,7 @@ export default function (pi) {
         let before = mode.chat_len();
         mode.set_tools_expanded(true);
         assert!(mode.tool_output_expanded);
-        assert_eq!(
-            mode.chat_len(),
-            before + 2,
-            "the status pair appends once"
-        );
+        assert_eq!(mode.chat_len(), before + 2, "the status pair appends once");
         mode.set_tools_expanded(true);
         assert_eq!(mode.chat_len(), before + 2, "the unchanged flag is a no-op");
         let chat = mode.chat_mut().render(100).join("\n");
@@ -12711,7 +12777,8 @@ export default function (pi) {
             "the built-in footer is back"
         );
         assert!(
-            mode.downcast_tree::<BuiltInHeader>(HostSlot::Header).is_some(),
+            mode.downcast_tree::<BuiltInHeader>(HostSlot::Header)
+                .is_some(),
             "the built-in header is back"
         );
         assert_eq!(mode.working_message, None);

@@ -33,7 +33,7 @@ impl StatusIndicator {
     /// indicator rides `workingIndicatorOptions` (`interactive-mode.ts
     /// :2486-2499`).
     pub fn working_with(
-        message: &str,
+        message: impl Into<String>,
         indicator: Option<pi_tui::components::loader::LoaderIndicator>,
     ) -> Self {
         let spinner_theme = theme::theme();
