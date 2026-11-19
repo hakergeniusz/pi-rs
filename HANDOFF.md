@@ -3196,6 +3196,61 @@ truths — the dock's editor entry moved to index 3 and the
 `defaultWorkingMessage` string; r3: fold-arm merge + an unsubscribe
 test's bool assert). Test totals: 1922 workspace tests, 0 failed.
 
+## 2026-11-19 — E3 slice 8: autocomplete wrappers
+
+Serial again (the spawn discipline stands). Branch
+`feat/e3-slice8-autocomplete` off ee0d111; commits b0cb193 (pi-ext-js
+crossings) + da82f02 (mode wiring) + e749ae1/c01e6f4/021e33a gate
+rounds + 390f4fd (gate fmt) + b2c9d94 (citation ranges).
+
+- **The chain** (`setupAutocompleteProvider`,
+  `interactive-mode.ts:853-867`): the base
+  `CombinedAutocompleteProvider` wraps L→R through the registered
+  wrappers (`AutocompleteProviderFactory`, `types.ts:144`); each
+  `JsAutocompleteProvider` holds its index and its base link.
+  `ComposedAutocompleteProvider` unions the wrappers'
+  `triggerCharacters` (`[...new Set(...)]`, first occurrence first)
+  and REPLACES the provider's own characters only when non-empty
+  (`:860-864`); the editor still merges its built-in `@`/`#` on top
+  (`editor.ts:2340-2350`). The chain rebuilds on every
+  `addAutocompleteProvider` crossing (`:2799-2802`) and on the reset
+  (`:2609-2611`).
+- **The data-passing adapter** — the round's design point: upstream
+  wrappers re-query `provider.getSuggestions(...)` (the composed chain)
+  inside an async call; a naive port would nest engine waits across the
+  mode thread (the 6b deadlock class). Instead `suggest` PRE-COMPUTES
+  the base chain's result for the SAME keystroke and crosses it as
+  `base_json`; `__piWrappedSuggest` stashes it on the base adapter
+  (`__piAutocompleteBase`), awaits the wrapper's async `getSuggestions`
+  (`tui/src/autocomplete.ts:274-280`), and writes the slot
+  (`__piAutocompleteResult`) the engine reads+clears. The async promise
+  settles via `drive_jobs` — safe because nothing waits on the mode. A
+  busy engine answers NO suggestions (try_lock → None, no dropdown).
+  `__piWrappedApply` runs the sync `applyCompletion`
+  (`:283-292`) through the same slot; when the wrapper defines no
+  `applyCompletion` (the common case) the base's application runs.
+- **Deviations** (documented on the types): the base adapter answers
+  with the pre-computed result instead of re-querying;
+  `shouldTriggerFileCompletion` delegates to the base only; the
+  wrapper's `options.signal` is `undefined` (no abort channel across
+  the boundary); a busy engine drops suggestions instead of blocking.
+- **Reset**: `clear_autocomplete_wrappers` empties the engine stash and
+  the mode's records, then `rebuild_autocomplete_provider` re-mounts
+  the base-only chain (`resetExtensionUI`, `:2609-2611`).
+
+Tests: pi-ext-js 1 (the registration crossing with index + trigger
+characters, the suggest merge over the pre-supplied base result with
+`force` reaching the options, the apply round-trip, the reset → None);
+pi-coding-agent 1 (the wrapper's item opens the popup with the base
+result proven crossed, Tab applies through the chain — the base's
+slash-command application since no JS `applyCompletion` — and the reset
+restores the base-only chain). Gate green in 4 rounds (r1: the rquickjs
+lifetime lesson — a borrowed `Value` cannot escape `ctx.with`, and the
+apply call's `undefined` cannot coerce to String, both crossings now
+drop the call Value inside the closure; r2: `too_many_arguments` allows
+on the 8-arg wrapped apply; r3: `repeat().take()` → `repeat_n`; r4
+green). Test totals: 1924 workspace tests, 0 failed.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
