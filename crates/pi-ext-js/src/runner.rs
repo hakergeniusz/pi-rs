@@ -1734,6 +1734,7 @@ impl ExtensionRunner {
 
     /// Runs one autocomplete wrapper's `applyCompletion`. `None` falls
     /// back to the base's application.
+    #[allow(clippy::too_many_arguments)] // the crossing protocol + upstream's apply shape
     pub fn wrapped_apply(
         &self,
         index: u32,

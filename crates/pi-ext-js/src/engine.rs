@@ -1338,8 +1338,9 @@ impl JsHost {
     }
 
     /// Runs one autocomplete wrapper's `applyCompletion`
-    /// (`autocomplete.ts:283-295` — synchronous upstream). `None` falls
+    /// (`autocomplete.ts:283-287` — synchronous upstream). `None` falls
     /// back to the base's application.
+    #[allow(clippy::too_many_arguments)] // the crossing protocol + upstream's apply shape
     pub fn wrapped_apply(
         &self,
         index: u32,
