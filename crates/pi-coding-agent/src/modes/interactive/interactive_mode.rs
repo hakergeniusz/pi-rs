@@ -58,6 +58,8 @@ use super::components::auth_selector::{
     AuthSelectorComponent, AuthSelectorEvent, LoginPromptComponent, LoginPromptEvent,
 };
 use super::components::easter_egg_3d::{EasterEgg3d, EasterEggHandle, play_easter_egg_3d};
+#[cfg(feature = "ext-js")]
+use super::components::extension_custom::ExtensionCustomComponent;
 use super::components::extension_editor::{ExtensionEditorComponent, ExtensionEditorEvent};
 #[cfg(feature = "ext-js")]
 use super::components::extension_input::{ExtensionInputComponent, ExtensionInputEvent};
@@ -128,13 +130,17 @@ enum ImportFromJsonlError {
     Other(String),
 }
 
-/// The extension dialog currently mounted for a `ctx.ui` request (E3
-/// slice 6a): which method it answers, its component's event mailbox, and
-/// the countdown deadline the pump ticks (`opts.timeout`,
-/// `extension-selector.ts:63-72` — upstream arms the countdown inside the
-/// component; the port keeps the clock in the mode's pump).
+/// One dialog on the extension stack (E3 slice 6b): which `ctx.ui` method
+/// it answers, its component's event mailbox, the countdown deadline the
+/// pump ticks (`opts.timeout`, `extension-selector.ts:63-72` — upstream
+/// arms the countdown inside the component; the port keeps the clock in
+/// the mode's pump), and the component itself: `None` while it is the
+/// editor slot's occupant (visible), `Some` while parked behind a dialog
+/// pushed later. Upstream keeps every dialog in `extensionDialogs`
+/// (`interactive-mode.ts:584`) and `showTopExtensionDialog` decides what
+/// the slot shows.
 #[cfg(feature = "ext-js")]
-struct ExtensionUiDialog {
+struct ExtensionUiDialogEntry {
     id: String,
     kind: ExtensionUiKind,
     events: ExtensionUiDialogEvents,
@@ -142,11 +148,16 @@ struct ExtensionUiDialog {
     /// The seconds the countdown last rendered, so the pump only
     /// re-renders on a real tick.
     last_seconds: Option<u32>,
+    /// The engine-side handle of a custom component — disposed on close
+    /// (upstream's `disposeComponent`, `interactive-mode.ts:3104-3109`).
+    handle: Option<u32>,
+    /// The dialog's component while parked; `None` means visible.
+    component: Option<Box<dyn Component>>,
 }
 
 /// The `ctx.ui` dialog methods the interactive bridge mounts
 /// (`showExtensionSelector`/`showExtensionConfirm`/`showExtensionInput`/
-/// `showExtensionEditor`).
+/// `showExtensionEditor`/`showExtensionCustom`).
 #[cfg(feature = "ext-js")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ExtensionUiKind {
@@ -154,6 +165,7 @@ enum ExtensionUiKind {
     Confirm,
     Input,
     Editor,
+    Custom,
 }
 
 /// The mounted dialog's event mailbox, tagged by component.
@@ -162,6 +174,9 @@ enum ExtensionUiDialogEvents {
     Selector(Arc<Mutex<Vec<ExtensionSelectorEvent>>>),
     Input(Arc<Mutex<Vec<ExtensionInputEvent>>>),
     Editor(Arc<Mutex<Vec<ExtensionEditorEvent>>>),
+    /// A custom component interacts through the runner crossings (the
+    /// wrapper's `handle_input`), not a mailbox.
+    Custom,
 }
 
 /// The drained dialog event, normalized across the component types.
@@ -1089,14 +1104,13 @@ pub struct InteractiveMode {
     /// channel (`createExtensionUIContext` over the protocol seam).
     #[cfg(feature = "ext-js")]
     extension_ui_bridge: Option<Arc<super::extension_ui::ExtensionUiBridge>>,
-    /// The currently mounted extension dialog, one at a time; requests
-    /// that arrived while one was open queue behind it
-    /// (`extension_ui_queue` — the FIFO answer to upstream's dialog stack
-    /// until slice 6b lands the full stack).
+    /// The extension dialog stack (`extensionDialogs`,
+    /// `interactive-mode.ts:584`): a new dialog hides the visible one and
+    /// closing the visible one shows the previous again; every dialog
+    /// stays answerable. The top's component rides the editor slot; the
+    /// rest park in their entries.
     #[cfg(feature = "ext-js")]
-    extension_ui_dialog: Option<ExtensionUiDialog>,
-    #[cfg(feature = "ext-js")]
-    extension_ui_queue: Vec<serde_json::Value>,
+    extension_ui_dialogs: Vec<ExtensionUiDialogEntry>,
     /// Events from the mounted `/fork` dialog (`UserMessageSelectorComponent`'s
     /// onSelect/onCancel).
     user_message_selector_events: Option<Arc<Mutex<Vec<UserMessageSelectorEvent>>>>,
@@ -1366,9 +1380,7 @@ impl InteractiveMode {
             #[cfg(feature = "ext-js")]
             extension_ui_bridge: options.extension_ui.clone(),
             #[cfg(feature = "ext-js")]
-            extension_ui_dialog: None,
-            #[cfg(feature = "ext-js")]
-            extension_ui_queue: Vec::new(),
+            extension_ui_dialogs: Vec::new(),
             user_message_selector_events: None,
             tree_selector_events: None,
             tree_summary_dialog_events: None,
@@ -1453,6 +1465,36 @@ impl InteractiveMode {
                     None => text.to_string(),
                 }
             });
+            // The factory's `theme.bold/italic/underline/inverse/
+            // strikethrough` (E3 slice 6b): the attribute wrappers of the
+            // live theme, exactly what upstream's `theme.ts:309-321` calls
+            // resolve to.
+            let style = std::sync::Arc::new(|method: &str, text: &str| {
+                let attributes = match method {
+                    "bold" => pi_tui::color::TextAttributes {
+                        bold: true,
+                        ..pi_tui::color::TextAttributes::default()
+                    },
+                    "italic" => pi_tui::color::TextAttributes {
+                        italic: true,
+                        ..pi_tui::color::TextAttributes::default()
+                    },
+                    "underline" => pi_tui::color::TextAttributes {
+                        underline: true,
+                        ..pi_tui::color::TextAttributes::default()
+                    },
+                    "inverse" => pi_tui::color::TextAttributes {
+                        inverse: true,
+                        ..pi_tui::color::TextAttributes::default()
+                    },
+                    "strikethrough" => pi_tui::color::TextAttributes {
+                        strikethrough: true,
+                        ..pi_tui::color::TextAttributes::default()
+                    },
+                    _ => return text.to_string(),
+                };
+                pi_tui::color::style_text_with_ansi(text, None, None, attributes)
+            });
             let keybindings: std::collections::BTreeMap<&str, Vec<&str>> =
                 theme::app_keys::DEFAULTS
                     .iter()
@@ -1460,6 +1502,7 @@ impl InteractiveMode {
                     .collect();
             let mut guard = runner.lock().expect("extension runner mutex poisoned");
             guard.set_theme_surface(fg, bg);
+            guard.set_style_surface(style);
             guard.set_app_keybindings(
                 &serde_json::to_string(&keybindings).unwrap_or_else(|_| "{}".to_string()),
             );
@@ -6039,12 +6082,47 @@ impl InteractiveMode {
     /// new occupant by identity.
     fn suspend_editor_with(&mut self, component: Box<dyn Component>) {
         let focused = component_id(component.as_ref());
-        let editor = self
+        let displaced = self
             .replace_editor_slot(component)
             .expect("the editor slot holds a component");
-        self.suspended_editor = Some(editor);
+        self.park_displaced_occupant(displaced);
         self.tui.set_focus(Some(FocusTarget::Id(focused)));
         self.tui.request_render();
+    }
+
+    /// Where the displaced editor-slot occupant goes (the slot-swap
+    /// invariant: `suspended_editor` always holds the `ChatEditor`, so a
+    /// built-in selector opened over an open extension dialog never
+    /// destroys the parked editor):
+    /// - the `ChatEditor`: back into `suspended_editor`;
+    /// - the visible top extension dialog: into its entry — upstream
+    ///   keeps the dialog in `extensionDialogs` while a selector replaces
+    ///   it visually and leaves its promise pending
+    ///   (`interactive-mode.ts:5088`, no dialogOpen check there);
+    /// - a built-in selector displaced by another: dropped, as before.
+    fn park_displaced_occupant(&mut self, mut displaced: Box<dyn Component>) {
+        if displaced
+            .as_any_mut()
+            .is_some_and(|any| any.is::<ChatEditor>())
+        {
+            self.suspended_editor = Some(displaced);
+            return;
+        }
+        #[cfg(feature = "ext-js")]
+        if !self.extension_ui_dialogs.is_empty()
+            && self
+                .extension_ui_dialogs
+                .last()
+                .is_some_and(|top| top.component.is_none())
+        {
+            let top = self
+                .extension_ui_dialogs
+                .last_mut()
+                .expect("stack top just checked");
+            top.component = Some(displaced);
+            return;
+        }
+        drop(displaced);
     }
 
     /// `showSelector`'s `done` (`interactive-mode.ts:5096-5103`): put the
@@ -6116,6 +6194,16 @@ impl InteractiveMode {
                 self.pending_tools.clear();
                 self.streaming_index = None;
                 self.compaction_run = None;
+                // No extension-UI reset: upstream runs `resetExtensionUI`
+                // at init (`interactive-mode.ts:643`) and on `/reload`
+                // (`:6628`) only — a session switch leaves pending dialogs
+                // and their promises exactly as they are, because the
+                // extensions themselves persist across the switch (they
+                // get `session_shutdown`/`session_start` instead). The
+                // port matches: mounted dialogs stay interactive over the
+                // resumed transcript, and their delivery threads hold no
+                // runner mutex while waiting (`begin_ui_dialog`), so the
+                // switch's own emits cannot deadlock on them.
                 // The rebind callback re-renders the CURRENT session state:
                 // `renderCurrentSessionState` clears the chat before replaying
                 // the resumed transcript (`interactive-mode.ts:2337-2347` via
@@ -6224,10 +6312,15 @@ impl InteractiveMode {
         }
 
         // `resetExtensionUI` (`interactive-mode.ts:6628`): a pending
-        // extension login flow cancels; mounted dialogs cannot be open —
-        // the editor owns the input while `/reload` is typed.
+        // extension login flow cancels and every open dialog disposes.
+        // Today the dialogs arm is unreachable through the UI — the
+        // editor owns input while `/reload` is typed, and a mounted
+        // dialog parks the editor — but the port runs it anyway, exactly
+        // like upstream, so the invariant never depends on that reach.
         #[cfg(feature = "ext-js")]
         self.cancel_extension_login_flow();
+        #[cfg(feature = "ext-js")]
+        self.reset_extension_ui_dialogs();
 
         // `session.reload` (`agent-session.ts:3838-3849`): the shutdown
         // event, the invalidation, the settings reload, the queue-mode
@@ -8294,13 +8387,63 @@ impl InteractiveMode {
         }
     }
 
-    /// The extension `ctx.ui` bridge's pump (E3 slice 6a): drains the
-    /// request channel and the mounted dialog's events. Requests that
-    /// arrive while a dialog is open queue behind it — the FIFO answer to
-    /// upstream's dialog stack (`pushExtensionDialog`,
-    /// `interactive-mode.ts:2833-2856`) until slice 6b lands the stack.
+    /// The extension `ctx.ui` bridge's pump (E3 slices 6a+6b): drains the
+    /// runner's engine-side request queue, then the bridge channel, then
+    /// the dialog stack's deadlines and mailboxes. Dialog requests mount
+    /// onto the stack immediately (`pushExtensionDialog`,
+    /// `interactive-mode.ts:2833-2838`) — a new dialog hides the visible
+    /// one and closing the visible one shows the previous again.
     #[cfg(feature = "ext-js")]
     fn pump_extension_ui(&mut self) {
+        // The runner drains the engine's ui_requests: a custom done()
+        // crossing forwards as fire-and-forget and ends its ui_prompt
+        // pair; nested dialog requests come back for delivery on threads.
+        // Those threads begin the dialog under a guard, wait for the
+        // answer OUTSIDE it (`begin_ui_dialog`), and complete under a
+        // fresh guard — upstream's pending dialogs hold nothing but the
+        // JS dispatch they started in, and this thread's crossings
+        // (component render/input) need the mutex while a dialog shows.
+        // This stays a try_lock for the frames where a competing JS run
+        // (an emit mid-settle, a dialog completion) briefly holds the
+        // mutex; skipping a frame beats stalling the UI thread. The Arc is
+        // cloned first so the guard's destructor never holds a borrow of
+        // `self` across the show_error arm.
+        let runner_arc = self.extension_runner.as_ref().map(Arc::clone);
+        if let Some(runner_arc) = runner_arc
+            && let Ok(mut runner) = runner_arc.try_lock()
+        {
+            let service = runner.service_ui_requests();
+            match service {
+                Ok(deferred) => {
+                    for request in deferred {
+                        let runner = Arc::clone(&runner_arc);
+                        std::thread::spawn(move || {
+                            let wait = match runner
+                                .lock()
+                                .expect("extension runner mutex poisoned")
+                                .begin_ui_dialog(&request)
+                            {
+                                Ok(Some(wait)) => wait,
+                                Ok(None) => return,
+                                Err(err) => {
+                                    eprintln!("Warning: extension dialog delivery failed: {err}");
+                                    return;
+                                }
+                            };
+                            let response = wait.wait();
+                            if let Err(err) = runner
+                                .lock()
+                                .expect("extension runner mutex poisoned")
+                                .complete_ui_dialog(&wait, &response)
+                            {
+                                eprintln!("Warning: extension dialog completion failed: {err}");
+                            }
+                        });
+                    }
+                }
+                Err(err) => self.show_error(&err.to_string()),
+            }
+        }
         let mut requests: Vec<serde_json::Value> = Vec::new();
         if let Some(bridge) = self.extension_ui_bridge.as_ref() {
             while let Some(request) = bridge.try_request() {
@@ -8308,30 +8451,62 @@ impl InteractiveMode {
             }
         }
         for request in requests {
-            if self.extension_ui_dialog.is_some() {
-                self.extension_ui_queue.push(request);
-            } else {
-                self.mount_extension_ui_request(&request);
+            let method = request
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            match method.as_str() {
+                // done() closed a custom dialog: the glue resolved its
+                // promise, the close only disposes the component and
+                // re-shows what was under it (`removeExtensionDialog`).
+                "customDone" => {
+                    let id = request
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    self.close_extension_ui_dialog_by_id(&id, &serde_json::json!({}));
+                }
+                "select" | "confirm" | "input" | "editor" | "custom" => {
+                    if let Some(entry) = self.extension_dialog_entry(&request) {
+                        self.push_extension_dialog_entry(entry);
+                    }
+                }
+                // `showExtensionNotify` (`interactive-mode.ts:3061-3071`).
+                "notify" => {
+                    let message = request
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    match request.get("notifyType").and_then(Value::as_str) {
+                        Some("error") => self.show_error(message),
+                        Some("warning") => self.show_warning(message),
+                        _ => self.show_status(message),
+                    }
+                }
+                // The custom factory's `tui.requestRender()` adapter.
+                "requestRender" => self.tui.request_render(),
+                // `setStatus` reaches the footer's extension-status surface,
+                // which lands with the E3 footer work.
+                _ => {}
             }
         }
-        if self.extension_ui_dialog.is_none() && !self.extension_ui_queue.is_empty() {
-            let next = self.extension_ui_queue.remove(0);
-            self.mount_extension_ui_request(&next);
-        }
-        self.pump_extension_ui_dialog();
+        self.pump_extension_ui_dialogs();
     }
 
-    /// Mounts one `ctx.ui` request's dialog (`showExtensionSelector`,
-    /// `showExtensionConfirm`, `showExtensionInput`, `showExtensionEditor`,
-    /// `showExtensionNotify` — `interactive-mode.ts:2858-3071`). The
-    /// editor-slot swap parks the editor with its text, which is
-    /// upstream's `restoreEditor` semantics (the saved text rides the
-    /// parked editor). The footer extension-status surface
-    /// (`setStatus` → `footerDataProvider.setExtensionStatus`) lands with
-    /// the E3 footer work; those requests drop for now.
+    /// Builds one `ctx.ui` dialog request's stack entry without mounting
+    /// (`showExtensionSelector`/`showExtensionConfirm`/
+    /// `showExtensionInput`/`showExtensionEditor` —
+    /// `interactive-mode.ts:2858-2955` — and the inline arm of
+    /// `showExtensionCustom`, `:3074-3163`). A custom request without a
+    /// runner or handle drops.
+    #[allow(clippy::too_many_lines)] // mirrors the TS show*Extension* mounts; split when extending
     #[cfg(feature = "ext-js")]
-    #[allow(clippy::too_many_lines)] // mirrors the TS dialog mounts; split when extending
-    fn mount_extension_ui_request(&mut self, request: &serde_json::Value) {
+    fn extension_dialog_entry(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> Option<ExtensionUiDialogEntry> {
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let id = request
             .get("id")
@@ -8358,14 +8533,15 @@ impl InteractiveMode {
                     .unwrap_or_default();
                 let events = Arc::new(Mutex::new(Vec::new()));
                 let selector = ExtensionSelectorComponent::new(title, options, Arc::clone(&events));
-                self.suspend_editor_with(Box::new(selector));
-                self.extension_ui_dialog = Some(ExtensionUiDialog {
+                Some(ExtensionUiDialogEntry {
                     id,
                     kind: ExtensionUiKind::Select,
                     events: ExtensionUiDialogEvents::Selector(events),
                     deadline,
                     last_seconds: None,
-                });
+                    handle: None,
+                    component: Some(Box::new(selector)),
+                })
             }
             "confirm" => {
                 // `${title}\n${message}` over Yes/No
@@ -8381,14 +8557,15 @@ impl InteractiveMode {
                     vec!["Yes".to_string(), "No".to_string()],
                     Arc::clone(&events),
                 );
-                self.suspend_editor_with(Box::new(selector));
-                self.extension_ui_dialog = Some(ExtensionUiDialog {
+                Some(ExtensionUiDialogEntry {
                     id,
                     kind: ExtensionUiKind::Confirm,
                     events: ExtensionUiDialogEvents::Selector(events),
                     deadline,
                     last_seconds: None,
-                });
+                    handle: None,
+                    component: Some(Box::new(selector)),
+                })
             }
             "input" => {
                 let title = request
@@ -8398,14 +8575,15 @@ impl InteractiveMode {
                 let placeholder = request.get("placeholder").and_then(Value::as_str);
                 let events = Arc::new(Mutex::new(Vec::new()));
                 let prompt = ExtensionInputComponent::new(title, placeholder, Arc::clone(&events));
-                self.suspend_editor_with(Box::new(prompt));
-                self.extension_ui_dialog = Some(ExtensionUiDialog {
+                Some(ExtensionUiDialogEntry {
                     id,
                     kind: ExtensionUiKind::Input,
                     events: ExtensionUiDialogEvents::Input(events),
                     deadline,
                     last_seconds: None,
-                });
+                    handle: None,
+                    component: Some(Box::new(prompt)),
+                })
             }
             "editor" => {
                 let title = request
@@ -8415,166 +8593,290 @@ impl InteractiveMode {
                 let prefill = request.get("prefill").and_then(Value::as_str);
                 let events = Arc::new(Mutex::new(Vec::new()));
                 let editor = ExtensionEditorComponent::new(title, prefill, Arc::clone(&events));
-                self.suspend_editor_with(Box::new(editor));
-                self.extension_ui_dialog = Some(ExtensionUiDialog {
+                Some(ExtensionUiDialogEntry {
                     id,
                     kind: ExtensionUiKind::Editor,
                     events: ExtensionUiDialogEvents::Editor(events),
                     deadline,
                     last_seconds: None,
-                });
+                    handle: None,
+                    component: Some(Box::new(editor)),
+                })
             }
-            // `showExtensionNotify` (`interactive-mode.ts:3061-3071`).
-            "notify" => {
-                let message = request
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                match request.get("notifyType").and_then(Value::as_str) {
-                    Some("error") => self.show_error(message),
-                    Some("warning") => self.show_warning(message),
-                    _ => self.show_status(message),
-                }
+            "custom" => {
+                // The inline arm of `showExtensionCustom`: the wrapper
+                // crosses render/input through the runner; done() closed
+                // the promise glue-side, the customDone crossing closes
+                // this entry. No timeout option upstream (`:3079-3086`).
+                let handle = request.get("handle").and_then(Value::as_u64)? as u32;
+                let runner = Arc::clone(self.extension_runner.as_ref()?);
+                let component = ExtensionCustomComponent::new(runner, handle);
+                Some(ExtensionUiDialogEntry {
+                    id,
+                    kind: ExtensionUiKind::Custom,
+                    events: ExtensionUiDialogEvents::Custom,
+                    deadline: None,
+                    last_seconds: None,
+                    handle: Some(handle),
+                    component: Some(Box::new(component)),
+                })
             }
-            // `setStatus` reaches the footer's extension-status surface,
-            // which lands with the E3 footer work.
-            _ => {}
+            _ => None,
         }
     }
 
-    /// The mounted dialog's drain: the countdown tick, the component
-    /// events, and the close path. The response shapes are the runner's
-    /// (`{value}`, `{confirmed}`, `{cancelled:true}` — the glue parses
-    /// them into the method's result).
+    /// `pushExtensionDialog` (`interactive-mode.ts:2833-2838`): a built-in
+    /// selector showing is disposed, the dialog pushes, and the slot
+    /// shows it. The displaced occupant parks by kind — the editor into
+    /// `suspended_editor`, the previous top dialog into its entry
+    /// ([`Self::park_displaced_occupant`]).
     #[cfg(feature = "ext-js")]
-    fn pump_extension_ui_dialog(&mut self) {
-        if self.extension_ui_dialog.is_none() {
+    fn push_extension_dialog_entry(&mut self, mut entry: ExtensionUiDialogEntry) {
+        let component = entry
+            .component
+            .take()
+            .expect("a fresh dialog entry carries its component");
+        let focused = component_id(component.as_ref());
+        let displaced = self
+            .replace_editor_slot(component)
+            .expect("the editor slot holds a component");
+        self.park_displaced_occupant(displaced);
+        self.extension_ui_dialogs.push(entry);
+        self.tui.set_focus(Some(FocusTarget::Id(focused)));
+        self.tui.request_render();
+    }
+
+    /// The dialog stack's drain: per-dialog countdown ticks (the timers
+    /// run inside the components upstream — hidden dialogs keep ticking,
+    /// `extension-selector.ts:63-72`), then the event mailboxes. Only the
+    /// visible top receives input, but a countdown expiry can close any
+    /// dialog. The response shapes are the runner's (`{value}`,
+    /// `{confirmed}`, `{cancelled:true}` — the glue parses them into the
+    /// method's result).
+    #[allow(clippy::too_many_lines)] // mirrors the TS dialog pump; split when extending
+    #[cfg(feature = "ext-js")]
+    fn pump_extension_ui_dialogs(&mut self) {
+        if self.extension_ui_dialogs.is_empty() {
             return;
         }
-        // The countdown tick (`extension-selector.ts:63-72`): the title
-        // re-renders with the remaining whole seconds; expiry cancels.
-        let countdown = self.extension_ui_dialog.as_ref().and_then(|dialog| {
-            dialog
-                .deadline
-                .map(|deadline| (deadline, dialog.last_seconds))
-        });
-        if let Some((deadline, last_seconds)) = countdown {
-            let now = Instant::now();
+        let now = Instant::now();
+        let mut ticked: Vec<(usize, u32)> = Vec::new();
+        let mut expired: Vec<String> = Vec::new();
+        for (index, dialog) in self.extension_ui_dialogs.iter().enumerate() {
+            let Some(deadline) = dialog.deadline else {
+                continue;
+            };
             if now >= deadline {
-                self.close_extension_ui_dialog(&serde_json::json!({ "cancelled": true }));
-                return;
-            }
-            let seconds = (deadline.saturating_duration_since(now).as_secs_f64().ceil()) as u32;
-            if last_seconds != Some(seconds) {
-                if let Some(dialog) = self.extension_ui_dialog.as_mut() {
-                    dialog.last_seconds = Some(seconds);
+                expired.push(dialog.id.clone());
+            } else {
+                let seconds = (deadline.saturating_duration_since(now).as_secs_f64().ceil()) as u32;
+                if dialog.last_seconds != Some(seconds) {
+                    ticked.push((index, seconds));
                 }
-                self.set_extension_ui_countdown(seconds);
             }
         }
-        let Some(dialog) = self.extension_ui_dialog.as_ref() else {
-            return;
-        };
-        // The component events, per kind.
-        let events = match &dialog.events {
-            ExtensionUiDialogEvents::Selector(events) => {
-                let drained: Vec<ExtensionSelectorEvent> =
-                    std::mem::take(&mut *events.lock().expect("extension ui selector"));
-                drained
-                    .into_iter()
-                    .map(|event| match event {
-                        ExtensionSelectorEvent::Selected(option) => {
-                            ExtensionUiDialogEvent::Selected(option)
-                        }
-                        ExtensionSelectorEvent::Cancel => ExtensionUiDialogEvent::Cancelled,
-                    })
-                    .collect::<Vec<ExtensionUiDialogEvent>>()
+        for (index, seconds) in ticked {
+            if let Some(dialog) = self.extension_ui_dialogs.get_mut(index) {
+                dialog.last_seconds = Some(seconds);
             }
-            ExtensionUiDialogEvents::Input(events) => {
-                let drained: Vec<ExtensionInputEvent> =
-                    std::mem::take(&mut *events.lock().expect("extension ui input"));
-                drained
-                    .into_iter()
-                    .map(|event| match event {
-                        ExtensionInputEvent::Submitted(value) => {
-                            ExtensionUiDialogEvent::Submitted(value)
-                        }
-                        ExtensionInputEvent::Cancel => ExtensionUiDialogEvent::Cancelled,
-                    })
-                    .collect()
-            }
-            ExtensionUiDialogEvents::Editor(events) => {
-                let drained: Vec<ExtensionEditorEvent> =
-                    std::mem::take(&mut *events.lock().expect("extension ui editor"));
-                drained
-                    .into_iter()
-                    .map(|event| match event {
-                        ExtensionEditorEvent::Submitted(value) => {
-                            ExtensionUiDialogEvent::Submitted(value)
-                        }
-                        ExtensionEditorEvent::Cancel => ExtensionUiDialogEvent::Cancelled,
-                    })
-                    .collect()
-            }
-        };
-        for event in events {
-            match event {
-                ExtensionUiDialogEvent::Submitted(value) => {
-                    let response = match self.extension_ui_dialog.as_ref().map(|d| d.kind) {
-                        Some(ExtensionUiKind::Confirm) => serde_json::json!({
-                            "confirmed": value == "Yes",
-                        }),
-                        _ => serde_json::json!({ "value": value }),
-                    };
-                    self.close_extension_ui_dialog(&response);
+            self.set_extension_ui_countdown(index, seconds);
+        }
+        for id in expired {
+            self.close_extension_ui_dialog_by_id(&id, &serde_json::json!({ "cancelled": true }));
+        }
+        // The event mailboxes, per dialog.
+        let mut drained: Vec<(String, ExtensionUiDialogEvent)> = Vec::new();
+        for dialog in &self.extension_ui_dialogs {
+            let events = match &dialog.events {
+                ExtensionUiDialogEvents::Selector(events) => {
+                    let taken: Vec<ExtensionSelectorEvent> =
+                        std::mem::take(&mut *events.lock().expect("extension ui selector"));
+                    taken
+                        .into_iter()
+                        .map(|event| match event {
+                            ExtensionSelectorEvent::Selected(option) => {
+                                ExtensionUiDialogEvent::Selected(option)
+                            }
+                            ExtensionSelectorEvent::Cancel => ExtensionUiDialogEvent::Cancelled,
+                        })
+                        .collect::<Vec<ExtensionUiDialogEvent>>()
                 }
-                ExtensionUiDialogEvent::Selected(option) => {
-                    let response = match self.extension_ui_dialog.as_ref().map(|d| d.kind) {
-                        Some(ExtensionUiKind::Confirm) => serde_json::json!({
-                            "confirmed": option == "Yes",
-                        }),
-                        _ => serde_json::json!({ "value": option }),
-                    };
-                    self.close_extension_ui_dialog(&response);
+                ExtensionUiDialogEvents::Input(events) => {
+                    let taken: Vec<ExtensionInputEvent> =
+                        std::mem::take(&mut *events.lock().expect("extension ui input"));
+                    taken
+                        .into_iter()
+                        .map(|event| match event {
+                            ExtensionInputEvent::Submitted(value) => {
+                                ExtensionUiDialogEvent::Submitted(value)
+                            }
+                            ExtensionInputEvent::Cancel => ExtensionUiDialogEvent::Cancelled,
+                        })
+                        .collect()
                 }
-                ExtensionUiDialogEvent::Cancelled => {
-                    self.close_extension_ui_dialog(&serde_json::json!({ "cancelled": true }));
+                ExtensionUiDialogEvents::Editor(events) => {
+                    let taken: Vec<ExtensionEditorEvent> =
+                        std::mem::take(&mut *events.lock().expect("extension ui editor"));
+                    taken
+                        .into_iter()
+                        .map(|event| match event {
+                            ExtensionEditorEvent::Submitted(value) => {
+                                ExtensionUiDialogEvent::Submitted(value)
+                            }
+                            ExtensionEditorEvent::Cancel => ExtensionUiDialogEvent::Cancelled,
+                        })
+                        .collect()
                 }
+                // A custom component interacts through the runner
+                // crossings; the close crosses as customDone.
+                ExtensionUiDialogEvents::Custom => continue,
+            };
+            for event in events {
+                drained.push((dialog.id.clone(), event));
             }
+        }
+        for (id, event) in drained {
+            let kind = self
+                .extension_ui_dialogs
+                .iter()
+                .find(|dialog| dialog.id == id)
+                .map(|dialog| dialog.kind);
+            let response = match (event, kind) {
+                (ExtensionUiDialogEvent::Submitted(value), Some(ExtensionUiKind::Confirm)) => {
+                    serde_json::json!({ "confirmed": value == "Yes" })
+                }
+                (ExtensionUiDialogEvent::Selected(option), Some(ExtensionUiKind::Confirm)) => {
+                    serde_json::json!({ "confirmed": option == "Yes" })
+                }
+                (ExtensionUiDialogEvent::Submitted(value), _) => {
+                    serde_json::json!({ "value": value })
+                }
+                (ExtensionUiDialogEvent::Selected(option), _) => {
+                    serde_json::json!({ "value": option })
+                }
+                (ExtensionUiDialogEvent::Cancelled, _) => {
+                    serde_json::json!({ "cancelled": true })
+                }
+            };
+            self.close_extension_ui_dialog_by_id(&id, &response);
         }
     }
 
-    /// The countdown re-render: reach the mounted selector/input through
-    /// the editor slot and refresh the title suffix (the editor/editor
-    /// kinds have no countdown).
+    /// The countdown re-render for the dialog at `index`: the visible one
+    /// (its entry holds no component) through the editor slot, a parked
+    /// one through its entry (upstream's timer updates the component
+    /// wherever it lives; the title suffix shows when it surfaces again).
     #[cfg(feature = "ext-js")]
-    fn set_extension_ui_countdown(&mut self, seconds: u32) {
-        if let Some(selector) = self.downcast_tree::<ExtensionSelectorComponent>(HostSlot::Editor) {
-            selector.set_countdown_seconds(Some(seconds));
-        } else if let Some(prompt) = self.downcast_tree::<ExtensionInputComponent>(HostSlot::Editor)
+    fn set_extension_ui_countdown(&mut self, index: usize, seconds: u32) {
+        let visible = self
+            .extension_ui_dialogs
+            .get(index)
+            .is_some_and(|dialog| dialog.component.is_none());
+        if visible {
+            if let Some(selector) =
+                self.downcast_tree::<ExtensionSelectorComponent>(HostSlot::Editor)
+            {
+                selector.set_countdown_seconds(Some(seconds));
+            } else if let Some(prompt) =
+                self.downcast_tree::<ExtensionInputComponent>(HostSlot::Editor)
+            {
+                prompt.set_countdown_seconds(Some(seconds));
+            }
+        } else if let Some(component) = self
+            .extension_ui_dialogs
+            .get_mut(index)
+            .and_then(|dialog| dialog.component.as_mut())
+            && let Some(any) = component.as_any_mut()
         {
-            prompt.set_countdown_seconds(Some(seconds));
+            if let Some(selector) = any.downcast_mut::<ExtensionSelectorComponent>() {
+                selector.set_countdown_seconds(Some(seconds));
+            } else if let Some(prompt) = any.downcast_mut::<ExtensionInputComponent>() {
+                prompt.set_countdown_seconds(Some(seconds));
+            }
         }
         self.tui.request_render();
     }
 
-    /// The dialog's close path: answer the runner, put the editor back,
-    /// and mount the next queued request
-    /// (`removeExtensionDialog` → `showTopExtensionDialog`'s editor
-    /// fallback, `interactive-mode.ts:2843-2856`).
+    /// The dialog's close path (`removeExtensionDialog` +
+    /// `showTopExtensionDialog`, `interactive-mode.ts:2840-2856`): splice
+    /// the dialog out by identity; if it was visible, the previous dialog
+    /// (or the editor) shows again. The response answers the runner's
+    /// wait for the mailbox kinds; a custom dialog's promise resolved
+    /// glue-side at `done()` — the close only disposes its component.
     #[cfg(feature = "ext-js")]
-    fn close_extension_ui_dialog(&mut self, response: &serde_json::Value) {
-        let Some(dialog) = self.extension_ui_dialog.take() else {
+    fn close_extension_ui_dialog_by_id(&mut self, id: &str, response: &serde_json::Value) {
+        let Some(index) = self
+            .extension_ui_dialogs
+            .iter()
+            .position(|dialog| dialog.id == id)
+        else {
             return;
         };
+        let was_top = index + 1 == self.extension_ui_dialogs.len();
+        let entry = self.extension_ui_dialogs.remove(index);
         if let Some(bridge) = self.extension_ui_bridge.as_ref() {
-            bridge.respond(&dialog.id, response);
+            bridge.respond(id, response);
+        }
+        if was_top {
+            // The slot holds the closed dialog: show the previous dialog
+            // or the editor, focused like `showTopExtensionDialog`.
+            if let Some(top) = self.extension_ui_dialogs.last_mut() {
+                let component = top
+                    .component
+                    .take()
+                    .expect("a parked top dialog carries its component");
+                let focused = component_id(component.as_ref());
+                drop(self.replace_editor_slot(component));
+                self.tui.set_focus(Some(FocusTarget::Id(focused)));
+            } else {
+                let editor = self
+                    .suspended_editor
+                    .take()
+                    .expect("the editor is parked while a dialog shows");
+                drop(self.replace_editor_slot(editor));
+                self.tui.set_focus(Some(FocusTarget::Id(self.editor_id)));
+            }
+            self.tui.request_render();
+        }
+        drop(entry.component);
+        // `disposeComponent` (`interactive-mode.ts:3104-3109`) for the
+        // custom kinds; the mailbox components hold no engine state.
+        if let Some(handle) = entry.handle
+            && let Some(runner) = self.extension_runner.as_ref()
+        {
+            let _ = runner
+                .lock()
+                .expect("extension runner mutex poisoned")
+                .component_dispose(handle);
+        }
+    }
+
+    /// `resetExtensionUI`'s dialogs arm (`interactive-mode.ts:2592-2600`,
+    /// called from init `:643` and `/reload` `:6628` — never on session
+    /// switches): dispose every open dialog without calling `done()` and
+    /// put the editor back. The port answers `cancelled` for the mailbox
+    /// kinds so their delivery threads unblock (upstream leaves the
+    /// promises pending — its engine is in-process and threadless).
+    #[cfg(feature = "ext-js")]
+    fn reset_extension_ui_dialogs(&mut self) {
+        if self.extension_ui_dialogs.is_empty() {
+            return;
+        }
+        for dialog in self.extension_ui_dialogs.drain(..) {
+            if let Some(bridge) = self.extension_ui_bridge.as_ref() {
+                bridge.respond(&dialog.id, &serde_json::json!({ "cancelled": true }));
+            }
+            if let Some(handle) = dialog.handle
+                && let Some(runner) = self.extension_runner.as_ref()
+            {
+                let _ = runner
+                    .lock()
+                    .expect("extension runner mutex poisoned")
+                    .component_dispose(handle);
+            }
+            drop(dialog.component);
         }
         self.restore_editor();
-        if !self.extension_ui_queue.is_empty() {
-            let next = self.extension_ui_queue.remove(0);
-            self.mount_extension_ui_request(&next);
-        }
     }
 
     /// The settled credential (`completeProviderAuthentication`'s storage
@@ -10504,12 +10806,12 @@ export default function (pi) {
         });
         for _ in 0..200 {
             mode.pump();
-            if mode.extension_ui_dialog.is_some() {
+            if !mode.extension_ui_dialogs.is_empty() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let dialog = mode.extension_ui_dialog.as_ref().expect("dialog mounted");
+        let dialog = mode.extension_ui_dialogs.last().expect("dialog mounted");
         assert_eq!(dialog.kind, ExtensionUiKind::Select);
         assert!(mode.suspended_editor.is_some(), "the editor is parked");
         // Pick "B" through the component's event mailbox.
@@ -10541,7 +10843,7 @@ export default function (pi) {
             .find(|(custom_type, _)| custom_type == "picked")
             .map(|(_, data)| data.clone());
         assert_eq!(picked, Some(serde_json::json!({ "value": "B" })));
-        assert!(mode.extension_ui_dialog.is_none(), "the dialog closed");
+        assert!(mode.extension_ui_dialogs.is_empty(), "the dialog closed");
         assert!(mode.suspended_editor.is_none(), "editor restored");
         mode.shutdown().expect("shutdown");
     }
@@ -10572,12 +10874,12 @@ export default function (pi) {
         });
         for _ in 0..200 {
             mode.pump();
-            if mode.extension_ui_dialog.is_some() {
+            if !mode.extension_ui_dialogs.is_empty() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let dialog = mode.extension_ui_dialog.as_ref().expect("dialog mounted");
+        let dialog = mode.extension_ui_dialogs.last().expect("dialog mounted");
         assert_eq!(dialog.kind, ExtensionUiKind::Input);
         // Real keystrokes: the tui routes them to the focused dialog.
         mode.feed_stdin_bytes(b"h");
@@ -10601,7 +10903,7 @@ export default function (pi) {
             .find(|(custom_type, _)| custom_type == "named")
             .map(|(_, data)| data.clone());
         assert_eq!(named, Some(serde_json::json!({ "value": "hi" })));
-        assert!(mode.extension_ui_dialog.is_none(), "the dialog closed");
+        assert!(mode.extension_ui_dialogs.is_empty(), "the dialog closed");
         mode.shutdown().expect("shutdown");
     }
 
@@ -10644,9 +10946,276 @@ export default function (pi) {
         assert!(plain.contains("Warning: careful"), "{plain}");
         assert!(plain.contains("Error: bad"), "{plain}");
         assert!(
-            mode.extension_ui_dialog.is_none(),
+            mode.extension_ui_dialogs.is_empty(),
             "notify never mounts a dialog"
         );
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `ctx.ui.custom` mounts the factory's adopted component in the
+    /// editor slot; its render/input cross through the runner and `done()`
+    /// resolves the extension's promise (`showExtensionCustom`,
+    /// `interactive-mode.ts:3074-3163`).
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_ui_custom_mounts_and_done_resolves() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (_event, ctx) => {
+    const value = await ctx.ui.custom((_tui, _theme, _kb, done) => ({
+      render: (width) => ["CUSTOM BODY " + width],
+      invalidate: () => {},
+      handleInput: (data) => {
+        if (data === "\r") {
+          done("picked-value");
+          return true;
+        }
+        return false;
+      },
+    }));
+    pi.appendEntry("picked", { value: value ?? null });
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        let runner = mode.extension_runner.clone().expect("runner");
+        let emitter = std::thread::spawn(move || {
+            runner
+                .lock()
+                .expect("runner")
+                .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+                .expect("emit");
+        });
+        for _ in 0..200 {
+            mode.pump();
+            if !mode.extension_ui_dialogs.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let dialog = mode.extension_ui_dialogs.last().expect("custom mounted");
+        assert_eq!(dialog.kind, ExtensionUiKind::Custom);
+        assert!(mode.suspended_editor.is_some(), "the editor is parked");
+        // The wrapper renders through the runner crossings.
+        let component = mode
+            .downcast_tree::<ExtensionCustomComponent>(HostSlot::Editor)
+            .expect("the custom sits in the editor slot");
+        assert_eq!(component.render(100), vec!["CUSTOM BODY 100".to_string()],);
+        // Enter reaches it through the focused slot; done() closes.
+        mode.feed_stdin_bytes(b"\r");
+        mode.pump();
+        emitter.join().expect("emit thread");
+        let entries = mode
+            .extension_runner
+            .as_ref()
+            .expect("runner")
+            .lock()
+            .expect("runner")
+            .core()
+            .lock()
+            .expect("core")
+            .entries
+            .clone();
+        let picked = entries
+            .iter()
+            .find(|(custom_type, _)| custom_type == "picked")
+            .map(|(_, data)| data.clone());
+        assert_eq!(picked, Some(serde_json::json!({ "value": "picked-value" })));
+        assert!(mode.extension_ui_dialogs.is_empty(), "the custom closed");
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// Two `ctx.ui.custom` calls stack: the second mounts over the first
+    /// (which parks in its entry), and closing it resurfaces the first
+    /// (upstream's `extensionDialogs` stack,
+    /// `interactive-mode.ts:2833-2856`).
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_ui_custom_stack_push_and_pop() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (_event, ctx) => {
+    const first = ctx.ui.custom((_tui, _theme, _kb, doneA) => ({
+      render: (width) => ["ALPHA " + width],
+      invalidate: () => {},
+      handleInput: (data) => {
+        if (data === "a") {
+          doneA("alpha");
+          return true;
+        }
+        return false;
+      },
+    }));
+    const second = ctx.ui.custom((_tui, _theme, _kb, doneB) => ({
+      render: (width) => ["BETA " + width],
+      invalidate: () => {},
+      handleInput: (data) => {
+        if (data === "b") {
+          doneB("beta");
+          return true;
+        }
+        return false;
+      },
+    }));
+    const results = await Promise.all([first, second]);
+    pi.appendEntry("stack", { a: results[0] ?? null, b: results[1] ?? null });
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        let runner = mode.extension_runner.clone().expect("runner");
+        let emitter = std::thread::spawn(move || {
+            runner
+                .lock()
+                .expect("runner")
+                .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+                .expect("emit");
+        });
+        for _ in 0..200 {
+            mode.pump();
+            if mode.extension_ui_dialogs.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(mode.extension_ui_dialogs.len(), 2, "both customs mounted");
+        assert!(
+            mode.extension_ui_dialogs[0].component.is_some(),
+            "the first custom is parked under the second"
+        );
+        assert!(
+            mode.extension_ui_dialogs[1].component.is_none(),
+            "the second custom is visible"
+        );
+        // BETA sits in the editor slot.
+        let beta = mode
+            .downcast_tree::<ExtensionCustomComponent>(HostSlot::Editor)
+            .expect("the top custom sits in the editor slot");
+        assert_eq!(beta.render(100), vec!["BETA 100".to_string()]);
+        // "b" closes it; ALPHA resurfaces.
+        mode.feed_stdin_bytes(b"b");
+        mode.pump();
+        assert_eq!(mode.extension_ui_dialogs.len(), 1, "BETA closed");
+        let alpha = mode
+            .downcast_tree::<ExtensionCustomComponent>(HostSlot::Editor)
+            .expect("the first custom resurfaced");
+        assert_eq!(alpha.render(100), vec!["ALPHA 100".to_string()]);
+        mode.feed_stdin_bytes(b"a");
+        mode.pump();
+        emitter.join().expect("emit thread");
+        let entries = mode
+            .extension_runner
+            .as_ref()
+            .expect("runner")
+            .lock()
+            .expect("runner")
+            .core()
+            .lock()
+            .expect("core")
+            .entries
+            .clone();
+        let stack = entries
+            .iter()
+            .find(|(custom_type, _)| custom_type == "stack")
+            .map(|(_, data)| data.clone());
+        assert_eq!(
+            stack,
+            Some(serde_json::json!({ "a": "alpha", "b": "beta" }))
+        );
+        assert!(mode.extension_ui_dialogs.is_empty(), "both closed");
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// A session switch leaves pending dialogs exactly as they are —
+    /// upstream runs `resetExtensionUI` at init (`interactive-mode.ts:643`)
+    /// and on `/reload` (`:6628`) only, and the extensions themselves
+    /// persist across the switch. The still-mounted dialog stays
+    /// interactive and resolves after the switch. A custom dialog rides
+    /// here because its answer holds no runner mutex (a mailbox dialog
+    /// opened by the emit blocks its emitter thread inline; the mode-side
+    /// survival behavior is the same stack code for every kind).
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_ui_session_switch_leaves_dialogs_pending() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (_event, ctx) => {
+    const value = await ctx.ui.custom((_tui, _theme, _kb, done) => ({
+      render: (width) => ["KEEP ME " + width],
+      invalidate: () => {},
+      handleInput: (data) => {
+        if (data === "z") {
+          done("kept-value");
+          return true;
+        }
+        return false;
+      },
+    }));
+    pi.appendEntry("kept", { value: value ?? null });
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        let runner = mode.extension_runner.clone().expect("runner");
+        let emitter = std::thread::spawn(move || {
+            runner
+                .lock()
+                .expect("runner")
+                .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+                .expect("emit");
+        });
+        for _ in 0..200 {
+            mode.pump();
+            if !mode.extension_ui_dialogs.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        emitter.join().expect("emit thread");
+        assert_eq!(mode.extension_ui_dialogs.len(), 1, "the custom mounted");
+        // Switch to a fresh session while the dialog is open.
+        let other = SessionManager::create(dir.path(), None, &NewSessionOptions::default())
+            .expect("session");
+        let other_path = other.session_file().expect("session file").to_path_buf();
+        drop(other);
+        mode.switch_session(&other_path);
+        // Upstream-faithful: the dialog survives, still mounted and focused.
+        assert_eq!(
+            mode.extension_ui_dialogs.len(),
+            1,
+            "the switch does not dispose the dialog"
+        );
+        assert_eq!(mode.extension_ui_dialogs[0].kind, ExtensionUiKind::Custom);
+        assert!(mode.suspended_editor.is_some(), "still parked");
+        // And it still answers.
+        mode.feed_stdin_bytes(b"z");
+        mode.pump();
+        let entries = mode
+            .extension_runner
+            .as_ref()
+            .expect("runner")
+            .lock()
+            .expect("runner")
+            .core()
+            .lock()
+            .expect("core")
+            .entries
+            .clone();
+        let kept = entries
+            .iter()
+            .find(|(custom_type, _)| custom_type == "kept")
+            .map(|(_, data)| data.clone());
+        assert_eq!(kept, Some(serde_json::json!({ "value": "kept-value" })));
+        assert!(
+            mode.extension_ui_dialogs.is_empty(),
+            "answered after switch"
+        );
+        assert!(mode.suspended_editor.is_none(), "editor restored");
         mode.shutdown().expect("shutdown");
     }
 

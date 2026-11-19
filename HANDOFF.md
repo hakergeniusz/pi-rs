@@ -2906,6 +2906,118 @@ the handler's `ctx` parameter) — a wrong surface fails SILENTLY (the
 handler throws, the dispatch reports to the error listener, nothing
 crosses). Gate 1869/0.
 
+## E3 slice 6b: interactive `ctx.ui.custom` + the dialog stack (landed on `feat/ext-custom-components`, 2026-11-19)
+
+The dialog FIFO from 6a became the real stack, and `ctx.ui.custom`
+invokes its factory. Ground truth: `showExtensionCustom`
+(`interactive-mode.ts:3074-3163`), the stack ops
+(`pushExtensionDialog`/`removeExtensionDialog`/`showTopExtensionDialog`,
+`:2833-2856`), `disposeComponent` (`:3104-3109`),
+`disposeActiveSelector` (`:5061-5066`), and the runner's custom wrap
+(`runner.ts:585`).
+
+- **Glue `live.custom`** (`glue.rs`): branches on `__piOps.mode() !==
+  "tui"` — RPC mode keeps the immediate `undefined` answer
+  (`rpc-mode.ts:232-234`); TUI mode runs the factory in a `.then` job
+  with four adapters — `tui` (`requestRender` only this slice; the
+  crossing is a fire-and-forget `requestRender` uiRequest), `theme`
+  (fg/bg + bold/italic/underline/inverse/strikethrough through the
+  themeFg/themeBg/themeStyle ops), `keybindings` (`matches` through the
+  new keybindingMatch op + `set_keybinding_matcher` — the mode installs
+  `pi_tui::keybindings::matches`; `getKeys` reads the crossed table),
+  and `done(result)` which queues the result on a fire-and-forget
+  `customDone` crossing (closed flag; done-before-crossing resolves
+  directly and without any request or prompt pair — documented
+  deviation). The adopted component crosses as `{method:"custom",
+  handle}`; the deferred is registered glue-side under the crossing's id
+  with a `parseValue`-style wrapper, and the runner resolves it from the
+  `customDone` crossing BEFORE ending the `ui_prompt` pair — so the end
+  emit precedes the resolved continuation like upstream's
+  `.finally(finish)` (`runner.ts:585-611`). (The wrapper's extra
+  reaction link is load-bearing: the direct resolve enqueued the
+  continuation AHEAD of the prompt-end session's handler job, yielding
+  `[prompt-start, picked, prompt-end]`; the link lands it behind, the
+  upstream order.) Deviation: the result crosses as JSON, so
+  non-serializable values come back undefined (upstream's in-process
+  TUI keeps them).
+- **Mutex tenure — the load-bearing design point.** The glue's
+  `queue()` never blocks inside the op: dialog promises are deferred
+  and resolved later by `resolve_ui`, so the only blocking waits live
+  in the runner's dialog delivery. Its two callers have different
+  mutex needs: `settle_session`'s drains (a tool handler awaiting a
+  dialog must settle before its `block` decision — the wait stays
+  inline under the caller's guard) and the pump's delivery threads
+  (own guards). New split: `begin_ui_dialog` begins the `ui_prompt`
+  pair and crosses the request under a guard, returns a
+  `UiDialogWait`; the thread waits OUTSIDE the guard and
+  `complete_ui_dialog` resolves + ends the pair + drives jobs under a
+  fresh one. Pending dialogs therefore hold no mutex — component
+  render/input crossings, further deliveries, and deadline closes all
+  work while a dialog is up (upstream's pending dialogs hold nothing
+  but the JS dispatch they started in).
+- **The stack** (`extension_ui_dialogs: Vec<ExtensionUiDialogEntry>`):
+  `component: None` = visible in the editor slot, `Some` = parked in
+  its entry. `push_extension_dialog_entry` parks whatever the slot
+  held via the new `park_displaced_occupant`: the ChatEditor returns
+  to `suspended_editor`; the visible top dialog returns to its entry —
+  upstream keeps dialogs in `extensionDialogs` pending while a selector
+  replaces them visually (`:5088`, no dialogOpen check there) — and
+  6a DROPPED the displaced dialog (its promise never resolved, its
+  delivery thread hung); anything else drops (`disposeActiveSelector`,
+  `:5061-5066`). Closing a top dialog resurfaces the entry below it or
+  the editor (`showTopExtensionDialog`); closing disposes the component
+  handle (`component_dispose` → `dispose?.()` swallowed + registry
+  drop). A custom's `handleInput` consumes only when it says so — the
+  TUI re-renders after every input by itself.
+- **`service_ui_requests`** drains the engine's `ui_requests` outside a
+  dispatch: `customDone` resolves its custom deferred (mailbox symmetry
+  with the dialog methods) and pairs one prompt end per done (two
+  stacked customs closing in one drain end twice), `requestRender` and
+  the rest forward fire-and-forget, and dialog methods return to the
+  pump for thread delivery. The pump keeps its try_lock: a competing
+  JS run briefly holds the mutex; skipping a frame beats stalling the
+  UI.
+- **Session switches keep dialogs pending** — upstream-faithful this
+  time: `resetExtensionUI` runs at init (`:643`) and on `/reload`
+  (`:6628`) only, and the extensions persist across a switch, so
+  `/resume` neither disposes nor answers open dialogs; they stay
+  mounted over the resumed transcript and answer afterwards. `/reload`
+  now runs the reset (unreachable through the UI today — the editor
+  owns input while `/reload` is typed — but faithful). The 6a reset on
+  switch was wrong (based on a misreading of when upstream resets) and
+  is gone.
+- **Adapter-surface deviations (documented)**: the TUI adapter exposes
+  `requestRender` only (overlays land in slice 6c); the theme adapter
+  lacks `style()`, the ANSI getters, and palette accessors; a custom
+  component's render error renders as an `Error: custom component
+  render failed: …` line and keeps the dialog alive (upstream's throw
+  surfaces through the TUI's error handling).
+- **Known limitation (exotic, documented)**: a MODE-THREAD runner lock
+  while an emit-delivered mailbox dialog is open deadlocks — the emit
+  thread blocks in `settle_session`'s inline wait holding the mutex
+  (gate handlers `session_before_*` that open dialogs;
+  `emit_extension_shutdown`; a session switch during such a dialog).
+  The real UI cannot reach it: a mounted dialog parks the editor, so
+  `/resume`-class triggers are unreachable while it shows — only tests
+  hit it (the switch test rides a custom dialog, whose answer holds no
+  mutex). Upstream survives the same code path because its await
+  yields the main loop. The fix shape (a defer-dialog-waits flag for
+  mode-thread emits) is sketched for a follow-up slice; tool emits on
+  agent threads and pump-spawned deliveries are safe.
+
+Tests: 8 new — runner-level: the factory-adapters round trip (render
+crosses fg/matcher/getKeys/styler; input `x` → done + requestRender;
+service forwards customDone/requestRender and the continuation
+appends; prompt pair), factory-throw rejects without crossing,
+done-before-crossing resolves without a prompt, and a GateSink proves
+the split wait releases the runner mutex (a blocking lock during the
+wait would hang the test) with a second round proving the depth did
+not leak. Mode-level: custom mounts/parks/answers through the focused
+slot; two customs stack (BETA over parked ALPHA, closing resurfaces
+ALPHA); a session switch leaves the dialog pending and answerable;
+plus the component's own crossing test (`render_and_input_cross_through_the_runner`).
+Gate 1877/0.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).

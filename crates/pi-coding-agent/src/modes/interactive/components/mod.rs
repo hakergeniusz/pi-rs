@@ -16,6 +16,8 @@ pub mod custom_entry;
 #[cfg(feature = "ext-js")]
 pub mod custom_message;
 pub mod easter_egg_3d;
+#[cfg(feature = "ext-js")]
+pub mod extension_custom;
 pub mod extension_editor;
 pub mod extension_input;
 pub mod extension_selector;

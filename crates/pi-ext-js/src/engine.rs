@@ -89,11 +89,25 @@ pub struct HostActions {
     pub theme_fg: ThemeStyler,
     /// `theme.bg(color, text)`.
     pub theme_bg: ThemeStyler,
+    /// `theme.bold/italic/underline/inverse/strikethrough(text)` for the
+    /// custom-component factory's theme adapter (E3 slice 6b): method
+    /// name + text in, styled text out. Identity until the embedder
+    /// installs the ANSI attribute mapping.
+    pub theme_style: ThemeStyler,
+    /// `keybindings.matches(data, action)` for the custom-component
+    /// factory's keybindings adapter (E3 slice 6b): the embedder installs
+    /// the port's matcher; the default answers false because the headless
+    /// matrix never invokes factories.
+    pub keybinding_match: KeybindingMatcher,
 }
 
 /// One synchronous `theme.fg`/`theme.bg` call
 /// (`theme.ts:297/:303`): token name + text in, styled text out.
 pub type ThemeStyler = Box<dyn Fn(&str, &str) -> String + Send>;
+
+/// One synchronous `keybindings.matches(data, action)` call for the
+/// custom-component factory's keybindings adapter (E3 slice 6b).
+pub type KeybindingMatcher = Box<dyn Fn(&str, &str) -> bool + Send>;
 
 impl Default for HostActions {
     fn default() -> Self {
@@ -109,6 +123,8 @@ impl Default for HostActions {
             has_pending_messages: Box::new(|| false),
             theme_fg: Box::new(|_token, text| text.to_string()),
             theme_bg: Box::new(|_token, text| text.to_string()),
+            theme_style: Box::new(|_method, text| text.to_string()),
+            keybinding_match: Box::new(|_data, _action| false),
         }
     }
 }
@@ -494,13 +510,17 @@ impl JsHost {
         });
         // A `ctx.ui` call crossing the boundary: the request JSON is
         // `{method, ...params}`; dialogs get the id back so their promise
-        // can be resolved later via `__piUiResolve`.
+        // can be resolved later via `__piUiResolve`. A caller-supplied id
+        // survives — the customDone crossing carries the dialog's id for
+        // the mode's close lookup (E3 slice 6b).
         op!("uiRequest", core, |request: String| -> String {
             let mut core = core.lock().expect("host core mutex poisoned");
             core.ui_counter += 1;
             let id = format!("ui-{}", core.ui_counter);
             let mut value: Json = serde_json::from_str(&request).unwrap_or(Json::Null);
-            if let Some(object) = value.as_object_mut() {
+            if let Some(object) = value.as_object_mut()
+                && !object.contains_key("id")
+            {
                 object.shift_insert(0, "id".to_string(), Json::String(id.clone()));
             }
             core.ui_requests.push(value);
@@ -516,6 +536,30 @@ impl JsHost {
         op!("themeBg", core, |token: String, text: String| -> String {
             let guard = core.lock().expect("host core mutex poisoned");
             (guard.actions.theme_bg)(&token, &text)
+        });
+        // The custom-component factory's theme adapter attribute methods
+        // (E3 slice 6b): `theme.bold/italic/underline/inverse/
+        // strikethrough(text)` cross with the method name; the embedder
+        // installs the ANSI attribute mapping at bind time.
+        op!("themeStyle", core, |method: String,
+                                 text: String|
+         -> String {
+            let guard = core.lock().expect("host core mutex poisoned");
+            (guard.actions.theme_style)(&method, &text)
+        });
+        // The custom-component factory's `keybindings.matches` (E3 slice
+        // 6b): the embedder installs the port's matcher; the default
+        // answers false because the headless matrix never invokes
+        // factories (headless custom resolves undefined without one).
+        op!("keybindingMatch", core, |data: String,
+                                      action: String|
+         -> String {
+            let guard = core.lock().expect("host core mutex poisoned");
+            if (guard.actions.keybinding_match)(&data, &action) {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
         });
         // The resolved keybindings table (id → chords) — `getKeys`
         // upstream (`keybinding-hints.ts:34-36`).
@@ -1426,6 +1470,19 @@ impl JsHost {
     pub fn component_release(&self, handle: u32) -> Result<(), JsHostError> {
         self.ctx.with(|ctx| -> Result<(), JsHostError> {
             let call: Function = ctx.globals().get("__piComponentRelease")?;
+            let _: Value = call
+                .call((handle,))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
+    /// Disposes one adopted component (`__piComponentDispose`) — the
+    /// custom dialog's close path: `dispose?.()` with errors swallowed,
+    /// then the registry entry drops.
+    pub fn component_dispose(&self, handle: u32) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx.globals().get("__piComponentDispose")?;
             let _: Value = call
                 .call((handle,))
                 .map_err(|err| Self::js_error(&ctx, err))?;

@@ -27,9 +27,13 @@ surface and keybinding hints), and extension message renderers
 component or the default label+markdown box, also over the handle
 bridge), and extension tool renderers (`pi.registerToolRenderer` —
 resolver chains over the built-in renderers, custom components over
-the handle bridge with `renderShell: "self"` support), while the rest
-of the TUI
-renderer bridging (E3: `ctx.ui.custom`,
+the handle bridge with `renderShell: "self"` support), and the
+interactive `ctx.ui` dialogs with the real dialog stack (`ctx.ui.select`/
+`confirm`/`input`/`editor` mount over the bridge with countdowns, and
+`ctx.ui.custom` invokes its factory — the adopted component stacks in
+the editor slot, `done()` resolves the promise), while the rest of the
+TUI
+renderer bridging (E3: overlays,
 editor components, themes) and the
 MCP tool bridge are still landing. See [PLAN.md](PLAN.md) for the
 phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
@@ -79,7 +83,7 @@ phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
 | `pi-agent` | `@earendil-works/pi-agent-core` | agent loop with steering/follow-up queues, transcript, events |
 | `pi-tui` | `@earendil-works/pi-tui` | differential renderer, editor, fuzzy/autocomplete, mouse, alt screen, theme |
 | `pi-mcp` | `@earendil-works/pi-mcp` | JSON-RPC types + stdio transport client (HTTP transport + tool bridge pending) |
-| `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, UI dialogs over protocol, `user_bash`, context transforms, RPC dialog subprotocol, virtual-model routing, extension keyboard shortcuts + markdown transformers + entry/message/tool renderers and components over the handle bridge (`tool-search` exit gate green; rest of TUI renderer bridging pending) |
+| `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, UI dialogs over protocol, `user_bash`, context transforms, RPC dialog subprotocol, virtual-model routing, extension keyboard shortcuts + markdown transformers + entry/message/tool renderers and components over the handle bridge, interactive `ctx.ui.custom` + the dialog stack (`tool-search` exit gate green; rest of TUI renderer bridging pending) |
 | `pi-codemode` | `@earendil-works/pi-codemode` | stub |
 | `pi-coding-agent` (`pi` binary) | `@earendil-works/pi-coding-agent` | CLI, print/JSON/RPC/interactive modes, session store, tools, auth |
 

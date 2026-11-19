@@ -911,11 +911,70 @@ globalThis.__piCreateUiCtx = function () {
       if (prefill !== undefined) fields.prefill = prefill;
       return queue("editor", fields, true).then(parseValue);
     },
-    custom: () => {
-      // RPC mode answers custom immediately; the request still crosses
-      // so the runner emits its ui_prompt pair in upstream's order.
+    custom: (factory, options) => {
       assertActive();
-      return queue("custom", {}, true);
+      if (globalThis.__piOps.mode() !== "tui") {
+        // RPC mode answers custom immediately without invoking the
+        // factory (rpc-mode.ts:232-234); the request still crosses so
+        // the runner emits its ui_prompt pair in upstream's order.
+        return queue("custom", {}, true);
+      }
+      // Interactive `ctx.ui.custom` (`showExtensionCustom`,
+      // `interactive-mode.ts:3074-3163`): the factory receives
+      // (tui, theme, keybindings, done) and returns the component (or a
+      // promise of one, like upstream's `Promise.resolve(factory(...))`).
+      // The engine adopts it and the handle crosses for the mode to
+      // mount. done() does NOT resolve this promise directly — the mode's
+      // pump must stay lock-free for the component render/input crossings,
+      // so the result rides the fire-and-forget customDone crossing and
+      // the runner resolves the deferred registered below, before ending
+      // the prompt pair (the mailbox symmetry of the dialog methods; the
+      // wrapper mirrors the ui methods' parseValue, whose extra reaction
+      // link orders the resolved continuation behind the ui_prompt_end
+      // handlers like upstream's `.finally(finish)` — runner.ts:585-611).
+      // Deviations: `overlay: true` mounts inline for now (the overlay arm
+      // lands with the overlay slice); a done() before the component
+      // crosses resolves directly and without the ui_prompt pair (the pair
+      // is emitted by the runner on the crossing, which never happens);
+      // the result crosses as JSON, so non-serializable values come back
+      // undefined (upstream's in-process TUI keeps them).
+      return new Promise((resolve, reject) => {
+        let closed = false;
+        let requestId;
+        const done = (result) => {
+          if (closed) return;
+          closed = true;
+          if (requestId !== undefined) {
+            globalThis.__piOps.uiRequest(
+              JSON.stringify({ method: "customDone", id: requestId, result }),
+            );
+          } else {
+            resolve(result);
+          }
+        };
+        Promise.resolve()
+          .then(() => factory(makeTuiAdapter(), makeThemeAdapter(), makeKeybindingsAdapter(), done))
+          .then((component) => {
+            if (closed) return;
+            const handle = globalThis.__piComponentAdopt(component);
+            if (handle === undefined) {
+              reject(new Error("custom component factory returned no component"));
+              return;
+            }
+            const fields = { handle };
+            requestId = globalThis.__piOps.uiRequest(JSON.stringify(Object.assign({ method: "custom" }, fields)));
+            globalThis.__piUiPending.set(requestId, (payload) => {
+              // The `.then` adds the reaction link that keeps the resolved
+              // continuation behind the ui_prompt_end handlers — the same
+              // ordering effect as upstream's `.finally(finish)`, which
+              // attaches before the handler awaits (runner.ts:585-611).
+              Promise.resolve(payload && "value" in payload ? payload.value : undefined).then(resolve);
+            });
+          })
+          .catch((error) => {
+            if (!closed) reject(error instanceof Error ? error : new Error(String(error)));
+          });
+      });
     },
     notify: (message, notifyType) => {
       assertActive();
@@ -1407,6 +1466,57 @@ globalThis.__piComponentInvalidate = function (handle) {
 globalThis.__piComponentRelease = function (handle) {
   globalThis.__piComponentHandles.delete(handle);
 };
+
+// The custom dialog's close path (`disposeComponent`,
+// `interactive-mode.ts:3104-3109`): `dispose?.()` with errors swallowed —
+// upstream wraps the call the same way — then the registry entry drops
+// (upstream's component object is simply dropped).
+globalThis.__piComponentDispose = function (handle) {
+  const component = globalThis.__piComponentHandles.get(handle);
+  if (component !== undefined && typeof component.dispose === "function") {
+    try {
+      component.dispose();
+    } catch (error) {
+      /* ignore dispose errors */
+    }
+  }
+  globalThis.__piComponentHandles.delete(handle);
+};
+
+// The custom-component factory's adapters (E3 slice 6b,
+// `showExtensionCustom` invokes the factory with
+// `(tui, theme, keybindings, done)` — `interactive-mode.ts:3142-3147`).
+// The theme styles synchronously through ops, like the renderers' theme;
+// the attribute methods mirror upstream's `theme.ts` surface (fg/bg/
+// bold/italic/underline/inverse/strikethrough — `style()`, the ANSI
+// getters, and the palette accessors stay unported).
+const makeThemeAdapter = () => ({
+  fg: (color, text) => globalThis.__piOps.themeFg(String(color), String(text)),
+  bg: (color, text) => globalThis.__piOps.themeBg(String(color), String(text)),
+  bold: (text) => globalThis.__piOps.themeStyle("bold", String(text)),
+  italic: (text) => globalThis.__piOps.themeStyle("italic", String(text)),
+  underline: (text) => globalThis.__piOps.themeStyle("underline", String(text)),
+  inverse: (text) => globalThis.__piOps.themeStyle("inverse", String(text)),
+  strikethrough: (text) => globalThis.__piOps.themeStyle("strikethrough", String(text)),
+});
+// The factory's tui adapter: `requestRender` only in this slice — the
+// fire-and-forget request lands on the mode's pump and turns into a
+// render tick. Upstream's TUI (`tui.ts:518+`) carries far more; the rest
+// stays unported.
+const makeTuiAdapter = () => ({
+  requestRender: () => {
+    globalThis.__piOps.uiRequest(JSON.stringify({ method: "requestRender" }));
+  },
+});
+// The factory's keybindings adapter: `matches` crosses through the
+// host-installed matcher (`set_keybinding_matcher` — the port's
+// `pi_tui::keybindings::matches` over the live defaults), `getKeys` reads
+// the crossed table (`keybindings.ts:60-70`).
+const makeKeybindingsAdapter = () => ({
+  matches: (data, action) =>
+    globalThis.__piOps.keybindingMatch(String(data), String(action)) === "true",
+  getKeys: (keybinding) => globalThis.__piKeybindingKeys(keybinding),
+});
 
 // The entry renderer call (`addCustomEntryToChat`, interactive-mode.ts:3986;
 // custom-entry.ts rebuild): the FIRST extension with a renderer for the

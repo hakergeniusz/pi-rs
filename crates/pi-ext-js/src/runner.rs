@@ -35,7 +35,16 @@
 //! register into a synthetic record through the bridge
 //! (`__piMcpRegisterTools` — the `pi.registerTool` surface), and registry
 //! changes reconcile into `mcp_servers_change` emissions at the end of
-//! every dispatch (the change listener, `runner.ts:465-466`).
+//! every dispatch (the change listener, `runner.ts:465-466`). The UI
+//! surface (E3 slices 6a/6b) is the host half of `wrapUIPromptContext`
+//! (`runner.ts:577-613`): dialog methods emit the depth-gated
+//! `ui_prompt_*` pair around the mode's answer, interactive `ctx.ui.custom`
+//! mounts the factory's adopted component and resolves its deferred from
+//! the `customDone` crossing before the pair ends (upstream's
+//! `.finally(finish)` order, `runner.ts:585-611`), and the pump's
+//! deliveries split into [`ExtensionRunner::begin_ui_dialog`] +
+//! [`ExtensionRunner::complete_ui_dialog`] so a dialog's wait never holds
+//! the runner mutex.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -444,6 +453,31 @@ pub trait UiSink: Send + Sync {
     /// sink resolves its own timeout default (the request payload carries
     /// the `timeout` field upstream includes in the wire request).
     fn wait_response(&self, id: &str, method: &str) -> Json;
+}
+
+/// One delivered dialog awaiting its mode response
+/// ([`ExtensionRunner::begin_ui_dialog`]'s return). The wait runs on the
+/// delivery thread WITHOUT the runner mutex held — upstream's pending
+/// dialogs hold nothing but the JS dispatch they started in, and the
+/// port's component render/input crossings need the mutex while a dialog
+/// shows (E3 slice 6b).
+pub struct UiDialogWait {
+    sink: std::sync::Arc<dyn UiSink>,
+    id: String,
+    method: String,
+}
+
+impl UiDialogWait {
+    /// The dialog request's id.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Blocks for the mode's response. Call this OUTSIDE the runner guard;
+    /// complete through [`ExtensionRunner::complete_ui_dialog`].
+    pub fn wait(&self) -> Json {
+        self.sink.wait_response(&self.id, &self.method)
+    }
 }
 
 /// What a `user_bash` handler decided (`UserBashEventResult`): custom
@@ -1403,6 +1437,13 @@ impl ExtensionRunner {
         self.host.tool_renderer_release(stash_id)
     }
 
+    /// Disposes one adopted component (`disposeComponent` — `dispose?.()`
+    /// swallowed, `interactive-mode.ts:3104-3109`) and drops the registry
+    /// entry. The custom dialog's close path calls this once.
+    pub fn component_dispose(&self, handle: u32) -> Result<(), JsHostError> {
+        self.host.component_dispose(handle)
+    }
+
     /// Renders one adopted component (`custom-entry.ts` embeds it as a
     /// child; the handle comes from [`Self::render_entry`]).
     pub fn component_render(&self, handle: u32, width: usize) -> Result<Vec<String>, JsHostError> {
@@ -1593,6 +1634,24 @@ impl ExtensionRunner {
         core.actions.theme_bg = Box::new(move |token, text| bg(token, text));
     }
 
+    /// Installs the custom-component factory's keybinding matcher (E3
+    /// slice 6b) — the port's `pi_tui::keybindings::matches` over the
+    /// live app defaults, so a factory's `keybindings.matches(data,
+    /// action)` behaves like the mode's.
+    pub fn set_keybinding_matcher(&mut self, matcher: fn(&str, &str) -> bool) {
+        let mut core = self.core.lock().expect("host core mutex poisoned");
+        core.actions.keybinding_match = Box::new(matcher);
+    }
+
+    /// Installs the custom-component factory's theme attribute styler (E3
+    /// slice 6b) — `theme.bold/italic/underline/inverse/strikethrough`
+    /// wrap with the live theme's ANSI attributes, next to the fg/bg
+    /// surface [`Self::set_theme_surface`] installs.
+    pub fn set_style_surface(&mut self, style: ThemeSurfaceFn) {
+        let mut core = self.core.lock().expect("host core mutex poisoned");
+        core.actions.theme_style = Box::new(move |method, text| style(method, text));
+    }
+
     /// Binds the UI surface (`setUIContext`, `runner.ts:570-575`):
     /// `ctx.mode`/`ctx.hasUI` flip, and every `ctx.ui` request crosses to
     /// the sink. Without this call the runner stays headless.
@@ -1643,12 +1702,89 @@ impl ExtensionRunner {
         Ok(value.get("done").and_then(Json::as_bool).unwrap_or(true))
     }
 
+    /// Drains the engine's `ui_requests` OUTSIDE a dispatch (E3 slice 6b) —
+    /// the interactive mode's pump calls this every frame. Fire-and-forget
+    /// requests (`customDone`, `requestRender`) forward to the sink
+    /// immediately; a `customDone` also resolves its custom deferred (the
+    /// result `done()` queued on the crossing) and ends the active custom
+    /// prompt — resolution precedes the pair's end, so `ui_prompt_end`
+    /// precedes the resolved continuation like upstream's `.finally(finish)`
+    /// (`runner.ts:585-611`); dialog methods come back to the caller,
+    /// which delivers them on threads through
+    /// [`Self::begin_ui_dialog`]/[`Self::complete_ui_dialog`] — the wait
+    /// must never hold the runner mutex here, or the pump's component
+    /// crossings would stall behind it. Anything returned or forwarded
+    /// drives jobs afterwards: the custom `done()` continuation is a job.
+    pub fn service_ui_requests(&mut self) -> Result<Vec<Json>, JsHostError> {
+        let requests = self.host.drain_ui_requests();
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut deferred: Vec<Json> = Vec::new();
+        let mut ends = 0usize;
+        for request in &requests {
+            match request.get("method").and_then(Json::as_str) {
+                Some("customDone") => {
+                    if let Some(sink) = self.ui_sink.clone() {
+                        sink.request(request);
+                    }
+                    // Mailbox symmetry with the dialog methods: the glue
+                    // registers the custom deferred under the crossing's id,
+                    // and the wrapper glue-side (mirroring the ui methods'
+                    // `parseValue`) adds the reaction link that keeps the
+                    // handler's continuation behind the prompt-end handlers.
+                    let id = request
+                        .get("id")
+                        .and_then(Json::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let payload = match request.get("result") {
+                        Some(result) => {
+                            serde_json::to_string(&json!({ "value": result })).unwrap_or_default()
+                        }
+                        None => String::new(),
+                    };
+                    self.host.resolve_ui(&id, &payload)?;
+                    ends += 1;
+                }
+                Some("select" | "confirm" | "input" | "editor") => deferred.push(request.clone()),
+                _ => {
+                    if let Some(sink) = self.ui_sink.clone() {
+                        sink.request(request);
+                    }
+                }
+            }
+        }
+        // Each custom's done() pairs with exactly one prompt end — two
+        // stacked customs closing in one drain end twice (the depth-gated
+        // begins counted them too).
+        for _ in 0..ends {
+            self.end_ui_prompt()?;
+        }
+        self.host.drive_jobs()?;
+        Ok(deferred)
+    }
+
     /// Delivers one UI request. Dialog methods (`select`, `confirm`,
     /// `input`, `editor`) emit the `ui_prompt_*` pair around the blocking
-    /// wait (`wrapUIPromptContext`, `runner.ts:577-613`); `custom` emits
-    /// the pair with no sink delivery (RPC mode answers it immediately);
-    /// everything else is fire-and-forget.
-    fn deliver_ui_request(&mut self, request: &Json) -> Result<(), JsHostError> {
+    /// wait (`wrapUIPromptContext`, `runner.ts:577-613`); `custom` splits
+    /// by shape: the interactive arm (a `handle` field — an adopted
+    /// component, E3 slice 6b) emits only the pair's start and forwards —
+    /// the promise resolves glue-side when the extension calls `done()`,
+    /// and the fire-and-forget `customDone` crossing ends the prompt
+    /// ([`Self::service_ui_requests`]) — while the RPC arm keeps the
+    /// blocking pair (rpc-mode answers immediately). Everything else is
+    /// fire-and-forget.
+    ///
+    /// The blocking wait runs under the CALLER's mutex tenure: callers
+    /// are [`Self::settle_session`]'s drains (a tool handler awaiting a
+    /// dialog must be settled before its `block` decision — the wait is
+    /// load-bearing) and the mode thread's own emits. Delivery threads
+    /// that must not hold the runner mutex while the dialog is up (the
+    /// pump's, E3 slice 6b — component render/input crossings need the
+    /// mutex then) use [`Self::begin_ui_dialog`] +
+    /// [`Self::complete_ui_dialog`] instead.
+    pub fn deliver_ui_request(&mut self, request: &Json) -> Result<(), JsHostError> {
         let method = request
             .get("method")
             .and_then(Json::as_str)
@@ -1660,6 +1796,18 @@ impl ExtensionRunner {
             .unwrap_or_default()
             .to_string();
         match method.as_str() {
+            "custom" if request.get("handle").is_some() => {
+                // Interactive `ctx.ui.custom` (E3 slice 6b): the mode
+                // mounts the adopted component; done() queues the result on
+                // the customDone crossing and [`Self::service_ui_requests`]
+                // resolves the deferred. NO blocking wait — the runner mutex
+                // must stay free for the component crossings, and
+                // nothing ever answers this request through the sink.
+                self.begin_ui_prompt("custom", None)?;
+                if let Some(sink) = self.ui_sink.clone() {
+                    sink.request(request);
+                }
+            }
             "select" | "confirm" | "input" | "editor" => {
                 let title = request
                     .get("title")
@@ -1686,6 +1834,63 @@ impl ExtensionRunner {
             }
         }
         Ok(())
+    }
+
+    /// Delivers one UI request for a caller that must NOT hold the runner
+    /// mutex across the dialog wait (E3 slice 6b — the pump's delivery
+    /// threads): dialog methods emit the `ui_prompt_*` pair's start, cross
+    /// the request, and return a [`UiDialogWait`]; the caller blocks on it
+    /// outside the guard and completes through [`Self::complete_ui_dialog`].
+    /// While a dialog is up the mutex stays free for component render/input
+    /// crossings, further deliveries, and deadline closes. Non-dialog
+    /// requests ride [`Self::deliver_ui_request`] (no wait involved).
+    pub fn begin_ui_dialog(&mut self, request: &Json) -> Result<Option<UiDialogWait>, JsHostError> {
+        let method = request
+            .get("method")
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match method.as_str() {
+            "select" | "confirm" | "input" | "editor" => {
+                let title = request
+                    .get("title")
+                    .and_then(Json::as_str)
+                    .map(ToOwned::to_owned);
+                let id = request
+                    .get("id")
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.begin_ui_prompt(&method, title.as_deref())?;
+                if let Some(sink) = self.ui_sink.clone() {
+                    sink.request(request);
+                    return Ok(Some(UiDialogWait { sink, id, method }));
+                }
+                // No sink: nothing can ever answer — mirror
+                // [`Self::deliver_ui_request`]'s no-sink arm and close
+                // the prompt pair instead of leaking it.
+                self.end_ui_prompt()?;
+                Ok(None)
+            }
+            _ => {
+                self.deliver_ui_request(request)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Completes a dialog delivered through [`Self::begin_ui_dialog`]:
+    /// resolves the glue deferred, ends the `ui_prompt` pair, drives jobs
+    /// (the resolved handler's continuation).
+    pub fn complete_ui_dialog(
+        &mut self,
+        wait: &UiDialogWait,
+        response: &Json,
+    ) -> Result<(), JsHostError> {
+        let payload = serde_json::to_string(response).unwrap_or_default();
+        self.host.resolve_ui(&wait.id, &payload)?;
+        self.end_ui_prompt()?;
+        self.host.drive_jobs()
     }
 
     /// Depth-gated `ui_prompt_start`: only the outermost prompt emits,
@@ -3127,6 +3332,289 @@ export default function (pi) {
                 json!({ "type": "prompt-start", "data": "select" }),
                 json!({ "type": "prompt-end", "data": "select" }),
                 json!({ "type": "choice", "data": "a" }),
+            ]
+        );
+    }
+
+    // ---- E3 slice 6b: interactive ctx.ui.custom ----
+
+    /// The factory's adapters: theme.fg stays identity (no surface
+    /// installed), theme.bold crosses through the installed styler, the
+    /// keybindings adapter answers matches/getKeys from the installed
+    /// matcher + table, and `tui.requestRender()` queues a crossing.
+    const EXT_UI_CUSTOM: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    try {
+      const value = await ctx.ui.custom((tui, theme, keybindings, done) => ({
+        render: (width) => [
+          theme.fg("accent",
+            "PICK " + width +
+            " m:" + keybindings.matches("\x1b", "select.cancel") +
+            " k:" + keybindings.getKeys("app.cancel").join("/") +
+            " b:" + theme.bold("B")),
+        ],
+        invalidate: () => {},
+        handleInput: (data) => {
+          if (data === "x") {
+            done("picked-value");
+            tui.requestRender();
+            return true;
+          }
+          return false;
+        },
+      }));
+      pi.appendEntry("picked", String(value));
+    } catch (error) {
+      pi.appendEntry("caught", String(error && error.message ? error.message : error));
+    }
+  });
+  pi.on("ui_prompt_start", (event) => pi.appendEntry("prompt-start", event.kind));
+  pi.on("ui_prompt_end", (event) => pi.appendEntry("prompt-end", event.kind));
+}
+"#;
+
+    fn esc_select_cancel(data: &str, action: &str) -> bool {
+        data == "\x1b" && action == "select.cancel"
+    }
+
+    #[test]
+    fn ui_custom_factory_mounts_and_done_resolves() {
+        let mut runner = runner_with(&[EXT_UI_CUSTOM]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "tui");
+        runner.set_keybinding_matcher(esc_select_cancel);
+        runner.set_app_keybindings(r#"{"app.cancel":["ctrl+c"]}"#);
+        runner.set_style_surface(std::sync::Arc::new(|method, text| match method {
+            "bold" => format!("\x1b[1m{text}\x1b[22m"),
+            _ => text.to_string(),
+        }));
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+
+        // The factory's component adopted; exactly the `custom` crossing
+        // (the prompt pair's start emit carries no request).
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "custom");
+        let handle = requests[0]["handle"].as_u64().expect("adopted handle") as u32;
+
+        // Render crosses the adapters: identity fg, the matcher, the
+        // crossed keybinding table, the installed styler.
+        assert_eq!(
+            runner.component_render(handle, 40).expect("render"),
+            vec!["PICK 40 m:true k:ctrl+c b:\x1b[1mB\x1b[22m".to_string()]
+        );
+        assert!(runner.component_handle_input(handle, "x").expect("input"));
+        assert!(!runner.component_handle_input(handle, "y").expect("input"));
+
+        // done() queued the result on the customDone crossing: the next
+        // service forwards it, resolves the deferred (registered glue-side
+        // under the crossing's id), ends the prompt pair, and runs the
+        // resolved continuation — the end emit lands before the continuation
+        // (upstream's `.finally(finish)` order).
+        let deferred = runner.service_ui_requests().expect("service");
+        assert!(deferred.is_empty());
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1]["method"], "customDone");
+        assert_eq!(requests[1]["id"], requests[0]["id"]);
+        assert_eq!(requests[2]["method"], "requestRender");
+        assert_eq!(
+            entries_of(&runner),
+            vec![
+                json!({ "type": "prompt-start", "data": "custom" }),
+                json!({ "type": "prompt-end", "data": "custom" }),
+                json!({ "type": "picked", "data": "picked-value" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn ui_custom_factory_throw_rejects_without_crossing() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    try {
+      await ctx.ui.custom(() => {
+        throw new Error("boom-factory");
+      });
+    } catch (error) {
+      pi.appendEntry("caught", String(error && error.message ? error.message : error));
+    }
+  });
+}
+"#;
+        let mut runner = runner_with(&[EXT]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "tui");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        // The rejection carries the thrown error; nothing was adopted or
+        // crossed (no request, no ui_prompt pair).
+        assert!(sink.requests().is_empty());
+        assert_eq!(
+            entries_of(&runner),
+            vec![json!({ "type": "caught", "data": "boom-factory" })]
+        );
+    }
+
+    #[test]
+    fn ui_custom_done_before_crossing_resolves_without_a_prompt() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    const value = await ctx.ui.custom((_tui, _theme, _kb, done) => {
+      done("early");
+      return { render: () => ["SHOULD NOT RENDER"], invalidate: () => {} };
+    });
+    pi.appendEntry("picked", String(value));
+  });
+  pi.on("ui_prompt_start", (event) => pi.appendEntry("prompt-start", event.kind));
+  pi.on("ui_prompt_end", (event) => pi.appendEntry("prompt-end", event.kind));
+}
+"#;
+        let mut runner = runner_with(&[EXT]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "tui");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        // done() closed before the component crossed: the promise resolved
+        // without the `custom` request, the mount, or the prompt pair.
+        assert!(sink.requests().is_empty());
+        assert_eq!(
+            entries_of(&runner),
+            vec![json!({ "type": "picked", "data": "early" })]
+        );
+    }
+
+    /// A sink whose dialog answers block on a gate — for asserting that a
+    /// split-path wait ([`UiDialogWait`]) holds no runner mutex.
+    struct GateSink {
+        requests: Mutex<Vec<Json>>,
+        gate: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl UiSink for GateSink {
+        fn request(&self, request: &Json) {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(request.clone());
+        }
+
+        fn wait_response(&self, _id: &str, _method: &str) -> Json {
+            let (flag, cv) = &*self.gate;
+            let mut open = flag.lock().expect("gate");
+            while !*open {
+                open = cv.wait(open).expect("gate");
+            }
+            json!({ "value": "a" })
+        }
+    }
+
+    const EXT_UI_PROMPTS: &str = r#"
+export default function (pi) {
+  pi.on("ui_prompt_start", (event) => pi.appendEntry("prompt-start", event.kind));
+  pi.on("ui_prompt_end", (event) => pi.appendEntry("prompt-end", event.kind));
+}
+"#;
+
+    #[test]
+    fn ui_dialog_wait_releases_the_runner_mutex() {
+        let mut runner = runner_with(&[EXT_UI_PROMPTS]);
+        let gate: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)> =
+            std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let sink = std::sync::Arc::new(GateSink {
+            requests: Mutex::new(Vec::new()),
+            gate: gate.clone(),
+        });
+        runner.set_ui_context(sink.clone(), "tui");
+
+        // A dialog request queued OUTSIDE a dispatch rides the split path:
+        // service_ui_requests defers it, the delivery thread begins under
+        // a guard and waits WITHOUT one.
+        let request = json!({
+            "id": "ui-1",
+            "method": "select",
+            "title": "Pick",
+            "options": ["a", "b"],
+        });
+        runner
+            .core()
+            .lock()
+            .expect("core")
+            .ui_requests
+            .push(request);
+        let deferred = runner.service_ui_requests().expect("service");
+        assert_eq!(deferred.len(), 1);
+
+        let runner = std::sync::Arc::new(std::sync::Mutex::new(runner));
+        let worker_runner = std::sync::Arc::clone(&runner);
+        let worker = std::thread::spawn(move || {
+            let wait = {
+                let mut guard = worker_runner
+                    .lock()
+                    .expect("extension runner mutex poisoned");
+                guard
+                    .begin_ui_dialog(&deferred[0])
+                    .expect("begin")
+                    .expect("wait handle")
+            };
+            let response = wait.wait();
+            let mut guard = worker_runner
+                .lock()
+                .expect("extension runner mutex poisoned");
+            guard
+                .complete_ui_dialog(&wait, &response)
+                .expect("complete");
+        });
+
+        // The worker is blocked in wait_response; the runner mutex must be
+        // free — this lock would hang if the wait held it.
+        {
+            let _guard = runner.lock().expect("mutex free during the wait");
+        }
+        let (flag, cv) = &*gate;
+        *flag.lock().expect("gate") = true;
+        cv.notify_all();
+        worker.join().expect("worker");
+
+        // The pair opened at begin and closed at complete; the completion
+        // resolved the (unknown-id) deferred harmlessly.
+        assert_eq!(sink.requests.lock().expect("requests").len(), 1);
+        assert_eq!(
+            entries_of(&runner.lock().expect("runner")),
+            vec![
+                json!({ "type": "prompt-start", "data": "select" }),
+                json!({ "type": "prompt-end", "data": "select" }),
+            ]
+        );
+
+        // A second split round re-emits the pair — the depth did not leak.
+        let second = json!({ "id": "ui-2", "method": "confirm", "title": "Sure?" });
+        let wait = runner
+            .lock()
+            .expect("runner")
+            .begin_ui_dialog(&second)
+            .expect("begin")
+            .expect("wait handle");
+        let response = wait.wait();
+        runner
+            .lock()
+            .expect("runner")
+            .complete_ui_dialog(&wait, &response)
+            .expect("complete");
+        assert_eq!(
+            entries_of(&runner.lock().expect("runner")),
+            vec![
+                json!({ "type": "prompt-start", "data": "select" }),
+                json!({ "type": "prompt-end", "data": "select" }),
+                json!({ "type": "prompt-start", "data": "confirm" }),
+                json!({ "type": "prompt-end", "data": "confirm" }),
             ]
         );
     }
