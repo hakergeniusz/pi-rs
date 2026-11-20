@@ -282,6 +282,25 @@ pub struct ResolvedMarkdownTransformer {
 /// The embedder-installed `theme.fg`/`theme.bg` mapping
 /// ([`Self::set_theme_surface`]): token name + text in, styled text out.
 pub type ThemeSurfaceFn = std::sync::Arc<dyn Fn(&str, &str) -> String + Send + Sync>;
+/// The embedder surface the ctx.ui themes ops serve (E3 slice 10): one
+/// bundle of closures over the mode's theme loaders and the by-name
+/// theme stash ([`Self::set_theme_ext_surface`]).
+pub struct ThemeExtSurface {
+    /// `getAllThemes` — the JSON `[{name, path}]` list.
+    pub all: Box<dyn Fn() -> Json + Send>,
+    /// `getTheme(name)` — `Some((handle, name, appearance))` or `None`.
+    pub by_name: Box<dyn Fn(&str) -> Option<(u32, String, String)> + Send>,
+    /// `theme.fg` against a stashed theme (handle-keyed).
+    pub fg_with: Box<dyn Fn(u32, &str, &str) -> String + Send>,
+    /// `theme.bg` against a stashed theme (handle-keyed).
+    pub bg_with: Box<dyn Fn(u32, &str, &str) -> String + Send>,
+    /// The current theme's appearance.
+    pub appearance: Box<dyn Fn() -> String + Send>,
+    /// `setTheme(name)`'s synchronous half — load + install + fallback.
+    pub set_name: Box<dyn Fn(&str) -> Result<(), String> + Send>,
+    /// `setTheme(instance)`'s synchronous half — install the stash hit.
+    pub set_instance: Box<dyn Fn(u32) -> bool + Send>,
+}
 
 /// The embedder-installed mode-state reads the synchronous ui queries
 /// serve ([`Self::set_ui_snapshot_surface`], E3 slice 7): one JSON footer
@@ -1712,6 +1731,24 @@ impl ExtensionRunner {
     pub fn set_style_surface(&mut self, style: ThemeSurfaceFn) {
         let mut core = self.core.lock().expect("host core mutex poisoned");
         core.actions.theme_style = Box::new(move |method, text| style(method, text));
+    }
+
+    /// Installs the ctx.ui themes API's embedder surface (E3 slice 10,
+    /// `interactive-mode.ts:2806-2822`): the reads (`getAllThemes`/
+    /// `getTheme`/`appearance`) and the synchronous `setTheme` halves
+    /// route through the mode's loaders and stash; the `themeChanged`
+    /// crossing carries the mode-side visuals and persistence. Without
+    /// this the defaults answer an empty list / unknown theme / failure
+    /// (the headless matrix).
+    pub fn set_theme_ext_surface(&mut self, surface: ThemeExtSurface) {
+        let mut core = self.core.lock().expect("host core mutex poisoned");
+        core.actions.theme_all = surface.all;
+        core.actions.theme_by_name = surface.by_name;
+        core.actions.theme_fg_with = surface.fg_with;
+        core.actions.theme_bg_with = surface.bg_with;
+        core.actions.theme_appearance = surface.appearance;
+        core.actions.theme_set_name = surface.set_name;
+        core.actions.theme_set_instance = surface.set_instance;
     }
 
     /// Installs the mode-state snapshot the synchronous ui reads serve (E3
@@ -7293,5 +7330,162 @@ export default function (pi) {
             .tool_render_call(resolved.stash_id, "{}", "{}")
             .expect("render call");
         assert!(matches!(outcome, EntryRenderOutcome::None), "{outcome:?}");
+    }
+
+    /// The ctx.ui themes API (E3 slice 10, `interactive-mode.ts:2806
+    /// -2822`): the reads cross through the embedder's theme surface, a
+    /// by-name theme adapters back to the stash handle, `setTheme`'s
+    /// synchronous half returns the result and fires the `themeChanged`
+    /// crossing, and the RPC/headless arms keep upstream's stubs.
+    #[test]
+    #[allow(clippy::too_many_lines)] // covers the three ui-context modes
+    fn ui_theme_surface_lists_loads_and_switches() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    const themes = ctx.ui.getAllThemes();
+    ctx.ui.notify("count:" + themes.length);
+    if (themes[0] !== undefined) {
+      ctx.ui.notify(
+        "first:" +
+          themes[0].name +
+          ":" +
+          (themes[0].path === undefined ? "undefined" : String(themes[0].path))
+      );
+    }
+    const missing = ctx.ui.getTheme("nope");
+    ctx.ui.notify("missing:" + String(missing === undefined));
+    const probe = ctx.ui.setTheme("probe-name");
+    ctx.ui.notify("probe:" + JSON.stringify(probe));
+    const theme = ctx.ui.getTheme("tokyonight");
+    if (theme !== undefined) {
+      ctx.ui.notify("name:" + theme.name + ":" + theme.appearance);
+      ctx.ui.notify("fg:" + theme.fg("accent", "x"));
+      ctx.ui.notify("bg:" + theme.bg("accent", "x"));
+      const again = ctx.ui.setTheme(theme);
+      ctx.ui.notify("seti:" + JSON.stringify(again));
+    }
+    ctx.ui.notify("app:" + ctx.ui.theme.appearance());
+  });
+}
+"#;
+        let surface = ThemeExtSurface {
+            all: Box::new(|| {
+                json!([
+                    { "name": "system", "path": Json::Null },
+                    { "name": "tokyonight", "path": "/themes/tokyonight.json" },
+                ])
+            }),
+            by_name: Box::new(|name: &str| match name {
+                "tokyonight" => Some((1, "tokyonight".to_string(), "dark".to_string())),
+                _ => None,
+            }),
+            fg_with: Box::new(|handle: u32, _token: &str, text: &str| {
+                format!("[theme{handle}]{text}")
+            }),
+            bg_with: Box::new(|handle: u32, _token: &str, text: &str| {
+                format!("[theme{handle}-bg]{text}")
+            }),
+            appearance: Box::new(|| "dark".to_string()),
+            set_name: Box::new(|name: &str| {
+                if name == "tokyonight" {
+                    Ok(())
+                } else {
+                    Err("load failed".to_string())
+                }
+            }),
+            set_instance: Box::new(|handle: u32| handle == 1),
+        };
+        let notifies_of = |sink: &FakeSink| -> Vec<String> {
+            sink.requests()
+                .iter()
+                .filter(|request| request["method"] == "notify")
+                .filter_map(|request| {
+                    request["message"]
+                        .as_str()
+                        .map(std::string::ToString::to_string)
+                })
+                .collect()
+        };
+
+        // The interactive surface ("tui"): the real themes API.
+        let mut runner = runner_with(&[EXT]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "tui");
+        runner.set_theme_ext_surface(surface);
+
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        runner.service_ui_requests().expect("service");
+        let notifies = notifies_of(&sink);
+        assert_eq!(
+            notifies,
+            vec![
+                "count:2",
+                "first:system:undefined",
+                "missing:true",
+                "probe:{\"success\":false,\"error\":\"load failed\"}",
+                "name:tokyonight:dark",
+                "fg:[theme1]x",
+                "bg:[theme1-bg]x",
+                "seti:{\"success\":true}",
+                "app:dark",
+            ],
+            "{notifies:?}"
+        );
+        // The `themeChanged` crossings forwarded fire-and-forget: one per
+        // setTheme, in order (failed name, then the instance).
+        let changed: Vec<&Json> = sink
+            .requests()
+            .iter()
+            .filter(|request| request["method"] == "themeChanged")
+            .collect();
+        assert_eq!(changed.len(), 2, "{:?}", sink.requests());
+        assert_eq!(changed[0]["name"], "probe-name");
+        assert_eq!(changed[0]["success"], false);
+        assert!(changed[1]["name"].is_null());
+        assert_eq!(changed[1]["success"], true);
+
+        // The RPC surface: upstream's stubs verbatim
+        // (`rpc-mode.ts:290-306`).
+        let mut rpc_runner = runner_with(&[EXT]);
+        let rpc_sink = FakeSink::scripted(&[]);
+        rpc_runner.set_ui_context(rpc_sink.clone(), "rpc");
+        rpc_runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        rpc_runner.service_ui_requests().expect("service");
+        let rpc_notifies = notifies_of(&rpc_sink);
+        assert_eq!(
+            rpc_notifies,
+            vec![
+                "count:0",
+                "missing:true",
+                "probe:{\"success\":false,\"error\":\"Theme switching not supported in RPC mode\"}",
+                "app:dark",
+            ],
+            "{rpc_notifies:?}"
+        );
+
+        // The headless surface: upstream's no-op context
+        // (`runner.ts:331-339`).
+        let mut headless_runner = runner_with(&[EXT]);
+        let headless_sink = FakeSink::scripted(&[]);
+        headless_runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        headless_runner.service_ui_requests().expect("service");
+        let headless_notifies = notifies_of(&headless_sink);
+        assert_eq!(
+            headless_notifies,
+            vec![
+                "count:0",
+                "missing:true",
+                "probe:{\"success\":false,\"error\":\"UI not available\"}",
+                "app:dark",
+            ],
+            "{headless_notifies:?}"
+        );
     }
 }

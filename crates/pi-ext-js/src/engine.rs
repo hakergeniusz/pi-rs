@@ -106,6 +106,34 @@ pub struct HostActions {
     /// pump frame; the default reads empty/null/false because the
     /// headless matrix has no mode behind it.
     pub ui_snapshot: UiSnapshot,
+    /// `ctx.ui.getAllThemes()` (E3 slice 10): the JSON
+    /// `[{name, path}]` list — system first, then built-ins, then the
+    /// custom themes directory. The embedder installs the mode's loader;
+    /// the default answers an empty list (the headless matrix).
+    pub theme_all: Box<dyn Fn() -> Json + Send>,
+    /// `ctx.ui.getTheme(name)`: load without switching —
+    /// `Some((handle, name, appearance))` crosses as an adapter object
+    /// keyed by the handle; `None` is upstream's `undefined`. The
+    /// handle keys the embedder's theme stash the `themeFgWith`/
+    /// `themeBgWith`/`setThemeInstance` ops resolve.
+    pub theme_by_name: Box<dyn Fn(&str) -> Option<(u32, String, String)> + Send>,
+    /// `theme.fg(color, text)` against a stashed by-name theme (E3 slice
+    /// 10): the handle resolves through the embedder's stash; unknown
+    /// handles pass the text through like an unknown token.
+    pub theme_fg_with: Box<dyn Fn(u32, &str, &str) -> String + Send>,
+    /// `theme.bg(color, text)` against a stashed by-name theme.
+    pub theme_bg_with: Box<dyn Fn(u32, &str, &str) -> String + Send>,
+    /// The current theme's appearance (`theme.appearance`): `"dark"` or
+    /// `"light"`.
+    pub theme_appearance: Box<dyn Fn() -> String + Send>,
+    /// `ctx.ui.setTheme(name)`'s synchronous half (E3 slice 10): load +
+    /// install with the system fallback (`theme.ts:703-724`); the
+    /// `themeChanged` crossing carries the mode-side visuals and the
+    /// settings persistence. `Err` maps to `{success: false, error}`.
+    pub theme_set_name: Box<dyn Fn(&str) -> Result<(), String> + Send>,
+    /// `ctx.ui.setTheme(instance)`'s synchronous half: install the
+    /// stashed theme; `false` = unknown handle.
+    pub theme_set_instance: Box<dyn Fn(u32) -> bool + Send>,
 }
 
 /// The synchronous mode-state reads the `footerData`/`editorText`/
@@ -172,6 +200,13 @@ impl Default for HostActions {
             theme_style: Box::new(|_method, text| text.to_string()),
             keybinding_match: Box::new(|_data, _action| false),
             ui_snapshot: UiSnapshot::default(),
+            theme_all: Box::new(|| Json::Array(Vec::new())),
+            theme_by_name: Box::new(|_name| None),
+            theme_fg_with: Box::new(|_handle, _token, text| text.to_string()),
+            theme_bg_with: Box::new(|_handle, _token, text| text.to_string()),
+            theme_appearance: Box::new(|| "dark".to_string()),
+            theme_set_name: Box::new(|_name| Err("UI not available".to_string())),
+            theme_set_instance: Box::new(|_handle| false),
         }
     }
 }
@@ -593,6 +628,49 @@ impl JsHost {
          -> String {
             let guard = core.lock().expect("host core mutex poisoned");
             (guard.actions.theme_style)(&method, &text)
+        });
+        // The ctx.ui themes API (E3 slice 10, `interactive-mode.ts:2806
+        // -2822`): the reads cross synchronously through the embedder's
+        // theme loaders; `setTheme`'s synchronous half installs the
+        // global with the system fallback and the `themeChanged`
+        // crossing carries the mode-side visuals + settings persistence.
+        op!("getAllThemes", core, || -> Json {
+            let guard = core.lock().expect("host core mutex poisoned");
+            (guard.actions.theme_all)()
+        });
+        op!("getTheme", core, |name: String| -> Json {
+            let guard = core.lock().expect("host core mutex poisoned");
+            match (guard.actions.theme_by_name)(&name) {
+                Some((handle, name, appearance)) => serde_json::json!({
+                    "handle": handle,
+                    "name": name,
+                    "appearance": appearance,
+                }),
+                None => Json::Null,
+            }
+        });
+        op!("themeFgWith", core, |handle: u32, token: String, text: String| -> String {
+            let guard = core.lock().expect("host core mutex poisoned");
+            (guard.actions.theme_fg_with)(handle, &token, &text)
+        });
+        op!("themeBgWith", core, |handle: u32, token: String, text: String| -> String {
+            let guard = core.lock().expect("host core mutex poisoned");
+            (guard.actions.theme_bg_with)(handle, &token, &text)
+        });
+        op!("themeAppearance", core, || -> String {
+            let guard = core.lock().expect("host core mutex poisoned");
+            (guard.actions.theme_appearance)()
+        });
+        op!("setThemeName", core, |name: String| -> Json {
+            let guard = core.lock().expect("host core mutex poisoned");
+            match (guard.actions.theme_set_name)(&name) {
+                Ok(()) => serde_json::json!({ "success": true }),
+                Err(error) => serde_json::json!({ "success": false, "error": error }),
+            }
+        });
+        op!("setThemeInstance", core, |handle: u32| -> bool {
+            let guard = core.lock().expect("host core mutex poisoned");
+            (guard.actions.theme_set_instance)(handle)
         });
         // The custom-component factory's `keybindings.matches` (E3 slice
         // 6b): the embedder installs the port's matcher; the default

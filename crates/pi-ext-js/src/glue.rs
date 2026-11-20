@@ -876,6 +876,14 @@ globalThis.__piCreateUiCtx = function () {
       assertActive();
       return undefined;
     },
+    get theme() {
+      assertActive();
+      // Upstream's no-op context returns the global `theme` instance
+      // (`runner.ts:331-339`); the port's adapter styles through the ops
+      // — the identity default renders plain text in the headless
+      // matrix, like the renderer theme crossings (E3 slice 3).
+      return makeThemeAdapter();
+    },
     getToolsExpanded: () => {
       assertActive();
       return false;
@@ -1217,17 +1225,61 @@ globalThis.__piCreateUiCtx = function () {
       assertActive();
       return globalThis.__piEditorComponentFactory ?? undefined;
     },
-    setTheme: () => {
+    setTheme: (themeOrName) => {
       assertActive();
-      return { success: false, error: "Theme switching not supported in RPC mode" };
+      // The RPC surface keeps upstream's stub (`rpc-mode.ts:302-306`);
+      // the interactive mode carries the real API
+      // (`interactive-mode.ts:2814-2821`). An object carrying a
+      // `__piThemeHandle` is a theme ADAPTER from `getTheme` — upstream
+      // distinguishes `instanceof Theme`; the port resolves the handle
+      // back to the stashed instance.
+      if (globalThis.__piOps.mode() !== "tui") {
+        return { success: false, error: "Theme switching not supported in RPC mode" };
+      }
+      if (
+        themeOrName &&
+        typeof themeOrName === "object" &&
+        themeOrName.__piThemeHandle !== undefined
+      ) {
+        const ok = globalThis.__piOps.setThemeInstance(themeOrName.__piThemeHandle);
+        if (!ok) return { success: false, error: "unknown theme instance" };
+        queue("themeChanged", { name: null, success: true }, false);
+        return { success: true };
+      }
+      const name = String(themeOrName);
+      const result = JSON.parse(globalThis.__piOps.setThemeName(name));
+      queue("themeChanged", { name, success: result.success === true }, false);
+      return result;
     },
     getAllThemes: () => {
       assertActive();
-      return [];
+      // `getAvailableThemesWithPaths()` (`interactive-mode.ts:2808`); RPC
+      // answers `[]` (`rpc-mode.ts:294-296`).
+      if (globalThis.__piOps.mode() !== "tui") return [];
+      // The JSON boundary has no `undefined` — the system theme's `path:
+      // null` restores to `undefined` (`ThemeInfo`, `theme.ts:407-410`).
+      return JSON.parse(globalThis.__piOps.getAllThemes()).map((info) => ({
+        name: info.name,
+        path: info.path === null ? undefined : info.path,
+      }));
     },
-    getTheme: () => {
+    getTheme: (name) => {
       assertActive();
-      return undefined;
+      // `getThemeByName` (`interactive-mode.ts:2809`): unloadable names
+      // answer undefined. RPC answers undefined too (`rpc-mode.ts:298
+      // -300`).
+      if (globalThis.__piOps.mode() !== "tui") return undefined;
+      const info = JSON.parse(globalThis.__piOps.getTheme(String(name)));
+      if (info === null) return undefined;
+      return makeNamedThemeAdapter(info);
+    },
+    get theme() {
+      assertActive();
+      // Upstream returns the global theme instance
+      // (`interactive-mode.ts:2806-2807`, `rpc-mode.ts:290-292`); the
+      // port's adapter styles through the ops per call, so it always
+      // reflects the live theme.
+      return makeThemeAdapter();
     },
     getToolsExpanded: () => {
       assertActive();
@@ -1270,6 +1322,9 @@ globalThis.__piCreateUiCtx = function () {
     setTheme: (theme) => pick().setTheme(theme),
     getAllThemes: () => pick().getAllThemes(),
     getTheme: (name) => pick().getTheme(name),
+    get theme() {
+      return pick().theme;
+    },
     getToolsExpanded: () => pick().getToolsExpanded(),
     setToolsExpanded: (expanded) => pick().setToolsExpanded(expanded),
   };
@@ -1684,6 +1739,26 @@ const makeThemeAdapter = () => ({
   underline: (text) => globalThis.__piOps.themeStyle("underline", String(text)),
   inverse: (text) => globalThis.__piOps.themeStyle("inverse", String(text)),
   strikethrough: (text) => globalThis.__piOps.themeStyle("strikethrough", String(text)),
+  appearance: () => globalThis.__piOps.themeAppearance(),
+});
+// A by-name theme adapter (`ctx.ui.getTheme(name)`, E3 slice 10): the
+// upstream `Theme` instance styles with THAT theme, not the active one —
+// the `themeFgWith`/`themeBgWith` ops resolve the handle through the
+// embedder's stash. The attribute methods are theme-independent (pure
+// SGR), like upstream's. `__piThemeHandle` lets `setTheme(instance)`
+// resolve the object back to the stashed `Theme` — upstream's
+// `instanceof Theme` branch (`interactive-mode.ts:2811-2813`).
+const makeNamedThemeAdapter = (info) => ({
+  name: info.name,
+  appearance: info.appearance,
+  fg: (color, text) => globalThis.__piOps.themeFgWith(info.handle, String(color), String(text)),
+  bg: (color, text) => globalThis.__piOps.themeBgWith(info.handle, String(color), String(text)),
+  bold: (text) => globalThis.__piOps.themeStyle("bold", String(text)),
+  italic: (text) => globalThis.__piOps.themeStyle("italic", String(text)),
+  underline: (text) => globalThis.__piOps.themeStyle("underline", String(text)),
+  inverse: (text) => globalThis.__piOps.themeStyle("inverse", String(text)),
+  strikethrough: (text) => globalThis.__piOps.themeStyle("strikethrough", String(text)),
+  __piThemeHandle: info.handle,
 });
 // The factory's tui adapter (E3 slices 6b/6c): `requestRender` plus the
 // overlay surface — `showOverlay(component, options?)` and the topmost
