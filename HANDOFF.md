@@ -3251,6 +3251,81 @@ drop the call Value inside the closure; r2: `too_many_arguments` allows
 on the 8-arg wrapped apply; r3: `repeat().take()` → `repeat_n`; r4
 green). Test totals: 1924 workspace tests, 0 failed.
 
+## 2026-11-20 — E3 slice 9: the editor component (setCustomEditorComponent)
+
+Serial (the spawn discipline stands). Branch
+`feat/e3-slice9-editor-component` off 28c44bc; commits 74b0817 (pi-ext-js
+crossings) + 0956eaa (mode wiring) + 121634f/f45bb34/ed166c5 gate rounds +
+687b34b (the status-slot swap) + a52efe1 (gate fmt).
+
+- **The swap** (`setCustomEditorComponent`,
+  `interactive-mode.ts:2979-3055`; `EditorFactory`, `types.ts:145`,
+  `setEditorComponent`/`getEditorComponent`, `types.ts:299/:302`): the
+  glue invokes the factory INLINE in the op (the footer/header pattern),
+  adopts the returned component through the registry (`__piComponentAdopt`
+  — render + invalidate required), wires it (`wireEditorComponent`), and
+  crosses `{restore, handle}` to the mode; `undefined` queues
+  `{restore: true}`. Upstream swaps `this.editor` immediately and remounts
+  the container when the last dialog closes — the port's ChatEditor keeps
+  its slot permanently and routes render/input through the delegate
+  (`ExtensionEditorLive`), so selector/dialog parks keep working
+  unchanged.
+- **The wiring** mirrors upstream duck-typing: `onSubmit`/`onChange`
+  cross as `editorSubmit`/`editorChange` uiRequests; the swap-time text
+  copy rides the snapshot mirror (`setText(__piOps.editorText())`, ≤1
+  frame stale — documented); `borderColor` is overwritten only when the
+  component declares it, mapped through `themeFg` with camelCase
+  ThemeColor tokens; chrome (paddingX/maxVisible/appActions) rides the
+  `editorChrome` op with `?? {}` guards (`JSON.parse("null")` headless);
+  `setAutocompleteProvider` receives an adapter that re-queries the
+  port's COMPOSED provider via the promise-answer `editorAutocomplete`
+  crossing (the same deferred machinery as the overlay answer class, E3
+  slice 6c); an `actionHandlers` Map copies app_keys ids + fallback
+  handlers routing `editorAction` crossings.
+- **Input ownership**: the delegate consumes EVERY key while live
+  (upstream's custom editor receives `handleInput(data)` and the
+  built-in editor underneath sees nothing); a busy engine stashes the
+  chunk (the terminal-input fold pattern — the 6b deadlock class), the
+  pump redelivers; text writes stash likewise. `editorSubmit` joins the
+  editor-events pipeline; the submit-drain skips the built-in
+  `set_text("")` clear while the delegate is live (the component owns
+  its text lifecycle).
+- **The status row**: `isEmbeddedStatus` (`:232-240`) never matches a
+  custom component, so upstream puts the indicator in `statusContainer`
+  (`:2445-2455`). The port swaps an `ExtensionEditorStatusRow` into the
+  status host slot (reading the shared indicator; `IdleStatus`'s two
+  blank lines when idle) and swaps `IdleStatus` back on restore — the
+  host mounts `IdleStatus`, not a container, so the row moves wholesale
+  (`swap_slot_component`).
+- **Routing details**: `addToHistory?.()` sites route through the
+  delegate's duck-typed crossing (4 sites); `editorAction` resolves
+  `escape`→Interrupt, `ctrlD`→Exit, `pasteImage`→no-op (the port has no
+  clipboard-image paste — documented), `extensionShortcut`→
+  `run_extension_shortcut`, `app:<id>`→ the app_keys action table;
+  `rebuild_autocomplete_provider` re-sets the delegate's provider too
+  (`setupAutocompleteProvider` re-calls it on the non-default editor,
+  `:855-871`); `getEditorComponent()` answers the stored factory;
+  `resetExtensionUI` restores the built-in editor (the component's text
+  moves back) and clears the factory stash.
+
+Tests: pi-ext-js 1 (the factory runs in the op and the handle crosses,
+`notify "type:function"`, the swap copies "", the setText/read
+round-trip, handleInput consumes and mutates, the wired onSubmit crosses
+its argument, clear_stash → `getEditorComponent()` undefined);
+pi-coding-agent 1 (the delegate mounts + the status row swaps in, typed
+keys land in the component with the built-in editor empty, the snapshot
+mirrors, `setEditorText` routes, "/exit" submits through the wired
+onSubmit → exiting, the reset restores the built-in editor with the
+component's text and unmounts the row). Gate green in 7 rounds (r1:
+or-pattern nesting + the surface initializer's new fields + a Component
+impl for StatusIndicator + mutex/borrow fixes; r2: `Value::Null` as a
+closure (unit variants are values, not fns), method-path maps,
+collapsible if, drop(&mut) no-ops; r3: a bool assert; r4: the status
+host mounts IdleStatus not a Container — the row now swaps the slot
+wholesale; r5: single_match_else; r6: the runner fixture submitted
+before appending the CR; r7 green). Test totals: 1926 workspace tests,
+0 failed.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
