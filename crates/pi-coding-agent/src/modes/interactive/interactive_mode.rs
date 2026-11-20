@@ -14153,6 +14153,12 @@ export default function (pi) {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
         mode.tui.start().expect("tui start");
+        let runner = mode.extension_runner.clone().expect("runner");
+        runner
+            .lock()
+            .expect("extension runner mutex poisoned")
+            .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
         mode.pump();
         // The global theme switched twice synchronously (dark, then the
         // system fallback, then the stashed dark instance) — the final
