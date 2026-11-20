@@ -2122,19 +2122,28 @@ impl InteractiveMode {
                         .collect(),
                 )
             });
-            let theme_by_name: Box<dyn Fn(&str) -> Option<(u32, String, String)> + Send> =
-                Box::new(move |name| {
-                    let loaded = theme::theme_by_name(name)?;
-                    let appearance = loaded.appearance().as_str().to_string();
-                    let handle = counter_for_load.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    stash_for_load
-                        .lock()
-                        .expect("theme stash")
-                        .insert(handle, loaded);
-                    Some((handle, name.to_string(), appearance))
-                });
-            let theme_fg_with: Box<dyn Fn(u32, &str, &str) -> String + Send> = Box::new(
-                move |handle, token, text| match fg_stash
+            let theme_by_name: pi_ext_js::ThemeByNameFn = Box::new(move |name| {
+                let loaded = theme::theme_by_name(name)?;
+                let appearance = loaded.appearance().as_str().to_string();
+                let handle = counter_for_load.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                stash_for_load
+                    .lock()
+                    .expect("theme stash")
+                    .insert(handle, loaded);
+                Some((handle, name.to_string(), appearance))
+            });
+            let theme_appearance: Box<dyn Fn() -> String + Send> =
+                Box::new(|| theme::theme().appearance().as_str().to_string());
+            let mut guard = runner.lock().expect("extension runner mutex poisoned");
+            guard.set_theme_surface(fg, bg);
+            guard.set_style_surface(style);
+            guard.set_theme_ext_surface(pi_ext_js::ThemeExtSurface {
+                all: theme_all,
+                by_name: theme_by_name,
+                // The by-handle stylers resolve the stash inline: the
+                // unknown handle passes the text through, like an
+                // unknown token.
+                fg_with: Box::new(move |handle, token, text| match fg_stash
                     .lock()
                     .expect("theme stash")
                     .get(&handle)
@@ -2145,10 +2154,8 @@ impl InteractiveMode {
                         None => text.to_string(),
                     },
                     None => text.to_string(),
-                },
-            );
-            let theme_bg_with: Box<dyn Fn(u32, &str, &str) -> String + Send> = Box::new(
-                move |handle, token, text| match bg_stash
+                }),
+                bg_with: Box::new(move |handle, token, text| match bg_stash
                     .lock()
                     .expect("theme stash")
                     .get(&handle)
@@ -2159,14 +2166,10 @@ impl InteractiveMode {
                         None => text.to_string(),
                     },
                     None => text.to_string(),
-                },
-            );
-            let theme_appearance: Box<dyn Fn() -> String + Send> =
-                Box::new(|| theme::theme().appearance().as_str().to_string());
-            let theme_set_name: Box<dyn Fn(&str) -> Result<(), String> + Send> =
-                Box::new(move |name| theme::set_theme_with_fallback(name));
-            let theme_set_instance: Box<dyn Fn(u32) -> bool + Send> =
-                Box::new(move |handle| match stash_for_instance
+                }),
+                appearance: theme_appearance,
+                set_name: Box::new(theme::set_theme_with_fallback),
+                set_instance: Box::new(move |handle| match stash_for_instance
                     .lock()
                     .expect("theme stash")
                     .remove(&handle)
@@ -2176,18 +2179,7 @@ impl InteractiveMode {
                         true
                     }
                     None => false,
-                });
-            let mut guard = runner.lock().expect("extension runner mutex poisoned");
-            guard.set_theme_surface(fg, bg);
-            guard.set_style_surface(style);
-            guard.set_theme_ext_surface(pi_ext_js::ThemeExtSurface {
-                all: theme_all,
-                by_name: theme_by_name,
-                fg_with: theme_fg_with,
-                bg_with: theme_bg_with,
-                appearance: theme_appearance,
-                set_name: theme_set_name,
-                set_instance: theme_set_instance,
+                }),
             });
             guard.set_app_keybindings(
                 &serde_json::to_string(&keybindings).unwrap_or_else(|_| "{}".to_string()),
@@ -10372,7 +10364,7 @@ impl InteractiveMode {
                                 // (`interactive-mode.ts:2815-2820`).
                                 self.theme_auto_sync = name == pi_tui::theme::SYSTEM_THEME_NAME;
                                 self.tui.set_color_scheme_notifications(self.theme_auto_sync);
-                                self.theme_active_name = name.clone();
+                                self.theme_active_name.clone_from(&name);
                                 if self.settings.get("theme").and_then(Value::as_str) != Some(name.as_str())
                                 {
                                     self.settings
