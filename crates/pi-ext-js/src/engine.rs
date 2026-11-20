@@ -116,13 +116,13 @@ pub struct HostActions {
     /// keyed by the handle; `None` is upstream's `undefined`. The
     /// handle keys the embedder's theme stash the `themeFgWith`/
     /// `themeBgWith`/`setThemeInstance` ops resolve.
-    pub theme_by_name: Box<dyn Fn(&str) -> Option<(u32, String, String)> + Send>,
+    pub theme_by_name: ThemeByNameFn,
     /// `theme.fg(color, text)` against a stashed by-name theme (E3 slice
     /// 10): the handle resolves through the embedder's stash; unknown
     /// handles pass the text through like an unknown token.
-    pub theme_fg_with: Box<dyn Fn(u32, &str, &str) -> String + Send>,
+    pub theme_fg_with: ThemeHandleStyler,
     /// `theme.bg(color, text)` against a stashed by-name theme.
-    pub theme_bg_with: Box<dyn Fn(u32, &str, &str) -> String + Send>,
+    pub theme_bg_with: ThemeHandleStyler,
     /// The current theme's appearance (`theme.appearance`): `"dark"` or
     /// `"light"`.
     pub theme_appearance: Box<dyn Fn() -> String + Send>,
@@ -130,7 +130,7 @@ pub struct HostActions {
     /// install with the system fallback (`theme.ts:703-724`); the
     /// `themeChanged` crossing carries the mode-side visuals and the
     /// settings persistence. `Err` maps to `{success: false, error}`.
-    pub theme_set_name: Box<dyn Fn(&str) -> Result<(), String> + Send>,
+    pub theme_set_name: ThemeSetNameFn,
     /// `ctx.ui.setTheme(instance)`'s synchronous half: install the
     /// stashed theme; `false` = unknown handle.
     pub theme_set_instance: Box<dyn Fn(u32) -> bool + Send>,
@@ -182,6 +182,14 @@ pub type ThemeStyler = Box<dyn Fn(&str, &str) -> String + Send>;
 /// One synchronous `keybindings.matches(data, action)` call for the
 /// custom-component factory's keybindings adapter (E3 slice 6b).
 pub type KeybindingMatcher = Box<dyn Fn(&str, &str) -> bool + Send>;
+/// `theme_by_name(name)` — the by-name theme loader's crossing tuple:
+/// `(handle, name, appearance)` or `None` (upstream's `undefined`).
+pub type ThemeByNameFn = Box<dyn Fn(&str) -> Option<(u32, String, String)> + Send>;
+/// `theme.fg/bg` against a stashed by-name theme (handle-keyed).
+pub type ThemeHandleStyler = Box<dyn Fn(u32, &str, &str) -> String + Send>;
+/// `setTheme(name)`'s synchronous half — load + install + the system
+/// fallback.
+pub type ThemeSetNameFn = Box<dyn Fn(&str) -> Result<(), String> + Send>;
 
 impl Default for HostActions {
     fn default() -> Self {

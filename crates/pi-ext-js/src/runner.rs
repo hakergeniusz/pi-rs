@@ -52,7 +52,9 @@ use std::sync::Mutex;
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
 
-use crate::engine::{ContextKind, HostCore, JsHost};
+use crate::engine::{
+    ContextKind, HostCore, JsHost, ThemeByNameFn, ThemeHandleStyler, ThemeSetNameFn,
+};
 use crate::error::{ExtensionError, JsHostError};
 use crate::events::{
     self, BeforeAgentStartCombined, BeforeAgentStartResult, BeforeAgentStartTrigger,
@@ -289,15 +291,15 @@ pub struct ThemeExtSurface {
     /// `getAllThemes` — the JSON `[{name, path}]` list.
     pub all: Box<dyn Fn() -> Json + Send>,
     /// `getTheme(name)` — `Some((handle, name, appearance))` or `None`.
-    pub by_name: Box<dyn Fn(&str) -> Option<(u32, String, String)> + Send>,
+    pub by_name: ThemeByNameFn,
     /// `theme.fg` against a stashed theme (handle-keyed).
-    pub fg_with: Box<dyn Fn(u32, &str, &str) -> String + Send>,
+    pub fg_with: ThemeHandleStyler,
     /// `theme.bg` against a stashed theme (handle-keyed).
-    pub bg_with: Box<dyn Fn(u32, &str, &str) -> String + Send>,
+    pub bg_with: ThemeHandleStyler,
     /// The current theme's appearance.
     pub appearance: Box<dyn Fn() -> String + Send>,
     /// `setTheme(name)`'s synchronous half — load + install + fallback.
-    pub set_name: Box<dyn Fn(&str) -> Result<(), String> + Send>,
+    pub set_name: ThemeSetNameFn,
     /// `setTheme(instance)`'s synchronous half — install the stash hit.
     pub set_instance: Box<dyn Fn(u32) -> bool + Send>,
 }
