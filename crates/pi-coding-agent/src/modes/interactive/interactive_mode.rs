@@ -2101,8 +2101,8 @@ impl InteractiveMode {
             > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             // Each closure takes its own Arc clone: they all `move`.
             let stash_for_load = std::sync::Arc::clone(&theme_stash);
-            let stash_for_fg = std::sync::Arc::clone(&theme_stash);
-            let stash_for_bg = std::sync::Arc::clone(&theme_stash);
+            let fg_stash = std::sync::Arc::clone(&theme_stash);
+            let bg_stash = std::sync::Arc::clone(&theme_stash);
             let stash_for_instance = std::sync::Arc::clone(&theme_stash);
             // Monotonic handles: `setThemeInstance` removes from the stash,
             // so a length-based id would collide with a still-live
@@ -2134,7 +2134,7 @@ impl InteractiveMode {
                     Some((handle, name.to_string(), appearance))
                 });
             let theme_fg_with: Box<dyn Fn(u32, &str, &str) -> String + Send> = Box::new(
-                move |handle, token, text| match stash_for_fg
+                move |handle, token, text| match fg_stash
                     .lock()
                     .expect("theme stash")
                     .get(&handle)
@@ -2148,7 +2148,7 @@ impl InteractiveMode {
                 },
             );
             let theme_bg_with: Box<dyn Fn(u32, &str, &str) -> String + Send> = Box::new(
-                move |handle, token, text| match stash_for_bg
+                move |handle, token, text| match bg_stash
                     .lock()
                     .expect("theme stash")
                     .get(&handle)
