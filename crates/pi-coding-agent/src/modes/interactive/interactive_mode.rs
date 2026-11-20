@@ -405,7 +405,12 @@ impl pi_tui::component::Component for ExtensionEditorStatusRow {
         let guard = self.status.lock().expect("status");
         match guard.as_ref() {
             Some(indicator) => indicator.render(width),
-            None => Vec::new(),
+            // Idle while delegating: `IdleStatus`'s two blank lines keep
+            // the slot's height identical to the built-in editor's.
+            None => {
+                let empty_line = " ".repeat(width);
+                vec![empty_line.clone(), empty_line]
+            }
         }
     }
 }
@@ -7248,14 +7253,17 @@ impl InteractiveMode {
         if delegate_live == self.extension_editor_status_row {
             return;
         }
-        let status = Arc::clone(&self.status_handle);
-        let Some(host) = self.downcast_tree::<pi_tui::component::Container>(HostSlot::Status)
-        else {
-            return;
-        };
-        host.clear();
+        // The status host holds `IdleStatus` (not a container) — the row
+        // swaps in wholesale and swaps back out on restore, like the
+        // editor/footer slot swaps.
         if delegate_live {
-            host.add_child(Box::new(ExtensionEditorStatusRow { status }));
+            let status = Arc::clone(&self.status_handle);
+            drop(self.swap_slot_component(
+                HostSlot::Status,
+                Box::new(ExtensionEditorStatusRow { status }),
+            ));
+        } else {
+            drop(self.swap_slot_component(HostSlot::Status, Box::new(IdleStatus)));
         }
         self.extension_editor_status_row = delegate_live;
     }
@@ -13871,7 +13879,9 @@ export default function (pi) {
             "",
             "the built-in editor stays empty under the delegate"
         );
-        // The snapshot (what `getEditorText` serves) mirrors the component.
+        // The snapshot (what `getEditorText` serves) mirrors the component —
+        // pump-refreshed, one frame stale like the synchronous reads.
+        mode.pump();
         assert_eq!(
             mode.ui_snapshot.lock().expect("ui snapshot").editor_text,
             "hi"
