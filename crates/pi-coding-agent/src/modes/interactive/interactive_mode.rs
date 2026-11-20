@@ -438,11 +438,7 @@ struct ExtensionEditorLive {
 
 #[cfg(feature = "ext-js")]
 impl ExtensionEditorLive {
-    fn new(
-        runner: Arc<Mutex<pi_ext_js::ExtensionRunner>>,
-        handle: u32,
-        text: String,
-    ) -> Self {
+    fn new(runner: Arc<Mutex<pi_ext_js::ExtensionRunner>>, handle: u32, text: String) -> Self {
         Self {
             runner,
             handle,
@@ -7174,7 +7170,12 @@ impl InteractiveMode {
     /// `setText` — the delegate's when a component is live (E3 slice 9).
     #[cfg(feature = "ext-js")]
     fn set_editor_text(&mut self, text: &str) {
-        if let Some(live) = self.extension_editor.lock().expect("extension editor").as_mut() {
+        if let Some(live) = self
+            .extension_editor
+            .lock()
+            .expect("extension editor")
+            .as_mut()
+        {
             live.set_text(text);
         } else if let Some(editor) = self.editor_host_mut() {
             editor.editor.set_text(text);
@@ -7227,7 +7228,12 @@ impl InteractiveMode {
             .as_mut()
             .map(ExtensionEditorLive::editor_text)
             .unwrap_or_default();
-        if let Some(live) = self.extension_editor.lock().expect("extension editor").take() {
+        if let Some(live) = self
+            .extension_editor
+            .lock()
+            .expect("extension editor")
+            .take()
+        {
             live.release();
         }
         if let Some(editor) = self.editor_host_mut() {
@@ -7282,9 +7288,18 @@ impl InteractiveMode {
                     .collect()
             })
             .unwrap_or_default();
-        let cursor_line = request.get("cursorLine").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let cursor_col = request.get("cursorCol").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let force = request.get("force").and_then(Value::as_bool).unwrap_or(false);
+        let cursor_line = request
+            .get("cursorLine")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let cursor_col = request
+            .get("cursorCol")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let force = request
+            .get("force")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         // The composed chain: the base wrapped through the registered JS
         // wrappers (E3 slice 8) — the same provider the built-in editor
         // uses, exactly what upstream passes (`this.autocompleteProvider`).
@@ -7440,21 +7455,22 @@ impl InteractiveMode {
             self.editor_host_mut()
                 .map_or(String::new(), |editor| editor.editor.get_expanded_text())
         });
-        let (padding_x, max_visible) = self
-            .editor_host_mut()
-            .map_or((0, 5), |editor| {
-                (
-                    editor.editor.padding_x(),
-                    editor.editor.autocomplete_max_visible(),
-                )
-            });
+        let (padding_x, max_visible) = self.editor_host_mut().map_or((0, 5), |editor| {
+            (
+                editor.editor.padding_x(),
+                editor.editor.autocomplete_max_visible(),
+            )
+        });
         let border_color = if self
             .editor_host_mut()
             .is_some_and(|editor| editor.is_bash_mode)
         {
             "bashMode".to_string()
         } else {
-            format!("thinking{}", Self::thinking_color_suffix(self.thinking_level))
+            format!(
+                "thinking{}",
+                Self::thinking_color_suffix(self.thinking_level)
+            )
         };
         let app_actions: Vec<String> = theme::app_keys::DEFAULTS
             .iter()
@@ -7534,7 +7550,12 @@ impl InteractiveMode {
         // re-calls `setAutocompleteProvider` on `this.editor` when it is
         // not the default — `interactive-mode.ts:855-871`): the delegate's
         // provider is a fresh composed adapter each rebuild.
-        if let Some(live) = self.extension_editor.lock().expect("extension editor").as_ref() {
+        if let Some(live) = self
+            .extension_editor
+            .lock()
+            .expect("extension editor")
+            .as_ref()
+        {
             live.set_autocomplete_provider();
         }
         self.tui.request_render();
@@ -11401,7 +11422,12 @@ impl InteractiveMode {
             // (E3 slice 7). The editor delegate's deferred keys/text
             // writes flush the same way (E3 slice 9).
             self.pump_deferred_terminal_input();
-            if let Some(live) = self.extension_editor.lock().expect("extension editor").as_mut() {
+            if let Some(live) = self
+                .extension_editor
+                .lock()
+                .expect("extension editor")
+                .as_mut()
+            {
                 live.flush_pending();
             }
             self.refresh_ui_snapshot();
@@ -13847,7 +13873,10 @@ export default function (pi) {
             .expect("emit");
         mode.pump();
         assert!(
-            mode.extension_editor.lock().expect("extension editor").is_some(),
+            mode.extension_editor
+                .lock()
+                .expect("extension editor")
+                .is_some(),
             "the delegate mounted"
         );
         assert!(
@@ -13873,7 +13902,10 @@ export default function (pi) {
         );
         assert!(rendered.contains("[EXT] hi"), "{rendered}");
         assert_eq!(
-            mode.editor_host_mut().expect("editor host").editor.get_text(),
+            mode.editor_host_mut()
+                .expect("editor host")
+                .editor
+                .get_text(),
             "",
             "the built-in editor stays empty under the delegate"
         );
@@ -13907,7 +13939,10 @@ export default function (pi) {
         mode.pump();
         assert!(mode.exiting, "the component's submit ran the pipeline");
         assert_eq!(
-            mode.editor_host_mut().expect("editor host").editor.get_text(),
+            mode.editor_host_mut()
+                .expect("editor host")
+                .editor
+                .get_text(),
             "",
             "the built-in editor was empty all along"
         );
@@ -13916,7 +13951,10 @@ export default function (pi) {
         // and unmounts the status row.
         mode.reset_extension_ui_dialogs();
         assert!(
-            mode.extension_editor.lock().expect("extension editor").is_none(),
+            mode.extension_editor
+                .lock()
+                .expect("extension editor")
+                .is_none(),
             "the reset dropped the delegate"
         );
         assert!(
@@ -13924,7 +13962,10 @@ export default function (pi) {
             "the status row unmounted"
         );
         assert_eq!(
-            mode.editor_host_mut().expect("editor host").editor.get_text(),
+            mode.editor_host_mut()
+                .expect("editor host")
+                .editor
+                .get_text(),
             "/exit",
             "the component's text moved back into the built-in editor"
         );

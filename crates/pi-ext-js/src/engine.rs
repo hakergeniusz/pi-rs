@@ -1407,9 +1407,7 @@ impl JsHost {
                 .globals()
                 .get("__piEditorComponentFactoryClear")
                 .map_err(|err| Self::js_error(&ctx, err))?;
-            let _: Value = call
-                .call(())
-                .map_err(|err| Self::js_error(&ctx, err))?;
+            let _: Value = call.call(()).map_err(|err| Self::js_error(&ctx, err))?;
             Ok(())
         })
     }

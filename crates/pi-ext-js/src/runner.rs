@@ -1910,10 +1910,8 @@ impl ExtensionRunner {
                 // read (E3 slice 9) rides the same machinery — the mode
                 // answers from its composed provider.
                 Some(
-                    "overlayIsHidden"
-                        | "overlayIsFocused"
-                        | "overlayGetBounds"
-                        | "editorAutocomplete",
+                    "overlayIsHidden" | "overlayIsFocused" | "overlayGetBounds"
+                    | "editorAutocomplete",
                 ) => {
                     deferred.push(request.clone());
                 }
@@ -4270,9 +4268,7 @@ export default function (pi) {
             "",
             "the swap copies the previous editor's text"
         );
-        runner
-            .component_set_text(handle, "hi")
-            .expect("set text");
+        runner.component_set_text(handle, "hi").expect("set text");
         assert_eq!(runner.component_editor_text(handle).expect("text"), "hi");
 
         // Input feeds the component; the wired onSubmit crosses when the
@@ -4291,7 +4287,9 @@ export default function (pi) {
         runner
             .component_handle_input(handle, "\r")
             .expect("submit key");
-        runner.service_ui_requests().expect("service the submit crossing");
+        runner
+            .service_ui_requests()
+            .expect("service the submit crossing");
         let drained = sink.requests();
         let submit = drained
             .iter()
@@ -4306,9 +4304,9 @@ export default function (pi) {
             .emit(&json!({ "type": "session_before_switch" }))
             .expect("emit");
         let drained = sink.requests();
-        let after = drained
-            .iter()
-            .find(|request| request["method"] == "notify" && request["message"] == "after:undefined");
+        let after = drained.iter().find(|request| {
+            request["method"] == "notify" && request["message"] == "after:undefined"
+        });
         assert!(after.is_some(), "{drained:?}");
     }
 
