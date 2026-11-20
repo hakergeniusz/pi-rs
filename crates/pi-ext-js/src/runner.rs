@@ -4225,8 +4225,14 @@ export default function (pi) {
         getText: () => text,
         setText: (next) => { text = next; },
         handleInput: (data) => {
-          text += data;
-          if (data === "\r" && component.onSubmit) component.onSubmit(text);
+          for (let i = 0; i < data.length; i++) {
+            const code = data.charCodeAt(i);
+            if (code === 13) {
+              if (component.onSubmit) component.onSubmit(text);
+            } else {
+              text += data[i];
+            }
+          }
           return true;
         },
       };
