@@ -4271,11 +4271,10 @@ export default function (pi) {
 
         // Input feeds the component; the wired onSubmit crosses when the
         // component calls it (Enter in the test's own handler).
-        assert_eq!(
+        assert!(
             runner
                 .component_handle_input(handle, "x")
-                .expect("handle input"),
-            true
+                .expect("handle input")
         );
         runner.service_ui_requests().expect("service");
         assert_eq!(
