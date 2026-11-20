@@ -634,19 +634,21 @@ impl JsHost {
         // theme loaders; `setTheme`'s synchronous half installs the
         // global with the system fallback and the `themeChanged`
         // crossing carries the mode-side visuals + settings persistence.
-        op!("getAllThemes", core, || -> Json {
+        op!("getAllThemes", core, || -> String {
             let guard = core.lock().expect("host core mutex poisoned");
-            (guard.actions.theme_all)()
+            serde_json::to_string(&(guard.actions.theme_all)())
+                .unwrap_or_else(|_| "[]".to_string())
         });
-        op!("getTheme", core, |name: String| -> Json {
+        op!("getTheme", core, |name: String| -> String {
             let guard = core.lock().expect("host core mutex poisoned");
             match (guard.actions.theme_by_name)(&name) {
-                Some((handle, name, appearance)) => serde_json::json!({
+                Some((handle, name, appearance)) => serde_json::to_string(&serde_json::json!({
                     "handle": handle,
                     "name": name,
                     "appearance": appearance,
-                }),
-                None => Json::Null,
+                }))
+                .unwrap_or_else(|_| "null".to_string()),
+                None => "null".to_string(),
             }
         });
         op!("themeFgWith", core, |handle: u32, token: String, text: String| -> String {
@@ -661,12 +663,13 @@ impl JsHost {
             let guard = core.lock().expect("host core mutex poisoned");
             (guard.actions.theme_appearance)()
         });
-        op!("setThemeName", core, |name: String| -> Json {
+        op!("setThemeName", core, |name: String| -> String {
             let guard = core.lock().expect("host core mutex poisoned");
-            match (guard.actions.theme_set_name)(&name) {
+            serde_json::to_string(&match (guard.actions.theme_set_name)(&name) {
                 Ok(()) => serde_json::json!({ "success": true }),
                 Err(error) => serde_json::json!({ "success": false, "error": error }),
-            }
+            })
+            .unwrap_or_else(|_| "{\"success\":false}".to_string())
         });
         op!("setThemeInstance", core, |handle: u32| -> bool {
             let guard = core.lock().expect("host core mutex poisoned");

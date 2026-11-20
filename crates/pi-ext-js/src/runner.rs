@@ -7436,8 +7436,8 @@ export default function (pi) {
         );
         // The `themeChanged` crossings forwarded fire-and-forget: one per
         // setTheme, in order (failed name, then the instance).
-        let changed: Vec<&Json> = sink
-            .requests()
+        let requests = sink.requests();
+        let changed: Vec<&Json> = requests
             .iter()
             .filter(|request| request["method"] == "themeChanged")
             .collect();
