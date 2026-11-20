@@ -3388,6 +3388,80 @@ the headless phase reads `ui_log` — round 6 masked it because cargo
 test stops at the first failing binary; r8 green). Test totals: 1928
 workspace tests, 0 failed.
 
+## MCP streamable-HTTP transport (landed on `feat/mcp-http-transport`, 2026-11-20)
+
+The streamable-HTTP arm of `@earendil-works/pi-mcp`:
+`crates/pi-mcp/src/http.rs` ports
+`packages/mcp/src/transports/streamable-http.ts` (579 lines) onto
+reqwest; `client.rs` grows the transport union and the
+supported-version check; the manager dispatches URL configs (which
+were an outright error before this slice).
+
+- **Transport mechanics** (upstream order preserved): POST with
+  `accept: application/json, text/event-stream`; the session rides
+  `mcp-session-id` (empty string treated as absent); after the
+  handshake `MCP-Protocol-Version` carries the negotiated version.
+  `build_headers` order: config headers → per-request (overrides) →
+  session → protocol version → `Authorization: Bearer` (when a
+  provider supplies a token — the provider hook lands with OAuth).
+  Notifications expect 202 and discard the body;
+  `notifications/initialized` opens the GET stream
+  (`openGetStream`-guarded). On a REQUEST, 202/204 error with
+  `"MCP server accepted request {method} without a response"` BEFORE
+  the content-type dispatch (`streamable-http.ts:305-307`).
+- **Response arms**: `application/json` (16 MiB cap; array or single;
+  no matching reply → immediate error) and `text/event-stream`
+  (consumed until the awaited answer, then the rest of the stream
+  moves to a spawned task). The SSE parser is byte-level: CRLF/LF/CR
+  line endings incl. splits across chunk boundaries, `:` comments, one
+  leading space stripped, data lines joined with a per-event byte cap,
+  `id` (NUL rejected) and `retry` (digits only) emit immediately.
+- **GET stream + resumption**: the server-to-client stream opens after
+  `initialized`; on failure it reopens with `Last-Event-ID` once ids
+  have been seen. Retryable: 408/429/5xx (stream-level includes 501)
+  and network errors; backoff `initial·2^attempt` capped 30 s, the
+  server's `retry:` overrides, max 5 retries, healthy resets when
+  events arrived or the cap elapsed. Exhaustion surfaces
+  `Rpc{-32603, "MCP response stream failed: …"}`.
+- **Error kinds** (`checkResponse`): 401 → `AuthRequired` with the
+  `www-authenticate` challenge; 404 with a session →
+  `SessionExpired`; otherwise `Http` with a body snippet (8 KiB read
+  cap, 500 chars in the message). `close()` = DELETE with a 1 s
+  timeout reusing the last token, only when started with a session.
+- **Client** (`client.ts:216-243`): the handshake validates the
+  server's `protocolVersion` against
+  `SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18",
+  "2025-03-26", "2024-11-05"]` and rides `setProtocolVersion`; a
+  failed handshake closes the transport. The manager keeps the
+  URL-server connect retries (`runtime.ts`: delays [250, 1000] on
+  408/429/5xx≠501/network) and retries a tool call once on
+  `SessionExpired` by reconnecting.
+- **Deviations** (all in module docs): the port's `initialize` sends
+  its pinned `PROTOCOL_VERSION` "2025-06-18" (upstream sends LATEST
+  "2025-11-25"); SSE consumption is inline-until-answer plus a spawned
+  continuation (upstream: fully background — reqwest's
+  `bytes_stream` takes ownership); a JSON body with no matching reply
+  errors immediately and invalid JSON-RPC in a JSON body fails the
+  request with `Rpc{-32600}` (upstream drops both and the request
+  times out; SSE-arm malformed events stay inbound diagnostics);
+  unmatched responses are dropped (stdio pending-map parity); i64 ids
+  only (pre-existing `types.rs` limitation); `needs_authorization`
+  (the 401/insufficient-scope step-up check) is `#[cfg(test)]` until
+  OAuth wires the authorized-fetch recovery; a session-expired retry
+  reconnects and REPLACES the manager entry (upstream detaches the old
+  client without closing it — the worker is serial, so the reconnect
+  cannot overlap an in-flight call).
+- Tests: pi-mcp 25 (SSE parser units, header/session/version flows,
+  resumption, GET stream, error kinds over a raw `TcpListener` test
+  server; the SSE-answer test caught a real bug — batch items after
+  the reply were dropped instead of routed), pi-ext-js manager tests.
+  Gate green in 4 rounds (r1: 11 clippy lints in http.rs — let-chains,
+  by-ref `network_error`, `clone_from`, type aliases, `write!` vs
+  `push_str(format!)`; r2: two orphan-brace slips, caught by rustfmt's
+  parse before the container round; r3: 2 lints in the manager — by-ref
+  spawn config, `Failed { .. }` over a wildcard; r4 green). Test
+  totals: 1950 workspace tests, 0 failed.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).

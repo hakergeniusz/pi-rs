@@ -1,19 +1,22 @@
 //! The native MCP server manager: the host half of the bundled `mcp`
-//! extension (`packages/coding-agent/src/extensions/mcp/`), reduced to the
-//! stdio subset this slice lands — connections, tool discovery, tool
-//! calls, and the result mapping the bridge registers.
+//! extension (`packages/coding-agent/src/extensions/mcp/`) — connections
+//! over stdio or streamable HTTP, tool discovery, tool calls, and the
+//! result mapping the bridge registers.
 //!
 //! What each upstream piece becomes:
 //!
 //! * `runtime.ts:141-456` (`McpServerConnection`) — a per-server entry in
-//!   the worker thread: `connect` is `connectOnce` (`:361-409`, minus the
-//!   HTTP retries/OAuth), `call_tool` is `withClient` (`:280-303`) with the
-//!   stdio lazy-reconnect arm, and the `getClient` guards the tool
-//!   definitions close over (`index.ts:424-438`) run at call time.
-//! * `runtime.ts:100-124` (`createDefaultTransport`, stdio arm) —
-//!   [`stdio_spawn_config`]: `~` expansion (`:92-98`), env
-//!   `resolveConfigValueOrThrow` (`:113-116`), and the session-cwd-relative
-//!   `cwd` (`:120`).
+//!   the worker thread: `connect` is `open`/`connectOnce` (`:361-409`, the
+//!   URL-server transient retries at `:371-376`; OAuth/`needs-auth` waits
+//!   for the OAuth port), `call_tool` is `withClient` (`:280-303`) with
+//!   the stdio lazy-reconnect arm and the HTTP session-expired retry, and
+//!   the `getClient` guards the tool definitions close over
+//!   (`index.ts:424-438`) run at call time.
+//! * `runtime.ts:100-124` (`createDefaultTransport`) — [`spawn_config`]:
+//!   the stdio arm (`~` expansion `:92-98`, env
+//!   `resolveConfigValueOrThrow` `:113-116`, the session-cwd-relative
+//!   `cwd` `:120`) and the HTTP arm (the `resolveHeadersOrThrow`
+//!   headers, `resolve-config-value.ts:271-282`).
 //! * `tools.ts:215-235` (`convertMcpResult`) + `content.ts:76-127`
 //!   (`toLlmContent`) + `output-limit.ts:28-77` — [`convert_mcp_result`]:
 //!   the model-facing blocks, the empty-error fallback (`tools.ts:224-226`),
@@ -26,10 +29,12 @@
 //! its connections on a dedicated worker thread with its own current-thread
 //! runtime; ops send requests over a channel and block on the reply
 //! (bounded by the server's configured timeout, like every synchronous op).
+//! The HTTP transports' background stream tasks are polled during the
+//! `block_on` windows the calls provide.
 //!
-//! Not in this slice (recorded open): streamable HTTP transports and
-//! OAuth/`needs-auth` (`oauth.ts`, the HTTP arm of `runtime.ts`), resources
-//! (`resources.ts`), and the `/mcp` manager UI (`ui.ts`).
+//! Not in this slice (recorded open): OAuth/`needs-auth` (`oauth.ts` and
+//! the HTTP arm's sign-in flow), resources (`resources.ts`), and the
+//! `/mcp` manager UI (`ui.ts`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,7 +44,7 @@ use std::time::Duration;
 use serde_json::{Value as Json, json};
 
 use pi_mcp::types::ContentBlock;
-use pi_mcp::{CallToolResult, McpClient, McpServerConfig};
+use pi_mcp::{CallToolResult, McpClient, McpError, McpServerConfig, McpTransportConfig};
 
 /// Upstream's per-connection default timeout (`DEFAULT_TIMEOUT_SECONDS`,
 /// `runtime.ts:50`).
@@ -54,17 +59,22 @@ const MCP_OUTPUT_MAX_BYTES: usize = 20 * 1024;
 /// How long a `!command` config value may run (`resolve-config-value.ts`
 /// `executeWithConfiguredShell`, timeout 10000).
 const COMMAND_VALUE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Delays between attempts to connect to an HTTP server that failed with a
+/// transient error (`CONNECT_RETRY_DELAYS_MS`, `runtime.ts:54`).
+const CONNECT_RETRY_DELAYS_MS: [u64; 2] = [250, 1_000];
 
 /// One configured server's connection state in the worker.
 ///
-/// Both variants keep the spawn config so a failed stdio server can
-/// reconnect lazily on the next call (`runtime.ts:280-303` — stdio has no
-/// connect retries).
+/// Both variants keep the spawn config so a failed server can reconnect
+/// lazily on the next call (`runtime.ts:280-303` — stdio has no connect
+/// retries) and a session-expired HTTP server can reconnect with a fresh
+/// session (`withClient`'s retry, `runtime.ts:289-295`).
 enum ServerState {
     Connected {
         client: McpClient,
         tools: Vec<Json>,
         timeout: Duration,
+        spawn: McpServerConfig,
     },
     Failed {
         spawn: McpServerConfig,
@@ -254,21 +264,25 @@ fn worker_loop(
                 reply,
             } => {
                 let timeout = config_timeout(&config);
-                let outcome = match stdio_spawn_config(&name, &config, &cwd) {
-                    Ok(spawn) => connect_with_spawn(&runtime, &mut servers, &name, spawn, timeout),
-                    Err(error) => {
-                        let _ = timeouts
-                            .lock()
-                            .expect("mcp timeouts mutex poisoned")
-                            .remove(&name);
-                        Err(error)
+                let outcome = match spawn_config(&name, &config, &cwd) {
+                    Ok(spawn) => {
+                        match connect_with_retries(&runtime, &mut servers, &name, &spawn, timeout) {
+                            Ok(outcome) => Ok(outcome),
+                            Err(error) => Err(error.to_string()),
+                        }
                     }
+                    Err(error) => Err(error),
                 };
                 if outcome.is_ok() {
                     timeouts
                         .lock()
                         .expect("mcp timeouts mutex poisoned")
                         .insert(name.clone(), timeout);
+                } else {
+                    timeouts
+                        .lock()
+                        .expect("mcp timeouts mutex poisoned")
+                        .remove(&name);
                 }
                 let _ = reply.send(outcome);
             }
@@ -304,26 +318,69 @@ fn worker_loop(
         .clear();
 }
 
-/// Connects (or reconnects) one server, replacing any existing entry.
+/// Connects (or reconnects) one server, replacing any existing entry, with
+/// the URL-server connect retries (`open`, `runtime.ts:358-377`: URL
+/// servers retry the two transient-failure delays).
+fn connect_with_retries(
+    runtime: &tokio::runtime::Runtime,
+    servers: &mut HashMap<String, ServerEntry>,
+    name: &str,
+    spawn: &McpServerConfig,
+    timeout: Duration,
+) -> Result<ConnectOutcome, McpError> {
+    let retries: &[u64] = match spawn.transport {
+        McpTransportConfig::Http { .. } => &CONNECT_RETRY_DELAYS_MS,
+        McpTransportConfig::Stdio { .. } => &[],
+    };
+    for attempt in 0.. {
+        match connect_with_spawn(runtime, servers, name, spawn.clone(), timeout) {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) => {
+                let Some(delay_ms) = retries.get(attempt) else {
+                    return Err(error);
+                };
+                if !error_is_transient(&error) {
+                    return Err(error);
+                }
+                // The worker is serial, so the wait cannot overlap a
+                // shutdown request (upstream sleeps with its shutdown
+                // signal, `runtime.ts:377-379`).
+                std::thread::sleep(Duration::from_millis(*delay_ms));
+            }
+        }
+    }
+    unreachable!("retry loop returns on every path");
+}
+
+/// Whether a connect failure is worth another attempt
+/// (`isTransientError`, `runtime.ts:55-62`): 408, 429, 5xx-but-not-501, or
+/// a network failure. (The stream-resumption classifier in pi-mcp has no
+/// 501 exclusion; this is the connection-level one.)
+fn error_is_transient(error: &McpError) -> bool {
+    match error {
+        McpError::Http { status, .. } => {
+            *status == 408 || *status == 429 || (*status >= 500 && *status != 501)
+        }
+        McpError::Network(_) => true,
+        _ => false,
+    }
+}
+
+/// Connects (or reconnects) one server, replacing any existing entry
+/// (`connectOnce`, `runtime.ts:381-409`).
 fn connect_with_spawn(
     runtime: &tokio::runtime::Runtime,
     servers: &mut HashMap<String, ServerEntry>,
     name: &str,
     spawn: McpServerConfig,
     timeout: Duration,
-) -> Result<ConnectOutcome, String> {
+) -> Result<ConnectOutcome, McpError> {
     let attempt = runtime.block_on(async {
-        let client = McpClient::connect_with_timeout(&spawn, timeout)
-            .await
-            .map_err(|error| error.to_string())?;
+        let client = McpClient::connect_with_timeout(&spawn, timeout).await?;
         // Servers without the tools capability (prompts or resources only)
         // do not answer tools/list (`runtime.ts:387-388`).
         let tools = if client.capabilities.tools.is_some() {
-            client
-                .tools_list_with_timeout(timeout)
-                .await
-                .map_err(|error| error.to_string())?
-                .tools
+            client.tools_list_with_timeout(timeout).await?.tools
         } else {
             Vec::new()
         };
@@ -332,7 +389,7 @@ fn connect_with_spawn(
             .map(|tool| serde_json::to_value(tool).unwrap_or(Json::Null))
             .collect::<Vec<_>>();
         let instructions = client.instructions.clone();
-        Ok::<_, String>((client, tools, instructions))
+        Ok::<_, McpError>((client, tools, instructions))
     });
     let (client, tools, instructions) = match attempt {
         Ok(attempt) => attempt,
@@ -343,7 +400,7 @@ fn connect_with_spawn(
                     state: ServerState::Failed {
                         spawn,
                         timeout,
-                        error: error.clone(),
+                        error: error.to_string(),
                     },
                 },
             );
@@ -357,6 +414,7 @@ fn connect_with_spawn(
                 client,
                 tools: tools.clone(),
                 timeout,
+                spawn,
             },
         },
     );
@@ -393,7 +451,8 @@ fn shutdown_all(runtime: &tokio::runtime::Runtime, servers: &mut HashMap<String,
     }
 }
 
-/// One tool call with the execution-time guards, then the wire call.
+/// One tool call with the execution-time guards, then the wire call
+/// (`withClient`, `runtime.ts:276-303`).
 fn call_tool_on(
     runtime: &tokio::runtime::Runtime,
     servers: &mut HashMap<String, ServerEntry>,
@@ -426,16 +485,11 @@ fn call_tool_on(
     let Some(entry) = servers.get(server) else {
         return Err(format!("MCP server \"{server}\" is disabled."));
     };
-    let ServerState::Connected {
-        client,
-        tools,
-        timeout,
-    } = &entry.state
-    else {
+    let ServerState::Connected { tools, .. } = &entry.state else {
         return Err(format!("MCP server \"{server}\" is disabled."));
     };
     // A tool the server no longer offers is no longer available
-    // (`index.ts:433-435`).
+    // (`index.ts:433-435`); the guard runs once, before the call.
     let offered = tools
         .iter()
         .any(|candidate| candidate.get("name").and_then(Json::as_str) == Some(tool));
@@ -449,29 +503,70 @@ fn call_tool_on(
     } else {
         Some(json!({}))
     };
-    let result = runtime.block_on(async {
-        client
-            .tools_call(tool, arguments, *timeout)
-            .await
-            .map_err(|error| error.to_string())
-    })?;
-    Ok(convert_mcp_result(server, tool, &result))
+    let mut session_retry = true;
+    loop {
+        let ServerState::Connected {
+            client, timeout, ..
+        } = &servers[server].state
+        else {
+            return Err(format!("MCP server \"{server}\" is disabled."));
+        };
+        let result = runtime.block_on(client.tools_call(tool, arguments.clone(), *timeout));
+        match result {
+            Ok(result) => return Ok(convert_mcp_result(server, tool, &result)),
+            Err(McpError::SessionExpired { .. }) if session_retry => {
+                // The server no longer knows the session (restart, deploy),
+                // so it did not run the request; retry once on a new
+                // session (`runtime.ts:289-295`). Upstream detaches the old
+                // client without closing it, so concurrent in-flight calls
+                // survive; the worker is serial, so the reconnect replaces
+                // the entry (closing the old transport).
+                session_retry = false;
+                let (spawn, timeout) = match &servers[server].state {
+                    ServerState::Connected { spawn, timeout, .. } => (spawn.clone(), *timeout),
+                    ServerState::Failed { .. } => {
+                        return Err(format!("MCP server \"{server}\" is disabled."));
+                    }
+                };
+                connect_with_spawn(runtime, servers, server, spawn, timeout)
+                    .map_err(|error| error.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
 }
 
-/// The stdio spawn config from a server entry (`createDefaultTransport`'s
-/// stdio arm, `runtime.ts:112-123`). Streamable HTTP entries are a
-/// recorded open item and fail to connect instead of silently doing
-/// nothing.
-fn stdio_spawn_config(name: &str, config: &Json, cwd: &str) -> Result<McpServerConfig, String> {
-    if config.get("url").is_some_and(Json::is_string) {
-        return Err(format!(
-            "MCP server \"{name}\": the streamable HTTP transport is not implemented by this build yet (stdio servers only)"
-        ));
+/// The spawn config from a server entry (`createDefaultTransport`,
+/// `runtime.ts:103-124`): the HTTP arm for a `url`, the stdio arm
+/// otherwise.
+fn spawn_config(name: &str, config: &Json, cwd: &str) -> Result<McpServerConfig, String> {
+    if let Some(url) = config.get("url").and_then(Json::as_str) {
+        // `resolveHeadersOrThrow` (`resolve-config-value.ts:271-282`):
+        // every header value resolves like every config value, with the
+        // per-key description.
+        let mut headers = HashMap::new();
+        if let Some(record) = config.get("headers").and_then(Json::as_object) {
+            for (key, value) in record {
+                let Some(raw) = value.as_str() else {
+                    continue;
+                };
+                let resolved = resolve_config_value_or_throw(
+                    raw,
+                    &format!("MCP server \"{name}\" header \"{key}\""),
+                )?;
+                headers.insert(key.clone(), resolved);
+            }
+        }
+        return Ok(McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransportConfig::Http {
+                url: url.to_string(),
+                headers,
+            },
+        });
     }
     let Some(command) = config.get("command").and_then(Json::as_str) else {
-        return Err(format!(
-            "MCP server \"{name}\": config has no \"command\" (stdio servers only in this build)"
-        ));
+        return Err(format!("MCP server \"{name}\": config has no \"command\""));
     };
     let args = config
         .get("args")
@@ -501,10 +596,12 @@ fn stdio_spawn_config(name: &str, config: &Json, cwd: &str) -> Result<McpServerC
     ));
     Ok(McpServerConfig {
         name: name.to_string(),
-        command: expand_home(command),
-        args,
-        env,
-        working_dir: Some(working_dir),
+        transport: McpTransportConfig::Stdio {
+            command: expand_home(command),
+            args,
+            env,
+            working_dir: Some(working_dir),
+        },
     })
 }
 

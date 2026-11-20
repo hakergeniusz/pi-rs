@@ -1580,9 +1580,11 @@ dependencies = [
 name = "pi-mcp"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "bytes",
  "futures",
  "pi-ai",
  "pi-schema",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

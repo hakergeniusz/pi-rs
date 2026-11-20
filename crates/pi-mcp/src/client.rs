@@ -1,4 +1,5 @@
-//! MCP client: one connected server, after the `initialize` handshake.
+//! MCP client: one connected server, after the `initialize` handshake
+//! (upstream `client.ts:204-250`, over either transport).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -6,28 +7,129 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::error::McpError;
+use crate::http::{StreamableHttpOptions, StreamableHttpTransport};
 use crate::transport::{SpawnOptions, StdioTransport};
 use crate::types::{
     CallToolParams, CallToolResult, ClientCapabilities, Implementation, InitializeParams,
     InitializeResult, ToolsListResult,
 };
 
-/// How to launch one MCP server (`mcp-servers.json` entry shape).
+/// How to reach one MCP server (`mcp-servers.json` entry shape): a stdio
+/// subprocess or a streamable HTTP endpoint. The config values are already
+/// resolved by the caller (`createDefaultTransport`, upstream
+/// `runtime.ts:103-124`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpServerConfig {
     pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: HashMap<String, String>,
-    pub working_dir: Option<std::path::PathBuf>,
+    pub transport: McpTransportConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum McpTransportConfig {
+    /// Launch a subprocess and speak newline-delimited JSON-RPC on its
+    /// stdio (`runtime.ts:114-123`).
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        working_dir: Option<std::path::PathBuf>,
+    },
+    /// POST JSON-RPC to a streamable HTTP URL (`runtime.ts:107-112`).
+    Http {
+        url: String,
+        headers: HashMap<String, String>,
+    },
 }
 
 /// Default request timeout for protocol calls.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// One live connection, over either transport. The stdio arm correlates
+/// replies on a pending map; the HTTP arm correlates on the POST itself.
+enum ActiveTransport {
+    Stdio(StdioTransport),
+    Http(StreamableHttpTransport),
+}
+
+impl ActiveTransport {
+    /// Builds the configured transport (`createDefaultTransport`,
+    /// `runtime.ts:103-124`).
+    ///
+    /// # Errors
+    /// On spawn or transport-construction failures.
+    fn build(config: &McpTransportConfig) -> Result<Self, McpError> {
+        match config {
+            McpTransportConfig::Stdio {
+                command,
+                args,
+                env,
+                working_dir,
+            } => Ok(Self::Stdio(StdioTransport::spawn(&SpawnOptions {
+                command: command.clone(),
+                args: args.clone(),
+                env: env.clone(),
+                working_dir: working_dir.clone(),
+            })?)),
+            McpTransportConfig::Http { url, headers } => Ok(Self::Http(
+                StreamableHttpTransport::new(StreamableHttpOptions {
+                    url: url.clone(),
+                    headers: headers.clone(),
+                    ..StreamableHttpOptions::default()
+                })?,
+            )),
+        }
+    }
+
+    /// The stdio transport is live from `spawn`; the HTTP transport starts
+    /// explicitly (`transport.start()`, upstream `client.ts:216`).
+    fn start(&self) -> Result<(), McpError> {
+        match self {
+            Self::Stdio(_) => Ok(()),
+            Self::Http(transport) => transport.start(),
+        }
+    }
+
+    fn set_protocol_version(&self, version: &str) {
+        match self {
+            Self::Stdio(_) => {}
+            Self::Http(transport) => transport.set_protocol_version(version),
+        }
+    }
+
+    async fn request(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, McpError> {
+        match self {
+            Self::Stdio(transport) => transport.request(method, params, timeout).await,
+            Self::Http(transport) => transport.request(method, params, timeout).await,
+        }
+    }
+
+    async fn notify(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), McpError> {
+        match self {
+            Self::Stdio(transport) => transport.notify(method, params).await,
+            Self::Http(transport) => transport.notify(method, params).await,
+        }
+    }
+
+    async fn shutdown(self) -> Result<(), McpError> {
+        match self {
+            Self::Stdio(transport) => transport.shutdown().await,
+            Self::Http(transport) => transport.shutdown().await,
+        }
+    }
+}
+
 /// A connected, initialized MCP server.
 pub struct McpClient {
-    transport: StdioTransport,
+    transport: ActiveTransport,
     pub server_info: Implementation,
     pub capabilities: crate::types::ServerCapabilities,
     /// Server instructions from `initialize` (`InitializeResult.instructions`).
@@ -57,45 +159,27 @@ impl McpClient {
         config: &McpServerConfig,
         timeout: Duration,
     ) -> Result<Self, McpError> {
-        let transport = StdioTransport::spawn(&SpawnOptions {
-            command: config.command.clone(),
-            args: config.args.clone(),
-            env: config.env.clone(),
-            working_dir: config.working_dir.clone(),
-        })?;
-
-        let params = InitializeParams {
-            protocol_version: crate::PROTOCOL_VERSION.to_string(),
-            capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: crate::CLIENT_NAME.to_string(),
-                version: Some(crate::CLIENT_VERSION.to_string()),
-            },
-        };
-        let result = transport
-            .request(
-                "initialize",
-                Some(serde_json::to_value(params).map_err(|error| serde_error(&error))?),
-                timeout,
-            )
-            .await?;
-        let initialized: InitializeResult = serde_json::from_value(result)
-            .map_err(|error| McpError::Handshake(format!("bad initialize result: {error}")))?;
-        if initialized.protocol_version != crate::PROTOCOL_VERSION {
-            return Err(McpError::Handshake(format!(
-                "server negotiated protocol version {} but client speaks {}",
-                initialized.protocol_version,
-                crate::PROTOCOL_VERSION
-            )));
+        let transport = ActiveTransport::build(&config.transport)?;
+        match handshake(&transport, timeout).await {
+            Ok(initialized) => {
+                // The negotiated version rides `MCP-Protocol-Version` on
+                // HTTP servers (`client.ts:242`, `streamable-http.ts:281`).
+                transport.set_protocol_version(&initialized.protocol_version);
+                transport.notify("notifications/initialized", None).await?;
+                Ok(Self {
+                    server_info: initialized.server_info,
+                    capabilities: initialized.capabilities,
+                    instructions: initialized.instructions,
+                    transport,
+                })
+            }
+            Err(error) => {
+                // A failed handshake closes the transport
+                // (`client.ts:246-249`).
+                let _ = transport.shutdown().await;
+                Err(error)
+            }
         }
-        transport.notify("notifications/initialized", None).await?;
-
-        Ok(Self {
-            server_info: initialized.server_info,
-            capabilities: initialized.capabilities,
-            instructions: initialized.instructions,
-            transport,
-        })
     }
 
     /// Lists the tools the server exposes.
@@ -157,13 +241,53 @@ impl McpClient {
             .map(|_| ())
     }
 
-    /// Kills the server process.
+    /// Kills a stdio server process, or closes an HTTP session
+    /// (`transport.close()`, upstream `client.ts:388-394`).
     ///
     /// # Errors
     /// Propagates transport-task join failures.
     pub async fn shutdown(self) -> Result<(), McpError> {
         self.transport.shutdown().await
     }
+}
+
+/// The `initialize` exchange through either transport (`client.ts:216-243`).
+///
+/// # Errors
+/// Transport failures, a bad result shape, or a protocol version outside
+/// [`crate::SUPPORTED_PROTOCOL_VERSIONS`].
+async fn handshake(
+    transport: &ActiveTransport,
+    timeout: Duration,
+) -> Result<InitializeResult, McpError> {
+    transport.start()?;
+    let params = InitializeParams {
+        protocol_version: crate::PROTOCOL_VERSION.to_string(),
+        capabilities: ClientCapabilities::default(),
+        client_info: Implementation {
+            name: crate::CLIENT_NAME.to_string(),
+            version: Some(crate::CLIENT_VERSION.to_string()),
+        },
+    };
+    let result = transport
+        .request(
+            "initialize",
+            Some(serde_json::to_value(params).map_err(|error| serde_error(&error))?),
+            timeout,
+        )
+        .await?;
+    let initialized: InitializeResult = serde_json::from_value(result)
+        .map_err(|error| McpError::Handshake(format!("bad initialize result: {error}")))?;
+    // Servers that do not support the requested version answer with their
+    // own latest one, so older versions stay accepted for servers built on
+    // older SDKs (`SUPPORTED_PROTOCOL_VERSIONS`, upstream `client.ts:235-237`).
+    if !crate::SUPPORTED_PROTOCOL_VERSIONS.contains(&initialized.protocol_version.as_str()) {
+        return Err(McpError::Handshake(format!(
+            "MCP server selected unsupported protocol version {}",
+            initialized.protocol_version
+        )));
+    }
+    Ok(initialized)
 }
 
 fn serde_error(error: &serde_json::Error) -> McpError {

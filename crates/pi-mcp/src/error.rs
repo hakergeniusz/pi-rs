@@ -28,4 +28,28 @@ pub enum McpError {
     /// I/O on the server pipes.
     #[error("MCP transport I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// A network-level HTTP failure (DNS, connect, connection reset
+    /// mid-body) — retryable like upstream's `TypeError` on `fetch`.
+    #[error("MCP network error: {0}")]
+    Network(String),
+    /// An HTTP status the transport cannot answer (`McpHttpError`); `body`
+    /// carries the first [`crate::http::MAX_ERROR_BODY_BYTES`] bytes.
+    #[error("{message}")]
+    Http {
+        status: u16,
+        message: String,
+        body: String,
+    },
+    /// The server requires authentication: 401, or a 403 bearer challenge
+    /// asking for `insufficient_scope` (`McpAuthRequiredError`).
+    #[error("MCP server requires authentication")]
+    AuthRequired {
+        /// The response's `www-authenticate` header.
+        www_authenticate: Option<String>,
+        body: String,
+    },
+    /// The server no longer knows the session (404 after a session id was
+    /// captured — restart or deploy; `McpSessionExpiredError`).
+    #[error("MCP session expired")]
+    SessionExpired { body: String },
 }

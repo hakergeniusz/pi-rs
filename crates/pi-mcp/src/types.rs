@@ -78,29 +78,54 @@ pub enum InboundMessage {
     Malformed(String),
 }
 
+/// JSON-RPC error codes (`JSON_RPC_ERROR_CODES`, upstream
+/// `protocol/jsonrpc.ts:37-43`).
+pub mod json_rpc_error_codes {
+    /// `-32700`.
+    pub const PARSE_ERROR: i64 = -32700;
+    /// `-32600`.
+    pub const INVALID_REQUEST: i64 = -32600;
+    /// `-32601`.
+    pub const METHOD_NOT_FOUND: i64 = -32601;
+    /// `-32602`.
+    pub const INVALID_PARAMS: i64 = -32602;
+    /// `-32603`.
+    pub const INTERNAL_ERROR: i64 = -32603;
+}
+
+/// Classifies one parsed inbound value (`isJsonRpcRequest` /
+/// `isJsonRpcNotification` / `isJsonRpcResponse`, upstream
+/// `protocol/jsonrpc.ts:93-108`): a message carries `method` with (`id` =
+/// request) or without (notification) an `id`, or `id` with `result` xor a
+/// well-formed `error` (response).
+#[must_use]
+pub fn classify_value(value: &Value, raw: &str) -> InboundMessage {
+    let has_id = value.get("id").is_some_and(|id| !id.is_null());
+    let has_method = value.get("method").is_some();
+    match (has_method, has_id) {
+        (true, true) => serde_json::from_value::<JsonRpcRequest>(value.clone()).map_or(
+            InboundMessage::Malformed(raw.to_string()),
+            InboundMessage::Request,
+        ),
+        (true, false) => serde_json::from_value::<JsonRpcNotification>(value.clone()).map_or(
+            InboundMessage::Malformed(raw.to_string()),
+            InboundMessage::Notification,
+        ),
+        (false, true) => serde_json::from_value::<JsonRpcResponse>(value.clone()).map_or(
+            InboundMessage::Malformed(raw.to_string()),
+            InboundMessage::Response,
+        ),
+        (false, false) => InboundMessage::Malformed(raw.to_string()),
+    }
+}
+
 /// Classifies one inbound line (`transport.rs` reader loop).
 #[must_use]
 pub fn classify_line(line: &str) -> InboundMessage {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return InboundMessage::Malformed(line.to_string());
     };
-    let has_id = value.get("id").is_some_and(|id| !id.is_null());
-    let has_method = value.get("method").is_some();
-    match (has_method, has_id) {
-        (true, true) => serde_json::from_value::<JsonRpcRequest>(value).map_or(
-            InboundMessage::Malformed(line.to_string()),
-            InboundMessage::Request,
-        ),
-        (true, false) => serde_json::from_value::<JsonRpcNotification>(value).map_or(
-            InboundMessage::Malformed(line.to_string()),
-            InboundMessage::Notification,
-        ),
-        (false, true) => serde_json::from_value::<JsonRpcResponse>(value).map_or(
-            InboundMessage::Malformed(line.to_string()),
-            InboundMessage::Response,
-        ),
-        (false, false) => InboundMessage::Malformed(line.to_string()),
-    }
+    classify_value(&value, line)
 }
 
 /// `initialize` request params.
