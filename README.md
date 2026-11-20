@@ -46,10 +46,14 @@ footer-data adapter, the working-status family (`setWorkingMessage`/
 chains over the built-in provider with the trigger union), and the
 editor component (`setEditorComponent` — a factory-built component
 takes the editor slot with the submit/change/autocomplete/action
-wiring and the working status moving to the status row) — while the
-rest of the TUI renderer bridging (E3: themes) and the MCP tool
-bridge are still landing. See [PLAN.md](PLAN.md) for the
-phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
+wiring and the working status moving to the status row), and the
+`ctx.ui` themes API (`ctx.ui.theme` styling, `getAllThemes`/`getTheme`
+with by-handle styling adapters, `setTheme` by name — persisting
+`settings.theme` — or by Theme instance as `<in-memory>`) — E3 TUI
+bridging has landed; the remaining opens are the MCP HTTP transport +
+OAuth, the package-manager npm arm, and the P7 tail. See
+[PLAN.md](PLAN.md) for the phased plan and [HANDOFF.md](HANDOFF.md)
+for the detailed, dated status.
 
 ## What works
 
@@ -96,7 +100,7 @@ phased plan and [HANDOFF.md](HANDOFF.md) for the detailed, dated status.
 | `pi-agent` | `@earendil-works/pi-agent-core` | agent loop with steering/follow-up queues, transcript, events |
 | `pi-tui` | `@earendil-works/pi-tui` | differential renderer, editor, fuzzy/autocomplete, mouse, alt screen, theme, input listeners |
 | `pi-mcp` | `@earendil-works/pi-mcp` | JSON-RPC types + stdio transport client (HTTP transport + tool bridge pending) |
-| `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, UI dialogs over protocol, `user_bash`, context transforms, RPC dialog subprotocol, virtual-model routing, extension keyboard shortcuts + markdown transformers + entry/message/tool renderers and components over the handle bridge, interactive `ctx.ui.custom` + the dialog stack + overlay handles, OSC 7501 program status + `ctx.ui.setStatus`/setTitle, the small `ctx.ui` surfaces (widgets, footer/header factories, working-status family, editor text ops, toolsExpanded, onTerminalInput), autocomplete wrappers (`addAutocompleteProvider` chain + trigger union), the editor component (`setEditorComponent`/`getEditorComponent` — the delegate editor slot + the status row) (`tool-search` exit gate green; themes bridging pending) |
+| `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, UI dialogs over protocol, `user_bash`, context transforms, RPC dialog subprotocol, virtual-model routing, extension keyboard shortcuts + markdown transformers + entry/message/tool renderers and components over the handle bridge, interactive `ctx.ui.custom` + the dialog stack + overlay handles, OSC 7501 program status + `ctx.ui.setStatus`/setTitle, the small `ctx.ui` surfaces (widgets, footer/header factories, working-status family, editor text ops, toolsExpanded, onTerminalInput), autocomplete wrappers (`addAutocompleteProvider` chain + trigger union), the editor component (`setEditorComponent`/`getEditorComponent` — the delegate editor slot + the status row), the `ctx.ui` themes API (`theme`/`getAllThemes`/`getTheme`/`setTheme` — the engine-side sync half, `themeChanged` crossings for the mode-side visuals + persistence, RPC/headless stubs verbatim) (`tool-search` exit gate green; E3 TUI bridging complete) |
 | `pi-codemode` | `@earendil-works/pi-codemode` | stub |
 | `pi-coding-agent` (`pi` binary) | `@earendil-works/pi-coding-agent` | CLI, print/JSON/RPC/interactive modes, session store, tools, auth |
 

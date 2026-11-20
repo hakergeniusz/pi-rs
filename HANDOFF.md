@@ -3326,6 +3326,68 @@ wholesale; r5: single_match_else; r6: the runner fixture submitted
 before appending the CR; r7 green). Test totals: 1926 workspace tests,
 0 failed.
 
+## 2026-11-20 — E3 slice 10: the ctx.ui themes API
+
+Serial. Branch `feat/e3-slice10-themes` off 1efd755; commits 4b35afe
+(pi-ext-js surface) + c27faf3 (engine theme fns + mode wiring) + gate
+fix rounds 68cbe58…2f2e549 + 2ef46dc (gate fmt).
+
+- **The API** (`interactive-mode.ts:2806-2822`, `theme.ts:703-733`,
+  `theme-controller.ts:100-260`): `ctx.ui.theme` styles through the
+  global theme; `getAllThemes()` answers
+  `getAvailableThemesWithPaths()` (system first with `path` undefined,
+  builtins with their `themesDir` paths, then customs);
+  `getTheme(name)` answers a Theme instance styled with THAT theme or
+  undefined; `setTheme` takes a Theme instance (installs it globally,
+  `activeName` → `"<in-memory>"`, terminal auto-sync OFF) or a name
+  (loads through `getThemeByName`; on failure installs the SYSTEM
+  theme and returns `{success:false,error}`; on success persists
+  `settings.theme` when it differs).
+- **The split** (mechanism deviation, documented): the sync half runs
+  engine-side in the ops via the mode's theme surface closures —
+  `theme::set_theme_with_fallback`/`set_theme_instance`/`theme_by_name`
+  /`available_themes_with_paths` (listing uses the real builtin dir;
+  loading stays embedded, so loader paths stay `/nonexistent`); the
+  mode-side visuals (auto-sync, active name, settings persistence,
+  invalidate + editor border color) ride a fire-and-forget
+  `themeChanged` crossing `{name: string|null, success}` the pump
+  processes one frame later (`name: null` = the instance path). The
+  mode owns its `Tui` outright, so `setTheme` cannot close over it.
+- **By-name handles**: `getTheme(name)` stashes the loaded theme under
+  a monotonic handle (`Arc<Mutex<HashMap<u32, Arc<Theme>>>>`); the
+  adapter's `fg`/`bg` resolve through the `themeFgWith`/`themeBgWith`
+  ops (unknown handle → passthrough text); `setTheme(instance)`
+  removes the stash entry and installs it (unknown →
+  `{success:false,error:"unknown theme instance"}`). rquickjs has no
+  `IntoJs` for `serde_json::Value`, so the Json-returning ops serialize
+  to strings the glue `JSON.parse`s (the editorChrome pattern); a
+  missing name parses to `null` → `undefined`.
+- **RPC/headless verbatim** (`rpc-mode.ts:290-306`, `runner.ts:331-339`,
+  `types.ts:295-320`): the glue branches on `mode() !== "tui"` — RPC
+  serves `getAllThemes()` `[]`, `getTheme(name)` undefined, `setTheme`
+  `{success:false,error:"Theme switching not supported in RPC mode"}`;
+  the headless context serves the no-op answers with `"UI not
+  available"` and a `theme` getter styling through the ops (identity
+  default headless, like the renderer crossings).
+
+Tests: pi-ext-js 1 (the tui phase lists/loads/switches through the
+surface closures and asserts both `themeChanged` crossings in order —
+failed name then instance; the rpc phase asserts the verbatim stubs;
+the headless phase asserts the no-op answers through `ui_log`, since
+headless `notify` calls the notify op directly and never reaches a
+sink); pi-coding-agent 1 (setTheme("dark") persists once,
+`getTheme("dark").fg` styles, a failed name falls back to the system
+active name, a Theme instance tracks `<in-memory>` + disables
+auto-sync + switches the global). Gate green in 8 rounds (r1: the
+Json-returning ops serialize — rquickjs has no IntoJs for Value — and
+a test temporary bound; r2: type aliases for the closure fields; r3:
+the surface export + distinct stash names; r4: aliases on the mode
+locals, stylers inlined; r5: the alias re-exports; r6: the mode test
+emits session_start like every neighbor — the fixture never does; r7:
+the headless phase reads `ui_log` — round 6 masked it because cargo
+test stops at the first failing binary; r8 green). Test totals: 1928
+workspace tests, 0 failed.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).

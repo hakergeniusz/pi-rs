@@ -678,6 +678,8 @@ with the raw message) are faithful. Options marshal as
   editor component, autocomplete, themes; component handles crossing as
   `render/handleInput/invalidate` round-trips. Exit: llama.cpp `/llama`
   manager and a renderer extension behave as in upstream TUI.
+  **Landed** (slices 1–10, through `feat/e3-slice10-themes` — the
+  `ctx.ui` themes API closes the list).
 - **E4 — completeness**: node built-in polyfill growth to the upstream
   documented set, npm-dependency resolution inside extensions, `/reload`
   lifecycle + staleness invalidation end-to-end, event-bus auto-unsubscribe
