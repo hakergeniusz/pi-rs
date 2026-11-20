@@ -3972,7 +3972,7 @@ export default function (pi) {
             }),
             editor_text: std::sync::Arc::new(|| "draft text".to_string()),
             tools_expanded: std::sync::Arc::new(|| true),
-            editor_chrome: std::sync::Arc::new(serde_json::Value::Null),
+            editor_chrome: std::sync::Arc::new(|| serde_json::Value::Null),
             editor_border_color: std::sync::Arc::new(String::new),
         });
         runner

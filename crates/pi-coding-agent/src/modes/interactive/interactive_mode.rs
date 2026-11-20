@@ -849,10 +849,10 @@ impl Component for ChatEditor {
         // A busy engine defers the chunk (consumed; the pump redelivers).
         #[cfg(feature = "ext-js")]
         {
-            let mut live = self.extension_editor.lock().expect("extension editor");
-            if let Some(live) = live.as_mut() {
+            let mut guard = self.extension_editor.lock().expect("extension editor");
+            if let Some(live) = guard.as_mut() {
                 let _consumed = live.handle_input(data);
-                drop(live);
+                drop(guard);
                 return Some(ComponentMutation { consume: true });
             }
         }
@@ -7222,7 +7222,7 @@ impl InteractiveMode {
             .lock()
             .expect("extension editor")
             .as_mut()
-            .map(|live| live.editor_text())
+            .map(ExtensionEditorLive::editor_text)
             .unwrap_or_default();
         if let Some(live) = self.extension_editor.lock().expect("extension editor").take() {
             live.release();
@@ -7307,7 +7307,7 @@ impl InteractiveMode {
     }
 
     /// The duck-typed `AppAction` resolution for the `editorAction`
-    /// crossings (`app:*` ids — the port's app_keys table).
+    /// crossings (`app:*` ids — the port's `app_keys` table).
     #[cfg(feature = "ext-js")]
     fn app_action_from_id(id: &str) -> Option<AppAction> {
         match id {
@@ -7429,7 +7429,7 @@ impl InteractiveMode {
             .lock()
             .expect("extension editor")
             .as_mut()
-            .map(|live| live.editor_text());
+            .map(ExtensionEditorLive::editor_text);
         let editor_text = delegate_text.unwrap_or_else(|| {
             self.editor_host_mut()
                 .map_or(String::new(), |editor| editor.editor.get_expanded_text())
@@ -10158,12 +10158,15 @@ impl InteractiveMode {
                         .unwrap_or_default()
                         .to_string();
                     let is_bash_mode = text.trim_start().starts_with('!');
-                    if let Some(editor) = self.editor_host_mut() {
-                        if editor.is_bash_mode != is_bash_mode {
-                            editor.is_bash_mode = is_bash_mode;
-                            drop(editor);
-                            self.update_editor_border_color();
+                    let changed = self.editor_host_mut().is_some_and(|editor| {
+                        if editor.is_bash_mode == is_bash_mode {
+                            return false;
                         }
+                        editor.is_bash_mode = is_bash_mode;
+                        true
+                    });
+                    if changed {
+                        self.update_editor_border_color();
                     }
                 }
                 // The CustomEditor-derived fallbacks + the actionHandlers
@@ -13795,6 +13798,7 @@ export default function (pi) {
     /// component's text (`setCustomEditorComponent` +
     /// `resetExtensionUI`, `interactive-mode.ts:2979-3055`/`:2611`).
     #[test]
+    #[allow(clippy::too_many_lines)] // mirrors the TS editor swap; split when extending
     fn extension_ui_editor_component_takes_the_editor_slot() {
         const EXT: &str = r#"
 export default function (pi) {
