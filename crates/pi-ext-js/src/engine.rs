@@ -644,8 +644,7 @@ impl JsHost {
         // crossing carries the mode-side visuals + settings persistence.
         op!("getAllThemes", core, || -> String {
             let guard = core.lock().expect("host core mutex poisoned");
-            serde_json::to_string(&(guard.actions.theme_all)())
-                .unwrap_or_else(|_| "[]".to_string())
+            serde_json::to_string(&(guard.actions.theme_all)()).unwrap_or_else(|_| "[]".to_string())
         });
         op!("getTheme", core, |name: String| -> String {
             let guard = core.lock().expect("host core mutex poisoned");
@@ -659,11 +658,17 @@ impl JsHost {
                 None => "null".to_string(),
             }
         });
-        op!("themeFgWith", core, |handle: u32, token: String, text: String| -> String {
+        op!("themeFgWith", core, |handle: u32,
+                                  token: String,
+                                  text: String|
+         -> String {
             let guard = core.lock().expect("host core mutex poisoned");
             (guard.actions.theme_fg_with)(handle, &token, &text)
         });
-        op!("themeBgWith", core, |handle: u32, token: String, text: String| -> String {
+        op!("themeBgWith", core, |handle: u32,
+                                  token: String,
+                                  text: String|
+         -> String {
             let guard = core.lock().expect("host core mutex poisoned");
             (guard.actions.theme_bg_with)(handle, &token, &text)
         });

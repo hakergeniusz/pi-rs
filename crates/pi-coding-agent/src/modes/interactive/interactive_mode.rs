@@ -2143,42 +2143,38 @@ impl InteractiveMode {
                 // The by-handle stylers resolve the stash inline: the
                 // unknown handle passes the text through, like an
                 // unknown token.
-                fg_with: Box::new(move |handle, token, text| match fg_stash
-                    .lock()
-                    .expect("theme stash")
-                    .get(&handle)
-                    .cloned()
-                {
-                    Some(stashed) => match pi_tui::theme::ThemeColor::from_name(token) {
-                        Some(color) => stashed.fg(color, text),
+                fg_with: Box::new(move |handle, token, text| {
+                    match fg_stash.lock().expect("theme stash").get(&handle).cloned() {
+                        Some(stashed) => match pi_tui::theme::ThemeColor::from_name(token) {
+                            Some(color) => stashed.fg(color, text),
+                            None => text.to_string(),
+                        },
                         None => text.to_string(),
-                    },
-                    None => text.to_string(),
+                    }
                 }),
-                bg_with: Box::new(move |handle, token, text| match bg_stash
-                    .lock()
-                    .expect("theme stash")
-                    .get(&handle)
-                    .cloned()
-                {
-                    Some(stashed) => match pi_tui::theme::ThemeBg::from_name(token) {
-                        Some(color) => stashed.bg(color, text),
+                bg_with: Box::new(move |handle, token, text| {
+                    match bg_stash.lock().expect("theme stash").get(&handle).cloned() {
+                        Some(stashed) => match pi_tui::theme::ThemeBg::from_name(token) {
+                            Some(color) => stashed.bg(color, text),
+                            None => text.to_string(),
+                        },
                         None => text.to_string(),
-                    },
-                    None => text.to_string(),
+                    }
                 }),
                 appearance: theme_appearance,
                 set_name: Box::new(theme::set_theme_with_fallback),
-                set_instance: Box::new(move |handle| match stash_for_instance
-                    .lock()
-                    .expect("theme stash")
-                    .remove(&handle)
-                {
-                    Some(stashed) => {
-                        theme::set_theme_instance(stashed);
-                        true
+                set_instance: Box::new(move |handle| {
+                    match stash_for_instance
+                        .lock()
+                        .expect("theme stash")
+                        .remove(&handle)
+                    {
+                        Some(stashed) => {
+                            theme::set_theme_instance(stashed);
+                            true
+                        }
+                        None => false,
                     }
-                    None => false,
                 }),
             });
             guard.set_app_keybindings(
@@ -10347,7 +10343,10 @@ impl InteractiveMode {
                 // `theme-controller.ts:124-148`).
                 "themeChanged" => {
                     let success = request.get("success").and_then(Value::as_bool) == Some(true);
-                    let name = request.get("name").and_then(Value::as_str).map(String::from);
+                    let name = request
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(String::from);
                     match name {
                         // A Theme INSTANCE: `setThemeInstance` disables the
                         // terminal auto-sync (`:138-148`).
@@ -10363,9 +10362,11 @@ impl InteractiveMode {
                                 // op's settings persistence
                                 // (`interactive-mode.ts:2815-2820`).
                                 self.theme_auto_sync = name == pi_tui::theme::SYSTEM_THEME_NAME;
-                                self.tui.set_color_scheme_notifications(self.theme_auto_sync);
+                                self.tui
+                                    .set_color_scheme_notifications(self.theme_auto_sync);
                                 self.theme_active_name.clone_from(&name);
-                                if self.settings.get("theme").and_then(Value::as_str) != Some(name.as_str())
+                                if self.settings.get("theme").and_then(Value::as_str)
+                                    != Some(name.as_str())
                                 {
                                     self.settings
                                         .set("theme", serde_json::Value::String(name.clone()));
@@ -14172,7 +14173,9 @@ export default function (pi) {
             "the instance install disabled the terminal auto-sync"
         );
         assert_eq!(
-            mode.settings.get("theme").and_then(serde_json::Value::as_str),
+            mode.settings
+                .get("theme")
+                .and_then(serde_json::Value::as_str),
             Some("dark"),
             "the successful name persisted once, the failure did not"
         );
