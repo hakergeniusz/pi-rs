@@ -7471,14 +7471,21 @@ export default function (pi) {
         );
 
         // The headless surface: upstream's no-op context
-        // (`runner.ts:331-339`).
+        // (`runner.ts:331-339`). Headless `notify` calls the notify op
+        // directly, so the messages land in the host's ui_log, not a
+        // sink (the `ui_headless_matrix_unchanged_without_a_sink`
+        // channel).
         let mut headless_runner = runner_with(&[EXT]);
-        let headless_sink = FakeSink::scripted(&[]);
         headless_runner
             .emit(&json!({ "type": "session_start", "reason": "startup" }))
             .expect("emit");
         headless_runner.service_ui_requests().expect("service");
-        let headless_notifies = notifies_of(&headless_sink);
+        let headless_notifies = headless_runner
+            .core()
+            .lock()
+            .expect("core mutex poisoned")
+            .ui_log
+            .clone();
         assert_eq!(
             headless_notifies,
             vec![
