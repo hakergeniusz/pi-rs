@@ -358,13 +358,18 @@ struct ExtensionChrome {
 
 /// The mode-state snapshot the synchronous ui ops read (E3 slice 7):
 /// `footerData`/`editorText`/`toolsExpanded`. The pump refreshes it each
-/// frame; the runner's closures read it under the mutex.
+/// frame; the runner's closures read it under the mutex. E3 slice 9 adds
+/// the editor chrome the editor-component wire reads.
 #[cfg(feature = "ext-js")]
 #[derive(Default)]
 struct UiSnapshotState {
     footer: serde_json::Value,
     editor_text: String,
     tools_expanded: bool,
+    editor_padding_x: usize,
+    editor_max_visible: usize,
+    editor_border_color: String,
+    app_actions: Vec<String>,
 }
 
 /// `InteractiveMode.MAX_WIDGET_LINES` (`interactive-mode.ts:2626`): the
@@ -380,6 +385,161 @@ const MAX_WIDGET_LINES: usize = 10;
 struct AutocompleteWrapperRecord {
     index: u32,
     trigger_characters: Vec<char>,
+}
+
+/// The working-status row a live extension editor gets (E3 slice 9):
+/// upstream's `setEditorWorkingStatusIndicator` embeds only into editors
+/// that duck-type `embedWorkingStatus` (`interactive-mode.ts:232-240`) —
+/// a custom component never does, so the indicator renders in
+/// `statusContainer` instead (`:2445-2455`). The port's decorator belongs
+/// to the built-in editor, so the delegate mounts this row in the status
+/// host; it reads the same shared indicator slot each frame.
+#[cfg(feature = "ext-js")]
+struct ExtensionEditorStatusRow {
+    status: Arc<Mutex<Option<StatusIndicator>>>,
+}
+
+#[cfg(feature = "ext-js")]
+impl pi_tui::component::Component for ExtensionEditorStatusRow {
+    fn render(&self, width: usize) -> Vec<String> {
+        let guard = self.status.lock().expect("status");
+        match guard.as_ref() {
+            Some(indicator) => indicator.render(width),
+            None => Vec::new(),
+        }
+    }
+}
+
+/// The active extension editor component, seen from the mode (E3 slice 9):
+/// the adopted handle plus the state the synchronous reads serve. The
+/// engine-was-busy (defer) semantics follow the terminal-input fold — keys
+/// and text writes stash in pending queues the pump flushes each frame, so
+/// a busy engine can never wedge the input path (the 6b deadlock class).
+/// Deviations from upstream's in-process editor: the swap-time text copy
+/// reads the pump-refreshed snapshot (≤ 1 frame stale), and the working
+/// status never embeds into the component (`isEmbeddedStatus`,
+/// `interactive-mode.ts:232-240`) — it renders in the status host row like
+/// upstream's non-embedded branch.
+#[cfg(feature = "ext-js")]
+struct ExtensionEditorLive {
+    runner: Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+    handle: u32,
+    /// Last known text (`getExpandedText?.() ?? getText()`): the
+    /// pump-refreshed mirror the synchronous reads serve.
+    text: String,
+    /// Key chunks deferred while the engine was busy.
+    pending_input: Vec<String>,
+    /// Text write deferred while the engine was busy.
+    pending_set_text: Option<String>,
+}
+
+#[cfg(feature = "ext-js")]
+impl ExtensionEditorLive {
+    fn new(
+        runner: Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+        handle: u32,
+        text: String,
+    ) -> Self {
+        Self {
+            runner,
+            handle,
+            text,
+            pending_input: Vec::new(),
+            pending_set_text: None,
+        }
+    }
+
+    /// Renders the component (`Component.render`): a blocking lock matches
+    /// the widget proxies' precedent — renders run on the pump thread,
+    /// which holds no runner lock of its own.
+    fn render(&self, width: usize) -> Vec<String> {
+        let runner = self.runner.lock().expect("extension runner mutex poisoned");
+        match runner.component_render(self.handle, width) {
+            Ok(lines) => lines,
+            // Upstream lets a component render throw take the frame down;
+            // the port renders the failure in place instead.
+            Err(error) => vec![theme::theme().fg(
+                pi_tui::theme::ThemeColor::Error,
+                &format!("editor component render failed: {error}"),
+            )],
+        }
+    }
+
+    /// Feeds one key chunk (`handleInput`): a busy engine defers the chunk
+    /// and consumes it — the pump redelivers it next frame, upstream
+    /// equivalent to the single-threaded engine finishing first. `false` =
+    /// forward (an error behaves like a non-consuming component).
+    fn handle_input(&mut self, data: &str) -> bool {
+        let Ok(mut runner) = self.runner.try_lock() else {
+            self.pending_input.push(data.to_string());
+            return true;
+        };
+        runner
+            .component_handle_input(self.handle, data)
+            .unwrap_or(false)
+    }
+
+    /// Refreshes and returns the text mirror (`getExpandedText?.() ??
+    /// getText()`): a busy engine keeps the previous mirror.
+    fn editor_text(&mut self) -> String {
+        let Ok(runner) = self.runner.try_lock() else {
+            return self.text.clone();
+        };
+        if let Ok(text) = runner.component_editor_text(self.handle) {
+            self.text = text;
+        }
+        self.text.clone()
+    }
+
+    /// Writes the text (`setText`, `interactive-mode.ts:3000`): a busy
+    /// engine defers the write.
+    fn set_text(&mut self, text: &str) {
+        self.text = text.to_string();
+        let Ok(runner) = self.runner.try_lock() else {
+            self.pending_set_text = Some(text.to_string());
+            return;
+        };
+        let _ = runner.component_set_text(self.handle, text);
+    }
+
+    /// Re-sets the component's autocomplete provider (`setupAutocomplete
+    /// Provider` re-calls it on the non-default editor).
+    fn set_autocomplete_provider(&self) {
+        let runner = self.runner.lock().expect("extension runner mutex poisoned");
+        let _ = runner.component_set_autocomplete_provider(self.handle);
+    }
+
+    /// Flushes the deferred keys and text write (the pump, each frame).
+    fn flush_pending(&mut self) {
+        if !self.pending_input.is_empty() {
+            let deferred = std::mem::take(&mut self.pending_input);
+            let mut remaining = Vec::new();
+            for data in deferred {
+                let Ok(mut runner) = self.runner.try_lock() else {
+                    remaining.push(data);
+                    continue;
+                };
+                if runner.component_handle_input(self.handle, &data).is_err() {
+                    remaining.push(data);
+                }
+            }
+            self.pending_input = remaining;
+        }
+        if let Some(text) = self.pending_set_text.take() {
+            let Ok(runner) = self.runner.try_lock() else {
+                self.pending_set_text = Some(text);
+                return;
+            };
+            let _ = runner.component_set_text(self.handle, &text);
+        }
+    }
+
+    /// Releases the handle (the restore/reset path — upstream drops the
+    /// component object; the port drops its registry entry).
+    fn release(&self) {
+        let runner = self.runner.lock().expect("extension runner mutex poisoned");
+        let _ = runner.component_release(self.handle);
+    }
 }
 
 /// One JS wrapper, seen from Rust (`AutocompleteProviderFactory` wraps the
@@ -609,6 +769,13 @@ struct ChatEditor {
     extension_shortcuts: Arc<Mutex<Vec<String>>>,
     /// `isBashMode` (`interactive-mode.ts:551`): the draft starts with `!`.
     is_bash_mode: bool,
+    /// The active extension editor component (E3 slice 9): the host keeps
+    /// the slot; when a component is live, render/input/text route through
+    /// it (`this.editor` points at the custom component upstream — the
+    /// port's built-in editor stays mounted with its slot, so a dialog
+    /// swap or selector park keeps working unchanged).
+    #[cfg(feature = "ext-js")]
+    extension_editor: Arc<Mutex<Option<ExtensionEditorLive>>>,
 }
 
 impl ChatEditor {
@@ -651,16 +818,44 @@ impl ChatEditor {
             events,
             extension_shortcuts,
             is_bash_mode: false,
+            #[cfg(feature = "ext-js")]
+            extension_editor: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 impl Component for ChatEditor {
     fn render(&self, width: usize) -> Vec<String> {
+        // The extension editor component renders in the slot (E3 slice 9):
+        // `this.editor` is the custom component upstream; the port routes
+        // the built-in host's render through it.
+        #[cfg(feature = "ext-js")]
+        if let Some(live) = self
+            .extension_editor
+            .lock()
+            .expect("extension editor")
+            .as_ref()
+        {
+            return live.render(width);
+        }
         self.editor.render(width)
     }
 
     fn handle_input(&mut self, data: &str) -> Option<ComponentMutation> {
+        // The extension editor component owns every key while live (E3
+        // slice 9): `this.editor` is the custom component upstream — its
+        // `handleInput(data)` is void, so whatever the JS side does with
+        // the chunk, nothing forwards to the built-in editor underneath.
+        // A busy engine defers the chunk (consumed; the pump redelivers).
+        #[cfg(feature = "ext-js")]
+        {
+            let mut live = self.extension_editor.lock().expect("extension editor");
+            if let Some(live) = live.as_mut() {
+                let _consumed = live.handle_input(data);
+                drop(live);
+                return Some(ComponentMutation { consume: true });
+            }
+        }
         // Extension-registered shortcuts first (`custom-editor.ts:89-92`):
         // the check runs before every built-in key, and the runner's
         // conflict resolution has already filtered the reserved chords out.
@@ -1386,6 +1581,16 @@ pub struct InteractiveMode {
     terminal_input_listeners: usize,
     #[cfg(feature = "ext-js")]
     deferred_terminal_input: Vec<String>,
+    /// The active extension editor component (E3 slice 9): the same state
+    /// Arc the editor host routes render/input through; `None` while the
+    /// built-in editor is live.
+    #[cfg(feature = "ext-js")]
+    extension_editor: Arc<Mutex<Option<ExtensionEditorLive>>>,
+    /// Whether the working-status row is mounted in the status host (E3
+    /// slice 9 — the delegate never embeds the status, so it renders in
+    /// the host row like upstream's non-embedded branch).
+    #[cfg(feature = "ext-js")]
+    extension_editor_status_row: bool,
     /// The boot-frozen base autocomplete provider the JS wrapper chain
     /// wraps (`createBaseAutocompleteProvider`'s product; upstream
     /// re-creates it per setup, E3 slice 8 keeps the boot-frozen base).
@@ -1598,6 +1803,10 @@ impl InteractiveMode {
             Arc::clone(&status_handle),
             Arc::clone(&editor_extension_shortcuts),
         );
+        // The extension editor state is shared between the host (render/
+        // input) and the mode (pump arms, swaps) — E3 slice 9.
+        #[cfg(feature = "ext-js")]
+        let extension_editor_state = Arc::clone(&editor_host.extension_editor);
 
         // `setupAutocompleteProvider` (`interactive-mode.ts:855-871`): the
         // base provider is built once from the builtin commands, the session
@@ -1727,6 +1936,10 @@ impl InteractiveMode {
             terminal_input_listeners: 0,
             #[cfg(feature = "ext-js")]
             deferred_terminal_input: Vec::new(),
+            #[cfg(feature = "ext-js")]
+            extension_editor: extension_editor_state,
+            #[cfg(feature = "ext-js")]
+            extension_editor_status_row: false,
             base_autocomplete_provider,
             #[cfg(feature = "ext-js")]
             autocomplete_wrappers: Vec::new(),
@@ -1885,6 +2098,8 @@ impl InteractiveMode {
             let footer_snapshot = Arc::clone(&mode.ui_snapshot);
             let editor_snapshot = Arc::clone(&mode.ui_snapshot);
             let tools_snapshot = Arc::clone(&mode.ui_snapshot);
+            let chrome_snapshot = Arc::clone(&mode.ui_snapshot);
+            let border_snapshot = Arc::clone(&mode.ui_snapshot);
             guard.set_ui_snapshot_surface(pi_ext_js::UiSnapshotSurface {
                 footer_data: std::sync::Arc::new(move || {
                     footer_snapshot.lock().expect("ui snapshot").footer.clone()
@@ -1898,6 +2113,21 @@ impl InteractiveMode {
                 }),
                 tools_expanded: std::sync::Arc::new(move || {
                     tools_snapshot.lock().expect("ui snapshot").tools_expanded
+                }),
+                editor_chrome: std::sync::Arc::new(move || {
+                    let snapshot = chrome_snapshot.lock().expect("ui snapshot");
+                    serde_json::json!({
+                        "paddingX": snapshot.editor_padding_x,
+                        "maxVisible": snapshot.editor_max_visible,
+                        "appActions": snapshot.app_actions,
+                    })
+                }),
+                editor_border_color: std::sync::Arc::new(move || {
+                    border_snapshot
+                        .lock()
+                        .expect("ui snapshot")
+                        .editor_border_color
+                        .clone()
                 }),
             });
         }
@@ -2501,6 +2731,26 @@ impl InteractiveMode {
             .expect("editor host")
     }
 
+    /// The active editor's `addToHistory?.()` (E3 slice 9): the delegate's
+    /// duck-typed crossing when a component is live (a no-op when it lacks
+    /// the method), the built-in editor's otherwise.
+    fn editor_add_to_history(&mut self, text: &str) {
+        #[cfg(feature = "ext-js")]
+        {
+            let target = self
+                .extension_editor
+                .lock()
+                .expect("extension editor")
+                .as_ref()
+                .map(|live| (Arc::clone(&live.runner), live.handle));
+            if let Some((runner, handle)) = target {
+                let _ = runner.component_add_to_history(handle, text);
+                return;
+            }
+        }
+        self.editor_mut().editor.add_to_history(text);
+    }
+
     /// The editor host, mounted or parked: `this.editor` stays reachable
     /// while a selector occupies the slot, because the parked editor rides
     /// in `suspended_editor`.
@@ -2802,7 +3052,7 @@ impl InteractiveMode {
                         self.markdown_transform_ctx.clone(),
                     )));
                     if populate_history {
-                        self.editor_mut().editor.add_to_history(&text);
+                        self.editor_add_to_history(&text);
                     }
                 }
             }
@@ -3493,7 +3743,7 @@ impl InteractiveMode {
     /// the loop's queue, shows in the pending display, and persists when the
     /// loop declares it — so the transcript order matches upstream.
     fn queue_message(&mut self, text: &str, follow_up: bool) {
-        self.editor_mut().editor.add_to_history(text);
+        self.editor_add_to_history(text);
         let message = pi_agent::transcript::user_message(text, now_millis());
         self.queued_deliveries.push((follow_up, message.clone()));
         {
@@ -3961,7 +4211,7 @@ impl InteractiveMode {
     /// `queueCompactionMessage` (`interactive-mode.ts:4951-4958`).
     fn queue_compaction_message(&mut self, text: &str, follow_up: bool) {
         self.compaction_queued.push((text.to_string(), follow_up));
-        self.editor_mut().editor.add_to_history(text);
+        self.editor_add_to_history(text);
         self.editor_mut().editor.set_text("");
         self.update_pending_messages();
         self.show_status("Queued message for after compaction");
@@ -5860,7 +6110,7 @@ impl InteractiveMode {
 
     /// Start one agent run on a worker thread (`session.prompt`).
     fn start_agent_run(&mut self, text: &str) {
-        self.editor_mut().editor.add_to_history(text);
+        self.editor_add_to_history(text);
 
         // Session context from the persisted entries (before the new prompt).
         let leaf_id = self.session.get_leaf_id().map(str::to_string);
@@ -6027,6 +6277,10 @@ impl InteractiveMode {
     fn set_working_status(&mut self, indicator: Option<StatusIndicator>) {
         // The editor's border decorator reads the same slot every frame.
         *self.status_handle.lock().expect("status") = indicator;
+        // The delegate never embeds the status (E3 slice 9) — the row in
+        // the status host tracks the indicator's presence.
+        #[cfg(feature = "ext-js")]
+        self.sync_extension_editor_status_row();
     }
 
     /// `showStatus` (`interactive-mode.ts:3964-3984`): a muted line in the
@@ -6910,13 +7164,163 @@ impl InteractiveMode {
         self.tui.request_render();
     }
 
-    /// `setEditorText` (`interactive-mode.ts:2796`).
+    /// `setEditorText` (`interactive-mode.ts:2796`): the active editor's
+    /// `setText` — the delegate's when a component is live (E3 slice 9).
     #[cfg(feature = "ext-js")]
     fn set_editor_text(&mut self, text: &str) {
-        if let Some(editor) = self.editor_host_mut() {
+        if let Some(live) = self.extension_editor.lock().expect("extension editor").as_mut() {
+            live.set_text(text);
+        } else if let Some(editor) = self.editor_host_mut() {
             editor.editor.set_text(text);
         }
         self.tui.request_render();
+    }
+
+    // ---- E3 slice 9: the extension editor component ----
+
+    /// Mounts the extension editor component (the `setEditorComponent`
+    /// arm): the delegate adopts the handle with the snapshot text, and
+    /// the working status moves to the status host row (`isEmbeddedStatus`
+    /// fails for a custom component upstream — `interactive-mode.ts
+    /// :2445-2455`).
+    #[cfg(feature = "ext-js")]
+    fn mount_extension_editor_component(&mut self, handle: u32) {
+        let Some(runner) = self.extension_runner.as_ref().map(Arc::clone) else {
+            return;
+        };
+        // The swap copies the previous editor's text (`interactive-mode.ts
+        // :2984/:2999-3000`): the snapshot mirror, refreshed first so the
+        // read is current for this frame (≤ 1 frame stale across frames —
+        // documented).
+        self.refresh_ui_snapshot();
+        let text = self
+            .ui_snapshot
+            .lock()
+            .expect("ui snapshot")
+            .editor_text
+            .clone();
+        let mut live = self.extension_editor.lock().expect("extension editor");
+        if let Some(previous) = live.as_ref() {
+            previous.release();
+        }
+        *live = Some(ExtensionEditorLive::new(runner, handle, text));
+        drop(live);
+        self.sync_extension_editor_status_row();
+        self.tui.request_render();
+    }
+
+    /// Restores the built-in editor (`setCustomEditorComponent(undefined)`,
+    /// `interactive-mode.ts:3049-3053`): the custom editor's text moves
+    /// back, the delegate drops, and the status embedding reverts.
+    #[cfg(feature = "ext-js")]
+    fn restore_default_editor_component(&mut self) {
+        let text = self
+            .extension_editor
+            .lock()
+            .expect("extension editor")
+            .as_mut()
+            .map(|live| live.editor_text())
+            .unwrap_or_default();
+        if let Some(live) = self.extension_editor.lock().expect("extension editor").take() {
+            live.release();
+        }
+        if let Some(editor) = self.editor_host_mut() {
+            editor.editor.set_text(&text);
+        }
+        self.sync_extension_editor_status_row();
+        self.tui.request_render();
+    }
+
+    /// The working-status row: mounted while a delegate is live (upstream's
+    /// non-embedded branch puts the indicator in `statusContainer`),
+    /// removed when the built-in editor returns. The decorator path is
+    /// unchanged — the row only renders the same shared indicator.
+    #[cfg(feature = "ext-js")]
+    fn sync_extension_editor_status_row(&mut self) {
+        let delegate_live = self
+            .extension_editor
+            .lock()
+            .expect("extension editor")
+            .is_some();
+        if delegate_live == self.extension_editor_status_row {
+            return;
+        }
+        let Some(host) = self.downcast_tree::<pi_tui::component::Container>(HostSlot::Status)
+        else {
+            return;
+        };
+        host.clear();
+        if delegate_live {
+            host.add_child(Box::new(ExtensionEditorStatusRow {
+                status: Arc::clone(&self.status_handle),
+            }));
+        }
+        self.extension_editor_status_row = delegate_live;
+    }
+
+    /// The composed-provider answer for the wire's autocomplete adapter:
+    /// the same shape the built-in editor's provider serves
+    /// (`AutocompleteSuggestions` — items + prefix).
+    #[cfg(feature = "ext-js")]
+    fn extension_editor_autocomplete(&mut self, request: &serde_json::Value) -> serde_json::Value {
+        let lines: Vec<String> = request
+            .get("lines")
+            .and_then(Value::as_array)
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cursor_line = request.get("cursorLine").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let cursor_col = request.get("cursorCol").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let force = request.get("force").and_then(Value::as_bool).unwrap_or(false);
+        // The composed chain: the base wrapped through the registered JS
+        // wrappers (E3 slice 8) — the same provider the built-in editor
+        // uses, exactly what upstream passes (`this.autocompleteProvider`).
+        let provider = self.composed_autocomplete_provider();
+        let suggestions =
+            provider.and_then(|provider| provider.suggest(&lines, cursor_line, cursor_col, force));
+        let Some(suggestions) = suggestions else {
+            return serde_json::json!({});
+        };
+        serde_json::json!({
+            "result": {
+                "items": suggestions
+                    .items
+                    .iter()
+                    .map(|item| {
+                        serde_json::json!({
+                            "value": item.value,
+                            "label": item.label,
+                            "description": item.description,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                "prefix": suggestions.prefix,
+            }
+        })
+    }
+
+    /// The duck-typed `AppAction` resolution for the `editorAction`
+    /// crossings (`app:*` ids — the port's app_keys table).
+    #[cfg(feature = "ext-js")]
+    fn app_action_from_id(id: &str) -> Option<AppAction> {
+        match id {
+            theme::app_keys::CLEAR => Some(AppAction::Clear),
+            theme::app_keys::EXIT => Some(AppAction::Exit),
+            theme::app_keys::INTERRUPT => Some(AppAction::Interrupt),
+            theme::app_keys::THINKING_CYCLE => Some(AppAction::CycleThinking),
+            theme::app_keys::MODEL_CYCLE_FORWARD => Some(AppAction::CycleModel(1)),
+            theme::app_keys::MODEL_CYCLE_BACKWARD => Some(AppAction::CycleModel(-1)),
+            theme::app_keys::THINKING_TOGGLE => Some(AppAction::ToggleThinking),
+            theme::app_keys::TOOLS_EXPAND => Some(AppAction::ToolsExpand),
+            theme::app_keys::MESSAGE_FOLLOW_UP => Some(AppAction::FollowUp),
+            theme::app_keys::MESSAGE_DEQUEUE => Some(AppAction::Dequeue),
+            _ => None,
+        }
     }
 
     /// `WorkingIndicatorOptions` (`types.ts:136-141`) off the crossing.
@@ -7004,7 +7408,9 @@ impl InteractiveMode {
 
     /// The snapshot refresh (E3 slice 7): the footer cells, the editor's
     /// expanded text, and the tools flag the synchronous ops read — one
-    /// pump frame stale, the mode's own render cadence.
+    /// pump frame stale, the mode's own render cadence. E3 slice 9 adds
+    /// the editor chrome (padding, autocomplete max visible, app action
+    /// ids, border color token) and the delegate's text mirror.
     #[cfg(feature = "ext-js")]
     fn refresh_ui_snapshot(&mut self) {
         let footer_json = self.footer_mut().map(|footer| {
@@ -7014,15 +7420,64 @@ impl InteractiveMode {
                 "availableProviderCount": footer.data.available_provider_count,
             })
         });
-        let editor_text = self
+        // The delegate's text mirror refreshes here (a busy engine keeps
+        // the previous mirror); the built-in editor reads directly.
+        let delegate_text = self
+            .extension_editor
+            .lock()
+            .expect("extension editor")
+            .as_mut()
+            .map(|live| live.editor_text());
+        let editor_text = delegate_text.unwrap_or_else(|| {
+            self.editor_host_mut()
+                .map_or(String::new(), |editor| editor.editor.get_expanded_text())
+        });
+        let (padding_x, max_visible) = self
             .editor_host_mut()
-            .map_or(String::new(), |editor| editor.editor.get_expanded_text());
+            .map_or((0, 5), |editor| {
+                (
+                    editor.editor.padding_x,
+                    editor.editor.autocomplete_max_visible,
+                )
+            });
+        let border_color = if self
+            .editor_host_mut()
+            .is_some_and(|editor| editor.is_bash_mode)
+        {
+            "bashMode".to_string()
+        } else {
+            format!("thinking{}", Self::thinking_color_suffix(self.thinking_level))
+        };
+        let app_actions: Vec<String> = theme::app_keys::DEFAULTS
+            .iter()
+            .map(|(id, _)| (*id).to_string())
+            .collect();
         let mut snapshot = self.ui_snapshot.lock().expect("ui snapshot");
         if let Some(footer) = footer_json {
             snapshot.footer = footer;
         }
         snapshot.editor_text = editor_text;
         snapshot.tools_expanded = self.tool_output_expanded;
+        snapshot.editor_padding_x = padding_x;
+        snapshot.editor_max_visible = max_visible;
+        snapshot.editor_border_color = border_color;
+        snapshot.app_actions = app_actions;
+    }
+
+    /// The camelCase `ThemeColor` name for the thinking border token
+    /// (`thinking_border_styler`, `theme.rs:709-721` — the tokens are
+    /// `thinkingOff`/`thinkingMinimal`/… camelCase).
+    #[cfg(feature = "ext-js")]
+    fn thinking_color_suffix(level: ThinkingLevel) -> &'static str {
+        match level {
+            ThinkingLevel::Off => "Off",
+            ThinkingLevel::Minimal => "Minimal",
+            ThinkingLevel::Low => "Low",
+            ThinkingLevel::Medium => "Medium",
+            ThinkingLevel::High => "High",
+            ThinkingLevel::Xhigh => "Xhigh",
+            ThinkingLevel::Max => "Max",
+        }
     }
 
     /// `setupAutocompleteProvider` (`interactive-mode.ts:853-867`): the
@@ -7067,7 +7522,49 @@ impl InteractiveMode {
                 .editor
                 .set_autocomplete_provider(Some(Arc::clone(&composed)));
         }
+        // The non-default editor re-sets too (`setupAutocompleteProvider`
+        // re-calls `setAutocompleteProvider` on `this.editor` when it is
+        // not the default — `interactive-mode.ts:855-871`): the delegate's
+        // provider is a fresh composed adapter each rebuild.
+        if let Some(live) = self.extension_editor.lock().expect("extension editor").as_ref() {
+            live.set_autocomplete_provider();
+        }
         self.tui.request_render();
+    }
+
+    /// The composed chain the autocomplete reads serve (E3 slice 8 + 9):
+    /// the base wrapped L→R through the registered wrappers, the trigger
+    /// union replacing the provider's own characters when non-empty.
+    /// `None` when the runner is gone (a wrapper could not dispatch).
+    #[cfg(feature = "ext-js")]
+    fn composed_autocomplete_provider(
+        &self,
+    ) -> Option<Arc<dyn pi_tui::components::editor::AutocompleteProvider>> {
+        let mut current: Arc<dyn pi_tui::components::editor::AutocompleteProvider> =
+            Arc::clone(&self.base_autocomplete_provider);
+        let mut union: Vec<char> = Vec::new();
+        for record in &self.autocomplete_wrappers {
+            let runner = Arc::clone(self.extension_runner.as_ref()?);
+            union.extend(record.trigger_characters.iter().copied());
+            current = Arc::new(JsAutocompleteProvider {
+                runner,
+                index: record.index,
+                base: current,
+            });
+        }
+        if union.is_empty() {
+            return Some(current);
+        }
+        let mut unique: Vec<char> = Vec::new();
+        for character in union {
+            if !unique.contains(&character) {
+                unique.push(character);
+            }
+        }
+        Some(Arc::new(ComposedAutocompleteProvider {
+            provider: current,
+            trigger_characters: unique,
+        }))
     }
 
     /// Where the displaced editor-slot occupant goes (the slot-swap
@@ -9613,6 +10110,108 @@ impl InteractiveMode {
                     });
                     self.rebuild_autocomplete_provider();
                 }
+                // ---- E3 slice 9: the extension editor component ----
+                // `setCustomEditorComponent` (`interactive-mode.ts:2979
+                // -3055`): the glue already invoked the factory and wired
+                // the component; the handle mounts the mode-side delegate.
+                // Upstream swaps `this.editor` immediately and remounts the
+                // container when the last dialog closes — the port's host
+                // keeps its slot, so the delegate is visible on the next
+                // render either way.
+                "setEditorComponent" => {
+                    let restore = request
+                        .get("restore")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if restore {
+                        self.restore_default_editor_component();
+                    } else if let Some(handle) = request.get("handle").and_then(Value::as_u64) {
+                        self.mount_extension_editor_component(handle as u32);
+                    }
+                }
+                // The wired `onSubmit` (`interactive-mode.ts:2997` — the
+                // component calls the default editor's callback): the
+                // editor-events queue routes it through the same submit
+                // pipeline next pump frame. Upstream's built-in editor
+                // clears its own text before the callback; a custom
+                // component owns its text lifecycle, so the drain skips
+                // the clear while the delegate is live.
+                "editorSubmit" => {
+                    let text = request
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    self.editor_events
+                        .lock()
+                        .expect("editor events")
+                        .push(EditorEventOut::Submit(text));
+                }
+                // The wired `onChange` (`interactive-mode.ts:3248-3253`):
+                // the bash-mode flag tracks the component's text.
+                "editorChange" => {
+                    let text = request
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let is_bash_mode = text.trim_start().starts_with('!');
+                    if let Some(editor) = self.editor_host_mut() {
+                        if editor.is_bash_mode != is_bash_mode {
+                            editor.is_bash_mode = is_bash_mode;
+                            drop(editor);
+                            self.update_editor_border_color();
+                        }
+                    }
+                }
+                // The CustomEditor-derived fallbacks + the actionHandlers
+                // copy (`interactive-mode.ts:3024-3047`): the mode routes
+                // them like the built-in editor's own handlers. `escape` →
+                // the interrupt action (the port's escape binding), `ctrlD`
+                // → exit; `pasteImage` is a no-op (the port has no
+                // clipboard-image paste); `app:*` resolve through the
+                // action table.
+                "editorAction" => {
+                    let action = request
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    match action.as_str() {
+                        "escape" => self.handle_action(&AppAction::Interrupt),
+                        "ctrlD" => self.handle_action(&AppAction::Exit),
+                        "pasteImage" => {}
+                        "extensionShortcut" => {
+                            let data = request
+                                .get("data")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            self.run_extension_shortcut(&data);
+                        }
+                        app => {
+                            if let Some(resolved) =
+                                Self::app_action_from_id(app.strip_prefix("app:").unwrap_or(app))
+                            {
+                                self.handle_action(&resolved);
+                            }
+                        }
+                    }
+                }
+                // The composed-provider autocomplete read (the wire's
+                // adapter, `interactive-mode.ts:3014-3016`): the pump
+                // answers from the live composed chain.
+                "editorAutocomplete" => {
+                    let id = request
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let response = self.extension_editor_autocomplete(&request);
+                    if let Some(bridge) = self.extension_ui_bridge.as_ref() {
+                        bridge.respond(&id, &response);
+                    }
+                }
                 // The factory adapter's `TUI.showOverlay` surface
                 // (`tui.ts:518/:792-816`).
                 // Deviation: the port tracks these mounts in the same
@@ -10443,6 +11042,16 @@ impl InteractiveMode {
             }
             self.autocomplete_wrappers.clear();
             self.rebuild_autocomplete_provider();
+            // `setCustomEditorComponent(undefined)` (upstream's reset calls
+            // it at `:2611` — the custom editor's text moves back, the
+            // factory stash clears, and the status embedding reverts).
+            self.restore_default_editor_component();
+            if let Some(runner) = self.extension_runner.as_ref() {
+                let _ = runner
+                    .lock()
+                    .expect("extension runner mutex poisoned")
+                    .editor_component_clear_stash();
+            }
             self.working_message = None;
             self.working_visible = true;
             self.set_working_indicator(None);
@@ -10732,6 +11341,19 @@ impl InteractiveMode {
         for event in editor_events {
             match event {
                 EditorEventOut::Submit(text) => {
+                    // The built-in editor clears its own text before the
+                    // callback; a custom component owns its text lifecycle
+                    // (`onSubmit` upstream carries no clear — E3 slice 9).
+                    #[cfg(feature = "ext-js")]
+                    if self
+                        .extension_editor
+                        .lock()
+                        .expect("extension editor")
+                        .is_some()
+                    {
+                        self.submit(&text);
+                        continue;
+                    }
                     self.editor_mut().editor.set_text("");
                     self.submit(&text);
                 }
@@ -10765,8 +11387,12 @@ impl InteractiveMode {
             self.pump_extension_ui();
             // The deferred terminal-input chunks retry (the engine was
             // busy at dispatch time), then the ui-op snapshot refreshes
-            // (E3 slice 7).
+            // (E3 slice 7). The editor delegate's deferred keys/text
+            // writes flush the same way (E3 slice 9).
             self.pump_deferred_terminal_input();
+            if let Some(live) = self.extension_editor.lock().expect("extension editor").as_mut() {
+                live.flush_pending();
+            }
             self.refresh_ui_snapshot();
         }
 
@@ -13156,6 +13782,148 @@ export default function (pi) {
         assert!(
             !rendered.contains("ExtItem"),
             "the reset chain answers without the wrapper: {rendered}"
+        );
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// The extension editor component (E3 slice 9): the delegate renders in
+    /// the slot and takes every key (`this.editor` IS the component), the
+    /// text ops route through it, the wired `onSubmit` flows through the
+    /// submit pipeline, and the reset restores the built-in editor with the
+    /// component's text (`setCustomEditorComponent` +
+    /// `resetExtensionUI`, `interactive-mode.ts:2979-3055`/`:2611`).
+    #[test]
+    fn extension_ui_editor_component_takes_the_editor_slot() {
+        const EXT: &str = r#"
+export default function (pi) {
+  let text = "";
+  let component;
+  pi.on("session_start", (_event, ctx) => {
+    ctx.ui.setEditorComponent(() => {
+      component = {
+        render: () => ["[EXT] " + text],
+        invalidate: () => {},
+        getText: () => text,
+        setText: (next) => { text = next; },
+        handleInput: (data) => {
+          for (let i = 0; i < data.length; i++) {
+            const code = data.charCodeAt(i);
+            if (code === 13) {
+              if (component.onSubmit) component.onSubmit(text);
+            } else if (code === 127) {
+              text = text.slice(0, -1);
+            } else {
+              text += data[i];
+            }
+          }
+          return true;
+        },
+      };
+      return component;
+    });
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        mode.tui.start().expect("tui start");
+        let runner = mode.extension_runner.clone().expect("runner");
+        runner
+            .lock()
+            .expect("runner")
+            .emit(&serde_json::json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+        mode.pump();
+        assert!(
+            mode.extension_editor.lock().expect("extension editor").is_some(),
+            "the delegate mounted"
+        );
+        assert!(
+            mode.extension_editor_status_row,
+            "the working status moved to the host row"
+        );
+
+        // The delegate takes the keys: typed characters land in the
+        // component, the render shows it, and the built-in editor stays
+        // empty (nothing leaks underneath).
+        mode.dispatch_stdin_events(vec![pi_tui::stdin_buffer::StdinEvent::Data(
+            "h".to_string(),
+        )]);
+        mode.dispatch_stdin_events(vec![pi_tui::stdin_buffer::StdinEvent::Data(
+            "i".to_string(),
+        )]);
+        let rendered = pi_tui::ansi::strip_terminal_sequences(
+            &mode
+                .editor_host_mut()
+                .expect("editor host")
+                .render(100)
+                .join("\n"),
+        );
+        assert!(rendered.contains("[EXT] hi"), "{rendered}");
+        assert_eq!(
+            mode.editor_host_mut().expect("editor host").editor.get_text(),
+            "",
+            "the built-in editor stays empty under the delegate"
+        );
+        // The snapshot (what `getEditorText` serves) mirrors the component.
+        assert_eq!(
+            mode.ui_snapshot.lock().expect("ui snapshot").editor_text,
+            "hi"
+        );
+
+        // `setEditorText` routes through the delegate's `setText`.
+        mode.set_editor_text("hey");
+        let rendered = pi_tui::ansi::strip_terminal_sequences(
+            &mode
+                .editor_host_mut()
+                .expect("editor host")
+                .render(100)
+                .join("\n"),
+        );
+        assert!(rendered.contains("[EXT] hey"), "{rendered}");
+
+        // The wired `onSubmit` flows through the submit pipeline: "/exit"
+        // sets the exit flag, and the built-in editor's text was NOT
+        // cleared (the component owns its text lifecycle).
+        mode.set_editor_text("/exit");
+        mode.dispatch_stdin_events(vec![pi_tui::stdin_buffer::StdinEvent::Data(
+            "\r".to_string(),
+        )]);
+        mode.pump();
+        mode.pump();
+        assert!(mode.exiting, "the component's submit ran the pipeline");
+        assert_eq!(
+            mode.editor_host_mut().expect("editor host").editor.get_text(),
+            "",
+            "the built-in editor was empty all along"
+        );
+
+        // The reset restores the built-in editor with the component's text
+        // and unmounts the status row.
+        mode.reset_extension_ui_dialogs();
+        assert!(
+            mode.extension_editor.lock().expect("extension editor").is_none(),
+            "the reset dropped the delegate"
+        );
+        assert!(
+            !mode.extension_editor_status_row,
+            "the status row unmounted"
+        );
+        assert_eq!(
+            mode.editor_host_mut().expect("editor host").editor.get_text(),
+            "/exit",
+            "the component's text moved back into the built-in editor"
+        );
+        let rendered = pi_tui::ansi::strip_terminal_sequences(
+            &mode
+                .editor_host_mut()
+                .expect("editor host")
+                .render(100)
+                .join("\n"),
+        );
+        assert!(
+            !rendered.contains("[EXT]"),
+            "the built-in editor renders after the reset: {rendered}"
         );
         mode.shutdown().expect("shutdown");
     }
