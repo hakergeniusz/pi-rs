@@ -403,15 +403,13 @@ struct ExtensionEditorStatusRow {
 impl pi_tui::component::Component for ExtensionEditorStatusRow {
     fn render(&self, width: usize) -> Vec<String> {
         let guard = self.status.lock().expect("status");
-        match guard.as_ref() {
-            Some(indicator) => indicator.render(width),
-            // Idle while delegating: `IdleStatus`'s two blank lines keep
-            // the slot's height identical to the built-in editor's.
-            None => {
-                let empty_line = " ".repeat(width);
-                vec![empty_line.clone(), empty_line]
-            }
+        if let Some(indicator) = guard.as_ref() {
+            return indicator.render(width);
         }
+        // Idle while delegating: `IdleStatus`'s two blank lines keep the
+        // slot's height identical to the built-in editor's.
+        let empty_line = " ".repeat(width);
+        vec![empty_line.clone(), empty_line]
     }
 }
 
