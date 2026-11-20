@@ -42,7 +42,9 @@ pub mod runner;
 pub mod transcript;
 pub mod transpile;
 
-pub use engine::{ContextKind, HostActions, HostCore, JsHost};
+pub use engine::{
+    ContextKind, HostActions, HostCore, JsHost, ThemeByNameFn, ThemeHandleStyler, ThemeSetNameFn,
+};
 pub use error::{ExtensionError, JsHostError, LoadError};
 pub use loader::{ExtensionOrigin, LoadExtensionsResult, discover_and_load, discover_extensions};
 pub use provider_registry::{RegisteredNativeProvider, RegisteredProvider, RegisteredVirtualModel};
