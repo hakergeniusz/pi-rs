@@ -296,7 +296,7 @@ pub struct UiSnapshotSurface {
     /// `toolsExpanded` op — `ctx.ui.getToolsExpanded()`.
     pub tools_expanded: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
     /// `editorChrome` op (E3 slice 9) — one JSON object
-    /// `{paddingX, maxVisible, appActions, borderColor}`.
+    /// `{paddingX, maxVisible, appActions}`.
     pub editor_chrome: std::sync::Arc<dyn Fn() -> Json + Send + Sync>,
     /// `editorBorderColor` op (E3 slice 9) — the camelCase `ThemeColor`
     /// name the wired border function maps through the theme ops.
@@ -1909,8 +1909,12 @@ impl ExtensionRunner {
                 // frame (E3 slice 6c). The editor component's autocomplete
                 // read (E3 slice 9) rides the same machinery — the mode
                 // answers from its composed provider.
-                Some("overlayIsHidden" | "overlayIsFocused" | "overlayGetBounds")
-                | Some("editorAutocomplete") => {
+                Some(
+                    "overlayIsHidden"
+                        | "overlayIsFocused"
+                        | "overlayGetBounds"
+                        | "editorAutocomplete",
+                ) => {
                     deferred.push(request.clone());
                 }
                 _ => {
@@ -3968,6 +3972,8 @@ export default function (pi) {
             }),
             editor_text: std::sync::Arc::new(|| "draft text".to_string()),
             tools_expanded: std::sync::Arc::new(|| true),
+            editor_chrome: std::sync::Arc::new(serde_json::Value::Null),
+            editor_border_color: std::sync::Arc::new(String::new),
         });
         runner
             .emit(&json!({ "type": "session_start", "reason": "startup" }))

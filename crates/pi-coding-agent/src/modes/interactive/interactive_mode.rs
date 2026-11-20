@@ -470,7 +470,7 @@ impl ExtensionEditorLive {
     /// equivalent to the single-threaded engine finishing first. `false` =
     /// forward (an error behaves like a non-consuming component).
     fn handle_input(&mut self, data: &str) -> bool {
-        let Ok(mut runner) = self.runner.try_lock() else {
+        let Ok(runner) = self.runner.try_lock() else {
             self.pending_input.push(data.to_string());
             return true;
         };
@@ -515,7 +515,7 @@ impl ExtensionEditorLive {
             let deferred = std::mem::take(&mut self.pending_input);
             let mut remaining = Vec::new();
             for data in deferred {
-                let Ok(mut runner) = self.runner.try_lock() else {
+                let Ok(runner) = self.runner.try_lock() else {
                     remaining.push(data);
                     continue;
                 };
@@ -2744,7 +2744,10 @@ impl InteractiveMode {
                 .as_ref()
                 .map(|live| (Arc::clone(&live.runner), live.handle));
             if let Some((runner, handle)) = target {
-                let _ = runner.component_add_to_history(handle, text);
+                let _ = runner
+                    .lock()
+                    .expect("extension runner mutex poisoned")
+                    .component_add_to_history(handle, text);
                 return;
             }
         }
@@ -7245,15 +7248,14 @@ impl InteractiveMode {
         if delegate_live == self.extension_editor_status_row {
             return;
         }
+        let status = Arc::clone(&self.status_handle);
         let Some(host) = self.downcast_tree::<pi_tui::component::Container>(HostSlot::Status)
         else {
             return;
         };
         host.clear();
         if delegate_live {
-            host.add_child(Box::new(ExtensionEditorStatusRow {
-                status: Arc::clone(&self.status_handle),
-            }));
+            host.add_child(Box::new(ExtensionEditorStatusRow { status }));
         }
         self.extension_editor_status_row = delegate_live;
     }
@@ -7436,8 +7438,8 @@ impl InteractiveMode {
             .editor_host_mut()
             .map_or((0, 5), |editor| {
                 (
-                    editor.editor.padding_x,
-                    editor.editor.autocomplete_max_visible,
+                    editor.editor.padding_x(),
+                    editor.editor.autocomplete_max_visible(),
                 )
             });
         let border_color = if self

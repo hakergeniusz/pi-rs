@@ -149,6 +149,15 @@ impl StatusIndicator {
     }
 }
 
+/// The indicator mounts into `statusContainer` for non-embedding editors
+/// (`interactive-mode.ts:2445-2455`, E3 slice 9): a plain component whose
+/// lines are the loader's (blank separator above the spinner line).
+impl pi_tui::component::Component for StatusIndicator {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.loader.render(width)
+    }
+}
+
 /// `IdleStatus` (`status-indicator.ts:114-123`): two blank lines.
 pub struct IdleStatus;
 
