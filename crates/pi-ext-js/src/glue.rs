@@ -1181,12 +1181,41 @@ globalThis.__piCreateUiCtx = function () {
         false,
       );
     },
-    setEditorComponent: () => {
+    setEditorComponent: (factory) => {
       assertActive();
+      if (factory !== undefined && typeof factory !== "function") {
+        throw new TypeError("setEditorComponent expects a factory function or undefined");
+      }
+      globalThis.__piEditorComponentFactory = factory ?? undefined;
+      if (globalThis.__piOps.mode() !== "tui") {
+        // RPC mode has no editor surface to swap; the factory stays
+        // gettable like upstream's stored field.
+        queue("setEditorComponent", { restore: factory === undefined }, false);
+        return;
+      }
+      if (factory === undefined) {
+        // `setCustomEditorComponent(undefined)` (`interactive-mode.ts
+        // :3049-3053`): the pump copies the custom editor's text back into
+        // the built-in editor.
+        queue("setEditorComponent", { restore: true }, false);
+        return;
+      }
+      // `setCustomEditorComponent` (`interactive-mode.ts:2979-3047`): the
+      // factory gets `(tui, theme, keybindings)`. A factory throw
+      // propagates into the caller's handler — upstream crashes the swap
+      // mid-way (the container is already cleared); the port never reaches
+      // the container, so the built-in editor stays.
+      const component = factory(makeTuiAdapter(), makeThemeAdapter(), makeKeybindingsAdapter());
+      const handle = globalThis.__piComponentAdopt(component);
+      if (handle === undefined) {
+        throw new Error("editor component factory returned no component");
+      }
+      wireEditorComponent(component);
+      queue("setEditorComponent", { restore: false, handle }, false);
     },
     getEditorComponent: () => {
       assertActive();
-      return undefined;
+      return globalThis.__piEditorComponentFactory ?? undefined;
     },
     setTheme: () => {
       assertActive();
@@ -1884,6 +1913,132 @@ globalThis.__piWrappedApply = (index, baseJson, linesJson, cursorLine, cursorCol
 
 globalThis.__piAutocompleteWrappersClear = function () {
   globalThis.__piAutocompleteWrappers = [];
+};
+
+// ---- E3 slice 9: the extension editor component ----
+// `ctx.ui.setEditorComponent` (`interactive-mode.ts:2803` →
+// `setCustomEditorComponent` :2979-3055) and the editor-component text
+// crossings. The adopted component lives in the shared handle registry;
+// `getText`/`setText`/`addToHistory`/`setAutocompleteProvider` cross
+// mailbox-style, and submit/change/actions queue uiRequests the pump
+// routes through the built-in pipelines.
+globalThis.__piEditorComponentFactory = undefined;
+
+globalThis.__piEditorComponentFactoryClear = function () {
+  globalThis.__piEditorComponentFactory = undefined;
+};
+
+// The composed provider adapter the custom editor's
+// `setAutocompleteProvider` receives (`interactive-mode.ts:3014-3016`):
+// upstream passes the live composed provider object; the adapter answers
+// through the promise the pump serves from the port's composed chain
+// (`AutocompleteProvider.getSuggestions(lines, cursorLine, cursorCol,
+// {force})`, `autocomplete.ts:268-296`).
+const makeComposedAutocompleteAdapter = () => ({
+  getSuggestions: (lines, cursorLine, cursorCol, force) => {
+    const id = globalThis.__piOps.uiRequest(
+      JSON.stringify({
+        method: "editorAutocomplete",
+        lines: lines ?? [],
+        cursorLine: cursorLine ?? 0,
+        cursorCol: cursorCol ?? 0,
+        force: force === true || force?.force === true,
+      }),
+    );
+    return new Promise((resolve) => {
+      globalThis.__piUiPending.set(id, (payload) => {
+        resolve(payload && payload.result !== undefined ? payload.result : undefined);
+      });
+    });
+  },
+});
+
+// The custom editor's wiring (`setCustomEditorComponent`, `interactive
+// -mode.ts:2997-3048`): callbacks cross back as uiRequests; text,
+// appearance and autocomplete duck-type — a missing method skips the copy
+// like upstream's `if (newEditor.X !== undefined)` checks.
+const wireEditorComponent = (component) => {
+  component.onSubmit = (text) => {
+    globalThis.__piOps.uiRequest(JSON.stringify({ method: "editorSubmit", text: String(text) }));
+  };
+  component.onChange = (text) => {
+    globalThis.__piOps.uiRequest(JSON.stringify({ method: "editorChange", text: String(text) }));
+  };
+  // Copy text from the previous editor (:2999-3000). The snapshot is the
+  // pump-refreshed editor text — at most one frame stale (documented).
+  component.setText(String(globalThis.__piOps.editorText()));
+  // Appearance (:3002-3012). The border function maps through the live
+  // color id the snapshot pushes (bash mode / thinking level); an unknown
+  // id passes the text through, like upstream's `theme.fg` on an unknown
+  // token.
+  if (component.borderColor !== undefined) {
+    component.borderColor = (str) =>
+      globalThis.__piOps.themeFg(globalThis.__piOps.editorBorderColor(), String(str));
+  }
+  const chrome = JSON.parse(globalThis.__piOps.editorChrome()) ?? {};
+  if (typeof component.setPaddingX === "function") {
+    component.setPaddingX(chrome.paddingX);
+  }
+  if (typeof component.setAutocompleteMaxVisible === "function") {
+    component.setAutocompleteMaxVisible(chrome.maxVisible);
+  }
+  if (typeof component.setAutocompleteProvider === "function") {
+    component.setAutocompleteProvider(makeComposedAutocompleteAdapter());
+  }
+  // CustomEditor-derived duck typing (:3020-3048): the fallback handlers
+  // route to the mode's app-action handling (`editorAction` crossings);
+  // the `actionHandlers` copy mirrors the default editor's table (the
+  // port's app_keys ids).
+  if (component.actionHandlers instanceof Map) {
+    const action = (name, fields) =>
+      globalThis.__piOps.uiRequest(
+        JSON.stringify(Object.assign({ method: "editorAction", action: name }, fields)),
+      );
+    if (!component.onEscape) component.onEscape = () => action("escape");
+    if (!component.onCtrlD) component.onCtrlD = () => action("ctrlD");
+    if (!component.onPasteImage) component.onPasteImage = () => action("pasteImage");
+    if (!component.onExtensionShortcut) {
+      component.onExtensionShortcut = (data) => action("extensionShortcut", { data: String(data) });
+    }
+    for (const id of chrome.appActions ?? []) {
+      component.actionHandlers.set(id, () => action("app:" + id));
+    }
+  }
+};
+
+// The text read (`editor.getExpandedText?.() ?? editor.getText()`,
+// `interactive-mode.ts:2984`): the fallback lives here so every caller
+// sees the same shape.
+globalThis.__piComponentEditorText = function (handle) {
+  const component = globalThis.__piComponentHandles.get(handle);
+  if (component === undefined || typeof component.getText !== "function") return undefined;
+  const expanded =
+    typeof component.getExpandedText === "function" ? component.getExpandedText() : undefined;
+  return JSON.stringify({ text: expanded === undefined ? component.getText() : expanded });
+};
+
+globalThis.__piComponentSetText = function (handle, text) {
+  const component = globalThis.__piComponentHandles.get(handle);
+  if (component !== undefined && typeof component.setText === "function") {
+    component.setText(String(text));
+  }
+};
+
+globalThis.__piComponentAddToHistory = function (handle, text) {
+  const component = globalThis.__piComponentHandles.get(handle);
+  if (component !== undefined && typeof component.addToHistory === "function") {
+    component.addToHistory(String(text));
+  }
+};
+
+// The autocomplete re-set (`setupAutocompleteProvider` re-calls it on the
+// non-default editor too, `interactive-mode.ts:855-871`): a fresh adapter
+// each call, duck-typed no-op when absent.
+globalThis.__piComponentSetAutocomplete = function (handle) {
+  const component = globalThis.__piComponentHandles.get(handle);
+  if (component !== undefined && typeof component.setAutocompleteProvider === "function") {
+    component.setAutocompleteProvider(makeComposedAutocompleteAdapter());
+  }
 };
 
 // The entry renderer call (`addCustomEntryToChat`, interactive-mode.ts:3986;

@@ -286,7 +286,8 @@ pub type ThemeSurfaceFn = std::sync::Arc<dyn Fn(&str, &str) -> String + Send + S
 /// The embedder-installed mode-state reads the synchronous ui queries
 /// serve ([`Self::set_ui_snapshot_surface`], E3 slice 7): one JSON footer
 /// snapshot `{gitBranch, extensionStatuses, availableProviderCount}`, the
-/// editor's expanded text, and the tool-expansion flag.
+/// editor's expanded text, and the tool-expansion flag. E3 slice 9 adds
+/// the editor chrome + border color token the editor-component wire reads.
 pub struct UiSnapshotSurface {
     /// `footerData` op — the custom footer factory's data adapter reads.
     pub footer_data: std::sync::Arc<dyn Fn() -> Json + Send + Sync>,
@@ -294,6 +295,12 @@ pub struct UiSnapshotSurface {
     pub editor_text: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
     /// `toolsExpanded` op — `ctx.ui.getToolsExpanded()`.
     pub tools_expanded: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    /// `editorChrome` op (E3 slice 9) — one JSON object
+    /// `{paddingX, maxVisible, appActions, borderColor}`.
+    pub editor_chrome: std::sync::Arc<dyn Fn() -> Json + Send + Sync>,
+    /// `editorBorderColor` op (E3 slice 9) — the camelCase `ThemeColor`
+    /// name the wired border function maps through the theme ops.
+    pub editor_border_color: std::sync::Arc<dyn Fn() -> String + Send + Sync>,
 }
 
 /// One `ToolRenderers` slot after resolution (`types.ts:693`): the
@@ -1490,6 +1497,36 @@ impl ExtensionRunner {
         self.host.component_set_expanded(handle, expanded)
     }
 
+    // ---- E3 slice 9: the extension editor component crossings ----
+
+    /// Reads one editor component's text (`getExpandedText?.() ??
+    /// getText()`); empty when the handle is gone.
+    pub fn component_editor_text(&self, handle: u32) -> Result<String, JsHostError> {
+        self.host.component_editor_text(handle)
+    }
+
+    /// Writes one editor component's text (`setText`).
+    pub fn component_set_text(&self, handle: u32, text: &str) -> Result<(), JsHostError> {
+        self.host.component_set_text(handle, text)
+    }
+
+    /// Feeds one editor component's history (`addToHistory?.()`, duck
+    /// typed).
+    pub fn component_add_to_history(&self, handle: u32, text: &str) -> Result<(), JsHostError> {
+        self.host.component_add_to_history(handle, text)
+    }
+
+    /// Re-sets one editor component's autocomplete provider (the composed
+    /// adapter, duck typed).
+    pub fn component_set_autocomplete_provider(&self, handle: u32) -> Result<(), JsHostError> {
+        self.host.component_set_autocomplete_provider(handle)
+    }
+
+    /// Clears the stashed editor-component factory (upstream's reset).
+    pub fn editor_component_clear_stash(&self) -> Result<(), JsHostError> {
+        self.host.editor_component_clear_stash()
+    }
+
     /// Executes a registered shortcut handler (`interactive-mode.ts:2425-2427`
     /// invokes `handler(ctx)`; the port dispatches the stashed handler
     /// through the base-ctx session machinery — the same shape the command
@@ -1683,12 +1720,16 @@ impl ExtensionRunner {
     /// the custom footer's data adapter read the mode's live state without
     /// a blocking round-trip. The mode refreshes the shared snapshots each
     /// pump frame; without this the defaults read null/""/false (the
-    /// headless matrix).
+    /// headless matrix). E3 slice 9 adds the editor chrome + border color
+    /// token the editor-component wire reads.
     pub fn set_ui_snapshot_surface(&mut self, snapshot: UiSnapshotSurface) {
         let mut core = self.core.lock().expect("host core mutex poisoned");
         core.actions.ui_snapshot.footer_data = Box::new(move || (snapshot.footer_data)());
         core.actions.ui_snapshot.editor_text = Box::new(move || (snapshot.editor_text)());
         core.actions.ui_snapshot.tools_expanded = Box::new(move || (snapshot.tools_expanded)());
+        core.actions.ui_snapshot.editor_chrome = Box::new(move || (snapshot.editor_chrome)());
+        core.actions.ui_snapshot.editor_border_color =
+            Box::new(move || (snapshot.editor_border_color)());
     }
 
     /// Folds one terminal input chunk through the extension-registered
@@ -1865,8 +1906,11 @@ impl ExtensionRunner {
                 // The answer-class overlay crossings ride the same deferred
                 // shape: the pump's delivery threads block on the bridge
                 // like a dialog close, and the mode answers on its next
-                // frame (E3 slice 6c).
-                Some("overlayIsHidden" | "overlayIsFocused" | "overlayGetBounds") => {
+                // frame (E3 slice 6c). The editor component's autocomplete
+                // read (E3 slice 9) rides the same machinery — the mode
+                // answers from its composed provider.
+                Some("overlayIsHidden" | "overlayIsFocused" | "overlayGetBounds")
+                | Some("editorAutocomplete") => {
                     deferred.push(request.clone());
                 }
                 _ => {
@@ -1971,6 +2015,12 @@ impl ExtensionRunner {
                 };
                 self.host.resolve_ui(&id, payload)?;
             }
+            // The editor component's autocomplete read made INSIDE a
+            // dispatch (E3 slice 9): no suggestions — the same
+            // settle-with-default deviation as the overlay reads.
+            "editorAutocomplete" => {
+                self.host.resolve_ui(&id, "")?;
+            }
             _ => {
                 if let Some(sink) = &self.ui_sink {
                     sink.request(request);
@@ -2040,6 +2090,26 @@ impl ExtensionRunner {
                 }
                 // No sink: no registry could ever answer (a handle only
                 // exists after a showOverlay crossing, which needs one).
+                Ok(None)
+            }
+            // The editor component's autocomplete read (E3 slice 9) rides
+            // the same answer-class shape — no `ui_prompt` pair, the mode
+            // answers from its composed provider.
+            "editorAutocomplete" => {
+                let id = request
+                    .get("id")
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(sink) = self.ui_sink.clone() {
+                    sink.request(request);
+                    return Ok(Some(UiDialogWait {
+                        sink,
+                        id,
+                        method,
+                        prompt: false,
+                    }));
+                }
                 Ok(None)
             }
             _ => {
@@ -4127,6 +4197,108 @@ export default function (pi) {
             entries.is_empty(),
             "no ui_prompt pair for an answer crossing: {entries:?}"
         );
+    }
+
+    /// The extension editor component (E3 slice 9): the factory runs in the
+    /// op, the adopted handle crosses, and `getText`/`setText`/
+    /// `handleInput`/`onSubmit` cross through the component registry —
+    /// `setCustomEditorComponent`'s wiring (`interactive-mode.ts:2979
+    /// -3047`), with the snapshot text copy ("" headless) landing in the
+    /// component.
+    #[test]
+    fn ui_editor_component_crosses_text_input_submit_and_factory() {
+        const EXT: &str = r#"
+export default function (pi) {
+  let text = "";
+  let component;
+  pi.on("session_start", async (event, ctx) => {
+    ctx.ui.setEditorComponent(() => {
+      component = {
+        render: () => ["[EXT] " + text],
+        invalidate: () => {},
+        getText: () => text,
+        setText: (next) => { text = next; },
+        handleInput: (data) => {
+          text += data;
+          if (data === "\r" && component.onSubmit) component.onSubmit(text);
+          return true;
+        },
+      };
+      return component;
+    });
+    ctx.ui.notify("type:" + typeof ctx.ui.getEditorComponent());
+  });
+  pi.on("session_before_switch", async (event, ctx) => {
+    ctx.ui.notify("after:" + typeof ctx.ui.getEditorComponent());
+  });
+}
+"#;
+        let mut runner = runner_with(&[EXT]);
+        let sink = FakeSink::scripted(&[]);
+        runner.set_ui_context(sink.clone(), "tui");
+        runner
+            .emit(&json!({ "type": "session_start", "reason": "startup" }))
+            .expect("emit");
+
+        // The swap crossing carries the adopted handle.
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert_eq!(requests[0]["method"], "setEditorComponent");
+        assert_eq!(requests[0]["restore"], false);
+        let handle = requests[0]["handle"].as_u64().expect("handle") as u32;
+        assert!(handle >= 1);
+        // `getEditorComponent()` answers the stored factory.
+        assert_eq!(requests[1]["method"], "notify");
+        assert_eq!(requests[1]["message"], "type:function");
+
+        // The swap copied the snapshot text ("" headless) into the
+        // component; setText/write/read cross through the registry.
+        assert_eq!(
+            runner.component_editor_text(handle).expect("text"),
+            "",
+            "the swap copies the previous editor's text"
+        );
+        runner
+            .component_set_text(handle, "hi")
+            .expect("set text");
+        assert_eq!(runner.component_editor_text(handle).expect("text"), "hi");
+
+        // Input feeds the component; the wired onSubmit crosses when the
+        // component calls it (Enter in the test's own handler).
+        assert_eq!(
+            runner
+                .component_handle_input(handle, "x")
+                .expect("handle input"),
+            true
+        );
+        runner.service_ui_requests().expect("service");
+        assert_eq!(
+            runner.component_editor_text(handle).expect("text"),
+            "hix",
+            "handleInput mutated the component text"
+        );
+        runner
+            .component_handle_input(handle, "\r")
+            .expect("submit key");
+        runner.service_ui_requests().expect("service the submit crossing");
+        let drained = sink.requests();
+        let submit = drained
+            .iter()
+            .find(|request| request["method"] == "editorSubmit")
+            .expect("the wired onSubmit crossed");
+        assert_eq!(submit["text"], "hix");
+
+        // The reset clears the factory stash: `getEditorComponent()`
+        // answers undefined afterwards.
+        runner.editor_component_clear_stash().expect("clear stash");
+        runner
+            .emit(&json!({ "type": "session_before_switch" }))
+            .expect("emit");
+        let drained = sink.requests();
+        let after = drained
+            .iter()
+            .find(|request| request["method"] == "notify" && request["message"] == "after:undefined");
+        assert!(after.is_some(), "{drained:?}");
     }
 
     /// An answer-class read made INSIDE a dispatch settles with the method

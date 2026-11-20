@@ -110,7 +110,9 @@ pub struct HostActions {
 
 /// The synchronous mode-state reads the `footerData`/`editorText`/
 /// `toolsExpanded` ops serve (E3 slice 7): a JSON footer snapshot, the
-/// editor's text, and the tool-expansion flag.
+/// editor's text, and the tool-expansion flag. E3 slice 9 adds the
+/// editor chrome the custom editor component's wiring reads
+/// (`setCustomEditorComponent`, `interactive-mode.ts:2999-3016`).
 pub struct UiSnapshot {
     /// `getGitBranch()`/`getExtensionStatuses()`/
     /// `getAvailableProviderCount()` (`footer-data-provider.ts:385-390`):
@@ -121,6 +123,16 @@ pub struct UiSnapshot {
     pub editor_text: Box<dyn Fn() -> String + Send>,
     /// `toolOutputExpanded` (`interactive-mode.ts:2822`).
     pub tools_expanded: Box<dyn Fn() -> bool + Send>,
+    /// The editor chrome (E3 slice 9): padding, the autocomplete max
+    /// visible, the app action ids, and the current border color token —
+    /// one JSON object `{paddingX, maxVisible, appActions, borderColor}`
+    /// the editor-component wire reads (`getPaddingX()`/
+    /// `getAutocompleteMaxVisible()`, `interactive-mode.ts:3005-3011`).
+    pub editor_chrome: Box<dyn Fn() -> Json + Send>,
+    /// The editor border color token (`updateEditorBorderColor`,
+    /// `interactive-mode.ts:4700-4707`): the camelCase `ThemeColor` name
+    /// the wired `borderColor` function maps through the theme ops.
+    pub editor_border_color: Box<dyn Fn() -> String + Send>,
 }
 
 impl Default for UiSnapshot {
@@ -129,6 +141,8 @@ impl Default for UiSnapshot {
             footer_data: Box::new(|| Json::Null),
             editor_text: Box::new(String::new),
             tools_expanded: Box::new(|| false),
+            editor_chrome: Box::new(|| Json::Null),
+            editor_border_color: Box::new(String::new),
         }
     }
 }
@@ -625,6 +639,19 @@ impl JsHost {
             } else {
                 "false".to_string()
             }
+        });
+        // The editor chrome (E3 slice 9): padding, autocomplete max
+        // visible, app action ids, and the border color token the editor
+        // component's wiring reads (`setCustomEditorComponent`,
+        // `interactive-mode.ts:2999-3016`); the defaults read null.
+        op!("editorChrome", core, || -> String {
+            let guard = core.lock().expect("host core mutex poisoned");
+            serde_json::to_string(&(guard.actions.ui_snapshot.editor_chrome)())
+                .unwrap_or_else(|_| "null".to_string())
+        });
+        op!("editorBorderColor", core, || -> String {
+            let guard = core.lock().expect("host core mutex poisoned");
+            (guard.actions.ui_snapshot.editor_border_color)()
         });
         op!("providerRegister", core, |name: String,
                                        extension_path: String,
@@ -1286,6 +1313,102 @@ impl JsHost {
                 .map_err(|err| Self::js_error(&ctx, err))?;
             let _: Value = call
                 .call((handle, expanded))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
+    // ---- E3 slice 9: the extension editor component crossings ----
+    // `EditorComponent` (`editor-component.ts:11-67`): text reads/writes,
+    // history, and the autocomplete re-set cross mailbox-style through the
+    // adopted-component registry. All synchronous — the glue answers from
+    // the component object in one turn.
+
+    /// Reads one editor component's text (`getExpandedText?.() ??
+    /// getText()`, `interactive-mode.ts:2984`); empty when the handle is
+    /// gone or `getText` is missing (required by the interface — an absent
+    /// method means the component was released).
+    pub fn component_editor_text(&self, handle: u32) -> Result<String, JsHostError> {
+        let raw = self
+            .ctx
+            .with(|ctx| -> Result<Option<String>, JsHostError> {
+                let call: Function = ctx.globals().get("__piComponentEditorText")?;
+                let result: Option<String> = call
+                    .call((handle,))
+                    .map_err(|err| Self::js_error(&ctx, err))?;
+                Ok(result)
+            })?;
+        let Some(raw) = raw else {
+            return Ok(String::new());
+        };
+        let value: Json =
+            serde_json::from_str(&raw).map_err(|err| JsHostError::Job(err.to_string()))?;
+        Ok(value
+            .get("text")
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    /// Writes one editor component's text (`setText`, `interactive-mode
+    /// .ts:3000`): a no-op when the handle is gone or the method is
+    /// missing.
+    pub fn component_set_text(&self, handle: u32, text: &str) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx
+                .globals()
+                .get("__piComponentSetText")
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            let _: Value = call
+                .call((handle, text))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
+    /// Feeds one editor component's history (`addToHistory?.()`, duck
+    /// typed — `editor-component.ts:34-37`): a no-op when absent.
+    pub fn component_add_to_history(&self, handle: u32, text: &str) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx
+                .globals()
+                .get("__piComponentAddToHistory")
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            let _: Value = call
+                .call((handle, text))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
+    /// Re-sets one editor component's autocomplete provider
+    /// (`setupAutocompleteProvider` re-calls it on the non-default editor,
+    /// `interactive-mode.ts:855-871`): a fresh composed adapter each call,
+    /// duck-typed no-op when absent.
+    pub fn component_set_autocomplete_provider(&self, handle: u32) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx
+                .globals()
+                .get("__piComponentSetAutocomplete")
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            let _: Value = call
+                .call((handle,))
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            Ok(())
+        })
+    }
+
+    /// Clears the stashed editor-component factory (upstream's reset sets
+    /// `editorComponentFactory = undefined` through
+    /// `setCustomEditorComponent(undefined)`, `interactive-mode.ts:2611`).
+    pub fn editor_component_clear_stash(&self) -> Result<(), JsHostError> {
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            let call: Function = ctx
+                .globals()
+                .get("__piEditorComponentFactoryClear")
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            let _: Value = call
+                .call(())
                 .map_err(|err| Self::js_error(&ctx, err))?;
             Ok(())
         })
