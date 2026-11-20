@@ -227,6 +227,33 @@ pub fn set_theme(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `setTheme(name, true)`'s fallback half (`theme.ts:703-724`): on a load
+/// failure the SYSTEM theme installs and the error reports to the caller
+/// (`{success: false, error}` at the ctx.ui.setTheme crossing).
+pub fn set_theme_with_fallback(name: &str) -> Result<(), String> {
+    match set_theme(name) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Ok(system) = load_theme_by_name(pi_tui::theme::SYSTEM_THEME_NAME) {
+                *THEME.write().expect("theme lock") = Some(Arc::new(system));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// `setThemeInstance` (`theme.ts:726-733`): install a caller-built Theme
+/// as the global — the `<in-memory>` active name tracks mode-side.
+pub fn set_theme_instance(theme: Arc<Theme>) {
+    *THEME.write().expect("theme lock") = Some(theme);
+}
+
+/// `getThemeByName` (`theme.ts:568-573`): load without switching; an
+/// unloadable name answers `None` (upstream's `undefined`).
+pub fn theme_by_name(name: &str) -> Option<Arc<Theme>> {
+    load_theme_by_name(name).ok().map(Arc::new)
+}
+
 /// `getMarkdownTheme` (`theme.ts:1065-1083`): token stylers for the Markdown
 /// component.
 pub fn markdown_theme() -> pi_tui::components::markdown::MarkdownTheme {
@@ -300,12 +327,26 @@ pub fn settings_list_theme() -> pi_tui::components::settings_list::SettingsListT
 /// theme from the custom themes directory. The same paths
 /// [`load_theme_by_name`] resolves against.
 pub fn available_theme_names() -> Vec<String> {
-    let paths = pi_tui::theme::ThemePaths::new("/nonexistent", custom_themes_dir());
-    let registry = pi_tui::theme::ThemeRegistry::new();
-    pi_tui::theme::available_themes(&paths, &registry)
+    available_themes_with_paths()
         .into_iter()
         .map(|info| info.name)
         .collect()
+}
+
+/// `getAvailableThemesWithPaths` (`theme.ts:403-433`): the system theme
+/// (no file) first, then the built-ins (`<themesDir>/<name>.json`), then
+/// the custom themes directory, then registered themes — the port has no
+/// registered-themes loader yet, so the registry stays empty (documented).
+pub fn available_themes_with_paths() -> Vec<pi_tui::theme::ThemeInfo> {
+    // The REAL builtin dir: the listing reports `<themesDir>/<name>.json`
+    // for the built-ins (upstream `theme.ts:413-415`); loading itself
+    // reads the embedded content, so the loader paths stay "/nonexistent".
+    let paths = pi_tui::theme::ThemePaths::new(
+        pi_tui::theme::ThemePaths::builtin_dir(),
+        custom_themes_dir(),
+    );
+    let registry = pi_tui::theme::ThemeRegistry::new();
+    pi_tui::theme::available_themes(&paths, &registry)
 }
 
 /// `getEditorTheme` (`theme.ts:1095-1100`).

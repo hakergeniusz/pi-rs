@@ -2085,9 +2085,110 @@ impl InteractiveMode {
                     .iter()
                     .map(|(id, keys)| (*id, keys.to_vec()))
                     .collect();
+            // The ctx.ui themes API (E3 slice 10): the reads serve the
+            // mode's loaders (`getAvailableThemesWithPaths`/
+            // `getThemeByName`, `theme.ts:403-433`/`:568-573`); the
+            // synchronous `setTheme` halves install the global with the
+            // system fallback (`theme.ts:703-733`) — the `themeChanged`
+            // crossing then carries the visuals, the active-name
+            // tracking, and the settings persistence mode-side, because
+            // the closures own no mode state. A by-name theme stashes
+            // under a handle the styling ops resolve.
+            let theme_stash: std::sync::Arc<
+                std::sync::Mutex<
+                    std::collections::HashMap<u32, std::sync::Arc<pi_tui::theme::Theme>>,
+                >,
+            > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            // Each closure takes its own Arc clone: they all `move`.
+            let stash_for_load = std::sync::Arc::clone(&theme_stash);
+            let stash_for_fg = std::sync::Arc::clone(&theme_stash);
+            let stash_for_bg = std::sync::Arc::clone(&theme_stash);
+            let stash_for_instance = std::sync::Arc::clone(&theme_stash);
+            // Monotonic handles: `setThemeInstance` removes from the stash,
+            // so a length-based id would collide with a still-live
+            // adapter's handle.
+            let theme_handle_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1));
+            let counter_for_load = std::sync::Arc::clone(&theme_handle_counter);
+            let theme_all: Box<dyn Fn() -> serde_json::Value + Send> = Box::new(|| {
+                serde_json::Value::Array(
+                    theme::available_themes_with_paths()
+                        .into_iter()
+                        .map(|info| {
+                            serde_json::json!({
+                                "name": info.name,
+                                "path": info.path.map(|path| path.display().to_string()),
+                            })
+                        })
+                        .collect(),
+                )
+            });
+            let theme_by_name: Box<dyn Fn(&str) -> Option<(u32, String, String)> + Send> =
+                Box::new(move |name| {
+                    let loaded = theme::theme_by_name(name)?;
+                    let appearance = loaded.appearance().as_str().to_string();
+                    let handle = counter_for_load.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    stash_for_load
+                        .lock()
+                        .expect("theme stash")
+                        .insert(handle, loaded);
+                    Some((handle, name.to_string(), appearance))
+                });
+            let theme_fg_with: Box<dyn Fn(u32, &str, &str) -> String + Send> = Box::new(
+                move |handle, token, text| match stash_for_fg
+                    .lock()
+                    .expect("theme stash")
+                    .get(&handle)
+                    .cloned()
+                {
+                    Some(stashed) => match pi_tui::theme::ThemeColor::from_name(token) {
+                        Some(color) => stashed.fg(color, text),
+                        None => text.to_string(),
+                    },
+                    None => text.to_string(),
+                },
+            );
+            let theme_bg_with: Box<dyn Fn(u32, &str, &str) -> String + Send> = Box::new(
+                move |handle, token, text| match stash_for_bg
+                    .lock()
+                    .expect("theme stash")
+                    .get(&handle)
+                    .cloned()
+                {
+                    Some(stashed) => match pi_tui::theme::ThemeBg::from_name(token) {
+                        Some(color) => stashed.bg(color, text),
+                        None => text.to_string(),
+                    },
+                    None => text.to_string(),
+                },
+            );
+            let theme_appearance: Box<dyn Fn() -> String + Send> =
+                Box::new(|| theme::theme().appearance().as_str().to_string());
+            let theme_set_name: Box<dyn Fn(&str) -> Result<(), String> + Send> =
+                Box::new(move |name| theme::set_theme_with_fallback(name));
+            let theme_set_instance: Box<dyn Fn(u32) -> bool + Send> =
+                Box::new(move |handle| match stash_for_instance
+                    .lock()
+                    .expect("theme stash")
+                    .remove(&handle)
+                {
+                    Some(stashed) => {
+                        theme::set_theme_instance(stashed);
+                        true
+                    }
+                    None => false,
+                });
             let mut guard = runner.lock().expect("extension runner mutex poisoned");
             guard.set_theme_surface(fg, bg);
             guard.set_style_surface(style);
+            guard.set_theme_ext_surface(pi_ext_js::ThemeExtSurface {
+                all: theme_all,
+                by_name: theme_by_name,
+                fg_with: theme_fg_with,
+                bg_with: theme_bg_with,
+                appearance: theme_appearance,
+                set_name: theme_set_name,
+                set_instance: theme_set_instance,
+            });
             guard.set_app_keybindings(
                 &serde_json::to_string(&keybindings).unwrap_or_else(|_| "{}".to_string()),
             );
@@ -10244,6 +10345,56 @@ impl InteractiveMode {
                         bridge.respond(&id, &response);
                     }
                 }
+                // The ctx.ui themes API's follow-up (`setTheme`'s
+                // synchronous half ran engine-side through the surface
+                // closures — the visuals, the active-name tracking, and
+                // the settings persistence need the mode, so they ride
+                // here one frame later; upstream runs them inline in
+                // `setThemeName`/`setThemeInstance`
+                // (`interactive-mode.ts:2814-2821`,
+                // `theme-controller.ts:124-148`).
+                "themeChanged" => {
+                    let success = request.get("success").and_then(Value::as_bool) == Some(true);
+                    let name = request.get("name").and_then(Value::as_str).map(String::from);
+                    match name {
+                        // A Theme INSTANCE: `setThemeInstance` disables the
+                        // terminal auto-sync (`:138-148`).
+                        None => {
+                            self.theme_auto_sync = false;
+                            self.tui.set_color_scheme_notifications(false);
+                            self.theme_active_name = "<in-memory>".to_string();
+                        }
+                        Some(name) => {
+                            if success {
+                                // `setThemeName`'s auto-sync +
+                                // `activeThemeName` (`:124-131`), then the
+                                // op's settings persistence
+                                // (`interactive-mode.ts:2815-2820`).
+                                self.theme_auto_sync = name == pi_tui::theme::SYSTEM_THEME_NAME;
+                                self.tui.set_color_scheme_notifications(self.theme_auto_sync);
+                                self.theme_active_name = name.clone();
+                                if self.settings.get("theme").and_then(Value::as_str) != Some(name.as_str())
+                                {
+                                    self.settings
+                                        .set("theme", serde_json::Value::String(name.clone()));
+                                    self.theme_setting = Some(name.clone());
+                                }
+                            } else {
+                                // `applyThemeName`'s failure half
+                                // (`theme-controller.ts:178-183`): the
+                                // global fell back to the system theme
+                                // engine-side; the active name follows.
+                                self.theme_active_name =
+                                    pi_tui::theme::SYSTEM_THEME_NAME.to_string();
+                            }
+                        }
+                    }
+                    // `notifyChanged` (`theme-controller.ts:249-252`) +
+                    // `onChanged` (`interactive-mode.ts:699`).
+                    self.tui.invalidate();
+                    self.tui.request_render();
+                    self.update_editor_border_color();
+                }
                 // The factory adapter's `TUI.showOverlay` surface
                 // (`tui.ts:518/:792-816`).
                 // Deviation: the port tracks these mounts in the same
@@ -13979,6 +14130,58 @@ export default function (pi) {
         assert!(
             !rendered.contains("[EXT]"),
             "the built-in editor renders after the reset: {rendered}"
+        );
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// The ctx.ui themes API (E3 slice 10, `interactive-mode.ts:2806
+    /// -2822`): `setTheme(name)` applies the global engine-side and the
+    /// `themeChanged` crossing tracks the active name, persists the
+    /// setting once, and re-renders; a failed name falls back to the
+    /// system theme's active name; a Theme instance from `getTheme`
+    /// installs as `<in-memory>`; the current-theme getter styles.
+    #[test]
+    #[allow(clippy::too_many_lines)] // mirrors the TS theme flow; split when extending
+    fn extension_ui_theme_api_switches_and_persists() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("session_start", async (event, ctx) => {
+    const result = ctx.ui.setTheme("dark");
+    ctx.ui.notify("set:" + JSON.stringify(result));
+    const themed = ctx.ui.getTheme("dark");
+    ctx.ui.notify("fgStyled:" + (themed.fg("accent", "x").length > 2));
+    const failed = ctx.ui.setTheme("definitely-not-a-theme");
+    ctx.ui.notify("fail:" + String(failed.success === false));
+    const again = ctx.ui.setTheme(themed);
+    ctx.ui.notify("seti:" + JSON.stringify(again));
+    ctx.ui.notify("themeApp:" + ctx.ui.theme.appearance());
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        mode.tui.start().expect("tui start");
+        mode.pump();
+        // The global theme switched twice synchronously (dark, then the
+        // system fallback, then the stashed dark instance) — the final
+        // global is the instance, and the crossing tracked the names.
+        assert_eq!(
+            mode.theme_active_name, "<in-memory>",
+            "the instance install tracks <in-memory>"
+        );
+        assert!(
+            !mode.theme_auto_sync,
+            "the instance install disabled the terminal auto-sync"
+        );
+        assert_eq!(
+            mode.settings.get("theme").and_then(serde_json::Value::as_str),
+            Some("dark"),
+            "the successful name persisted once, the failure did not"
+        );
+        assert_eq!(
+            crate::modes::interactive::theme::theme().name(),
+            Some("dark"),
+            "the instance install switched the global"
         );
         mode.shutdown().expect("shutdown");
     }
