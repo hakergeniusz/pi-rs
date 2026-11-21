@@ -3678,14 +3678,26 @@ methods (`list_resources[_page]`, `list_resource_templates[_page]`,
 as `callTool` (`a829f37`). Reads currently require an already-connected
 server — upstream's lazy reconnect for reads is a follow-up.
 
-**Still open:** the extension-facing resource tools — three tool definitions,
-their host ops / execute wrappers, and the final `limitMcpContent` result
-assembly described in `mcp-resources-WIRING.md` §2c–2d. Two flaky pre-existing
+Those are now complete: the three native resource tools (schemas + read-only
+hints) register when any server advertises resources, route through one
+`mcpResource` host op, and assemble `limitMcpContent` results (`400c809`);
+resource reads lazily reconnect failed servers (`5fe2563`).
+
+**Also landed:** the npm package-manager arm (delegates registry/tarball work
+to `npm`/`pnpm`/`bun` like upstream 1.5.2, `semver` dep locked, `a4f9ce1`), a
+POSIX checksum-verifying `scripts/install.sh` + `docs/RELEASE.md`, and a CI
+matrix that builds four release assets + checksums on `v*` tags
+(`e28ee31`; tag jobs correctly skip on `main`). Two flaky pre-existing
 interactive tests were stabilized: a notify test that stopped pumping before
 its UI requests drained, and a global-theme assertion that raced with sibling
 tests re-initializing the process-wide theme. All `WIRING.md` notes were
 preserved under `/tmp/opencode/*-WIRING.md` (tmpfs — copy to docs if they must
 survive a reboot).
+
+**Release cut awaits user approval:** version bump to `0.1.0`, the `v0.1.0`
+tag, pushing it, and creating/finalizing the GitHub Release (see
+`docs/RELEASE.md` §3 and the preserved `release-install-WIRING.md`). The
+installer/CI plumbing is in place but no tag exists yet.
 
 **CI green** on `b3dc9ec`: all 7 jobs (clippy, test, fmt, NDF, audit, msrv,
 release) pass. Two CI-only issues fixed after the integrations: `fmt --check`
