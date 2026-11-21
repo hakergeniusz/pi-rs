@@ -11,25 +11,41 @@
 //! * [`transport`] — subprocess framing with request/response correlation.
 //! * [`http`] — the streamable HTTP transport (SSE parser, session
 //!   capture, GET stream, resumption).
+//! * [`auth_provider`] — the bearer-token + recovery hook the HTTP
+//!   transport authenticates through.
+//! * [`oauth`] — the OAuth flows: discovery, client settings, state
+//!   provider, sign-in, loopback callback.
 //! * [`client`] — `initialize` handshake, tool discovery and calls.
 //! * [`error`] — the error surface.
 
+/// The bearer-token + recovery hook of the HTTP transport
+/// (`auth-provider.ts`).
+pub mod auth_provider;
 /// The MCP client: `initialize` handshake, tool discovery and calls.
 pub mod client;
 /// The error surface ([`McpError`]).
 pub mod error;
 /// The streamable HTTP transport (`streamable-http.ts`).
 pub mod http;
+/// The OAuth flows (`oauth/`): discovery, client settings, state provider,
+/// sign-in, loopback callback.
+pub mod oauth;
 /// Subprocess stdio framing with request/response correlation.
 pub mod transport;
 /// JSON-RPC 2.0 envelope + MCP message types.
 pub mod types;
 
 /// MCP protocol version this port sends in the `initialize` handshake
-/// (upstream sends `LATEST_PROTOCOL_VERSION`, "2025-11-25"; the port pins
-/// its own — a recorded deviation — and accepts whatever version the
-/// server picks from [`SUPPORTED_PROTOCOL_VERSIONS`]).
+/// (upstream sends [`LATEST_PROTOCOL_VERSION`]; the port pins its own — a
+/// recorded deviation — and accepts whatever version the server picks from
+/// [`SUPPORTED_PROTOCOL_VERSIONS`]).
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// The newest version upstream advertises
+/// (`LATEST_PROTOCOL_VERSION`, `protocol/types.ts:4`). OAuth discovery
+/// carries it in `MCP-Protocol-Version`; unlike [`PROTOCOL_VERSION`] it is
+/// not a deviation — only the `initialize` handshake is pinned.
+pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Versions the client accepts from a server
 /// (`SUPPORTED_PROTOCOL_VERSIONS`, upstream
@@ -44,9 +60,10 @@ pub const CLIENT_NAME: &str = "pi-rs";
 /// Client version sent in the `initialize` handshake.
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub use auth_provider::{AuthProvider, McpFetch, UnauthorizedContext};
 pub use client::{McpClient, McpServerConfig, McpTransportConfig};
 pub use error::McpError;
-pub use http::{AuthProvider, StreamableHttpTransport};
+pub use http::StreamableHttpTransport;
 pub use types::{
     CallToolResult, ContentBlock, McpTool, ToolsListResult, normalize_mcp_input_schema,
 };

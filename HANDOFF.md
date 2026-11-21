@@ -3462,6 +3462,141 @@ were an outright error before this slice).
   spawn config, `Failed { .. }` over a wildcard; r4 green). Test
   totals: 1950 workspace tests, 0 failed.
 
+## MCP OAuth module (landing on `feat/mcp-oauth`, 2026-11-21)
+
+F2a of the MCP OAuth arc: the whole `packages/mcp/src/oauth/` module
+(11 TS files, read in full) ported into `crates/pi-mcp/src/oauth/`
+(10 files), the auth-provider surface at
+`crates/pi-mcp/src/auth_provider.rs`, and the authorized-fetch
+recovery loop wired into `http.rs`. The credential store and the
+manager wiring are F2b; `pi mcp` + `/mcp` are F2c.
+
+- **Module map** (upstream file → port):
+  `errors.ts` → `oauth/errors.rs` — one `OAuthError` enum where
+  upstream has sibling `Error` subclasses: `Protocol{code, message,
+  error_uri}` (the RFC 6749 error class), `IssuerMismatch` (renders
+  `None` as `none`, a value as its JSON spelling), `InsecureEndpoint`,
+  `Registration`, the pi-specific `AuthorizationRequired` /
+  `RefreshLockBusy` / `SignInCancelled`, and `Other(String)` carrying
+  every plain `new Error(...)` throw verbatim. `McpError` gains
+  `OAuth(#[from] OAuthError)`.
+  `types.ts` → `oauth/types.rs` — wire structs with serde; unknown
+  fields ride `#[serde(flatten)] extra` maps so parse→save→load
+  round trips preserve them (`preserve_order` keeps insertion order);
+  `expires_in` kept verbatim as a `Number` (strings parse like JS);
+  plus `OAuthChallenge` / `OAuthServerInfo` / `OAuthDiscoveryState`.
+  `discovery.ts` → `oauth/discovery.rs` — the `WWW-Authenticate`
+  parser, the protected-resource chain with the origin-root fallback,
+  the oauth→oidc→path-scoped candidate list with issuer validation
+  (trailing-slash-trimmed compare), and resource selection.
+  `client-settings.ts` → `oauth/client_settings.rs` — settings
+  (camelCase serde), the documents and server-store traits,
+  `create_oauth_client_provider` with the CIMD offer rules,
+  `callback_id` (sha256 of the URL sans fragment, first 9 bytes
+  base64url = 12 chars), `DEFAULT_REDIRECT_URL`, `loopback_settings`.
+  `provider.ts` → `oauth/provider.rs` — `McpOAuthState` (camelCase
+  serde, ready for F2b's mcp-auth.json), `MemoryOAuthStateStore`, and
+  `McpOAuthProvider` with a mutex-serialized load-modify-save
+  (upstream's `writes` promise chain) and `own()` cross-server
+  isolation.
+  `flow.ts` → `oauth/flow.rs` — PKCE (32 random bytes → base64url
+  verifier + S256 challenge), `start_authorization` (`offline_access`
+  → `prompt=consent`), `token_request` (the OAuth error body is
+  checked BEFORE the status; non-2xx → `server_error` with the full
+  text), `register_client` (`application_type` per SEP-837),
+  exchange/refresh (a response without `refresh_token` keeps the old
+  one), `with_scope`, `step_up_scope`, `run_flow` (discovery-state
+  caching unless a configured metadata URL; the redirect-URI
+  consistency check; the RFC 9207 `iss` check), and `authorize_mcp`
+  (invalid_client/unauthorized_client → invalidate + one rerun,
+  invalid_grant → invalidate tokens + one rerun).
+  `callback.ts` → `oauth/callback.rs` — the loopback callback server.
+  `loopback.ts` → `oauth/loopback.rs` —
+  `listen_for_loopback_sign_in` (the stored client's port preferred,
+  free-port fallback), `wait_for_loopback_sign_in` (callback-vs-prompt
+  race), `response_from_redirect_url`.
+  `sign-in.ts` → `oauth/sign_in.rs` — the two sign-in halves,
+  `state_for_sign_in` (the `cimd` client-replacement rules),
+  `merge_scopes`, `cancellable`.
+  `oauth/auth-provider.ts` → `oauth/auth_provider.rs` —
+  `McpAuthProvider`: `REFRESH_SKEW_MS` 30 s expiry check in `token()`,
+  a singleflight refresh (concurrent callers join one refresh and get
+  the same outcome — `McpError` grew a manual `Clone` for the joiner
+  path), the stale-token guard, insufficient_scope →
+  `AuthorizationRequired`, `settled()`, and `refresh_stored_tokens`
+  with the redirect-URI candidate chain.
+- **Auth provider trait** (`auth_provider.rs`): what the HTTP
+  transport consumes. `token()` boxes its future and can fail
+  (upstream's `token()` throwing fails the request);
+  `recovers()` stands in for upstream's optional `onUnauthorized`
+  method being present; `on_unauthorized` consumes the
+  `UnauthorizedContext` (response + server URL + the transport's fetch
+  + the rejected token). `McpFetch` = `Arc<reqwest::Client>` with the
+  15 s `OAUTH_REQUEST_TIMEOUT_MS` per request.
+- **authorizedFetch recovery** (`http.rs`): per attempt the token is
+  awaited (it may refresh), a 401 or 403-insufficient-scope response
+  is handed to a recovering provider ONCE and the request retried with
+  whatever credentials it left (upstream's single recovery shot;
+  provider errors replace the response). `needs_authorization` is
+  un-gated and live; a provider without recovery keeps the F1
+  behavior (the 401 surfaces via `checkResponse` as `AuthRequired`
+  with its body intact).
+- **Deviations** (all in module docs): no `AbortSignal`s — sign-in
+  cancellation rides a `tokio-util` `CancellationToken` and dropping a
+  future stands in for aborting a request (`cancellable` re-checks
+  the token on failure, so a completed success survives a racing
+  cancel like upstream's catch); the injectable fetches are
+  `McpFetch` (always carrying the 15 s timeout — upstream's
+  `timedFetch` composition collapses to clone-or-default); the
+  `OAuthClientProvider` interface is the concrete `McpOAuthProvider`
+  (no pi code passes custom providers); upstream's
+  `adaptOAuthProvider` (`flow.ts`) and the `addClientAuthentication`
+  hook are not ported — pi wires only `createMcpAuthProvider`, and no
+  pi provider sets the hook; the provider defaults treat an explicitly
+  empty `redirect_uris` list as absent (no pi caller passes one);
+  `with_refresh_lock` is the trait contract only — the cross-process
+  file lock lands with F2b's mcp-auth.json store. The callback server
+  closes every connection after its reply, so `close()` has nothing
+  to sweep (upstream `closeAllConnections`) and does not wait.
+- **Upstream consts**: `LATEST_PROTOCOL_VERSION` "2025-11-25" now
+  lives in `lib.rs` beside the pinned `PROTOCOL_VERSION`; discovery
+  and the flows carry it in `MCP-Protocol-Version` (not a deviation —
+  only the `initialize` handshake is pinned).
+- **New deps**: `getrandom 0.4` (PKCE/state randomness), `url 2`
+  (URL parsing), `tokio-util 0.7` default-features-off
+  (`CancellationToken`); base64/sha2 were already workspace deps.
+- **Tests**: 31 new in pi-mcp (lib total 56, 0 failed): the challenge
+  parser incl. the quoted-empty stop and the unquoted-empty continue,
+  discovery URLs, resource selection, the wire parsers (`expires_in`
+  as a string, `null` scope, extras round trips), provider defaults /
+  state / invalidation / expiry / `own()` isolation, loopback settings
+  + `callback_id` + the CIMD offer matrix, client-auth method
+  selection, the authorization URL (PKCE S256 verified against the
+  verifier, the consent prompt), the no-codes/no-S256/file-endpoint
+  failures, the callback server over real TCP (resolve, browser error,
+  404 paths, missing code, unknown state, duplicate wait, timeout,
+  close, rendered HTML), the pasted redirect URL checks, and an
+  end-to-end refresh against a synthetic authorization server
+  (protected-resource 404s → oauth-authorization-server document →
+  token endpoint; the rotated refresh token and the old refresh_token
+  in the request body asserted; a failed refresh falls through with
+  the old token; insufficient_scope → `AuthorizationRequired`;
+  `settled()` waits out a running refresh). The transport gained the
+  recovery tests: a challenged request recovers once and retries with
+  the replacement token; without recovery even an
+  `insufficient_scope` challenge stays a plain `AuthRequired` and
+  exactly one request goes out.
+- Gate green (r1: ~45 clippy lints across the new modules — let-chains
+  for the collapsed nested ifs, `map_or`/`map_or_else`, is_none_or/
+  is_some_and, redundant closures → method paths, `write!` vs
+  `push_str(format!)`, doc-markdown backticks, a let-else, the
+  too_many_lines allow on `run_flow` — fixed in two scripted passes;
+  r2 interrupted: the podman container died exit-137 mid-gate with
+  `OOMKilled=false` — host memory sat at ~2.4 GB available, so the
+  suspect is a host-level kill; restarted and re-ran at
+  `CARGO_BUILD_JOBS=4` per the OOM protocol). Test totals: 1981
+  workspace tests, 0 failed.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).

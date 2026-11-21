@@ -1,5 +1,7 @@
 //! MCP client error type.
 
+use crate::oauth::errors::OAuthError;
+
 /// Errors the client surfaces to the caller.
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
@@ -52,4 +54,60 @@ pub enum McpError {
     /// captured — restart or deploy; `McpSessionExpiredError`).
     #[error("MCP session expired")]
     SessionExpired { body: String },
+    /// An OAuth flow failure (`oauth::OAuthError`; the
+    /// [`OAuthError::AuthorizationRequired`] variant reaches the transport
+    /// through the auth provider's recovery hook).
+    #[error("{0}")]
+    OAuth(#[from] OAuthError),
+}
+
+/// `Clone` so concurrent requests joining one in-flight OAuth refresh all
+/// see the same failure (upstream: every waiter of the shared promise gets
+/// the same error object). `std::io::Error` is not `Clone`, so the two
+/// spawn/I/O variants rebuild one from the kind and the message.
+impl Clone for McpError {
+    fn clone(&self) -> Self {
+        let io_clone =
+            |error: &std::io::Error| std::io::Error::new(error.kind(), error.to_string());
+        match self {
+            McpError::Spawn { command, source } => McpError::Spawn {
+                command: command.clone(),
+                source: io_clone(source),
+            },
+            McpError::Io(source) => McpError::Io(io_clone(source)),
+            McpError::ConnectionClosed(message) => McpError::ConnectionClosed(message.clone()),
+            McpError::Rpc { code, message } => McpError::Rpc {
+                code: *code,
+                message: message.clone(),
+            },
+            McpError::Malformed(message) => McpError::Malformed(message.clone()),
+            McpError::Timeout {
+                method,
+                timeout_secs,
+            } => McpError::Timeout {
+                method: method.clone(),
+                timeout_secs: *timeout_secs,
+            },
+            McpError::Handshake(message) => McpError::Handshake(message.clone()),
+            McpError::Network(message) => McpError::Network(message.clone()),
+            McpError::Http {
+                status,
+                message,
+                body,
+            } => McpError::Http {
+                status: *status,
+                message: message.clone(),
+                body: body.clone(),
+            },
+            McpError::AuthRequired {
+                www_authenticate,
+                body,
+            } => McpError::AuthRequired {
+                www_authenticate: www_authenticate.clone(),
+                body: body.clone(),
+            },
+            McpError::SessionExpired { body } => McpError::SessionExpired { body: body.clone() },
+            McpError::OAuth(error) => McpError::OAuth(error.clone()),
+        }
+    }
 }

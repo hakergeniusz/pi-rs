@@ -1580,15 +1580,20 @@ dependencies = [
 name = "pi-mcp"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "futures",
+ "getrandom 0.4.3",
  "pi-ai",
  "pi-schema",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
+ "tokio-util",
+ "url",
 ]
 
 [[package]]

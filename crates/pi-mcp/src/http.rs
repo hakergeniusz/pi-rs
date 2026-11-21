@@ -28,6 +28,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::auth_provider::{AuthProvider, McpFetch, UnauthorizedContext};
 use crate::error::McpError;
 use crate::types::{
     InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, JsonRpcVersion,
@@ -273,9 +274,8 @@ fn describe_http_failure(status: u16, body: &str) -> String {
 
 /// 401, or 403 with an `insufficient_scope` bearer challenge (step-up
 /// authorization) (`needsAuthorization`, `streamable-http.ts:192-197`).
-/// The authorized-fetch retry consults this once the OAuth provider's
-/// recovery hook lands; until then only the tests exercise it.
-#[cfg(test)]
+/// The authorized-fetch retry consults this before handing the response to
+/// the auth provider's recovery hook.
 fn needs_authorization(status: u16, www_authenticate: Option<&str>) -> bool {
     if status == 401 {
         return true;
@@ -339,17 +339,12 @@ fn backoff_delay(initial_ms: u64, max_ms: u64, attempt: u32, server_delay_ms: Op
     initial_ms.saturating_mul(factor).min(max_ms)
 }
 
-/// Credential source for the HTTP transport (`AuthProvider`,
-/// `auth-provider.ts:6-24`). The OAuth provider lands with the OAuth port;
-/// its recovery hook (`onUnauthorized`) comes with it.
-pub trait AuthProvider: Send + Sync {
-    /// Bearer token for the next request, fetched fresh each time.
-    fn token(&self) -> Option<String> {
-        None
-    }
-}
-
-/// Construction options (`StreamableHttpTransportOptions`,
+/// Credential source for the HTTP transport: [`AuthProvider`]
+/// (`packages/mcp/src/auth-provider.ts:6-24`), re-exported through
+/// [`crate::auth_provider`]. The OAuth provider implements it via
+/// [`crate::oauth::auth_provider::McpAuthProvider`].
+//
+// Construction options (`StreamableHttpTransportOptions`,
 /// `streamable-http.ts:147-157`).
 #[derive(Clone)]
 pub struct StreamableHttpOptions {
@@ -421,36 +416,74 @@ impl Shared {
     /// Fetch with auth headers. A 401 (or a 403 asking for more scope) is
     /// handed to the auth provider once, and the request is retried with
     /// whatever credentials it left behind (`authorizedFetch`,
-    /// `streamable-http.ts:352-374`); the recovery hook arrives with the
-    /// OAuth provider, so without one the response returns as-is.
+    /// `streamable-http.ts:352-374`). A provider without a recovery hook
+    /// (`recovers()`) never sees the response; provider errors bubble in
+    /// place of it.
     async fn fetch_with_auth(
         &self,
         method: Method,
         extra: &[(&'static str, String)],
         body: Option<Vec<u8>>,
     ) -> Result<reqwest::Response, McpError> {
-        let (session_id, protocol_version) = {
-            let state = self.state.lock().expect("mcp http state mutex poisoned");
-            (state.session_id.clone(), state.protocol_version.clone())
-        };
-        let token = self.auth.as_ref().and_then(|provider| provider.token());
-        {
-            let mut state = self.state.lock().expect("mcp http state mutex poisoned");
-            state.last_token.clone_from(&token);
+        let mut attempt = 0;
+        loop {
+            let (session_id, protocol_version) = {
+                let state = self.state.lock().expect("mcp http state mutex poisoned");
+                (state.session_id.clone(), state.protocol_version.clone())
+            };
+            // `token()` may refresh over the network, so it is awaited per
+            // attempt (`headers`, `streamable-http.ts:377-383`).
+            let token = match self.auth.as_ref() {
+                Some(provider) => provider.token().await?,
+                None => None,
+            };
+            {
+                let mut state = self.state.lock().expect("mcp http state mutex poisoned");
+                state.last_token.clone_from(&token);
+            }
+            let mut request =
+                self.client
+                    .request(method.clone(), &self.url)
+                    .headers(self.build_headers(
+                        extra,
+                        session_id.as_deref(),
+                        protocol_version.as_deref(),
+                        token.as_deref(),
+                    ));
+            if let Some(body) = &body {
+                request = request.body(body.clone());
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|error| network_error(&error))?;
+            if attempt > 0 {
+                return Ok(response);
+            }
+            let Some(provider) = self.auth.as_ref().filter(|provider| provider.recovers()) else {
+                return Ok(response);
+            };
+            let challenged = needs_authorization(
+                response.status().as_u16(),
+                response
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|value| value.to_str().ok()),
+            );
+            if !challenged {
+                return Ok(response);
+            }
+            let context = UnauthorizedContext {
+                response,
+                server_url: self.url.clone(),
+                fetch: McpFetch::with_client(self.client.clone()),
+                token: token.clone(),
+            };
+            // One recovery shot: whatever it leaves behind (or throws)
+            // decides the retry (`authorizedFetch`, `streamable-http.ts:366-373`).
+            provider.on_unauthorized(context).await?;
+            attempt += 1;
         }
-        let mut request = self
-            .client
-            .request(method, &self.url)
-            .headers(self.build_headers(
-                extra,
-                session_id.as_deref(),
-                protocol_version.as_deref(),
-                token.as_deref(),
-            ));
-        if let Some(body) = body {
-            request = request.body(body);
-        }
-        request.send().await.map_err(|error| network_error(&error))
     }
 
     /// Request headers (`buildHeaders`, `streamable-http.ts:382-389`): the
@@ -1429,8 +1462,10 @@ async fn consume_stream_rest(
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
+    use std::future::Future;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
 
     use serde_json::json;
@@ -2237,9 +2272,19 @@ mod tests {
     #[tokio::test]
     async fn a_bearer_token_rides_the_authorization_header() {
         struct Fixed;
-        impl AuthProvider for Fixed {
-            fn token(&self) -> Option<String> {
-                Some("tok-1".to_string())
+        impl crate::auth_provider::AuthProvider for Fixed {
+            fn token(
+                &self,
+            ) -> Pin<Box<dyn Future<Output = Result<Option<String>, McpError>> + Send + '_>>
+            {
+                Box::pin(std::future::ready(Ok(Some("tok-1".to_string()))))
+            }
+
+            fn on_unauthorized(
+                &self,
+                _context: crate::auth_provider::UnauthorizedContext,
+            ) -> Pin<Box<dyn Future<Output = Result<(), McpError>> + Send + '_>> {
+                Box::pin(std::future::pending())
             }
         }
         let server = TestServer::spawn(Arc::new(|_request, stream| {
@@ -2279,5 +2324,162 @@ mod tests {
             "{:?}",
             recorded[0]
         );
+    }
+
+    /// A provider whose token flips after its first recovery, so the
+    /// retried request carries the replacement.
+    #[tokio::test]
+    async fn a_challenged_request_recovers_once_and_retries_with_the_new_token() {
+        struct Recovering(Arc<std::sync::atomic::AtomicUsize>);
+        impl crate::auth_provider::AuthProvider for Recovering {
+            fn token(
+                &self,
+            ) -> Pin<Box<dyn Future<Output = Result<Option<String>, McpError>> + Send + '_>>
+            {
+                let generation = self.0.load(std::sync::atomic::Ordering::SeqCst);
+                Box::pin(std::future::ready(Ok(Some(format!("tok-{generation}")))))
+            }
+
+            fn recovers(&self) -> bool {
+                true
+            }
+
+            fn on_unauthorized(
+                &self,
+                context: crate::auth_provider::UnauthorizedContext,
+            ) -> Pin<Box<dyn Future<Output = Result<(), McpError>> + Send + '_>> {
+                // Consume the response like the OAuth provider would and
+                // flip the token, so the retry carries the new one.
+                drop(context);
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+        let generation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = TestServer::spawn(Arc::new({
+            let generation = Arc::clone(&generation);
+            move |request, stream| {
+                if generation.load(std::sync::atomic::Ordering::SeqCst) == 0
+                    && request.body.contains(r#""method":"initialize""#)
+                {
+                    // The first initialize is challenged...
+                    return write_response(
+                        stream,
+                        "HTTP/1.1 401 Unauthorized",
+                        &[("www-authenticate", r#"Bearer realm="mcp""#)],
+                        b"nope",
+                    );
+                }
+                if request.body.contains(r#""method":"initialize""#) {
+                    // ...the retried one initializes.
+                    return write_response(
+                        stream,
+                        "HTTP/1.1 200 OK",
+                        &[("content-type", "application/json")],
+                        format!("{}\n", initialize_reply(1)).as_bytes(),
+                    );
+                }
+                write_response(
+                    stream,
+                    "HTTP/1.1 200 OK",
+                    &[("content-type", "application/json")],
+                    br#"{"jsonrpc":"2.0","id":9,"result":{}}"#.as_slice(),
+                );
+            }
+        }));
+        let transport = StreamableHttpTransport::new(StreamableHttpOptions {
+            url: server.url.clone(),
+            auth: Some(Arc::new(Recovering(Arc::clone(&generation)))),
+            ..options(&server.url)
+        })
+        .expect("transport");
+        transport.start().expect("start");
+        transport
+            .request(
+                "initialize",
+                Some(initialize_body()),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("recovered initialize");
+        // Two initialize requests went out, the second with the new token.
+        let recorded = server.recorded();
+        let initializes: Vec<_> = recorded
+            .iter()
+            .filter(|(_, headers)| {
+                headers
+                    .iter()
+                    .any(|header| header.to_lowercase().starts_with("authorization:"))
+            })
+            .collect();
+        assert_eq!(initializes.len(), 2, "{recorded:?}");
+        assert!(
+            initializes[0]
+                .1
+                .iter()
+                .any(|header| header.eq_ignore_ascii_case("authorization: Bearer tok-0")),
+            "{:?}",
+            initializes[0]
+        );
+        assert!(
+            initializes[1]
+                .1
+                .iter()
+                .any(|header| header.eq_ignore_ascii_case("authorization: Bearer tok-1")),
+            "{:?}",
+            initializes[1]
+        );
+        transport.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_recovery_leaves_the_challenge_to_the_caller() {
+        struct FixedNoRecovery;
+        impl crate::auth_provider::AuthProvider for FixedNoRecovery {
+            fn token(
+                &self,
+            ) -> Pin<Box<dyn Future<Output = Result<Option<String>, McpError>> + Send + '_>>
+            {
+                Box::pin(std::future::ready(Ok(Some("tok".to_string()))))
+            }
+
+            fn on_unauthorized(
+                &self,
+                _context: crate::auth_provider::UnauthorizedContext,
+            ) -> Pin<Box<dyn Future<Output = Result<(), McpError>> + Send + '_>> {
+                Box::pin(std::future::pending())
+            }
+        }
+        let server = TestServer::spawn(Arc::new(|_request, stream| {
+            write_response(
+                stream,
+                "HTTP/1.1 401 Unauthorized",
+                &[("www-authenticate", r#"Bearer error="insufficient_scope""#)],
+                b"nope",
+            );
+        }));
+        let transport = StreamableHttpTransport::new(StreamableHttpOptions {
+            url: server.url.clone(),
+            auth: Some(Arc::new(FixedNoRecovery)),
+            ..options(&server.url)
+        })
+        .expect("transport");
+        transport.start().expect("start");
+        // Even an insufficient_scope 403-class challenge stays a plain 401
+        // without a recovery hook, and exactly one request goes out.
+        let error = transport
+            .request(
+                "initialize",
+                Some(initialize_body()),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("challenged");
+        let McpError::AuthRequired { body, .. } = &error else {
+            panic!("{error}")
+        };
+        assert_eq!(body, "nope");
+        assert_eq!(server.recorded().len(), 1);
+        transport.shutdown().await.expect("shutdown");
     }
 }
