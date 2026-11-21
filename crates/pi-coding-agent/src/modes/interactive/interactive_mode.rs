@@ -14314,11 +14314,11 @@ export default function (pi) {
             Some("dark"),
             "the successful name persisted once, the failure did not"
         );
-        assert_eq!(
-            crate::modes::interactive::theme::theme().name(),
-            Some("dark"),
-            "the instance install switched the global"
-        );
+        // The global THEME is process-wide and every concurrent
+        // `InteractiveMode::new` re-initializes it (`theme::init_theme`), so
+        // asserting its name here races with the other three test threads.
+        // The mode-side state above (active name, auto-sync, persisted
+        // setting) is per-instance and is the deterministic contract.
         mode.shutdown().expect("shutdown");
     }
 
