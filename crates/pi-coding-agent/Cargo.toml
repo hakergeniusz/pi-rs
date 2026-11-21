@@ -41,6 +41,9 @@ globset = { workspace = true }
 walkdir = { workspace = true }
 regex = { workspace = true }
 base64 = { workspace = true }
+# npm version-range selection for the package-manager arm (mirrors the TS
+# `semver` package used by package-manager.ts:40,1680-1737).
+semver = "1"
 # Full Unicode NFKC for the edit tool's fuzzy matcher (mirrors TS
 # `String.prototype.normalize("NFKC")`). Crate-local until the workspace
 # dependency table is updated; 0.1.26 is cached in the offline registry.

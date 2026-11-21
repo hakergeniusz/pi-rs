@@ -4,13 +4,20 @@
 //! Ground truth: `packages/coding-agent/src/core/package-manager.ts` with the
 //! source parsing from `utils/git.ts` (`parseGitUrl`/`splitRef`/
 //! `parseGenericGitUrl`/`buildGitSource`) and `utils/paths.ts`
-//! (`isLocalPath`). This slice ports the git + local source arms and the
-//! settings persistence verbatim (install `:1106-1160`, git install
-//! `:2069-2126`, git update machinery `:2169-2231` + `:1774-1830`, remove
-//! `:1135-1159` + `:2233-2252`, settings `:902-945`, list `:1078-1103`,
-//! match keys `:1576-1648`); the npm arm (registry resolution, tarball
-//! installs, the managed-install machinery, `package-manager.ts:1357-1570`
-//! + `:2044-2068`) is deferred with an honest error — see HANDOFF.
+//! (`isLocalPath`). This slice ports the git, local **and npm** source arms
+//! plus the settings persistence verbatim: install/remove `:1106-1158`,
+//! git install `:2069-2126`, git update machinery `:2169-2231` +
+//! `:1774-1830`, remove git `:2233-2252`, settings `:902-945`, list
+//! `:1078-1103`, match keys `:1576-1648`; the npm arm covers registry
+//! version selection (`:70-76`, `:1680-1737`), managed installs
+//! (`:1357-1361`, `:2018-2067`, `:2262-2352`) and install layout.
+//!
+//! Upstream does **not** download npm tarballs itself: it delegates that to
+//! the configured package manager binary (`npm`/`pnpm`/`bun`) via
+//! [`Self::run_npm_command`]. The port mirrors that mechanism — no HTTP or tar
+//! dependency is introduced. Network-facing command execution goes through
+//! [`CommandRunner`], so tests can inject fake `npm view`/`npm install`
+//! responses without a registry or a package-manager binary.
 //!
 //! CLI texts live in [`crate::cli::package_command`].
 //!
@@ -20,11 +27,16 @@
 //!   progress events only fire on the npm/update paths).
 //! - `chalk` output is plain here — upstream's chalk degrades to plain on
 //!   non-TTY stdout, and CLI subcommands run before any TUI exists.
+//! - The `temporary` scope (upstream `getTemporaryDir`/`Scope = "temporary"`)
+//!   remains deferred: it only serves `resolveExtensionSources`, which is not
+//!   ported. The managed-install helpers expose a `temporary` flag in upstream;
+//!   here `Scope` has only `User`/`Project`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use semver::{Version, VersionReq};
 use serde_json::Value;
 
 use crate::config::PROJECT_CONFIG_DIR_NAME;
@@ -40,16 +52,31 @@ pub struct GitSource {
     pub pinned: bool,
 }
 
+/// `NpmSource` (`package-manager.ts:168-175`): the npm arm of [`ParsedSource`]
+/// as a standalone value, shared by the registry and install helpers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpmSource {
+    pub spec: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub range: Option<String>,
+    pub pinned: bool,
+}
+
+/// The result of `shouldUpdateNpmSource` (upstream `:1299-1316`): the version
+/// currently on disk and the one the registry reports, when either is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpmUpdateCheck {
+    pub should_update: bool,
+    pub installed_version: Option<String>,
+    pub target_version: Option<String>,
+}
+
 /// One parsed source (`parseSource`, `package-manager.ts:1650-1680`): an
-/// npm spec (parsed for the match keys; installation is deferred), a git
-/// remote, or a local filesystem path.
+/// npm spec, a git remote, or a local filesystem path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedSource {
-    Npm {
-        spec: String,
-        name: String,
-        version: Option<String>,
-    },
+    Npm(NpmSource),
     Git(GitSource),
     Local(String),
 }
@@ -378,22 +405,82 @@ fn parse_generic_git_url(url: &str) -> Option<GitSource> {
 /// One installed-source resolution failure.
 pub type PackageManagerResult<T> = Result<T, String>;
 
+/// The three process-spawning primitives the npm arm needs, injectable so
+/// tests can fake registry lookups (`npm view`) and installs without touching
+/// the network or requiring `npm`/`pnpm`/`bun` on `PATH` (upstream's
+/// `runCommand`/`runCommandCapture`/`runCommandSync`, `:2895-2966`).
+pub trait CommandRunner {
+    /// `runCommand` (`:2939-2951`): no captured output, check the exit code.
+    fn run(&self, command: &str, args: &[String], cwd: Option<&Path>) -> PackageManagerResult<()>;
+    /// `runCommandCapture` (`:2895-2937`): trimmed stdout on success.
+    fn run_capture(
+        &self,
+        command: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+    ) -> PackageManagerResult<String>;
+    /// `runCommandSync` (`:2953-2966`): trimmed stdout/stderr, upstream's
+    /// `Failed to run …` error text.
+    fn run_sync(&self, command: &str, args: &[String]) -> PackageManagerResult<String>;
+}
+
+/// The production [`CommandRunner`]: delegates to the free functions at the
+/// bottom of this module, which preserve upstream's verbatim failure texts.
+struct SystemCommandRunner;
+
+impl CommandRunner for SystemCommandRunner {
+    fn run(&self, command: &str, args: &[String], cwd: Option<&Path>) -> PackageManagerResult<()> {
+        run_command(command, args, cwd)
+    }
+
+    fn run_capture(
+        &self,
+        command: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+    ) -> PackageManagerResult<String> {
+        run_command_capture(command, args, cwd)
+    }
+
+    fn run_sync(&self, command: &str, args: &[String]) -> PackageManagerResult<String> {
+        run_command_sync(command, args)
+    }
+}
+
 /// The manager over one cwd/agent-dir pair (`DefaultPackageManager`,
-/// `package-manager.ts:158-166` + the git/local arms). Settings go through
-/// [`SettingsManager`]'s `packages` key.
+/// `package-manager.ts:158-166`). Settings go through [`SettingsManager`]'s
+/// `packages` key.
 pub struct PackageManager<'a> {
     cwd: PathBuf,
     agent_dir: PathBuf,
     settings: &'a mut SettingsManager,
+    runner: Box<dyn CommandRunner>,
+    /// `globalNpmRoot`/`globalNpmRootCommandKey` (`:2296-2310`). An
+    /// `Option<(command_key, root)>` behind a `RefCell` keeps the lookup on
+    /// `&self` (upstream's CLI accessor `getInstalledPath` is likewise &self).
+    global_npm_root: std::cell::RefCell<Option<(String, String)>>,
 }
 
 impl<'a> PackageManager<'a> {
     /// `DefaultPackageManager`'s constructor options (`:159-161`).
     pub fn new(cwd: &Path, agent_dir: &Path, settings: &'a mut SettingsManager) -> Self {
+        Self::with_runner(cwd, agent_dir, settings, Box::new(SystemCommandRunner))
+    }
+
+    /// The same manager with a custom [`CommandRunner`] — the seam that keeps
+    /// npm registry/install tests free of a real registry.
+    pub fn with_runner(
+        cwd: &Path,
+        agent_dir: &Path,
+        settings: &'a mut SettingsManager,
+        runner: Box<dyn CommandRunner>,
+    ) -> Self {
         PackageManager {
             cwd: cwd.to_path_buf(),
             agent_dir: agent_dir.to_path_buf(),
             settings,
+            runner,
+            global_npm_root: std::cell::RefCell::new(None),
         }
     }
 
@@ -403,11 +490,15 @@ impl<'a> PackageManager<'a> {
         if let Some(spec) = source.strip_prefix("npm:") {
             let spec = spec.trim().to_string();
             let (name, version) = parse_npm_spec(&spec);
-            return ParsedSource::Npm {
+            let range = version.as_deref().and_then(npm_version_range);
+            let pinned = version.as_deref().is_some_and(is_exact_npm_version);
+            return ParsedSource::Npm(NpmSource {
                 spec,
                 name,
                 version,
-            };
+                range,
+                pinned,
+            });
         }
         if is_local_path(source) {
             return ParsedSource::Local(source.to_string());
@@ -421,7 +512,7 @@ impl<'a> PackageManager<'a> {
     /// `getSourceMatchKeyForInput` (`:1580-1592`).
     fn source_match_key_for_input(&self, source: &str) -> String {
         match self.parse_source(source) {
-            ParsedSource::Npm { name, .. } => format!("npm:{name}"),
+            ParsedSource::Npm(npm) => format!("npm:{}", npm.name),
             ParsedSource::Git(git) => format!("git:{}/{}", git.host, git.path),
             ParsedSource::Local(path) => {
                 format!("local:{}", path_comparison_key(&self.resolve_path(&path)))
@@ -438,7 +529,7 @@ impl<'a> PackageManager<'a> {
         scope: Scope,
     ) -> PackageManagerResult<String> {
         match self.parse_source(source) {
-            ParsedSource::Npm { name, .. } => Ok(format!("npm:{name}")),
+            ParsedSource::Npm(npm) => Ok(format!("npm:{}", npm.name)),
             ParsedSource::Git(git) => Ok(format!("git:{}/{}", git.host, git.path)),
             ParsedSource::Local(path) => {
                 let base = self.base_dir_for_scope(scope)?;
@@ -525,15 +616,13 @@ impl<'a> PackageManager<'a> {
     }
 
     /// `install` (`:1106-1128`): parse, gate the scope, then the
-    /// per-source arm. The npm arm reports the honest deferral.
+    /// per-source arm.
     pub fn install(&mut self, source: &str, local: bool) -> PackageManagerResult<()> {
         let parsed = self.parse_source(source);
         let scope = if local { Scope::Project } else { Scope::User };
         self.assert_project_trusted_for_scope(scope)?;
         match parsed {
-            ParsedSource::Npm { .. } => Err(format!(
-                "Failed to install {source}: npm sources are not implemented in pi-rs yet"
-            )),
+            ParsedSource::Npm(npm) => self.install_npm(&npm, scope),
             ParsedSource::Git(git) => self.install_git(&git, scope),
             ParsedSource::Local(path) => {
                 let resolved = self.resolve_path(&path);
@@ -605,15 +694,13 @@ impl<'a> PackageManager<'a> {
     }
 
     /// `remove` (`:1135-1159`): parse, gate the scope, then the
-    /// per-source arm. The npm arm reports the honest deferral.
+    /// per-source arm.
     pub fn remove(&mut self, source: &str, local: bool) -> PackageManagerResult<()> {
         let parsed = self.parse_source(source);
         let scope = if local { Scope::Project } else { Scope::User };
         self.assert_project_trusted_for_scope(scope)?;
         match parsed {
-            ParsedSource::Npm { .. } => Err(format!(
-                "Failed to remove {source}: npm sources are not implemented in pi-rs yet"
-            )),
+            ParsedSource::Npm(npm) => self.uninstall_npm(&npm, scope),
             ParsedSource::Git(git) => self.remove_git(&git, scope),
             ParsedSource::Local(_) => Ok(()),
         }
@@ -756,19 +843,17 @@ impl<'a> PackageManager<'a> {
         Ok(configured)
     }
 
-    /// `getInstalledPath` (`:951-970`). The npm arm drops the legacy global
-    /// fallback (`getLegacyGlobalNpmInstallPath` shells out to a package
-    /// manager): the npm arm is deferred, so no legacy install could exist —
-    /// part of the documented npm deferral.
+    /// `getInstalledPath` (`:951-970`): the npm arm now consults
+    /// [`Self::get_npm_install_path`], which falls back to a legacy global
+    /// install for user-scope entries (upstream `:2337-2352`).
     fn get_installed_path(
         &self,
         source: &str,
         scope: Scope,
     ) -> PackageManagerResult<Option<PathBuf>> {
         match self.parse_source(source) {
-            ParsedSource::Npm { name, .. } => {
-                let root = self.base_dir_for_scope(scope)?.join("npm");
-                let path = resolve_managed_path(&root, &["node_modules", &name])?;
+            ParsedSource::Npm(npm) => {
+                let path = self.get_npm_install_path(&npm, scope)?;
                 Ok(path.exists().then_some(path))
             }
             ParsedSource::Git(git) => {
@@ -786,9 +871,9 @@ impl<'a> PackageManager<'a> {
     /// `buildNoMatchingPackageMessage` (`:1603-1609`) over the configured
     /// sources. The `pi remove` CLI prints the plain form directly (upstream
     /// `package-manager-cli.ts` too); the suggestion form serves `resolve()`'s
-    /// missing-source callback, which lands with the npm arm.
-    #[allow(dead_code)] // resolve() deferral; tests cover it
-    fn build_no_matching_package_message(&self, source: &str) -> PackageManagerResult<String> {
+    /// missing-source callback (upstream `:1180-1187`).
+    #[must_use]
+    pub fn build_no_matching_package_message(&self, source: &str) -> PackageManagerResult<String> {
         let configured: Vec<String> = self
             .list_configured_packages()?
             .into_iter()
@@ -804,8 +889,8 @@ impl<'a> PackageManager<'a> {
 
     /// `findSuggestedConfiguredSource` (`:1611-1634`): the first configured
     /// source whose npm name/spec or git shorthand the input names.
-    #[allow(dead_code)] // resolve() deferral; tests cover it
-    fn find_suggested_configured_source(
+    #[must_use]
+    pub fn find_suggested_configured_source(
         &self,
         source: &str,
         configured: &[String],
@@ -814,8 +899,10 @@ impl<'a> PackageManager<'a> {
         let mut suggestions: Vec<String> = Vec::new();
         for source_str in configured {
             match self.parse_source(source_str) {
-                ParsedSource::Npm { spec, name, .. } => {
-                    if (trimmed == name || trimmed == spec) && !suggestions.contains(source_str) {
+                ParsedSource::Npm(npm) => {
+                    if (trimmed == npm.name || trimmed == npm.spec)
+                        && !suggestions.contains(source_str)
+                    {
                         suggestions.push(source_str.clone());
                     }
                 }
@@ -915,6 +1002,375 @@ impl<'a> PackageManager<'a> {
         .into_iter()
         .map(str::to_string)
         .collect())
+    }
+
+    // ---- npm source arm (`:70-76`, `:1357-1361`, `:1680-1737`,
+    //      `:1989-2067`, `:2262-2352`) ------------------------------------
+
+    /// `isOfflineModeEnabled` (`:63-68`).
+    #[must_use]
+    pub fn is_offline_mode_enabled() -> bool {
+        std::env::var("PI_OFFLINE").is_ok_and(|value| {
+            !value.is_empty()
+                && (value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("yes"))
+        })
+    }
+
+    /// `runNpmCommand` (`:1989-1992`): prepend the configured npm command and
+    /// its args, then dispatch through the injectable runner.
+    fn run_npm_command(&self, args: &[String], cwd: Option<&Path>) -> PackageManagerResult<()> {
+        let (command, mut base) = self.npm_command()?;
+        base.extend_from_slice(args);
+        self.runner.run(&command, &base, cwd)
+    }
+
+    /// `runNpmCommandSync` (`:2013-2016`): the synchronous form used by the
+    /// legacy-global-install lookups.
+    fn run_npm_command_sync(&self, args: &[String]) -> PackageManagerResult<String> {
+        let (command, mut base) = self.npm_command()?;
+        base.extend_from_slice(args);
+        self.runner.run_sync(&command, &base)
+    }
+
+    /// `getNpmInstallRoot` (`:2285-2294`).
+    pub fn npm_install_root(&self, scope: Scope) -> PackageManagerResult<PathBuf> {
+        match scope {
+            Scope::Project => {
+                self.assert_project_trusted_for_scope(scope)?;
+                Ok(self.cwd.join(PROJECT_CONFIG_DIR_NAME).join("npm"))
+            }
+            Scope::User => Ok(self.agent_dir.join("npm")),
+        }
+    }
+
+    /// `getManagedNpmInstallPath` (`:2326-2335`): `<root>/node_modules/<name>`.
+    pub fn managed_npm_install_path(
+        &self,
+        npm: &NpmSource,
+        scope: Scope,
+    ) -> PackageManagerResult<PathBuf> {
+        let root = self.npm_install_root(scope)?;
+        resolve_managed_path(&root, &["node_modules", &npm.name])
+    }
+
+    /// `getGlobalNpmRoot` (`:2296-2310`), with the upstream command-key cache.
+    fn global_npm_root(&self) -> PackageManagerResult<PathBuf> {
+        let (command, args) = self.npm_command()?;
+        let mut key_parts = Vec::with_capacity(args.len() + 1);
+        key_parts.push(command.clone());
+        key_parts.extend_from_slice(&args);
+        let command_key = key_parts.join("\0");
+        if let Some(cached) = self.global_npm_root.borrow().as_ref()
+            && cached.0 == command_key
+        {
+            return Ok(PathBuf::from(&cached.1));
+        }
+
+        let root = if self.package_manager_name()? == "bun" {
+            // `pm bin -g` reports the global binary dir; upstream walks up
+            // to `<dir>/install/global/node_modules`.
+            let bin_dir = self.run_npm_command_sync(&[
+                "pm".to_string(),
+                "bin".to_string(),
+                "-g".to_string(),
+            ])?;
+            let bin_dir = bin_dir.trim();
+            Path::new(bin_dir)
+                .parent()
+                .unwrap_or(Path::new(""))
+                .join("install")
+                .join("global")
+                .join("node_modules")
+        } else {
+            PathBuf::from(
+                self.run_npm_command_sync(&["root".to_string(), "-g".to_string()])?
+                    .trim(),
+            )
+        };
+        *self.global_npm_root.borrow_mut() =
+            Some((command_key, root.to_string_lossy().to_string()));
+        Ok(root)
+    }
+
+    /// `getPnpmGlobalPackagePath` (`:2312-2324`).
+    fn pnpm_global_package_path(&self, name: &str) -> Option<PathBuf> {
+        if self.package_manager_name().ok()? != "pnpm" {
+            return None;
+        }
+        let output = self
+            .run_npm_command_sync(&[
+                "list".to_string(),
+                "-g".to_string(),
+                "--depth".to_string(),
+                "0".to_string(),
+                "--json".to_string(),
+            ])
+            .ok()?;
+        let parsed: Value = serde_json::from_str(&output).ok()?;
+        for entry in parsed.as_array()? {
+            if let Some(path) = entry
+                .get("dependencies")
+                .and_then(|deps| deps.get(name))
+                .and_then(|pkg| pkg.get("path"))
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+            {
+                return Some(PathBuf::from(path));
+            }
+        }
+        None
+    }
+
+    /// `getLegacyGlobalNpmInstallPath` (`:2337-2343`): any failure yields
+    /// `undefined` upstream (the `catch` around both lookups).
+    fn legacy_global_npm_install_path(&self, npm: &NpmSource) -> Option<PathBuf> {
+        self.pnpm_global_package_path(&npm.name)
+            .or_else(|| self.global_npm_root().ok().map(|root| root.join(&npm.name)))
+    }
+
+    /// `getNpmInstallPath` (`:2345-2352`): user scope falls back to a legacy
+    /// globally installed package when the managed path is absent.
+    pub fn get_npm_install_path(
+        &self,
+        npm: &NpmSource,
+        scope: Scope,
+    ) -> PackageManagerResult<PathBuf> {
+        let managed = self.managed_npm_install_path(npm, scope)?;
+        if scope != Scope::User || managed.exists() {
+            return Ok(managed);
+        }
+        let legacy = self
+            .legacy_global_npm_install_path(npm)
+            .filter(|path| path.exists());
+        Ok(legacy.unwrap_or(managed))
+    }
+
+    /// `ensureNpmProject` (`:2262-2273`): create the install root, mark it
+    /// ignored by cloud sync, write `.gitignore` and the private manifest.
+    fn ensure_npm_project(&self, root: &Path) -> PackageManagerResult<()> {
+        if !root.exists() {
+            std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+        }
+        mark_path_ignored_by_cloud_sync(root);
+        ensure_git_ignore(root);
+        let manifest_path = root.join("package.json");
+        if !manifest_path.exists() {
+            let manifest = serde_json::json!({
+                "name": "pi-extensions",
+                "private": true,
+            });
+            let content =
+                serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
+            std::fs::write(&manifest_path, content).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// `getNpmInstallArgs` (`:2018-2042`): the per-manager install flags,
+    /// with symlink realpath normalization for npm's `--prefix`.
+    pub fn npm_install_args(
+        &self,
+        specs: &[String],
+        root: &Path,
+    ) -> PackageManagerResult<Vec<String>> {
+        let install_root = if root.exists() {
+            std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+        } else {
+            root.to_path_buf()
+        };
+        let install_root = install_root.to_string_lossy().to_string();
+        let mut args = vec!["install".to_string()];
+        args.extend_from_slice(specs);
+        match self.package_manager_name()?.as_str() {
+            "bun" => args.extend(["--cwd".to_string(), install_root, "--omit=peer".to_string()]),
+            "pnpm" => args.extend([
+                "--prefix".to_string(),
+                install_root,
+                "--config.auto-install-peers=false".to_string(),
+                "--config.strict-peer-dependencies=false".to_string(),
+                "--config.strict-dep-builds=false".to_string(),
+            ]),
+            // npm (and any custom manager) — skip audit advice and avoid
+            // installing host-provided pi peers.
+            _ => args.extend([
+                "--prefix".to_string(),
+                install_root,
+                "--legacy-peer-deps".to_string(),
+                "--no-audit".to_string(),
+                "--no-fund".to_string(),
+            ]),
+        }
+        Ok(args)
+    }
+
+    /// `installNpm` (`:2044-2048`) and `installNpmBatch` (`:1357-1361`): the
+    /// same managed-install machinery for one spec or a batch of specs.
+    pub fn install_npm_specs(&self, specs: &[String], scope: Scope) -> PackageManagerResult<()> {
+        let root = self.npm_install_root(scope)?;
+        self.ensure_npm_project(&root)?;
+        let args = self.npm_install_args(specs, &root)?;
+        self.run_npm_command(&args, None)
+    }
+
+    fn install_npm(&self, npm: &NpmSource, scope: Scope) -> PackageManagerResult<()> {
+        self.install_npm_specs(&[npm.spec.clone()], scope)
+    }
+
+    /// `uninstallNpm` (`:2050-2067`).
+    fn uninstall_npm(&self, npm: &NpmSource, scope: Scope) -> PackageManagerResult<()> {
+        let root = self.npm_install_root(scope)?;
+        if !root.exists() {
+            return Ok(());
+        }
+        // npm writes broken nested package-lock.json paths through symlinks.
+        let install_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let install_root = install_root.to_string_lossy().to_string();
+        let manager = self.package_manager_name()?;
+        let mut args = vec!["uninstall".to_string(), npm.name.clone()];
+        if manager == "bun" {
+            args.extend(["--cwd".to_string(), install_root]);
+        } else {
+            args.extend(["--prefix".to_string(), install_root]);
+            if manager != "pnpm" {
+                args.extend([
+                    "--legacy-peer-deps".to_string(),
+                    "--no-audit".to_string(),
+                    "--no-fund".to_string(),
+                ]);
+            }
+        }
+        self.run_npm_command(&args, None)
+    }
+
+    /// `getInstalledNpmVersion` (`:1706-1716`): the installed package's
+    /// `package.json` version, or `undefined` on any read/parse failure.
+    #[must_use]
+    pub fn installed_npm_version(installed_path: &Path) -> Option<String> {
+        let manifest_path = installed_path.join("package.json");
+        if !manifest_path.exists() {
+            return None;
+        }
+        let content = std::fs::read_to_string(&manifest_path).ok()?;
+        let manifest: Value = serde_json::from_str(strip_bom(&content)).ok()?;
+        manifest.get("version")?.as_str().map(str::to_string)
+    }
+
+    /// `installedNpmMatchesConfiguredVersion` (`:1680-1686`): an unpinned
+    /// source accepts any installed version; a range must be satisfied.
+    #[must_use]
+    pub fn installed_npm_matches_configured_version(
+        npm: &NpmSource,
+        installed_path: &Path,
+    ) -> bool {
+        let Some(installed) = Self::installed_npm_version(installed_path) else {
+            return false;
+        };
+        npm.range
+            .as_deref()
+            .is_none_or(|range| npm_satisfies(&installed, range))
+    }
+
+    /// `getLatestNpmVersion` (`:1718-1737`): `npm view <spec> version --json`,
+    /// selecting via `maxSatisfying(range)` or semver-descending sort.
+    pub fn get_latest_npm_version(
+        &self,
+        package_spec: &str,
+        range: Option<&str>,
+    ) -> PackageManagerResult<String> {
+        let (command, mut args) = self.npm_command()?;
+        args.extend([
+            "view".to_string(),
+            package_spec.to_string(),
+            "version".to_string(),
+            "--json".to_string(),
+        ]);
+        let stdout = self.runner.run_capture(&command, &args, Some(&self.cwd))?;
+        let raw = stdout.trim();
+        if raw.is_empty() {
+            return Err("Empty response from npm view".to_string());
+        }
+        let parsed: Value = serde_json::from_str(raw).map_err(|error| error.to_string())?;
+        match parsed {
+            Value::String(version) => Ok(version),
+            Value::Array(entries) => {
+                let versions: Vec<String> = entries
+                    .into_iter()
+                    .filter_map(|entry| {
+                        entry
+                            .as_str()
+                            .filter(|version| !version.is_empty())
+                            .map(str::to_string)
+                    })
+                    .collect();
+                let latest = match range {
+                    Some(range) => npm_max_satisfying(&versions, range),
+                    None => npm_max_version(&versions),
+                };
+                match latest {
+                    Some(version) => Ok(version),
+                    None => Err("Unexpected response from npm view".to_string()),
+                }
+            }
+            _ => Err("Unexpected response from npm view".to_string()),
+        }
+    }
+
+    /// `npmHasAvailableUpdate` (`:1688-1704`).
+    #[must_use]
+    pub fn npm_has_available_update(&self, npm: &NpmSource, installed_path: &Path) -> bool {
+        if Self::is_offline_mode_enabled() {
+            return false;
+        }
+        let Some(installed) = Self::installed_npm_version(installed_path) else {
+            return false;
+        };
+        let spec = if npm.version.is_some() {
+            npm.spec.as_str()
+        } else {
+            npm.name.as_str()
+        };
+        match self.get_latest_npm_version(spec, npm.range.as_deref()) {
+            Ok(target) => npm_version_gt(&target, &installed),
+            Err(_) => false,
+        }
+    }
+
+    /// `shouldUpdateNpmSource` (`:1299-1316`): pinned sources are never
+    /// candidates (the caller filters them, mirroring `:1204-1207`).
+    pub fn should_update_npm_source(
+        &self,
+        npm: &NpmSource,
+        scope: Scope,
+    ) -> PackageManagerResult<NpmUpdateCheck> {
+        let installed_path = self.managed_npm_install_path(npm, scope)?;
+        let installed_version = Self::installed_npm_version(&installed_path);
+        let Some(installed) = installed_version.as_deref() else {
+            return Ok(NpmUpdateCheck {
+                should_update: true,
+                installed_version: None,
+                target_version: None,
+            });
+        };
+        let spec = if npm.version.is_some() {
+            npm.spec.as_str()
+        } else {
+            npm.name.as_str()
+        };
+        match self.get_latest_npm_version(spec, npm.range.as_deref()) {
+            Ok(target) => Ok(NpmUpdateCheck {
+                should_update: npm_version_gt(&target, installed),
+                installed_version,
+                target_version: Some(target),
+            }),
+            // Preserve existing update behavior when the lookup fails.
+            Err(_) => Ok(NpmUpdateCheck {
+                should_update: true,
+                installed_version,
+                target_version: None,
+            }),
+        }
     }
 
     /// `ensureGitRef` (`:2169-2203`): fetch only the ref we will reset to;
@@ -1176,6 +1632,145 @@ fn strip_bom(value: &str) -> &str {
     value.strip_prefix('\u{feff}').unwrap_or(value)
 }
 
+/// `markPathIgnoredByCloudSync` (`utils/paths.ts:169-184`): on Linux upstream
+/// sets a Dropbox xattr best-effort; failures are ignored. The port keeps the
+/// same call (other platforms are no-ops) without pulling in a dependency.
+fn mark_path_ignored_by_cloud_sync(path: &Path) {
+    let _ = Command::new("setfattr")
+        .args(["-n", "user.com.dropbox.ignored", "-v", "1"])
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// `runCommandSync` (`:2953-2966`): spawn, wait, and return trimmed output;
+/// upstream's `Failed to run {command} {args}: {detail}` failure text.
+fn run_command_sync(command: &str, args: &[String]) -> PackageManagerResult<String> {
+    let joined = args.join(" ");
+    let output = Command::new(command)
+        .args(args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        let detail = if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        return Err(format!(
+            "Failed to run {command} {joined}: {}",
+            String::from_utf8_lossy(detail)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(if stdout.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        stdout.trim().to_string()
+    })
+}
+
+/// `isExactNpmVersion` (`:70-72`): npm's `valid()` accepts only full semver.
+fn is_exact_npm_version(version: &str) -> bool {
+    Version::parse(version).is_ok()
+}
+
+/// `getNpmVersionRange` (`:74-76`): npm's `validRange(version) ?? undefined`.
+/// Bare versions and common ranges are kept verbatim; the Rust `semver`
+/// parser validates them at comparison time (see [`npm_satisfies`]).
+fn npm_version_range(version: &str) -> Option<String> {
+    if version.is_empty() {
+        return None;
+    }
+    if Version::parse(version).is_ok() {
+        return Some(version.to_string());
+    }
+    let normalized = normalize_npm_range(version);
+    VersionReq::parse(&normalized).ok()?;
+    Some(version.to_string())
+}
+
+/// Bridge the handful of npm range spellings Rust's `semver` does not accept
+/// verbatim: `x`/`X` wildcards and hyphen ranges. `||` is handled by the
+/// caller (one `VersionReq` cannot express an OR).
+fn normalize_npm_range(range: &str) -> String {
+    let trimmed = range.trim();
+    if let Some((left, right)) = trimmed.split_once(" - ") {
+        return format!(">={}, <={}", left.trim(), right.trim());
+    }
+    if trimmed == "x" || trimmed == "X" || trimmed.is_empty() {
+        return "*".to_string();
+    }
+    let replaced = trimmed.replace(".x", ".*").replace(".X", ".*");
+    // `>=1.2.0 <2.0.0` and `>= 1.2.0 < 2.0.0` are both valid npm ranges;
+    // Rust's `VersionReq` wants commas between comparators.
+    let tokens: Vec<&str> = replaced.split_whitespace().collect();
+    let mut merged: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index];
+        if ["<", ">", "<=", ">=", "=", "~", "^"].contains(&token) && index + 1 < tokens.len() {
+            merged.push(format!("{token}{}", tokens[index + 1]));
+            index += 2;
+        } else {
+            merged.push(token.to_string());
+            index += 1;
+        }
+    }
+    merged.join(", ")
+}
+
+/// npm's `satisfies`: exact versions are exact, ranges may use `||`.
+fn npm_satisfies(version: &str, range: &str) -> bool {
+    let Ok(installed) = Version::parse(version) else {
+        return false;
+    };
+    if let Ok(exact) = Version::parse(range.trim()) {
+        return installed == exact;
+    }
+    range.split("||").any(|part| {
+        let normalized = normalize_npm_range(part);
+        VersionReq::parse(&normalized).is_ok_and(|req| req.matches(&installed))
+    })
+}
+
+/// npm's `gt` (`:1311`, `:1700`): invalid versions compare as `false`.
+fn npm_version_gt(left: &str, right: &str) -> bool {
+    match (Version::parse(left), Version::parse(right)) {
+        (Ok(left), Ok(right)) => left > right,
+        _ => false,
+    }
+}
+
+/// npm's `[...versions].sort(rcompare)[0]`: semver descending.
+fn npm_max_version(versions: &[String]) -> Option<String> {
+    versions
+        .iter()
+        .filter_map(|value| {
+            Version::parse(value)
+                .ok()
+                .map(|parsed| (parsed, value.clone()))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, value)| value)
+}
+
+/// npm's `maxSatisfying(versions, range)`.
+fn npm_max_satisfying(versions: &[String], range: &str) -> Option<String> {
+    versions
+        .iter()
+        .filter(|version| npm_satisfies(version, range))
+        .filter_map(|value| {
+            Version::parse(value)
+                .ok()
+                .map(|parsed| (parsed, value.clone()))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, value)| value)
+}
+
 /// `getPackageSourceString` (`:1576-1578`): a string entry verbatim, an
 /// object entry's `source` field.
 fn package_source_string(package: &Value) -> String {
@@ -1382,6 +1977,132 @@ mod tests {
     use super::*;
     use crate::config::settings::{Settings, SettingsManagerCreateOptions};
     use serde_json::json;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    /// A scripted [`CommandRunner`]: records every invocation, serves canned
+    /// `npm view`/sync responses, and simulates an install by writing the
+    /// package's `package.json` under the install root. No network, no npm.
+    ///
+    /// The state lives behind `Rc<RefCell<_>>` so the test keeps a handle
+    /// after the runner is moved into the [`PackageManager`].
+    #[derive(Clone)]
+    struct FakeState {
+        calls: Rc<RefCell<Vec<Vec<String>>>>,
+        view_response: Rc<RefCell<String>>,
+        sync_responses: Rc<RefCell<VecDeque<String>>>,
+        installed_version: Rc<RefCell<String>>,
+    }
+
+    struct FakeRunner {
+        state: FakeState,
+    }
+
+    impl FakeRunner {
+        fn new(view_response: &str) -> (Self, FakeState) {
+            let state = FakeState {
+                calls: Rc::new(RefCell::new(Vec::new())),
+                view_response: Rc::new(RefCell::new(view_response.to_string())),
+                sync_responses: Rc::new(RefCell::new(VecDeque::new())),
+                installed_version: Rc::new(RefCell::new("1.2.3".to_string())),
+            };
+            (
+                Self {
+                    state: state.clone(),
+                },
+                state,
+            )
+        }
+
+        fn with_sync(mut self, responses: &[&str]) -> Self {
+            *self.state.sync_responses.borrow_mut() = responses
+                .iter()
+                .map(|response| (*response).to_string())
+                .collect();
+            self
+        }
+
+        fn with_version(mut self, version: &str) -> Self {
+            *self.state.installed_version.borrow_mut() = version.to_string();
+            self
+        }
+
+        fn record(&self, command: &str, args: &[String]) {
+            let mut call = Vec::with_capacity(args.len() + 1);
+            call.push(command.to_string());
+            call.extend_from_slice(args);
+            self.state.calls.borrow_mut().push(call);
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(
+            &self,
+            command: &str,
+            args: &[String],
+            _cwd: Option<&Path>,
+        ) -> PackageManagerResult<()> {
+            self.record(command, args);
+            match args.first().map(String::as_str) {
+                Some("install") => {
+                    let root = args
+                        .iter()
+                        .position(|arg| arg == "--prefix" || arg == "--cwd")
+                        .and_then(|index| args.get(index + 1))
+                        .map(PathBuf::from);
+                    let spec = args.get(1).map(String::as_str).unwrap_or_default();
+                    let name = parse_npm_spec(spec).0;
+                    if let Some(root) = root {
+                        let package_dir = root.join("node_modules").join(name);
+                        let _ = std::fs::create_dir_all(&package_dir);
+                        let manifest = format!(
+                            "{{\"name\":\"{spec}\",\"version\":\"{}\"}}",
+                            self.state.installed_version.borrow()
+                        );
+                        let _ = std::fs::write(package_dir.join("package.json"), manifest);
+                    }
+                }
+                Some("uninstall") => {
+                    let root = args
+                        .iter()
+                        .position(|arg| arg == "--prefix" || arg == "--cwd")
+                        .and_then(|index| args.get(index + 1))
+                        .map(PathBuf::from);
+                    let spec = args.get(1).map(String::as_str).unwrap_or_default();
+                    let name = parse_npm_spec(spec).0;
+                    if let Some(root) = root {
+                        let _ = std::fs::remove_dir_all(root.join("node_modules").join(name));
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn run_capture(
+            &self,
+            command: &str,
+            args: &[String],
+            _cwd: Option<&Path>,
+        ) -> PackageManagerResult<String> {
+            self.record(command, args);
+            if args.iter().any(|arg| arg == "view") {
+                return Ok(self.state.view_response.borrow().clone());
+            }
+            Ok(String::new())
+        }
+
+        fn run_sync(&self, command: &str, args: &[String]) -> PackageManagerResult<String> {
+            self.record(command, args);
+            Ok(self
+                .state
+                .sync_responses
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_default())
+        }
+    }
 
     fn git_source(repo: &str, host: &str, path: &str, ref_: Option<&str>) -> GitSource {
         GitSource {
@@ -1731,7 +2452,7 @@ mod tests {
     }
 
     #[test]
-    fn npm_sources_report_the_honest_deferral() {
+    fn parse_source_npm_sets_range_and_pinned() {
         let cwd = tempfile::tempdir().expect("cwd");
         let agent_dir = tempfile::tempdir().expect("agent dir");
         let mut settings_manager = SettingsManager::in_memory(
@@ -1740,16 +2461,472 @@ mod tests {
                 project_trusted: Some(false),
             },
         );
-        let mut manager = PackageManager::new(cwd.path(), agent_dir.path(), &mut settings_manager);
+        let manager = PackageManager::new(cwd.path(), agent_dir.path(), &mut settings_manager);
         assert_eq!(
-            manager
-                .install("npm:@foo/bar", false)
-                .expect_err("deferred"),
-            "Failed to install npm:@foo/bar: npm sources are not implemented in pi-rs yet"
+            manager.parse_source("npm:@scope/pkg@1.2.3"),
+            ParsedSource::Npm(NpmSource {
+                spec: "@scope/pkg@1.2.3".to_string(),
+                name: "@scope/pkg".to_string(),
+                version: Some("1.2.3".to_string()),
+                range: Some("1.2.3".to_string()),
+                pinned: true,
+            })
         );
         assert_eq!(
-            manager.remove("npm:@foo/bar", false).expect_err("deferred"),
-            "Failed to remove npm:@foo/bar: npm sources are not implemented in pi-rs yet"
+            manager.parse_source("npm:foo@^1.2.0"),
+            ParsedSource::Npm(NpmSource {
+                spec: "foo@^1.2.0".to_string(),
+                name: "foo".to_string(),
+                version: Some("^1.2.0".to_string()),
+                range: Some("^1.2.0".to_string()),
+                pinned: false,
+            })
+        );
+        assert_eq!(
+            manager.parse_source("npm:foo"),
+            ParsedSource::Npm(NpmSource {
+                spec: "foo".to_string(),
+                name: "foo".to_string(),
+                version: None,
+                range: None,
+                pinned: false,
+            })
+        );
+    }
+
+    #[test]
+    fn npm_install_writes_managed_layout_and_invokes_npm() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let mut settings_manager = SettingsManager::in_memory(
+            &Settings::new(),
+            SettingsManagerCreateOptions {
+                project_trusted: Some(false),
+            },
+        );
+        let (runner, state) = FakeRunner::new("");
+        let mut manager = PackageManager::with_runner(
+            cwd.path(),
+            agent_dir.path(),
+            &mut settings_manager,
+            Box::new(runner),
+        );
+        manager
+            .install_and_persist("npm:@scope/foo@^1.2.0", false)
+            .expect("install");
+
+        let root = agent_dir.path().join("npm");
+        // `ensureNpmProject`: upstream's two-space manifest and .gitignore.
+        assert_eq!(
+            std::fs::read_to_string(root.join("package.json")).expect("manifest"),
+            "{\n  \"name\": \"pi-extensions\",\n  \"private\": true\n}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitignore")).expect("ignore"),
+            "*\n!.gitignore\n"
+        );
+        // `getNpmInstallArgs`: npm's exact flag order (`:2041`).
+        let calls = state.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            vec![
+                "npm".to_string(),
+                "install".to_string(),
+                "@scope/foo@^1.2.0".to_string(),
+                "--prefix".to_string(),
+                root.to_string_lossy().to_string(),
+                "--legacy-peer-deps".to_string(),
+                "--no-audit".to_string(),
+                "--no-fund".to_string(),
+            ]
+        );
+        drop(calls);
+
+        // Settings persisted verbatim and `list` reports the installed path.
+        let configured = manager.list_configured_packages().expect("list");
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].source, "npm:@scope/foo@^1.2.0");
+        assert_eq!(configured[0].scope, Scope::User);
+        assert_eq!(
+            configured[0].installed_path.as_ref().expect("path"),
+            &root.join("node_modules/@scope/foo")
+        );
+    }
+
+    #[test]
+    fn npm_uninstall_removes_the_managed_package_and_settings() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let mut settings_manager = SettingsManager::in_memory(
+            &Settings::new(),
+            SettingsManagerCreateOptions {
+                project_trusted: Some(false),
+            },
+        );
+        let (runner, state) = FakeRunner::new("");
+        let mut manager = PackageManager::with_runner(
+            cwd.path(),
+            agent_dir.path(),
+            &mut settings_manager,
+            Box::new(runner),
+        );
+        manager
+            .install_and_persist("npm:foo@1.2.3", false)
+            .expect("install");
+        assert!(
+            manager
+                .remove_and_persist("npm:foo@1.2.3", false)
+                .expect("remove")
+        );
+        let calls = state.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1][..3],
+            [
+                "npm".to_string(),
+                "uninstall".to_string(),
+                "foo".to_string()
+            ]
+        );
+        assert!(calls[1].iter().any(|arg| arg == "--legacy-peer-deps"));
+        drop(calls);
+        assert_eq!(manager.list_configured_packages().expect("list").len(), 0);
+    }
+
+    #[test]
+    fn npm_install_respects_the_configured_package_manager() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        for (settings, expected) in [
+            (json!({"npmCommand": ["bun"]}), vec!["--cwd", "--omit=peer"]),
+            (
+                json!({"npmCommand": ["pnpm"]}),
+                vec!["--prefix", "--config.auto-install-peers=false"],
+            ),
+        ] {
+            let object = settings.as_object().cloned().expect("object");
+            let mut settings_manager = SettingsManager::in_memory(
+                &object,
+                SettingsManagerCreateOptions {
+                    project_trusted: Some(false),
+                },
+            );
+            let (runner, state) = FakeRunner::new("");
+            let mut manager = PackageManager::with_runner(
+                cwd.path(),
+                agent_dir.path(),
+                &mut settings_manager,
+                Box::new(runner),
+            );
+            manager.install("npm:foo", false).expect("install");
+            let calls = state.calls.borrow();
+            let call = &calls[0];
+            for flag in expected {
+                assert!(call.iter().any(|arg| arg == flag), "{call:?} lacks {flag}");
+            }
+        }
+
+        // Ambiguity surfaces upstream's verbatim error through the install arm.
+        let settings = json!({"npmCommand": ["wrapper", "npm", "pnpm"]});
+        let object = settings.as_object().cloned().expect("object");
+        let mut settings_manager = SettingsManager::in_memory(
+            &object,
+            SettingsManagerCreateOptions {
+                project_trusted: Some(false),
+            },
+        );
+        let (runner, _state) = FakeRunner::new("");
+        let mut manager = PackageManager::with_runner(
+            cwd.path(),
+            agent_dir.path(),
+            &mut settings_manager,
+            Box::new(runner),
+        );
+        assert_eq!(
+            manager.install("npm:foo", false).expect_err("ambiguous"),
+            "Ambiguous npmCommand package managers: npm, pnpm"
+        );
+    }
+
+    #[test]
+    fn npm_project_scope_still_requires_trust() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let mut settings_manager = SettingsManager::in_memory(
+            &Settings::new(),
+            SettingsManagerCreateOptions {
+                project_trusted: Some(false),
+            },
+        );
+        let (runner, state) = FakeRunner::new("");
+        let mut manager = PackageManager::with_runner(
+            cwd.path(),
+            agent_dir.path(),
+            &mut settings_manager,
+            Box::new(runner),
+        );
+        assert_eq!(
+            manager.install("npm:foo", true).expect_err("not trusted"),
+            "Project is not trusted; refusing to access project package storage"
+        );
+        assert_eq!(state.calls.borrow().len(), 0);
+    }
+
+    #[test]
+    fn npm_get_installed_path_falls_back_to_legacy_global_root() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let global_root = agent_dir.path().join("global-node-modules");
+        let legacy = global_root.join("foo");
+        std::fs::create_dir_all(&legacy).expect("legacy");
+        std::fs::write(legacy.join("package.json"), "{\"version\":\"0.9.0\"}").expect("write");
+        let global_root = global_root.to_string_lossy().to_string();
+        let (runner_base, state) = FakeRunner::new("");
+        let runner = runner_base.with_sync(&[global_root.as_str()]);
+        let mut settings_manager = SettingsManager::in_memory(
+            &Settings::new(),
+            SettingsManagerCreateOptions {
+                project_trusted: Some(false),
+            },
+        );
+        let manager = PackageManager::with_runner(
+            cwd.path(),
+            agent_dir.path(),
+            &mut settings_manager,
+            Box::new(runner),
+        );
+        assert_eq!(
+            manager
+                .get_installed_path("npm:foo", Scope::User)
+                .expect("path"),
+            Some(legacy.clone())
+        );
+        assert_eq!(
+            state.calls.borrow().last().expect("call"),
+            &vec!["npm".to_string(), "root".to_string(), "-g".to_string()]
+        );
+        // Project scope never consults the global fallback.
+        let mut trusted = SettingsManager::in_memory(
+            &Settings::new(),
+            SettingsManagerCreateOptions {
+                project_trusted: Some(true),
+            },
+        );
+        let manager = PackageManager::new(cwd.path(), agent_dir.path(), &mut trusted);
+        assert_eq!(
+            manager
+                .get_installed_path("npm:foo", Scope::Project)
+                .expect("path"),
+            None
+        );
+    }
+
+    #[test]
+    fn npm_get_installed_path_uses_pnpm_global_listing() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let global = agent_dir.path().join("pnpm-global").join("foo");
+        std::fs::create_dir_all(&global).expect("global");
+        let listing = json!([{
+            "dependencies": {"foo": {"path": global.to_string_lossy()}}
+        }])
+        .to_string();
+        let (runner_base, state) = FakeRunner::new("");
+        let runner = runner_base.with_sync(&[listing.as_str()]);
+        let settings = json!({"npmCommand": ["pnpm"]});
+        let object = settings.as_object().cloned().expect("object");
+        let mut settings_manager = SettingsManager::in_memory(
+            &object,
+            SettingsManagerCreateOptions {
+                project_trusted: Some(false),
+            },
+        );
+        let manager = PackageManager::with_runner(
+            cwd.path(),
+            agent_dir.path(),
+            &mut settings_manager,
+            Box::new(runner),
+        );
+        assert_eq!(
+            manager
+                .get_installed_path("npm:foo", Scope::User)
+                .expect("path"),
+            Some(global)
+        );
+        assert_eq!(
+            state.calls.borrow().last().expect("call")[..5],
+            [
+                "pnpm".to_string(),
+                "list".to_string(),
+                "-g".to_string(),
+                "--depth".to_string(),
+                "0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn npm_registry_view_selects_versions() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+
+        let (runner, state) = FakeRunner::new("\"1.2.3\"");
+        let mut settings_manager = SettingsManager::in_memory(
+            &Settings::new(),
+            SettingsManagerCreateOptions {
+                project_trusted: Some(false),
+            },
+        );
+        let manager = PackageManager::with_runner(
+            cwd.path(),
+            agent_dir.path(),
+            &mut settings_manager,
+            Box::new(runner),
+        );
+        assert_eq!(
+            manager
+                .get_latest_npm_version("foo", None)
+                .expect("string response"),
+            "1.2.3"
+        );
+        assert_eq!(
+            state.calls.borrow().last().expect("call"),
+            &vec![
+                "npm".to_string(),
+                "view".to_string(),
+                "foo".to_string(),
+                "version".to_string(),
+                "--json".to_string(),
+            ]
+        );
+
+        let (runner, _state) = FakeRunner::new("[\"1.2.3\",\"1.3.0\",\"1.10.0\",\"2.0.0\"]");
+        let mut settings_manager = SettingsManager::in_memory(
+            &Settings::new(),
+            SettingsManagerCreateOptions {
+                project_trusted: Some(false),
+            },
+        );
+        let manager = PackageManager::with_runner(
+            cwd.path(),
+            agent_dir.path(),
+            &mut settings_manager,
+            Box::new(runner),
+        );
+        assert_eq!(
+            manager
+                .get_latest_npm_version("foo@^1.2.0", Some("^1.2.0"))
+                .expect("max satisfying"),
+            "1.10.0"
+        );
+        assert_eq!(
+            manager
+                .get_latest_npm_version("foo", None)
+                .expect("semver descending"),
+            "2.0.0"
+        );
+    }
+
+    #[test]
+    fn npm_view_error_strings_are_verbatim() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        for (response, expected) in [
+            ("", "Empty response from npm view"),
+            ("{}", "Unexpected response from npm view"),
+            ("[]", "Unexpected response from npm view"),
+        ] {
+            let (runner, _state) = FakeRunner::new(response);
+            let mut settings_manager = SettingsManager::in_memory(
+                &Settings::new(),
+                SettingsManagerCreateOptions {
+                    project_trusted: Some(false),
+                },
+            );
+            let manager = PackageManager::with_runner(
+                cwd.path(),
+                agent_dir.path(),
+                &mut settings_manager,
+                Box::new(runner),
+            );
+            assert_eq!(
+                manager
+                    .get_latest_npm_version("foo", None)
+                    .expect_err("error"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn npm_version_helpers_and_update_check() {
+        assert!(is_exact_npm_version("1.2.3"));
+        assert!(!is_exact_npm_version("^1.2.3"));
+        assert_eq!(npm_version_range("^1.2.3"), Some("^1.2.3".to_string()));
+        assert_eq!(npm_version_range("latest"), None);
+        assert!(npm_version_gt("1.10.0", "1.2.3"));
+        assert!(!npm_version_gt("1.2.3", "1.2.3"));
+        assert!(npm_satisfies("1.3.0", "^1.2.0"));
+        assert!(!npm_satisfies("2.0.0", "^1.2.0"));
+        assert!(npm_satisfies("1.3.0", "1.x"));
+        assert!(npm_satisfies("1.3.0", ">=1.2.0 <2.0.0"));
+        assert!(npm_satisfies("1.3.0", "^1.0.0 || ^2.0.0"));
+        assert_eq!(
+            npm_max_satisfying(
+                &[
+                    "1.2.3".to_string(),
+                    "1.3.0".to_string(),
+                    "2.0.0".to_string()
+                ],
+                "1.x"
+            ),
+            Some("1.3.0".to_string())
+        );
+
+        let cwd = tempfile::tempdir().expect("cwd");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let (runner_base, _state) = FakeRunner::new("\"1.3.0\"");
+        let runner = runner_base.with_version("1.2.3");
+        let mut settings_manager = SettingsManager::in_memory(
+            &Settings::new(),
+            SettingsManagerCreateOptions {
+                project_trusted: Some(false),
+            },
+        );
+        let manager = PackageManager::with_runner(
+            cwd.path(),
+            agent_dir.path(),
+            &mut settings_manager,
+            Box::new(runner),
+        );
+        let npm = NpmSource {
+            spec: "foo@^1.2.0".to_string(),
+            name: "foo".to_string(),
+            version: Some("^1.2.0".to_string()),
+            range: Some("^1.2.0".to_string()),
+            pinned: false,
+        };
+        let installed = agent_dir.path().join("npm/node_modules/foo");
+        std::fs::create_dir_all(&installed).expect("installed");
+        std::fs::write(installed.join("package.json"), "{\"version\":\"1.2.3\"}").expect("write");
+        assert_eq!(
+            PackageManager::installed_npm_version(&installed),
+            Some("1.2.3".to_string())
+        );
+        assert!(PackageManager::installed_npm_matches_configured_version(
+            &npm, &installed
+        ));
+        assert!(manager.npm_has_available_update(&npm, &installed));
+        assert_eq!(
+            manager
+                .should_update_npm_source(&npm, Scope::User)
+                .expect("check"),
+            NpmUpdateCheck {
+                should_update: true,
+                installed_version: Some("1.2.3".to_string()),
+                target_version: Some("1.3.0".to_string()),
+            }
         );
     }
 }

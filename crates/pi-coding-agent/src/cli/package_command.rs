@@ -1,8 +1,8 @@
 //! The package subcommands — `pi install|remove|uninstall|list|update`
 //! (`package-manager-cli.ts`'s `parsePackageCommand` + `handlePackageCommand`,
 //! routed in `main.ts:648` before mode startup). The manager is
-//! [`crate::package_manager`]; the npm and self-update arms report the
-//! honest deferral (see HANDOFF).
+//! [`crate::package_manager`]; `update` (self-update, model catalogs and the
+//! batch updater) still reports the honest deferral (see HANDOFF).
 //!
 //! Output is plain: upstream's `chalk` degrades to plain on non-TTY
 //! stdout and these commands run before any TUI exists.
