@@ -25,6 +25,13 @@ set -u
 export CARGO_TARGET_DIR=/ramdisk/target
 export CARGO_BUILD_JOBS="${JOBS:-4}"
 export CARGO_INCREMENTAL=0
+# Cargo's real profile key is `debug`; `DEBUGINFO` (used in older gate docs) is
+# silently ignored. Both are set: DEBUG does the work, DEBUGINFO is kept for
+# parity with the historical gate command. Without this, rustc emits
+# `-C debuginfo=2` for dev AND test, and the tmpfs fills on the test step.
+export CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_PROFILE_TEST_DEBUG=0
+export CARGO_PROFILE_BENCH_DEBUG=0
 export CARGO_PROFILE_DEV_DEBUGINFO=0
 export CARGO_PROFILE_RELEASE_DEBUGINFO=0
 export CARGO_NET_OFFLINE=true
