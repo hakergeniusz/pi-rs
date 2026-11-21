@@ -23,7 +23,11 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+# `float_roundtrip` makes `serde_json` parse long decimal tokens with correct
+# rounding, matching V8's `JSON.parse` (the session store's load path). Without
+# it the fast path can be one ULP off for ~17-digit literals, so a load/rewrite
+# cycle would change bytes that pi itself preserves. See `session/json.rs`.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 thiserror = "2"
 tokio = { version = "1", features = [
 	"rt-multi-thread",

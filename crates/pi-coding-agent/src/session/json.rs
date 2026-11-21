@@ -13,10 +13,28 @@
 //!
 //! `serde_json`'s float formatting disagrees (it prints `1e21` where V8 prints
 //! `1e+21`, and `3.0` where V8 prints `3`), so every record line goes through
-//! [`to_string`] instead of `serde_json::to_string`. Parsing still uses
-//! `serde_json`; without its `float_roundtrip` feature the fast float parser
-//! can be off by one ULP for a few decimals, so an ultra-long decimal literal
-//! can rewrite as its shortest form — a reported dependency request.
+//! [`to_string`] instead of `serde_json::to_string`.
+//!
+//! # Two halves of float byte-fidelity
+//!
+//! A load→serialize cycle must agree with pi's `JSON.parse` → `JSON.stringify`
+//! on floating point tokens. That requires *both* halves to match V8:
+//!
+//! 1. **Parse to the same double.** The workspace enables `serde_json`'s
+//!    `float_roundtrip` feature, which routes long decimals through a correctly
+//!    rounded parser. The default fast path (`significand as f64`, then one
+//!    multiply/divide by a power of ten) can land one ULP away from V8 for
+//!    ~17-digit literals — e.g. `51.248178375505404` used to load as
+//!    `51.24817837550541`, which then rewrites as a different token. This was
+//!    the deferred P4 dependency request; no raw-token passthrough is needed
+//!    because correct parsing plus V8 formatting already reproduces V8 exactly,
+//!    *including* canonicalizing a non-V8 spelling the way `JSON.stringify`
+//!    does.
+//! 2. **Format with V8's `Number::toString` rules.** [`format_f64`] recovers the
+//!    shortest round-tripping digits from Rust's `{:e}` formatter and re-applies
+//!    ECMAScript's notation thresholds. V8 and Rust both emit the shortest
+//!    decimal that round-trips to the same double, so a V8-written token is
+//!    reproduced byte-for-byte (see the golden-fixture regression test).
 
 use std::fmt::Write as _;
 
@@ -98,7 +116,9 @@ fn format_number(number: &serde_json::Number) -> String {
 /// ECMAScript `Number::toString` (radix 10) for a finite double.
 ///
 /// `-0` serializes as `0` (as `JSON.stringify` does) and non-finite values as
-/// `null`.
+/// `null`. Rust's `{:e}` and V8's `DoubleToStringConverter` both produce the
+/// shortest round-tripping digits for a given double, so only the notation
+/// thresholds below differ from `ryu`/`serde_json`'s defaults.
 pub fn format_f64(value: f64) -> String {
     if !value.is_finite() {
         return "null".to_string();
@@ -198,5 +218,84 @@ mod tests {
             to_string(&value),
             r#"{"type":"custom","customType":"x","id":"1","parentId":null}"#
         );
+    }
+
+    /// A load→serialize cycle through the canonical [`crate::session::Record`]
+    /// path must produce V8's token for every float shape. The first five
+    /// literals are `serde_json`'s own `float_roundtrip` regression samples:
+    /// the default parser lands one ULP away on each, so the feature is what
+    /// makes these assertions hold. The long decimals pin shortest-round-trip
+    /// canonicalization (>17 digits) and the exponent forms pin ECMAScript's
+    /// explicit `+` and unpadded exponent spelling.
+    #[test]
+    fn exotic_float_literals_follow_v8_number_formatting() {
+        for (literal, expected) in [
+            // 1-ULP samples from serde_json's `test_roundtrip_f64`.
+            ("51.248178375505404", "51.248178375505404"),
+            ("-93.31137037688033", "-93.31137037688033"),
+            ("-36.573994842753436", "-36.573994842753436"),
+            ("52.314008204106244", "52.314008204106244"),
+            ("97.45365320034685", "97.45365320034685"),
+            // Finite samples from random IEEE-754 bit patterns.
+            ("2.0030397744267762e-253", "2.0030397744267762e-253"),
+            ("7.101215824554616e260", "7.101215824554616e+260"),
+            ("1.769268377902049e74", "1.769268377902049e+74"),
+            ("-1.6727517818542075e58", "-1.6727517818542075e+58"),
+            ("3.9287532173373315e299", "3.9287532173373315e+299"),
+            // >17 significant digits: exact decimal expansions collapse to the
+            // same shortest token V8 would write.
+            (
+                "0.1000000000000000055511151231257827021181583404541015625",
+                "0.1",
+            ),
+            ("51.24817837550540499", "51.248178375505404"),
+            (
+                "1.00000000000000011102230246251565404236316680908203125",
+                "1",
+            ),
+            // ECMAScript notation thresholds and exponent spelling.
+            ("1e21", "1e+21"),
+            ("1e-7", "1e-7"),
+        ] {
+            let line = format!(r#"{{"type":"custom","value":{literal}}}"#);
+            let record = crate::session::Record::parse_line_strict(&line).unwrap();
+            assert_eq!(
+                record.to_line(),
+                format!(r#"{{"type":"custom","value":{expected}}}"#),
+                "literal {literal} did not follow V8 formatting"
+            );
+        }
+    }
+
+    /// Regression for the deferred P4 finding: enabling `float_roundtrip`
+    /// must not disturb the 38 byte-exact lines generated by the real TS pi.
+    #[test]
+    fn golden_fixture_lines_round_trip_byte_exactly() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/golden");
+        let fixtures = [
+            "01-plain-user-assistant.jsonl",
+            "02-tool-read-round-trip.jsonl",
+            "03-model-change-thinking-low.jsonl",
+            "04-multi-turn-with-name.jsonl",
+            "05-resume-thinking-level-change.jsonl",
+        ];
+        let mut checked = 0usize;
+        for name in fixtures {
+            let path = std::path::Path::new(dir).join(name);
+            let text = std::fs::read_to_string(path).unwrap();
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let record = crate::session::Record::parse_line_strict(line).unwrap();
+                assert_eq!(
+                    record.to_line(),
+                    line,
+                    "fixture {name} changed a line on the raw Record path"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 38, "all lines of the five golden fixtures");
     }
 }

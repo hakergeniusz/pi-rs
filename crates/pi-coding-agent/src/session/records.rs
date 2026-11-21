@@ -1519,4 +1519,23 @@ mod tests {
             line
         );
     }
+
+    /// `float_roundtrip` must survive the typed decode→encode path too: a
+    /// 1-ULP sample in a real `f64` field (`tokensBefore`) and a >17-digit
+    /// exponential token kept in the `unknown` bag (`data`) both have to come
+    /// back out as the exact bytes V8 would have written.
+    #[test]
+    fn exotic_float_tokens_survive_the_typed_view() {
+        let line = concat!(
+            r#"{"type":"compaction","id":"c1","parentId":null,"timestamp":"t","#,
+            r#""summary":"s","firstKeptEntryId":"root","tokensBefore":51.248178375505404,"#,
+            r#""data":{"value":7.101215824554616e260}}"#
+        );
+        let record = Record::parse_line_strict(line).unwrap();
+        assert_eq!(record.to_line(), line);
+        let SessionEntry::Compaction(entry) = SessionEntry::from_record(&record) else {
+            panic!("expected compaction entry");
+        };
+        assert_eq!(SessionEntry::Compaction(entry).to_record().to_line(), line);
+    }
 }
