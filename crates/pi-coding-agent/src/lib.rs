@@ -33,6 +33,8 @@ pub mod cli;
 pub mod clipboard;
 /// Global + project config loading (`config.ts`).
 pub mod config;
+/// Crash log record store and panic hook (`core/crash-log.ts`).
+pub mod crash_log;
 /// Runtime-agnostic extension host seam (runtime decision pending at the P5 gate).
 pub mod extensions;
 /// Model reference resolution and scope patterns

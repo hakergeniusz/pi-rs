@@ -265,7 +265,9 @@ pub fn record_error(
     cwd: &str,
     path: &Path,
 ) -> Option<CrashRecord> {
-    let stack = error.backtrace().map(ToString::to_string).or_else(capture_backtrace);
+    // `std::error::Error::backtrace` is still unstable on the pinned stable
+    // toolchain, so a fresh capture is the only portable source here.
+    let stack = capture_backtrace();
     record_crash(
         CrashInput {
             kind,
@@ -500,17 +502,16 @@ pub fn find_extension_stack_matches(
         } else {
             None
         };
-        let slash_index = resolved_path.rfind('/');
         let directory_entry = is_index_entry(&resolved_path);
-        let matched = if let Some(root) = package_root {
+        let is_match = if let Some(root) = package_root {
             stack_contains_path(&normalized_stack, root, true)
-        } else if directory_entry && slash_index.is_some() {
-            let directory = &resolved_path[..slash_index.expect("checked above")];
+        } else if let (true, Some(slash_index)) = (directory_entry, resolved_path.rfind('/')) {
+            let directory = &resolved_path[..slash_index];
             stack_contains_path(&normalized_stack, directory, true)
         } else {
             stack_contains_path(&normalized_stack, &resolved_path, false)
         };
-        if !matched {
+        if !is_match {
             continue;
         }
         let label = if extension.source_info.origin == SourceOrigin::Package
@@ -668,10 +669,14 @@ fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
 fn panic_hook_body(info: &std::panic::PanicHookInfo<'_>, path: &Path, context: &CrashContext) {
     let message = panic_message(info);
     let stack = capture_backtrace();
-    // A lock held by the panicking thread must not deadlock the hook.
+    // A lock held by the panicking thread must not deadlock the hook. A
+    // published session file wins; an empty/cleared slot falls back to the
+    // install-time context (a prior hook's Drop clears the global slot).
     let session_file = PANIC_SESSION_FILE
         .try_lock()
-        .map_or_else(|_| context.session_file.clone(), |slot| slot.clone());
+        .ok()
+        .and_then(|slot| slot.clone())
+        .or_else(|| context.session_file.clone());
     let recorded = record_crash(
         CrashInput {
             kind: CrashKind::UncaughtException,
