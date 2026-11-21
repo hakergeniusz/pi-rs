@@ -12,6 +12,13 @@
 //!
 //! Section order is insertion order, which is what the TS object keeps, so
 //! [`SystemPromptSections`] is a `Vec` of pairs, not a sorted map.
+//!
+//! The `mcp_servers` section is rendered by [`mcp_section`] from a host-supplied
+//! snapshot (`extensions/mcp/index.ts:156-222`) and inserted as an ordinary
+//! custom section after `cwd`.
+
+/// The `mcp_servers` system-prompt section (`extensions/mcp/index.ts:156-222`).
+pub mod mcp_section;
 
 use std::collections::HashMap;
 
