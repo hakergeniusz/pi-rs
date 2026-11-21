@@ -3653,11 +3653,21 @@ and stale test expectations (each verified against upstream v1.5.2) before landi
 | pi-ai stream hooks | `9733495` | built-in adapters invoke hooks; 63 tests |
 | `pi mcp` CLI | `bdebab3` | full CLI; fixed inverted Levenshtein cost + stale tests |
 
-**Still open (wiring, not module code):** `/mcp` dispatch/mount/pump in
-`interactive_mode.rs`, `pi mcp` dispatch in `main.rs`/`cli/args.rs`, credential
-store → `mcp_manager` OAuth attachment, resources → `client.rs` hooks, config
-snapshot → system-prompt builder. The module layers compile and test; only the
-host integration is deferred. All `WIRING.md` notes were preserved under
+**Host wiring landed after the wave:**
+- `pi mcp` dispatch in `main.rs` + `cli/mcp_runtime.rs` (`CliMcpRuntime` bridges
+  `McpRuntime` to real `pi-mcp` connect/tools-list and the `mcp-auth.json`
+  store; OAuth sign-in stays interactive-only with a typed failure).
+  Live-smoked `pi mcp --help` and `pi mcp list`.
+- `/mcp` selector dispatch/mount/pump/autocomplete in `interactive_mode.rs`
+  (real-submit-path e2e test).
+- `mcp_servers` system-prompt section fed from the loaded config snapshot in
+  `system_prompt_for` (all modes).
+
+**Still open:** credential store → `mcp_manager` OAuth attachment and
+resources → `client.rs` hooks. Two flaky pre-existing interactive tests were
+stabilized: a notify test that stopped pumping before its UI requests drained,
+and a global-theme assertion that raced with sibling tests re-initializing the
+process-wide theme. All `WIRING.md` notes were preserved under
 `/tmp/opencode/*-WIRING.md` (tmpfs — copy to docs if they must survive a reboot).
 
 **CI green** on `b3dc9ec`: all 7 jobs (clippy, test, fmt, NDF, audit, msrv,
