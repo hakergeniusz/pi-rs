@@ -1518,11 +1518,10 @@ dependencies = [
 name = "pi-codemode"
 version = "0.1.0"
 dependencies = [
- "pi-schema",
+ "rquickjs",
  "serde",
  "serde_json",
  "thiserror",
- "tokio",
 ]
 
 [[package]]

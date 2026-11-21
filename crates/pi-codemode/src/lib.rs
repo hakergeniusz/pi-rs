@@ -62,8 +62,7 @@ pub use protocol::{
     VmStartData, WorkerToHostMessage, is_host_to_worker_message, is_worker_to_host_message,
 };
 pub use sandbox::{
-    FnTool, InlineCodemodeSandbox, Sandbox, SandboxOptions, Tool, ToolContext, ToolError,
-    ToolExecutor, tool,
+    FnTool, InlineCodemodeSandbox, Sandbox, SandboxOptions, Tool, ToolError, ToolExecutor, tool,
 };
 pub use source::{
     CODEMODE_OPTIONS_PREFIX, CODEMODE_SOURCE_GRAMMAR, CodemodeSourceError, CodemodeSourceOptions,
@@ -73,6 +72,6 @@ pub use types::{
     AbortFlag, Call, CallStatus, CodemodeDeclaredGlobal, CodemodeDeclaredTool, CodemodeDuring,
     CodemodeError, CodemodeErrorKind, CodemodeHostCall, CodemodeJsonSchema, CodemodeOutcome,
     CodemodeResult, CodemodeRun, CodemodeRunOptions, CodemodeStoreWrites, ExecuteOptions,
-    OutputItem,
+    OutputItem, ToolContext,
 };
 pub use vm::{DEFAULT_INTERRUPT_BUDGET, VmOptions, run_vm};

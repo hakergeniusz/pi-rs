@@ -244,7 +244,7 @@ mod tests {
     fn start_data_defaults_match_upstream() {
         let data = VmStartData::new("return 1;");
         assert_eq!(data.code, "return 1;");
-        assert!(data.tools.is_empty());
+        assert_eq!(data.tools, vec![]);
         assert!(data.memory_limit_bytes.is_none());
         assert!(data.deterministic.is_none());
     }

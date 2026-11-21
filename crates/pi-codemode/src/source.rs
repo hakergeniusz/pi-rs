@@ -14,7 +14,7 @@ pub const CODEMODE_OPTIONS_PREFIX: &str = "// @options:";
 /// Lark grammar for providers with grammar-constrained tool input
 /// (`source.ts:18-30`). Only the options-line shape is fixed; the JSON and
 /// code are checked by [`parse_codemode_source`].
-pub const CODEMODE_SOURCE_GRAMMAR: &str = r#"
+pub const CODEMODE_SOURCE_GRAMMAR: &str = r"
 start: options_source | plain_source
 options_source: OPTIONS_LINE NEWLINE SOURCE
 plain_source: SOURCE
@@ -22,7 +22,7 @@ plain_source: SOURCE
 OPTIONS_LINE: /[ \t]*\/\/ @options:[^\r\n]*/
 NEWLINE: /\r?\n/
 SOURCE: /[\s\S]+/
-"#;
+";
 
 const SUPPORTED_FIELDS_TEXT: &str = "`max_output_tokens` and `timeout_ms`";
 /// Largest delay `setTimeout` supports, which bounds `timeout_ms`.

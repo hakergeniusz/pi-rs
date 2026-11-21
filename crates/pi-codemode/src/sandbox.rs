@@ -622,7 +622,8 @@ mod tests {
 
     #[test]
     fn globals_can_spread_arguments_and_live_in_namespaces() {
-        let global = tool("ns.echo", |args, _| Ok(args)).spread(true);
+        let global: std::sync::Arc<dyn Tool> =
+            std::sync::Arc::new(FnTool::new("ns.echo", Box::new(|args, _| Ok(args))).spread(true));
         let sandbox = sandbox(vec![], vec![global]);
         let result = sandbox.execute("return await ns.echo(1, 'x');", ExecuteOptions::default());
         assert!(result.is_ok(), "{result:?}");
@@ -663,7 +664,7 @@ mod tests {
     #[test]
     fn syntax_errors_are_script_errors() {
         let sandbox = sandbox(vec![], vec![]);
-        let result = sandbox.execute("return ;;;", ExecuteOptions::default());
+        let result = sandbox.execute("return (((;", ExecuteOptions::default());
         let error = result.error().expect("must fail");
         assert_eq!(error.kind, CodemodeErrorKind::Script);
     }
@@ -726,7 +727,7 @@ mod tests {
             Sandbox::new(SandboxOptions {
                 globals: vec![
                     tool("ns.a", |_args, _| Ok(Json::Null)),
-                    tool("a", |_args, _| Ok(Json::Null))
+                    tool("ns", |_args, _| Ok(Json::Null))
                 ],
                 ..SandboxOptions::default()
             })

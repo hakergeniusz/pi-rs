@@ -90,6 +90,7 @@ fn sandbox_outcome(message: impl Into<String>) -> RunOutcome {
 /// Run one script in a fresh VM and return its result. Never panics for script
 /// failures: they come back as `CodemodeResult::Err`.
 #[must_use]
+#[allow(clippy::too_many_lines)] // mirrors upstream's VM lifecycle; split when extending
 pub fn run_vm(options: &VmOptions<'_>, executor: &dyn ToolExecutor) -> CodemodeResult {
     let signal = options.signal.clone().unwrap_or_default();
     if signal.is_aborted() {
@@ -194,17 +195,15 @@ pub fn run_vm(options: &VmOptions<'_>, executor: &dyn ToolExecutor) -> CodemodeR
                 ));
             }
         };
-        let api = match api.into_object() {
-            Ok(api) => api,
-            Err(_) => return sandbox_outcome("Sandbox prelude did not return an object"),
+        let Some(api) = api.into_object() else {
+            return sandbox_outcome("Sandbox prelude did not return an object");
         };
-        let (settle, run, stalled) = match (
+        let (Ok(settle), Ok(run), Ok(stalled)) = (
             api.get::<_, Function>("settle"),
             api.get::<_, Function>("run"),
             api.get::<_, Function>("stalled"),
-        ) {
-            (Ok(settle), Ok(run), Ok(stalled)) => (settle, run, stalled),
-            _ => return sandbox_outcome("Sandbox prelude is missing settle/run/stalled"),
+        ) else {
+            return sandbox_outcome("Sandbox prelude is missing settle/run/stalled");
         };
         // rquickjs ties JS handles to the lifetime of `Ctx`, so they cannot
         // leave `Context::with`. Stash the two callbacks the driver needs on
@@ -380,6 +379,7 @@ fn script_exception(ctx: &Ctx<'_>, error: &rquickjs::Error) -> CodemodeError {
     }
 }
 
+#[allow(clippy::too_many_lines)] // mirrors upstream's driver loop; split when extending
 fn drive(
     context: &Context,
     runtime: &Runtime,
@@ -394,14 +394,11 @@ fn drive(
         // JS calls must happen inside `ctx.with`; `Runtime::execute_pending_job`
         // must happen outside it (both lock the same runtime mutex).
         let answered = context.with(|ctx| -> usize {
-            let settle: Function = match ctx.globals().get("__codemodeSettle") {
-                Ok(settle) => settle,
-                Err(_) => {
-                    outcome.terminal = Some(Terminal::Error(CodemodeError::sandbox(
-                        "Sandbox bridge was removed unexpectedly",
-                    )));
-                    return 0;
-                }
+            let Ok(settle) = ctx.globals().get::<_, Function>("__codemodeSettle") else {
+                outcome.terminal = Some(Terminal::Error(CodemodeError::sandbox(
+                    "Sandbox bridge was removed unexpectedly",
+                )));
+                return 0;
             };
             let batch: Vec<WorkerToHostMessage> = {
                 let mut guard = mailbox
@@ -515,7 +512,7 @@ fn drive(
         let mut jobs = 0usize;
         let mut job_error = None;
         while jobs < MAX_LOOP_ITERATIONS {
-            if jobs % 50 == 0 && Instant::now() >= deadline {
+            if jobs.is_multiple_of(50) && Instant::now() >= deadline {
                 outcome.terminal = Some(Terminal::Error(CodemodeError::new(
                     CodemodeErrorKind::Timeout,
                     "Execution timed out",
@@ -671,16 +668,14 @@ mod tests {
 
     #[test]
     fn bridge_message_ignores_unknown_kinds() {
-        assert!(
-            bridge_message(
-                "unknown",
-                &Value::Undefined,
-                &Value::Undefined,
-                &Value::Undefined
-            )
-            .is_none()
-        );
-        assert_eq!(js_text(&Value::Undefined), None);
-        assert_eq!(js_text(&Value::Null), None);
+        let runtime = Runtime::new().expect("runtime");
+        let context = Context::full(&runtime).expect("context");
+        context.with(|ctx| {
+            let undefined = Value::new_undefined(ctx.clone());
+            let null = Value::new_null(ctx.clone());
+            assert!(bridge_message("unknown", &undefined, &undefined, &undefined).is_none());
+            assert_eq!(js_text(&undefined), None);
+            assert_eq!(js_text(&null), None);
+        });
     }
 }

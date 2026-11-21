@@ -385,7 +385,7 @@ fn as_object(schema: &Json) -> Option<&serde_json::Map<String, Json>> {
     schema.as_object()
 }
 
-fn string_field(schema: &serde_json::Map<String, Json>, key: &str) -> Option<&str> {
+fn string_field<'a>(schema: &'a serde_json::Map<String, Json>, key: &str) -> Option<&'a str> {
     schema.get(key).and_then(Json::as_str)
 }
 
@@ -525,6 +525,7 @@ fn number_text(value: &Json) -> String {
 
 /// Constraints a property's TypeScript type cannot express, as JSDoc-style
 /// tags (`declarations.ts:260-312`).
+#[allow(clippy::too_many_lines)] // mirrors upstream's declaration switch; split when extending
 fn constraint_tags(schema: &Json) -> String {
     let Some(property) = schema.as_object() else {
         return String::new();
@@ -675,10 +676,10 @@ fn object_type(schema: &serde_json::Map<String, Json>, context: &mut SchemaConte
             } else {
                 "?"
             };
-            let rendered = properties
-                .get(*name)
-                .map(|property| to_type(property, context))
-                .unwrap_or_else(|| "unknown".to_string());
+            let rendered = properties.get(*name).map_or_else(
+                || "unknown".to_string(),
+                |property| to_type(property, context),
+            );
             format!("{}{optional}: {rendered};", property_key(name))
         })
         .collect();
@@ -747,9 +748,11 @@ mod tests {
 
     #[test]
     fn renders_a_tool_signature_from_schemas() {
+        let input = json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]});
+        let output = json!({"type": "string"});
         let tool = RenderTool::new("my-tool")
-            .input_schema(&json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}))
-            .output_schema(&json!({"type": "string"}));
+            .input_schema(&input)
+            .output_schema(&output);
         assert_eq!(
             render_tool_signature(&tool, &RenderToolOptions::default()),
             "my_tool(args: { path: string; }): Promise<string>;"
@@ -784,9 +787,13 @@ mod tests {
     #[test]
     fn doc_comments_escape_close_markers_and_multiline() {
         let tool = RenderTool::new("x").description("Uses */ inline\nsecond line");
+        let options = RenderDeclarationsOptions {
+            tools: &[tool],
+            globals: &[],
+        };
         assert_eq!(
-            render_tool_signature(&tool, &RenderToolOptions::default()),
-            "/**\n * Uses *\\/ inline\n * second line\n */\nx(args: unknown): Promise<unknown>;"
+            render_declarations(&options),
+            "declare const tools: {\n  /**\n   * Uses *\\/ inline\n   * second line\n   */\n  x(args: unknown): Promise<unknown>;\n};"
         );
     }
 
