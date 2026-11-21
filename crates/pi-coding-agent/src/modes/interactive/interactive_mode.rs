@@ -69,6 +69,9 @@ use super::components::extension_selector::{ExtensionSelectorComponent, Extensio
 // The bridge's request payloads (E3 slice 6a); the rest of the file qualifies.
 use super::components::footer::{FooterComponent, FooterData, UsageTotals};
 use super::components::header::{BuiltInHeader, pi_logo_lines};
+use super::components::mcp_selector::{
+    McpMenu, McpSelectorComponent, McpSelectorEvent, McpSelectorScreen,
+};
 use super::components::model_selector::{ModelSelectorComponent, ModelSelectorEvent};
 use super::components::scoped_models_selector::{
     ModelsConfig, RefreshStatusKind, ScopedModelsSelectorComponent, ScopedModelsSelectorEvent,
@@ -1620,6 +1623,8 @@ pub struct InteractiveMode {
     /// `interactive-mode.ts:765-767`; the port's provider is built once, so
     /// the scope rides a shared slot the scope mutations refresh).
     scoped_completion_models: Arc<Mutex<Vec<pi_ai::types::Model>>>,
+    /// Events from the mounted `/mcp` manager selector, same queue pattern.
+    mcp_selector_events: Option<Arc<Mutex<Vec<McpSelectorEvent>>>>,
     /// Events from the mounted `/trust` selector, same queue pattern.
     trust_selector_events: Option<Arc<Mutex<Vec<TrustSelectorEvent>>>>,
     /// Events from the mounted `/settings` dialog, same queue pattern.
@@ -1952,6 +1957,7 @@ impl InteractiveMode {
             scoped_models_selector_events: None,
             scoped_models: Vec::new(),
             scoped_completion_models,
+            mcp_selector_events: None,
             trust_selector_events: None,
             settings_selector_events: None,
             session_selector_events: None,
@@ -2576,6 +2582,10 @@ impl InteractiveMode {
                     if items.is_empty() { None } else { Some(items) }
                 })),
             autocomplete::SlashCommand::new("compact", "Manually compact the session context"),
+            autocomplete::SlashCommand::new(
+                "mcp",
+                "Manage MCP servers: sign in, reconnect, enable or disable, and change exposure",
+            ),
             autocomplete::SlashCommand::new("trust", "Show the project trust options"),
             autocomplete::SlashCommand::new("settings", "Open settings menu"),
             autocomplete::SlashCommand::new("resume", "Resume another session"),
@@ -3703,6 +3713,11 @@ impl InteractiveMode {
         }
         if let Some(rest) = text.strip_prefix("/model") {
             self.handle_model_command(rest.trim());
+            return;
+        }
+        // `/mcp` (`extensions/mcp/index.ts:1261-1287`).
+        if text == "/mcp" {
+            self.open_mcp_selector();
             return;
         }
         // `/trust` (`interactive-mode.ts:2736-2739`).
@@ -4928,6 +4943,82 @@ impl InteractiveMode {
                 }
             }
         }
+    }
+
+    /// Mount the `/mcp` manager selector in the editor's slot
+    /// (`showMcpSelector`, `extensions/mcp/index.ts:1261-1287`). The component
+    /// is view-only — data comes from `mcp_config`, and its typed events are
+    /// drained by [`Self::pump_mcp_selector`].
+    fn open_mcp_selector(&mut self) {
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let selector = McpSelectorComponent::new(Arc::clone(&events));
+        self.mcp_selector_events = Some(events);
+        self.suspend_editor_with(Box::new(selector));
+
+        let cwd = self.session.get_cwd().to_path_buf();
+        let snapshot =
+            crate::mcp_config::load_mcp_config(&crate::mcp_config::LoadMcpConfigOptions {
+                agent_dir: self.agent_dir.clone(),
+                cwd: cwd.clone(),
+                project_trusted: self.project_trusted,
+            });
+        let items: Vec<pi_tui::components::select_list::SelectItem> = snapshot
+            .servers
+            .iter()
+            .map(|server| {
+                let description = server
+                    .config
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        server
+                            .config
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    });
+                pi_tui::components::select_list::SelectItem {
+                    value: server.name.clone(),
+                    label: server.name.clone(),
+                    description,
+                }
+            })
+            .collect();
+        let empty = format!(
+            "No MCP servers configured. Add them to {} or .pi/mcp.json.",
+            self.agent_dir.join("mcp.json").display()
+        );
+        let mut menu = McpMenu::new("MCP servers", items)
+            .with_empty(empty)
+            .with_selected(
+                snapshot
+                    .servers
+                    .first()
+                    .map_or_else(String::new, |s| s.name.clone()),
+            );
+        if !snapshot.errors.is_empty() {
+            menu.error = Some(snapshot.errors.join("\n"));
+        }
+        menu.confirm_label = "manage".to_string();
+        menu.cancel_label = "close".to_string();
+        if let Some(view) = self.downcast_tree::<McpSelectorComponent>(HostSlot::Editor) {
+            view.set_screen(McpSelectorScreen::Menu(menu));
+        }
+        self.tui.request_render();
+    }
+
+    /// Put the editor back after the `/mcp` manager closes.
+    fn close_mcp_selector(&mut self) {
+        if self.suspended_editor.is_none() {
+            return;
+        }
+        self.mcp_selector_events = None;
+        self.restore_editor();
+        self.tui.request_render();
     }
 
     /// Mount the `/trust` selector in the editor's tree slot
@@ -6616,6 +6707,34 @@ impl InteractiveMode {
         }
     }
 
+    /// The `/mcp` manager's typed event drain. The view itself is view-only;
+    /// the nested server/action state machine is driven from here.
+    fn pump_mcp_selector(&mut self) {
+        let Some(events) = self.mcp_selector_events.as_ref() else {
+            return;
+        };
+        let events = std::mem::take(&mut *events.lock().expect("mcp selector events"));
+        for event in events {
+            match event {
+                McpSelectorEvent::Select(value) => {
+                    self.show_status(&format!("MCP server {value}"));
+                }
+                McpSelectorEvent::SelectionChanged(_) => {}
+                McpSelectorEvent::Cancel => self.close_mcp_selector(),
+                McpSelectorEvent::StatusCancelled => {
+                    self.show_status("MCP sign-in cancelled");
+                }
+                McpSelectorEvent::RedirectUrl(_) => {
+                    self.show_status("Paste the redirect URL to finish signing in");
+                }
+                McpSelectorEvent::CopyUrl(url) => match crate::clipboard::copy_to_clipboard(&url) {
+                    Ok(()) => self.show_status("Authorization URL copied"),
+                    Err(error) => self.show_error(&error),
+                },
+            }
+        }
+    }
+
     /// The `/trust` selector's drain (`showTrustSelector`'s
     /// onSelect/onCancel): the decision persists to trust.json and the
     /// status tells the user a restart applies it.
@@ -7738,6 +7857,7 @@ impl InteractiveMode {
             drop(self.replace_editor_slot(editor));
         }
         self.model_selector_events = None;
+        self.mcp_selector_events = None;
         self.trust_selector_events = None;
         self.settings_selector_events = None;
         self.session_selector_events = None;
@@ -11544,6 +11664,7 @@ impl InteractiveMode {
         // to (`showSelector`'s onSelect/onCancel callbacks).
         self.pump_model_selector();
         self.pump_scoped_models_selector();
+        self.pump_mcp_selector();
         self.pump_trust_selector();
         self.pump_settings_selector();
         self.pump_session_selector();
@@ -15415,6 +15536,50 @@ export default function (pi) {
         mode.pump();
         assert!(mode.suspended_editor.is_none(), "editor not restored");
         assert_eq!(mode.model.id, "test-model");
+    }
+
+    #[test]
+    fn mcp_selector_mounts_on_submit_and_closes_on_cancel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = tempfile::tempdir().expect("agent dir");
+        let mut runtime = test_runtime(
+            dir.path(),
+            Arc::new(ScriptedStream {
+                calls: AtomicUsize::new(0),
+                file_path: "unused".to_string(),
+            }),
+        );
+        let options = InteractiveOptions {
+            auth_path: Some(dir.path().join("auth.json")),
+            agent_dir: Some(agent_dir.path().to_path_buf()),
+            ..InteractiveOptions::default()
+        };
+        let terminal = CaptureTerminal::with_size(TerminalSize {
+            columns: 100,
+            rows: 40,
+        });
+        let mut mode = InteractiveMode::new(&mut runtime, &options, Box::new(terminal));
+        mode.tui.start().expect("tui start");
+
+        mode.submit("/mcp");
+        mode.tui.render_now(false);
+        assert!(mode.suspended_editor.is_some(), "selector not mounted");
+        let selector = mode
+            .downcast_tree::<McpSelectorComponent>(HostSlot::Editor)
+            .expect("selector in the editor slot");
+        let rendered = strip_terminal_sequences(&selector.render(100).join("\n"));
+        assert!(rendered.contains("MCP servers"), "{rendered}");
+        assert!(rendered.contains("No MCP servers configured"), "{rendered}");
+
+        mode.mcp_selector_events
+            .as_ref()
+            .expect("mcp events")
+            .lock()
+            .expect("mcp events lock")
+            .push(McpSelectorEvent::Cancel);
+        mode.pump();
+        assert!(mode.suspended_editor.is_none(), "editor not restored");
+        assert!(mode.mcp_selector_events.is_none());
     }
 
     #[test]
