@@ -10,6 +10,10 @@ use serde_json::json;
 use crate::auth_provider::AuthProvider;
 use crate::error::McpError;
 use crate::http::{StreamableHttpOptions, StreamableHttpTransport};
+use crate::resources::{
+    ListResourceTemplatesResult, ListResourcesResult, ReadResourceResult, Resource,
+    ResourceTemplate,
+};
 use crate::transport::{SpawnOptions, StdioTransport};
 use crate::types::{
     CallToolParams, CallToolResult, ClientCapabilities, Implementation, InitializeParams,
@@ -248,6 +252,130 @@ impl McpClient {
             .await?;
         serde_json::from_value(result)
             .map_err(|error| McpError::Malformed(format!("bad tools/call result: {error}")))
+    }
+
+    /// One `resources/list` page (`client.ts:306-309`).
+    ///
+    /// # Errors
+    /// Transport failures or a malformed page.
+    pub async fn resources_list_page(
+        &self,
+        cursor: Option<&str>,
+        timeout: Duration,
+    ) -> Result<ListResourcesResult, McpError> {
+        let params = cursor.map(|cursor| json!({ "cursor": cursor }));
+        let value = self
+            .transport
+            .request("resources/list", params, timeout)
+            .await?;
+        crate::resources::parse_list_resources_page(&value)
+    }
+
+    /// Every resource, following `nextCursor` (`client.ts:301-303`, `:357-376`).
+    ///
+    /// # Errors
+    /// Transport failures, malformed pages, duplicate cursors, or a page
+    /// loop past [`crate::resources::MAX_LIST_PAGES`].
+    pub async fn resources_list(&self, timeout: Duration) -> Result<Vec<Resource>, McpError> {
+        let mut items = Vec::new();
+        let mut cursors = std::collections::HashSet::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..crate::resources::MAX_LIST_PAGES {
+            let page = self.resources_list_page(cursor.as_deref(), timeout).await?;
+            items.extend(page.resources);
+            let Some(next) = page.next_cursor else {
+                return Ok(items);
+            };
+            if !cursors.insert(next.clone()) {
+                return Err(McpError::Malformed(format!(
+                    "MCP resources/list returned duplicate cursor: {next}"
+                )));
+            }
+            cursor = Some(next);
+        }
+        Err(McpError::Malformed(format!(
+            "MCP resources/list exceeded {} pages",
+            crate::resources::MAX_LIST_PAGES
+        )))
+    }
+
+    /// One `resources/templates/list` page. A server that does not implement
+    /// the method answers as empty (`withoutTemplates`, `runtime.ts:126-138`).
+    ///
+    /// # Errors
+    /// Transport failures other than "method not found", or a malformed page.
+    pub async fn resources_templates_list_page(
+        &self,
+        cursor: Option<&str>,
+        timeout: Duration,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        let params = cursor.map(|cursor| json!({ "cursor": cursor }));
+        let value = match self
+            .transport
+            .request("resources/templates/list", params, timeout)
+            .await
+        {
+            Ok(value) => value,
+            Err(McpError::Rpc { code, .. })
+                if code == crate::types::json_rpc_error_codes::METHOD_NOT_FOUND =>
+            {
+                return Ok(ListResourceTemplatesResult {
+                    resource_templates: Vec::new(),
+                    next_cursor: None,
+                    meta: None,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        crate::resources::parse_list_resource_templates_page(&value)
+    }
+
+    /// Every resource template, following `nextCursor`.
+    ///
+    /// # Errors
+    /// As [`Self::resources_templates_list_page`], plus cursor loop errors.
+    pub async fn resources_templates_list(
+        &self,
+        timeout: Duration,
+    ) -> Result<Vec<ResourceTemplate>, McpError> {
+        let mut items = Vec::new();
+        let mut cursors = std::collections::HashSet::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..crate::resources::MAX_LIST_PAGES {
+            let page = self
+                .resources_templates_list_page(cursor.as_deref(), timeout)
+                .await?;
+            items.extend(page.resource_templates);
+            let Some(next) = page.next_cursor else {
+                return Ok(items);
+            };
+            if !cursors.insert(next.clone()) {
+                return Err(McpError::Malformed(format!(
+                    "MCP resources/templates/list returned duplicate cursor: {next}"
+                )));
+            }
+            cursor = Some(next);
+        }
+        Err(McpError::Malformed(format!(
+            "MCP resources/templates/list exceeded {} pages",
+            crate::resources::MAX_LIST_PAGES
+        )))
+    }
+
+    /// `resources/read` (`client.ts:337-339`).
+    ///
+    /// # Errors
+    /// Transport failures or a malformed result.
+    pub async fn resource_read(
+        &self,
+        uri: &str,
+        timeout: Duration,
+    ) -> Result<ReadResourceResult, McpError> {
+        let value = self
+            .transport
+            .request("resources/read", Some(json!({ "uri": uri })), timeout)
+            .await?;
+        crate::resources::parse_read_resource_result(&value)
     }
 
     /// Protocol liveness probe.

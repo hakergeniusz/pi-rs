@@ -76,6 +76,9 @@ enum ServerState {
     Connected {
         client: McpClient,
         tools: Vec<Json>,
+        /// `capabilities.resources` (`runtime.ts:393`) — only these servers
+        /// are reachable through the MCP resource tools.
+        has_resources: bool,
         timeout: Duration,
         spawn: McpServerConfig,
     },
@@ -107,6 +110,11 @@ enum Request {
     Drop {
         name: String,
     },
+    /// Names of connected servers advertising the resources capability
+    /// (`McpResourceServer[]`, `runtime.ts:393`).
+    ServersWithResources {
+        reply: std::sync::mpsc::Sender<Vec<String>>,
+    },
     ShutdownAll,
 }
 
@@ -115,6 +123,8 @@ enum Request {
 pub struct ConnectOutcome {
     pub tools: Vec<Json>,
     pub instructions: Option<String>,
+    /// `capabilities.resources.is_some()` (`runtime.ts:393`).
+    pub has_resources: bool,
 }
 
 /// Handle to the worker thread sharing one worker per host core.
@@ -178,6 +188,20 @@ impl McpManager {
         reply_rx
             .recv_timeout(window)
             .unwrap_or_else(|_| Err("MCP manager did not answer in time".to_string()))
+    }
+
+    /// Names of connected servers that advertise resources
+    /// (`runtime.ts:393`), for building the MCP resource tool definitions.
+    pub fn servers_with_resources(&self) -> Vec<String> {
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        if self
+            .sender()
+            .send(Request::ServersWithResources { reply })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        reply_rx.recv_timeout(REPLY_SLACK).unwrap_or_default()
     }
 
     /// Calls one tool on a connected server (`callTool` via `withClient`,
@@ -323,6 +347,22 @@ fn worker_loop(
                     .expect("mcp timeouts mutex poisoned")
                     .remove(&name);
             }
+            Request::ServersWithResources { reply } => {
+                let names = servers
+                    .iter()
+                    .filter(|(_, entry)| {
+                        matches!(
+                            &entry.state,
+                            ServerState::Connected {
+                                has_resources: true,
+                                ..
+                            }
+                        )
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                let _ = reply.send(names);
+            }
             Request::ShutdownAll => {
                 shutdown_all(&runtime, &mut servers);
                 timeouts
@@ -437,10 +477,11 @@ fn connect_with_spawn(
             .iter()
             .map(|tool| serde_json::to_value(tool).unwrap_or(Json::Null))
             .collect::<Vec<_>>();
+        let has_resources = client.capabilities.resources.is_some();
         let instructions = client.instructions.clone();
-        Ok::<_, McpError>((client, tools, instructions))
+        Ok::<_, McpError>((client, tools, has_resources, instructions))
     });
-    let (client, tools, instructions) = match attempt {
+    let (client, tools, has_resources, instructions) = match attempt {
         Ok(attempt) => attempt,
         Err(error) => {
             servers.insert(
@@ -462,6 +503,7 @@ fn connect_with_spawn(
             state: ServerState::Connected {
                 client,
                 tools: tools.clone(),
+                has_resources,
                 timeout,
                 spawn,
             },
@@ -475,6 +517,7 @@ fn connect_with_spawn(
     Ok(ConnectOutcome {
         tools,
         instructions,
+        has_resources,
     })
 }
 
