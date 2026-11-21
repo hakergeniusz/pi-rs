@@ -24,6 +24,23 @@
 //! payload does not decode stays a verbatim [`SessionEntry::Other`]. That is
 //! what makes unknown `type` values (extension-specific) survive a
 //! load/append/rewrite cycle untouched.
+//!
+//! # Typed re-encoding is byte-exact too
+//!
+//! A `#[derive(Serialize)]` struct would emit fields in *declaration* order,
+//! which diverges from pi's *write-site* order in three places:
+//! `custom`/`custom_message` put their payload before the base fields, nested
+//! `message` objects are built by the provider stream (`usage` before
+//! `responseId`, system `timestamp` before `toolsAdded`, …), and
+//! `SystemMessage.sections` is a JS object whose insertion order pi-ai flattens
+//! into a `BTreeMap`. Every typed entry therefore implements a manual
+//! [`Serialize`] that emits fields in the exact upstream object-literal order
+//! (`session-manager.ts:1215-1312`, `1350-1367`, `1399-1407`, `1452-1464`,
+//! `:1623-1633`, `agent-session.ts:1839`, `openai-completions.ts:321-337`).
+//! Nested message keys are reordered by [`serialize_message_ordered`]; the
+//! one thing a `BTreeMap` cannot rebuild — `sections` insertion order — is
+//! captured from the wire in `unknown` under [`SECTION_ORDER_KEY`] and restored
+//! on the way out. See `WIRING.md` for the golden-fixture proof.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
@@ -189,7 +206,7 @@ impl Default for Record {
 // ---------------------------------------------------------------------------
 
 /// `type: "session"` — line 1 of every file (`session-manager.ts:43-50`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionHeader {
     /// Absent means v1 (v1 sessions predate the version field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -254,12 +271,229 @@ impl Serialize for EntryBase {
 }
 
 // ---------------------------------------------------------------------------
+// Write-site ordering (typed re-encode)
+// ---------------------------------------------------------------------------
+
+/// Reserved `unknown` key carrying the wire insertion order of a system
+/// message's `sections` map. pi writes a JS object (insertion order); pi-ai
+/// decodes it into a `BTreeMap`, which alphabetizes. The hint is never emitted
+/// as a JSON field — it only drives the reordered `sections` value.
+const SECTION_ORDER_KEY: &str = "\u{0}pi-rs.sections-order";
+
+/// Pull the ordered list of `sections` keys captured for `which` at decode time.
+fn section_hint(unknown: &JsonObject, which: &str) -> Option<Vec<String>> {
+    let hints = unknown.get(SECTION_ORDER_KEY)?.as_object()?;
+    let array = hints.get(which)?.as_array()?;
+    Some(
+        array
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Capture the `sections` key order from a raw record, for both a top-level
+/// `message` entry and a compaction's embedded `systemMessage`.
+fn capture_section_order(record: &Record) -> Value {
+    fn keys_of(value: Option<&Value>) -> Vec<String> {
+        value
+            .and_then(Value::as_object)
+            .map(|object| object.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+    let mut hints = JsonObject::new();
+    let message = keys_of(
+        record
+            .object()
+            .get("message")
+            .and_then(|message| message.get("sections")),
+    );
+    if !message.is_empty() {
+        hints.insert(
+            "message".to_string(),
+            Value::Array(message.into_iter().map(Value::String).collect()),
+        );
+    }
+    let system_message = keys_of(
+        record
+            .object()
+            .get("systemMessage")
+            .and_then(|message| message.get("sections")),
+    );
+    if !system_message.is_empty() {
+        hints.insert(
+            "systemMessage".to_string(),
+            Value::Array(system_message.into_iter().map(Value::String).collect()),
+        );
+    }
+    Value::Object(hints)
+}
+
+/// Reorder an object so `order` keys come first (in that order); every other
+/// key — including extension fields — keeps its original relative order.
+fn reorder_object(source: &JsonObject, order: &[&str]) -> JsonObject {
+    let mut result = JsonObject::with_capacity(source.len());
+    for key in order {
+        if let Some(value) = source.get(*key) {
+            result.insert((*key).to_string(), value.clone());
+        }
+    }
+    for (key, value) in source {
+        if !result.contains_key(key) {
+            result.insert(key.clone(), value.clone());
+        }
+    }
+    result
+}
+
+/// Restore a `sections` object's original insertion order from a captured hint.
+fn reorder_sections(value: &mut Value, hint: Option<Vec<String>>) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let Some(keys) = hint else {
+        return;
+    };
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    *object = reorder_object(object, &refs);
+}
+
+/// Serialize an [`AgentMessage`] with the key order its upstream write site
+/// produces, not the order pi-ai declares its structs in. `role` first, then
+/// the provider-stream fields, then the fields appended after the stream by
+/// the agent loop (`thinkingLevel` last, per `generation.ts`).
+fn serialize_message_ordered(message: &AgentMessage, section_order: Option<Vec<String>>) -> Value {
+    let value = message.to_value();
+    let Some(object) = value.as_object() else {
+        return value;
+    };
+    let role = object.get("role").and_then(Value::as_str).unwrap_or("");
+    // `openai-completions.ts:321-337` + the stream/agent-loop assignments;
+    // `agent-session.ts:1839` for system; `toolResult` from the golden lines.
+    let order: &[&str] = match role {
+        "system" => &[
+            "role",
+            "content",
+            "sections",
+            "timestamp",
+            "toolsAdded",
+            "toolsRemoved",
+        ],
+        "user" => &["role", "content", "timestamp"],
+        "assistant" => &[
+            "role",
+            "content",
+            "api",
+            "provider",
+            "model",
+            "usage",
+            "stopReason",
+            "timestamp",
+            "responseId",
+            "responseModel",
+            "providerThinkingLevel",
+            "diagnostics",
+            "errorMessage",
+            "rawStopReason",
+            "endTurn",
+            "durationMs",
+            "thinkingLevel",
+            "deferred",
+        ],
+        "toolResult" => &[
+            "role",
+            "toolCallId",
+            "toolName",
+            "content",
+            "details",
+            "usage",
+            "nestedCalls",
+            "isError",
+            "durationMs",
+            "timestamp",
+        ],
+        // Unknown roles have no upstream shape to mirror; keep pi-agent's order.
+        _ => return value,
+    };
+    let mut reordered = reorder_object(object, order);
+    if role == "system" {
+        if let (Some(sections), Some(hint)) = (reordered.get_mut("sections"), section_order) {
+            reorder_sections(sections, Some(hint));
+        }
+    }
+    Value::Object(reordered)
+}
+
+/// `id`, `parentId`, `timestamp` in upstream base-field order (`null` parent).
+fn base_fields(base: &EntryBase) -> [(&'static str, Value); 3] {
+    [
+        ("id", Value::String(base.id.clone())),
+        (
+            "parentId",
+            base.parent_id.clone().map_or(Value::Null, Value::String),
+        ),
+        ("timestamp", Value::String(base.timestamp.clone())),
+    ]
+}
+
+/// Append the order-preserving `unknown` tail, skipping the discriminator
+/// (always emitted first) and the private section-order hint.
+fn finish_entry(mut object: JsonObject, unknown: &JsonObject) -> JsonObject {
+    for (key, value) in unknown {
+        if key == "type" || key == SECTION_ORDER_KEY || object.contains_key(key) {
+            continue;
+        }
+        object.insert(key.clone(), value.clone());
+    }
+    object
+}
+
+/// Entry shape for the nine types whose payload follows `EntryBase`
+/// (`session-manager.ts:1215-1305`, `:1357-1473`, `:1623-1633`).
+fn base_then_payload(
+    kind: &str,
+    base: &EntryBase,
+    fields: &[(&str, Value)],
+    unknown: &JsonObject,
+) -> JsonObject {
+    let mut object = JsonObject::new();
+    object.insert("type".to_string(), Value::String(kind.to_string()));
+    for (key, value) in base_fields(base) {
+        object.insert(key.to_string(), value);
+    }
+    for (key, value) in fields {
+        object.insert((*key).to_string(), value.clone());
+    }
+    finish_entry(object, unknown)
+}
+
+/// Entry shape for `custom` and `custom_message`, whose payload comes *before*
+/// the base fields (`session-manager.ts:1302-1309`, `:1356-1365`).
+fn payload_then_base(
+    kind: &str,
+    fields: &[(&str, Value)],
+    base: &EntryBase,
+    unknown: &JsonObject,
+) -> JsonObject {
+    let mut object = JsonObject::new();
+    object.insert("type".to_string(), Value::String(kind.to_string()));
+    for (key, value) in fields {
+        object.insert((*key).to_string(), value.clone());
+    }
+    for (key, value) in base_fields(base) {
+        object.insert(key.to_string(), value);
+    }
+    finish_entry(object, unknown)
+}
+
+// ---------------------------------------------------------------------------
 // Entries
 // ---------------------------------------------------------------------------
 
 /// `type: "message"` — the only entry carrying LLM content
 /// (`SessionMessageEntry`, `:64-67`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionMessageEntry {
     #[serde(flatten)]
     pub base: EntryBase,
@@ -270,7 +504,7 @@ pub struct SessionMessageEntry {
 }
 
 /// `type: "thinking_level_change"` (`:69-72`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ThinkingLevelChangeEntry {
     #[serde(flatten)]
     pub base: EntryBase,
@@ -281,7 +515,7 @@ pub struct ThinkingLevelChangeEntry {
 }
 
 /// `type: "model_change"` (`:74-78`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ModelChangeEntry {
     #[serde(flatten)]
     pub base: EntryBase,
@@ -294,7 +528,7 @@ pub struct ModelChangeEntry {
 
 /// `type: "usage"` — model-attributed usage that is not an assistant message
 /// and does not participate in LLM context (`:80-89`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct UsageEntry {
     #[serde(flatten)]
     pub base: EntryBase,
@@ -311,7 +545,7 @@ pub struct UsageEntry {
 }
 
 /// `type: "compaction"` — created when context is compacted (`:91-104`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CompactionEntry {
     #[serde(flatten)]
     pub base: EntryBase,
@@ -344,7 +578,7 @@ pub struct CompactionEntry {
 
 /// `type: "branch_summary"` — created when switching branches via `/tree`
 /// (`:106-116`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct BranchSummaryEntry {
     #[serde(flatten)]
     pub base: EntryBase,
@@ -364,7 +598,7 @@ pub struct BranchSummaryEntry {
 
 /// `type: "custom"` — extension state persistence; does NOT participate in LLM
 /// context (`:128-132`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CustomEntry {
     #[serde(rename = "customType")]
     pub custom_type: String,
@@ -378,7 +612,7 @@ pub struct CustomEntry {
 
 /// `type: "custom_message"` — extension-injected messages that DO participate
 /// in LLM context (`:159-165`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CustomMessageEntry {
     #[serde(rename = "customType")]
     pub custom_type: String,
@@ -396,7 +630,7 @@ pub struct CustomMessageEntry {
 
 /// `type: "context_edit"` — append-only edit of one earlier context-producing
 /// entry (`:175-180`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ContextEditEntry {
     #[serde(flatten)]
     pub base: EntryBase,
@@ -423,7 +657,7 @@ pub enum ContextReplacement {
 }
 
 /// `type: "label"` — user-defined bookmark/marker on an entry (`:135-139`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LabelEntry {
     #[serde(flatten)]
     pub base: EntryBase,
@@ -438,7 +672,7 @@ pub struct LabelEntry {
 
 /// `type: "session_info"` — session metadata, e.g. a user-defined display name
 /// (`:142-145`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SessionInfoEntry {
     #[serde(flatten)]
     pub base: EntryBase,
@@ -448,6 +682,207 @@ pub struct SessionInfoEntry {
     pub unknown: JsonObject,
 }
 
+// -- Manual `Serialize` impls: upstream write-site key order -----------------
+//
+// Each impl emits the exact object-literal order from the append* sites in
+// `session-manager.ts`, then appends any extension keys from `unknown` in their
+// original order. A derived impl would use declaration order instead, which is
+// not byte-identical (notably for `custom`/`custom_message`).
+
+impl Serialize for SessionHeader {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut object = JsonObject::new();
+        object.insert("type".to_string(), Value::String("session".to_string()));
+        if let Some(version) = self.version {
+            object.insert("version".to_string(), Value::from(version));
+        }
+        object.insert("id".to_string(), Value::String(self.id.clone()));
+        object.insert(
+            "timestamp".to_string(),
+            Value::String(self.timestamp.clone()),
+        );
+        object.insert("cwd".to_string(), Value::String(self.cwd.clone()));
+        if let Some(parent) = &self.parent_session {
+            object.insert("parentSession".to_string(), Value::String(parent.clone()));
+        }
+        for (key, value) in &self.unknown {
+            if key == "type" || object.contains_key(key) {
+                continue;
+            }
+            object.insert(key.clone(), value.clone());
+        }
+        Value::Object(object).serialize(serializer)
+    }
+}
+
+/// Serialize a field value, falling back to `null` only for a non-serializable
+/// value (impossible for the concrete field types here, but keeps the manual
+/// impls total rather than panicking).
+fn field<T: Serialize + ?Sized>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or_default()
+}
+
+impl Serialize for SessionMessageEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let hint = section_hint(&self.unknown, "message");
+        let message = serialize_message_ordered(&self.message, hint);
+        base_then_payload(
+            "message",
+            &self.base,
+            &[("message", message)],
+            &self.unknown,
+        )
+        .serialize(serializer)
+    }
+}
+
+impl Serialize for ThinkingLevelChangeEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        base_then_payload(
+            "thinking_level_change",
+            &self.base,
+            &[("thinkingLevel", field(&self.thinking_level))],
+            &self.unknown,
+        )
+        .serialize(serializer)
+    }
+}
+
+impl Serialize for ModelChangeEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        base_then_payload(
+            "model_change",
+            &self.base,
+            &[
+                ("provider", field(&self.provider)),
+                ("modelId", field(&self.model_id)),
+            ],
+            &self.unknown,
+        )
+        .serialize(serializer)
+    }
+}
+
+impl Serialize for UsageEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut fields = vec![
+            ("kind", field(&self.kind)),
+            ("provider", field(&self.provider)),
+            ("model", field(&self.model)),
+            ("usage", field(&self.usage)),
+        ];
+        if let Some(note) = &self.note {
+            fields.push(("note", field(note)));
+        }
+        base_then_payload("usage", &self.base, &fields, &self.unknown).serialize(serializer)
+    }
+}
+
+impl Serialize for CompactionEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut fields = vec![
+            ("summary", field(&self.summary)),
+            ("firstKeptEntryId", field(&self.first_kept_entry_id)),
+            ("tokensBefore", field(&self.tokens_before)),
+        ];
+        if let Some(details) = &self.details {
+            fields.push(("details", details.clone()));
+        }
+        if let Some(usage) = &self.usage {
+            fields.push(("usage", field(usage)));
+        }
+        if let Some(from_hook) = self.from_hook {
+            fields.push(("fromHook", Value::Bool(from_hook)));
+        }
+        if let Some(system) = &self.system_message {
+            let hint = section_hint(&self.unknown, "systemMessage");
+            let ordered = serialize_message_ordered(&AgentMessage::System(system.0.clone()), hint);
+            fields.push(("systemMessage", ordered));
+        }
+        base_then_payload("compaction", &self.base, &fields, &self.unknown).serialize(serializer)
+    }
+}
+
+impl Serialize for BranchSummaryEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut fields = vec![
+            ("fromId", field(&self.from_id)),
+            ("summary", field(&self.summary)),
+        ];
+        if let Some(details) = &self.details {
+            fields.push(("details", details.clone()));
+        }
+        if let Some(usage) = &self.usage {
+            fields.push(("usage", field(usage)));
+        }
+        if let Some(from_hook) = self.from_hook {
+            fields.push(("fromHook", Value::Bool(from_hook)));
+        }
+        base_then_payload("branch_summary", &self.base, &fields, &self.unknown)
+            .serialize(serializer)
+    }
+}
+
+impl Serialize for CustomEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut fields = vec![("customType", field(&self.custom_type))];
+        if let Some(data) = &self.data {
+            fields.push(("data", data.clone()));
+        }
+        payload_then_base("custom", &fields, &self.base, &self.unknown).serialize(serializer)
+    }
+}
+
+impl Serialize for CustomMessageEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut fields = vec![
+            ("customType", field(&self.custom_type)),
+            ("content", field(&self.content)),
+            ("display", Value::Bool(self.display)),
+        ];
+        if let Some(details) = &self.details {
+            fields.push(("details", details.clone()));
+        }
+        payload_then_base("custom_message", &fields, &self.base, &self.unknown)
+            .serialize(serializer)
+    }
+}
+
+impl Serialize for ContextEditEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        base_then_payload(
+            "context_edit",
+            &self.base,
+            &[
+                ("targetId", field(&self.target_id)),
+                ("replacement", field(&self.replacement)),
+            ],
+            &self.unknown,
+        )
+        .serialize(serializer)
+    }
+}
+
+impl Serialize for LabelEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut fields = vec![("targetId", field(&self.target_id))];
+        if let Some(label) = &self.label {
+            fields.push(("label", field(label)));
+        }
+        base_then_payload("label", &self.base, &fields, &self.unknown).serialize(serializer)
+    }
+}
+
+impl Serialize for SessionInfoEntry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut fields = Vec::new();
+        if let Some(name) = &self.name {
+            fields.push(("name", field(name)));
+        }
+        base_then_payload("session_info", &self.base, &fields, &self.unknown).serialize(serializer)
+    }
+}
+
 /// A [`SystemMessage`] that serializes with its `role: "system"` tag first, as
 /// pi writes it into a compaction entry (`appendCompaction`, `:1279-1305`).
 #[derive(Debug, Clone, PartialEq)]
@@ -455,7 +890,10 @@ pub struct TaggedSystemMessage(pub SystemMessage);
 
 impl Serialize for TaggedSystemMessage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        AgentMessage::System(self.0.clone()).serialize(serializer)
+        // No wire hint here (the value is built fresh); callers serializing a
+        // decoded compaction use `serialize_message_ordered` directly so the
+        // captured `sections` order is honoured.
+        serialize_message_ordered(&AgentMessage::System(self.0.clone()), None).serialize(serializer)
     }
 }
 
@@ -532,12 +970,25 @@ impl SessionEntry {
                 .map(SessionEntry::SessionInfo),
             _ => None,
         };
-        decoded.unwrap_or_else(|| SessionEntry::Other(record.clone()))
+        let mut decoded = decoded.unwrap_or_else(|| SessionEntry::Other(record.clone()));
+        // pi-ai's BTreeMap loses the JS insertion order of `sections`. Stash the
+        // wire order in `unknown`; the manual serializer restores it on the way
+        // out so a load→typed→serialize cycle is byte-identical.
+        if let Some(unknown) = entry_unknown_mut(&mut decoded) {
+            let hint = capture_section_order(record);
+            if hint.as_object().is_some_and(|object| !object.is_empty()) {
+                unknown.insert(SECTION_ORDER_KEY.to_string(), hint);
+            }
+        }
+        decoded
     }
 
-    /// Encode back to the canonical record. pi-written entries keep their key
-    /// order; loaded records that were never mutated re-serialize byte-exactly
-    /// via [`SessionEntry::Other`].
+    /// Encode back to the canonical record. Unknown/undecodable entries keep
+    /// their verbatim bytes via [`SessionEntry::Other`]; known entries are
+    /// re-encoded by their manual [`Serialize`] impls in upstream write-site
+    /// order, with the captured `sections` insertion order restored. A
+    /// load→typed→serialize cycle is therefore byte-identical to the raw
+    /// [`Record`] path (proven against the golden fixtures).
     pub fn to_record(&self) -> Record {
         match self {
             SessionEntry::Other(record) => record.clone(),
@@ -629,6 +1080,25 @@ impl SessionEntry {
             SessionEntry::Message(entry) => Some(&entry.message),
             _ => None,
         }
+    }
+}
+
+/// The extension/unknown key bag of a typed entry, for carrying the wire
+/// `sections` order hint across a decode/encode cycle.
+fn entry_unknown_mut(entry: &mut SessionEntry) -> Option<&mut JsonObject> {
+    match entry {
+        SessionEntry::Message(e) => Some(&mut e.unknown),
+        SessionEntry::ThinkingLevelChange(e) => Some(&mut e.unknown),
+        SessionEntry::ModelChange(e) => Some(&mut e.unknown),
+        SessionEntry::Usage(e) => Some(&mut e.unknown),
+        SessionEntry::Compaction(e) => Some(&mut e.unknown),
+        SessionEntry::BranchSummary(e) => Some(&mut e.unknown),
+        SessionEntry::Custom(e) => Some(&mut e.unknown),
+        SessionEntry::CustomMessage(e) => Some(&mut e.unknown),
+        SessionEntry::ContextEdit(e) => Some(&mut e.unknown),
+        SessionEntry::Label(e) => Some(&mut e.unknown),
+        SessionEntry::SessionInfo(e) => Some(&mut e.unknown),
+        SessionEntry::Other(..) => None,
     }
 }
 
@@ -900,5 +1370,153 @@ mod tests {
         );
         assert_eq!(entry.note.as_deref(), Some("n"));
         assert_eq!(SessionEntry::Usage(entry).to_record().to_line(), line);
+    }
+
+    // -- byte-exact typed re-encode (write-site order) -----------------------
+
+    /// Every golden line — including the nested `message` objects and their
+    /// `sections` maps — must survive load→typed→serialize byte-identically.
+    /// This is the finding recorded in HANDOFF "Golden session fixtures".
+    #[test]
+    fn golden_lines_are_byte_exact_through_the_typed_view() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/golden");
+        let fixtures = [
+            "01-plain-user-assistant.jsonl",
+            "02-tool-read-round-trip.jsonl",
+            "03-model-change-thinking-low.jsonl",
+            "04-multi-turn-with-name.jsonl",
+            "05-resume-thinking-level-change.jsonl",
+        ];
+        let mut checked = 0usize;
+        for name in fixtures {
+            let path = std::path::Path::new(dir).join(name);
+            let text = std::fs::read_to_string(&path).unwrap();
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let record = Record::parse_line_strict(line).unwrap();
+                let typed = SessionEntry::from_record(&record);
+                assert_eq!(
+                    typed.to_record().to_line(),
+                    record.to_line(),
+                    "typed view changed a line in {name}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 38, "all lines of the five golden fixtures");
+    }
+
+    #[test]
+    fn system_sections_keep_wire_insertion_order_not_alphabetical() {
+        let line = concat!(
+            r#"{"type":"message","id":"a","parentId":null,"timestamp":"t","message":{"#,
+            r#""role":"system","content":"","sections":{"zed":"z","alpha":"a","mid":"m"},"#,
+            r#""timestamp":1}}"#
+        );
+        let record = Record::parse_line_strict(line).unwrap();
+        // The decoded BTreeMap alphabetizes; the wire hint must restore order.
+        let SessionEntry::Message(entry) = SessionEntry::from_record(&record) else {
+            panic!("expected message entry");
+        };
+        let AgentMessage::System(system) = &entry.message else {
+            panic!("expected system message");
+        };
+        let sections = system.sections.as_ref().unwrap();
+        assert_eq!(
+            sections.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["alpha", "mid", "zed"]
+        );
+        assert_eq!(SessionEntry::Message(entry).to_record().to_line(), line);
+    }
+
+    #[test]
+    fn assistant_message_uses_write_site_order_not_declaration_order() {
+        let line = concat!(
+            r#"{"type":"message","id":"b","parentId":"a","timestamp":"t","message":{"#,
+            r#""role":"assistant","content":[{"type":"text","text":"4"}],"#,
+            r#""api":"openai-completions","provider":"llama-swap","model":"m","#,
+            r#""usage":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":3,"#,
+            r#""cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"#,
+            r#""stopReason":"stop","timestamp":1,"responseId":"id","responseModel":"model","#,
+            r#""rawStopReason":"stop","durationMs":12,"thinkingLevel":"off"}}"#
+        );
+        let record = Record::parse_line_strict(line).unwrap();
+        assert_eq!(
+            SessionEntry::from_record(&record).to_record().to_line(),
+            line
+        );
+    }
+
+    #[test]
+    fn tool_result_message_uses_upstream_field_order() {
+        let line = concat!(
+            r#"{"type":"message","id":"c","parentId":"b","timestamp":"t","message":{"#,
+            r#""role":"toolResult","toolCallId":"tc","toolName":"read","#,
+            r#""content":[{"type":"text","text":"ok"}],"isError":false,"#,
+            r#""durationMs":3,"timestamp":7}}"#
+        );
+        let record = Record::parse_line_strict(line).unwrap();
+        assert_eq!(
+            SessionEntry::from_record(&record).to_record().to_line(),
+            line
+        );
+    }
+
+    #[test]
+    fn custom_entries_keep_payload_before_base_fields() {
+        for line in [
+            r#"{"type":"custom","customType":"ct","data":{"n":1},"id":"d","parentId":null,"timestamp":"t","extra":true}"#,
+            r#"{"type":"custom_message","customType":"ct","content":"hi","display":true,"details":{"x":1},"id":"e","parentId":"d","timestamp":"t"}"#,
+        ] {
+            let record = Record::parse_line_strict(line).unwrap();
+            assert_eq!(
+                SessionEntry::from_record(&record).to_record().to_line(),
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn freshly_built_entries_emit_write_site_order_without_a_wire_hint() {
+        let entry = SessionMessageEntry {
+            base: EntryBase {
+                id: "fresh".into(),
+                parent_id: None,
+                timestamp: "t".into(),
+            },
+            message: AgentMessage::System(SystemMessage {
+                content: pi_ai::types::StringOrTextBlocks::Text(String::new()),
+                sections: None,
+                tools_added: None,
+                tools_removed: None,
+                timestamp: 1,
+            }),
+            unknown: JsonObject::new(),
+        };
+        let line = SessionEntry::Message(entry).to_record().to_line();
+        // `timestamp` before `toolsAdded` is the upstream system write order;
+        // no private hint key may leak into the serialized JSON.
+        assert_eq!(
+            line,
+            r#"{"type":"message","id":"fresh","parentId":null,"timestamp":"t","message":{"role":"system","content":"","timestamp":1}}"#
+        );
+        assert!(!line.contains("pi-rs"));
+    }
+
+    #[test]
+    fn compaction_system_message_sections_keep_wire_order() {
+        let line = concat!(
+            r#"{"type":"compaction","id":"g","parentId":null,"timestamp":"t","#,
+            r#""summary":"s","firstKeptEntryId":"g","tokensBefore":10,"#,
+            r#""systemMessage":{"role":"system","content":"","sections":{"cwd":"/x","preamble":"p"},"#,
+            r#""timestamp":1}}"#
+        );
+        let record = Record::parse_line_strict(line).unwrap();
+        assert_eq!(
+            SessionEntry::from_record(&record).to_record().to_line(),
+            line
+        );
     }
 }
