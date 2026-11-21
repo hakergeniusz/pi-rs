@@ -1529,7 +1529,7 @@ mod tests {
         let line = concat!(
             r#"{"type":"compaction","id":"c1","parentId":null,"timestamp":"t","#,
             r#""summary":"s","firstKeptEntryId":"root","tokensBefore":51.248178375505404,"#,
-            r#""data":{"value":7.101215824554616e260}}"#
+            r#""data":{"value":7.101215824554616e+260}}"#
         );
         let record = Record::parse_line_strict(line).unwrap();
         assert_eq!(record.to_line(), line);

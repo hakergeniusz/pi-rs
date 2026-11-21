@@ -3,3 +3,4 @@
 **/*.rs.bk
 Cargo.lock.bak
 .flutter-plugins-dependencies
+.build-cache/
