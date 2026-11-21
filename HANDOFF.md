@@ -3694,10 +3694,23 @@ tests re-initializing the process-wide theme. All `WIRING.md` notes were
 preserved under `/tmp/opencode/*-WIRING.md` (tmpfs — copy to docs if they must
 survive a reboot).
 
-**Release cut awaits user approval:** version bump to `0.1.0`, the `v0.1.0`
-tag, pushing it, and creating/finalizing the GitHub Release (see
-`docs/RELEASE.md` §3 and the preserved `release-install-WIRING.md`). The
-installer/CI plumbing is in place but no tag exists yet.
+**v0.1.0 RELEASED (user-approved):** workspace bumped to `0.1.0` (`7bb47d6`,
+CI green), annotated tag `v0.1.0` pushed at that commit, and the GitHub
+Release created with `pi-linux-x86_64` / `pi-linux-aarch64` plus `.sha256`
+files (all checksums verified locally). The tag workflow's macOS jobs sat
+queued indefinitely (no hosted macOS capacity for this private repo), so the
+run was cancelled and the release published via `gh release create` with the
+two completed Linux artifacts. The workflow was then amended to build only
+the two Linux targets (`f066c6c`); darwin assets can be added with
+`gh release upload v0.1.0 …` when a runner is available. `docs/RELEASE.md`
+records the actual release state.
+
+**Last slices landed:** the npm package-manager arm (`a4f9ce1`, `semver`
+locked; delegates registry/tarball work to npm/pnpm/bun like upstream) and
+the real `pi-codemode` crate (`dddea1b`, 49 tests — declarations, source
+parsing, protocol, QuickJS prelude/VM, inline sandbox and tool bridge;
+agent-session-side tool registration remains host wiring). `main` CI green on
+all jobs after each landing.
 
 **CI green** on `b3dc9ec`: all 7 jobs (clippy, test, fmt, NDF, audit, msrv,
 release) pass. Two CI-only issues fixed after the integrations: `fmt --check`
