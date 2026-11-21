@@ -868,7 +868,56 @@ impl ExtensionRunner {
                 }
             }
         }
+        self.register_resource_tools()?;
         Ok(reports)
+    }
+
+    /// Register the three native MCP resource tools when at least one
+    /// connected server advertises resources (`resources.ts:198-272`). Their
+    /// execute wrappers route through the shared `mcpResource` host op.
+    fn register_resource_tools(&mut self) -> Result<(), JsHostError> {
+        use pi_mcp::resources as res;
+        let manager = {
+            let core = self.host.core().lock().expect("host core mutex poisoned");
+            core.mcp_manager.clone()
+        };
+        if manager.servers_with_resources().is_empty() {
+            return Ok(());
+        }
+        let definitions = vec![
+            json!({
+                "name": res::LIST_MCP_RESOURCES_TOOL,
+                "label": res::LIST_MCP_RESOURCES_TOOL,
+                "description": res::LIST_RESOURCES_DESCRIPTION,
+                "parameters": res::list_parameters_schema(),
+                "outputSchema": res::list_output_schema(),
+                "exposure": "direct",
+                "annotations": { "readOnlyHint": true },
+                "resourceTool": res::LIST_MCP_RESOURCES_TOOL,
+            }),
+            json!({
+                "name": res::LIST_MCP_RESOURCE_TEMPLATES_TOOL,
+                "label": res::LIST_MCP_RESOURCE_TEMPLATES_TOOL,
+                "description": res::LIST_TEMPLATES_DESCRIPTION,
+                "parameters": res::list_parameters_schema(),
+                "outputSchema": res::list_templates_output_schema(),
+                "exposure": "direct",
+                "annotations": { "readOnlyHint": true },
+                "resourceTool": res::LIST_MCP_RESOURCE_TEMPLATES_TOOL,
+            }),
+            json!({
+                "name": res::READ_MCP_RESOURCE_TOOL,
+                "label": res::READ_MCP_RESOURCE_TOOL,
+                "description": res::READ_DESCRIPTION,
+                "parameters": res::read_parameters_schema(),
+                "outputSchema": res::read_output_schema(),
+                "exposure": "direct",
+                "annotations": { "readOnlyHint": true },
+                "resourceTool": res::READ_MCP_RESOURCE_TOOL,
+            }),
+        ];
+        self.host
+            .register_mcp_tools(MCP_EXTENSION_PATH, &json!(definitions))
     }
 
     /// Creates the synthetic record the bridge tools register into, once.

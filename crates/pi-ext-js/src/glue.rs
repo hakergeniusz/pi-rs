@@ -2804,6 +2804,7 @@ globalThis.__piMcpRegisterTools = function (path, toolsJson) {
     }
     const server = tool.server;
     const serverTool = tool.serverTool;
+    const resourceTool = tool.resourceTool;
     ext.tools[tool.name] = {
       name: tool.name,
       label: tool.label,
@@ -2812,11 +2813,18 @@ globalThis.__piMcpRegisterTools = function (path, toolsJson) {
       exposure: tool.exposure,
       namespace: tool.namespace,
       execute: (toolCallId, params) => {
-        const raw = globalThis.__piOps.mcpCallTool(
-          server,
-          serverTool,
-          JSON.stringify(params ?? {}),
-        );
+        // The three resource tools are hosted natively: their definitions
+        // carry `resourceTool` and the shared op builds the final result.
+        const raw = resourceTool
+          ? globalThis.__piOps.mcpResource(
+              resourceTool,
+              JSON.stringify(params ?? {}),
+            )
+          : globalThis.__piOps.mcpCallTool(
+              server,
+              serverTool,
+              JSON.stringify(params ?? {}),
+            );
         const parsed = JSON.parse(raw);
         if (parsed.error !== undefined) throw new Error(parsed.error);
         return parsed.result;

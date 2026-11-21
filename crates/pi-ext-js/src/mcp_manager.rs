@@ -297,6 +297,175 @@ impl McpManager {
         })
     }
 
+    /// Build the final tool result for one of the three MCP resource tools
+    /// (`resources.ts:179-193`, `:236-260`): payload/text, truncation details
+    /// and structured content, all in the shape the tool bridge expects.
+    pub fn resource_tool_result(&self, tool: &str, params: &Json) -> Json {
+        use pi_mcp::resources as res;
+        let servers = self.servers_with_resources();
+        match tool {
+            res::LIST_MCP_RESOURCES_TOOL => {
+                self.list_tool_payload(tool, params, "resources", &servers, false)
+            }
+            res::LIST_MCP_RESOURCE_TEMPLATES_TOOL => {
+                self.list_tool_payload(tool, params, "resourceTemplates", &servers, true)
+            }
+            res::READ_MCP_RESOURCE_TOOL => self.read_tool_result(tool, params, &servers),
+            _ => json!({ "error": format!("Unknown MCP resource tool: {tool}") }),
+        }
+    }
+
+    fn list_tool_payload(
+        &self,
+        tool: &str,
+        params: &Json,
+        key: &str,
+        servers: &[String],
+        templates: bool,
+    ) -> Json {
+        use pi_mcp::resources as res;
+        let reply_result = |reply: Json| -> Result<Json, McpError> {
+            reply.get("result").cloned().ok_or_else(|| {
+                McpError::Malformed(
+                    reply
+                        .get("error")
+                        .and_then(Json::as_str)
+                        .unwrap_or("resource list failed")
+                        .to_string(),
+                )
+            })
+        };
+        let page = |server: &str, cursor: Option<&str>| -> Result<res::Page, McpError> {
+            let reply = if templates {
+                self.list_resource_templates_page(server, cursor)
+            } else {
+                self.list_resources_page(server, cursor)
+            };
+            let value = reply_result(reply)?;
+            if templates {
+                let parsed = res::parse_list_resource_templates_page(&value)?;
+                Ok(res::Page {
+                    items: parsed
+                        .resource_templates
+                        .into_iter()
+                        .map(|item| serde_json::to_value(item).unwrap_or(Json::Null))
+                        .collect(),
+                    next_cursor: parsed.next_cursor,
+                })
+            } else {
+                let parsed = res::parse_list_resources_page(&value)?;
+                Ok(res::Page {
+                    items: parsed
+                        .resources
+                        .into_iter()
+                        .map(|item| serde_json::to_value(item).unwrap_or(Json::Null))
+                        .collect(),
+                    next_cursor: parsed.next_cursor,
+                })
+            }
+        };
+        let all = |server: &str| -> Result<Vec<Json>, McpError> {
+            let reply = if templates {
+                self.list_resource_templates(server)
+            } else {
+                self.list_resources(server)
+            };
+            let value = reply_result(reply)?;
+            if templates {
+                let parsed = res::parse_list_resource_templates_page(&value)?;
+                Ok(parsed
+                    .resource_templates
+                    .into_iter()
+                    .map(|item| serde_json::to_value(item).unwrap_or(Json::Null))
+                    .collect())
+            } else {
+                let parsed = res::parse_list_resources_page(&value)?;
+                Ok(parsed
+                    .resources
+                    .into_iter()
+                    .map(|item| serde_json::to_value(item).unwrap_or(Json::Null))
+                    .collect())
+            }
+        };
+        match res::list_payload(Some(params), key, servers, page, all) {
+            Ok(payload) => Self::finish_tool(tool, params, &payload),
+            Err(error) => json!({ "error": res::error_message(&error) }),
+        }
+    }
+
+    fn read_tool_result(&self, tool: &str, params: &Json, servers: &[String]) -> Json {
+        use pi_mcp::resources as res;
+        let uri = match res::string_argument(Some(params), "uri") {
+            Ok(Some(uri)) => uri,
+            Ok(None) => return json!({ "error": "uri must be provided" }),
+            Err(error) => return json!({ "error": res::error_message(&error) }),
+        };
+        let server = match res::string_argument(Some(params), "server") {
+            Ok(Some(server)) => server,
+            Ok(None) => return json!({ "error": "server must be provided" }),
+            Err(error) => return json!({ "error": res::error_message(&error) }),
+        };
+        if !servers.contains(&server) {
+            return json!({
+                "error": res::find_server_error(&server, servers.iter().map(String::as_str))
+            });
+        }
+        let reply = self.read_resource(&server, &uri);
+        let Some(value) = reply.get("result") else {
+            return json!({
+                "error": reply
+                    .get("error")
+                    .and_then(Json::as_str)
+                    .unwrap_or("resource read failed")
+            });
+        };
+        let read = match res::parse_read_resource_result(value) {
+            Ok(read) => read,
+            Err(error) => return json!({ "error": res::error_message(&error) }),
+        };
+        let blocks = res::contents_to_model_blocks(&read, &uri, |bytes, extension| {
+            write_output_file(extension, bytes)
+        });
+        let blocks = if blocks.is_empty() {
+            vec![json!({
+                "type": "text",
+                "text": format!("Resource {uri} is empty.")
+            })]
+        } else {
+            blocks
+        };
+        let (content, full_output_path) = limit_mcp_content(blocks);
+        let mut details = json!({ "server": server, "tool": tool });
+        if let Some(path) = full_output_path {
+            details["fullOutputPath"] = json!(path);
+        }
+        json!({
+            "content": content,
+            "details": details,
+            "structuredContent": res::read_structured_content(&server, &uri, &read),
+        })
+    }
+
+    fn finish_tool(tool: &str, params: &Json, payload: &Json) -> Json {
+        let text = serde_json::to_string(&payload).unwrap_or_default();
+        let (content, full_output_path) = limit_mcp_content(vec![json!({
+            "type": "text",
+            "text": text,
+        })]);
+        let mut details = json!({
+            "server": params.get("server").and_then(Json::as_str).unwrap_or(""),
+            "tool": tool,
+        });
+        if let Some(path) = full_output_path {
+            details["fullOutputPath"] = json!(path);
+        }
+        json!({
+            "content": content,
+            "details": details,
+            "structuredContent": payload,
+        })
+    }
+
     /// Calls one tool on a connected server (`callTool` via `withClient`,
     /// `runtime.ts:248-303`), mapped by [`convert_mcp_result`].
     ///

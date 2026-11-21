@@ -588,6 +588,21 @@ impl JsHost {
                 |_| r#"{"error":"mcp tool result serialization failed"}"#.to_string(),
             )
         });
+        // The three MCP resource tools share one op: the manager builds the
+        // payload, applies limitMcpContent and returns the tool result shape
+        // (`resources.ts:179-193`, `:236-260`).
+        op!("mcpResource", core, |tool: String,
+                                  args: String|
+         -> String {
+            let manager = {
+                let core = core.lock().expect("host core mutex poisoned");
+                core.mcp_manager.clone()
+            };
+            let params: Json = serde_json::from_str(&args).unwrap_or(Json::Null);
+            serde_json::to_string(&manager.resource_tool_result(&tool, &params)).unwrap_or_else(
+                |_| r#"{"error":"mcp resource result serialization failed"}"#.to_string(),
+            )
+        });
         op!("cwd", core, || -> String {
             core.lock().expect("host core mutex poisoned").cwd.clone()
         });
