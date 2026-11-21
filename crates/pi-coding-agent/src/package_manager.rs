@@ -872,7 +872,6 @@ impl<'a> PackageManager<'a> {
     /// sources. The `pi remove` CLI prints the plain form directly (upstream
     /// `package-manager-cli.ts` too); the suggestion form serves `resolve()`'s
     /// missing-source callback (upstream `:1180-1187`).
-    #[must_use]
     pub fn build_no_matching_package_message(&self, source: &str) -> PackageManagerResult<String> {
         let configured: Vec<String> = self
             .list_configured_packages()?
@@ -1149,7 +1148,7 @@ impl<'a> PackageManager<'a> {
 
     /// `ensureNpmProject` (`:2262-2273`): create the install root, mark it
     /// ignored by cloud sync, write `.gitignore` and the private manifest.
-    fn ensure_npm_project(&self, root: &Path) -> PackageManagerResult<()> {
+    fn ensure_npm_project(root: &Path) -> PackageManagerResult<()> {
         if !root.exists() {
             std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
         }
@@ -1209,13 +1208,13 @@ impl<'a> PackageManager<'a> {
     /// same managed-install machinery for one spec or a batch of specs.
     pub fn install_npm_specs(&self, specs: &[String], scope: Scope) -> PackageManagerResult<()> {
         let root = self.npm_install_root(scope)?;
-        self.ensure_npm_project(&root)?;
+        Self::ensure_npm_project(&root)?;
         let args = self.npm_install_args(specs, &root)?;
         self.run_npm_command(&args, None)
     }
 
     fn install_npm(&self, npm: &NpmSource, scope: Scope) -> PackageManagerResult<()> {
-        self.install_npm_specs(&[npm.spec.clone()], scope)
+        self.install_npm_specs(std::slice::from_ref(&npm.spec), scope)
     }
 
     /// `uninstallNpm` (`:2050-2067`).
@@ -2015,7 +2014,7 @@ mod tests {
             )
         }
 
-        fn with_sync(mut self, responses: &[&str]) -> Self {
+        fn with_sync(self, responses: &[&str]) -> Self {
             *self.state.sync_responses.borrow_mut() = responses
                 .iter()
                 .map(|response| (*response).to_string())
@@ -2023,7 +2022,7 @@ mod tests {
             self
         }
 
-        fn with_version(mut self, version: &str) -> Self {
+        fn with_version(self, version: &str) -> Self {
             *self.state.installed_version.borrow_mut() = version.to_string();
             self
         }
