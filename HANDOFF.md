@@ -3663,12 +3663,23 @@ and stale test expectations (each verified against upstream v1.5.2) before landi
 - `mcp_servers` system-prompt section fed from the loaded config snapshot in
   `system_prompt_for` (all modes).
 
-**Still open:** credential store → `mcp_manager` OAuth attachment and
-resources → `client.rs` hooks. Two flaky pre-existing interactive tests were
-stabilized: a notify test that stopped pumping before its UI requests drained,
-and a global-theme assertion that raced with sibling tests re-initializing the
-process-wide theme. All `WIRING.md` notes were preserved under
-`/tmp/opencode/*-WIRING.md` (tmpfs — copy to docs if they must survive a reboot).
+**OAuth + resources wiring landed:** `McpClient::connect_with_auth` carries an
+`AuthProvider` on the HTTP transport; `HostCore.mcp_auth_dir` (set from the
+agent dir in `extensions::load`) reaches the MCP worker, which builds an
+`McpAuthProvider` from `mcp-auth.json` per HTTP server, including lazy
+reconnects (`b9aa4cb`). `McpClient` gained async `resources_list[_page]`,
+`resources_templates_list[_page]` (method-not-found → empty) and
+`resource_read`; the manager records `has_resources` on connect and exposes
+`servers_with_resources()` (`d3dcff2`).
+
+**Still open:** the extension-facing resource tools (three tool definitions,
+their host ops and the worker request variants described in
+`mcp-resources-WIRING.md` §2b–2d). Two flaky pre-existing interactive tests
+were stabilized: a notify test that stopped pumping before its UI requests
+drained, and a global-theme assertion that raced with sibling tests
+re-initializing the process-wide theme. All `WIRING.md` notes were preserved
+under `/tmp/opencode/*-WIRING.md` (tmpfs — copy to docs if they must survive a
+reboot).
 
 **CI green** on `b3dc9ec`: all 7 jobs (clippy, test, fmt, NDF, audit, msrv,
 release) pass. Two CI-only issues fixed after the integrations: `fmt --check`
