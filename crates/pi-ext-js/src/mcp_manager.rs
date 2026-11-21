@@ -107,6 +107,32 @@ enum Request {
         args: Json,
         reply: std::sync::mpsc::Sender<Result<Json, String>>,
     },
+    /// Resource reads/lists (`resources.ts:100-107` — the native resource
+    /// tools). Each reply follows the `{"result": …}` / `{"error": …}`
+    /// convention so the execute wrapper can throw on an error.
+    ListResourcePage {
+        server: String,
+        cursor: Option<String>,
+        reply: std::sync::mpsc::Sender<Result<Json, String>>,
+    },
+    ListResources {
+        server: String,
+        reply: std::sync::mpsc::Sender<Result<Json, String>>,
+    },
+    ListTemplatePage {
+        server: String,
+        cursor: Option<String>,
+        reply: std::sync::mpsc::Sender<Result<Json, String>>,
+    },
+    ListTemplates {
+        server: String,
+        reply: std::sync::mpsc::Sender<Result<Json, String>>,
+    },
+    ReadResource {
+        server: String,
+        uri: String,
+        reply: std::sync::mpsc::Sender<Result<Json, String>>,
+    },
     Drop {
         name: String,
     },
@@ -204,6 +230,73 @@ impl McpManager {
         reply_rx.recv_timeout(REPLY_SLACK).unwrap_or_default()
     }
 
+    /// One resource request, replied to as `{"result": …}` or
+    /// `{"error": …}` so the JS execute wrapper can throw on an error.
+    fn resource_request(
+        &self,
+        server: &str,
+        build: impl FnOnce(std::sync::mpsc::Sender<Result<Json, String>>) -> Request,
+    ) -> Json {
+        let window = self.reply_window(server, config_default_window());
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        let outcome = self
+            .sender()
+            .send(build(reply))
+            .map_err(|_| "MCP manager is not running".to_string())
+            .and_then(|()| {
+                reply_rx
+                    .recv_timeout(window)
+                    .unwrap_or_else(|_| Err("MCP manager did not answer in time".to_string()))
+            });
+        match outcome {
+            Ok(value) => json!({ "result": value }),
+            Err(error) => json!({ "error": error }),
+        }
+    }
+
+    /// One `resources/list` page (`client.ts:306-309`).
+    pub fn list_resources_page(&self, server: &str, cursor: Option<&str>) -> Json {
+        self.resource_request(server, |reply| Request::ListResourcePage {
+            server: server.to_string(),
+            cursor: cursor.map(str::to_string),
+            reply,
+        })
+    }
+
+    /// Every resource, following `nextCursor`.
+    pub fn list_resources(&self, server: &str) -> Json {
+        self.resource_request(server, |reply| Request::ListResources {
+            server: server.to_string(),
+            reply,
+        })
+    }
+
+    /// One `resources/templates/list` page.
+    pub fn list_resource_templates_page(&self, server: &str, cursor: Option<&str>) -> Json {
+        self.resource_request(server, |reply| Request::ListTemplatePage {
+            server: server.to_string(),
+            cursor: cursor.map(str::to_string),
+            reply,
+        })
+    }
+
+    /// Every resource template, following `nextCursor`.
+    pub fn list_resource_templates(&self, server: &str) -> Json {
+        self.resource_request(server, |reply| Request::ListTemplates {
+            server: server.to_string(),
+            reply,
+        })
+    }
+
+    /// `resources/read` for one URI.
+    pub fn read_resource(&self, server: &str, uri: &str) -> Json {
+        self.resource_request(server, |reply| Request::ReadResource {
+            server: server.to_string(),
+            uri: uri.to_string(),
+            reply,
+        })
+    }
+
     /// Calls one tool on a connected server (`callTool` via `withClient`,
     /// `runtime.ts:248-303`), mapped by [`convert_mcp_result`].
     ///
@@ -283,6 +376,7 @@ fn spawn_worker(
 /// The worker: owns the tokio runtime and every connection. When all
 /// manager handles drop, the channel closes and remaining clients shut
 /// down (their transports kill the children).
+#[allow(clippy::too_many_lines)] // mirrors upstream's single worker loop; split when extending
 fn worker_loop(
     receiver: &std::sync::mpsc::Receiver<Request>,
     timeouts: &Arc<Mutex<HashMap<String, Duration>>>,
@@ -338,6 +432,52 @@ fn worker_loop(
                 reply,
             } => {
                 let outcome = call_tool_on(&runtime, &mut servers, &server, &tool, args, auth_dir);
+                let _ = reply.send(outcome);
+            }
+            Request::ListResourcePage {
+                server,
+                cursor,
+                reply,
+            } => {
+                let outcome = resource_reply(&servers, &server, |client, timeout| {
+                    let page =
+                        runtime.block_on(client.resources_list_page(cursor.as_deref(), timeout))?;
+                    Ok(serde_json::to_value(page).unwrap_or(Json::Null))
+                });
+                let _ = reply.send(outcome);
+            }
+            Request::ListResources { server, reply } => {
+                let outcome = resource_reply(&servers, &server, |client, timeout| {
+                    let items = runtime.block_on(client.resources_list(timeout))?;
+                    Ok(serde_json::to_value(items).unwrap_or(Json::Null))
+                });
+                let _ = reply.send(outcome);
+            }
+            Request::ListTemplatePage {
+                server,
+                cursor,
+                reply,
+            } => {
+                let outcome = resource_reply(&servers, &server, |client, timeout| {
+                    let page = runtime.block_on(
+                        client.resources_templates_list_page(cursor.as_deref(), timeout),
+                    )?;
+                    Ok(serde_json::to_value(page).unwrap_or(Json::Null))
+                });
+                let _ = reply.send(outcome);
+            }
+            Request::ListTemplates { server, reply } => {
+                let outcome = resource_reply(&servers, &server, |client, timeout| {
+                    let items = runtime.block_on(client.resources_templates_list(timeout))?;
+                    Ok(serde_json::to_value(items).unwrap_or(Json::Null))
+                });
+                let _ = reply.send(outcome);
+            }
+            Request::ReadResource { server, uri, reply } => {
+                let outcome = resource_reply(&servers, &server, |client, timeout| {
+                    let result = runtime.block_on(client.resource_read(&uri, timeout))?;
+                    Ok(serde_json::to_value(result).unwrap_or(Json::Null))
+                });
                 let _ = reply.send(outcome);
             }
             Request::Drop { name } => {
@@ -545,6 +685,27 @@ fn shutdown_all(runtime: &tokio::runtime::Runtime, servers: &mut HashMap<String,
 
 /// One tool call with the execution-time guards, then the wire call
 /// (`withClient`, `runtime.ts:276-303`).
+/// Run one read-only resource request against a connected server. Reads do
+/// not reconnect a failed server here (upstream's `withClient(…, true)` lazy
+/// reconnect is a follow-up); a missing/disconnected server answers with the
+/// upstream-style disabled error.
+fn resource_reply(
+    servers: &HashMap<String, ServerEntry>,
+    server: &str,
+    op: impl FnOnce(&McpClient, Duration) -> Result<Json, McpError>,
+) -> Result<Json, String> {
+    let entry = servers
+        .get(server)
+        .ok_or_else(|| format!("MCP server \"{server}\" is not connected"))?;
+    let ServerState::Connected {
+        client, timeout, ..
+    } = &entry.state
+    else {
+        return Err(format!("MCP server \"{server}\" is disabled"));
+    };
+    op(client, *timeout).map_err(|error| error.to_string())
+}
+
 fn call_tool_on(
     runtime: &tokio::runtime::Runtime,
     servers: &mut HashMap<String, ServerEntry>,
