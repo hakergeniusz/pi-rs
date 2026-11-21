@@ -3632,6 +3632,39 @@ restarts cancel long builds). Per operator order, no further subagents.
 - **Constraint**: /tmp tmpfs is ~2.0 GB free of 7.8 GB; never enlarge the RAM
   container's tmpfs or run two heavy gates in parallel.
 
+## 2026-11-21 — parallel wave COMPLETE (11 slices landed)
+
+All 11 subagent slices were integrated on `main` (each cherry-picked, registered,
+RAM-gated with targeted clippy+test, then pushed). Every slice arrived as an
+uncompiled module layer; the coordinator fixed compile errors, clippy lints,
+and stale test expectations (each verified against upstream v1.5.2) before landing.
+
+| Slice | Commit(s) | Notes |
+|---|---|---|
+| `/mcp` selector component | `0e0dbf4` | 811-line component, 13 tests; mode wiring STILL OPEN |
+| P7 crash log | `1af6714` | fixed unstable `Error::backtrace`, session-file fallback |
+| MCP resources | `f888f96` | 71 tests; sync transport trait |
+| P7 telemetry subset | `fe13ae2` | 13 tests; noop + in-memory + render |
+| NFKC fuzzy edit | `1e807e0` + `c518ddf` | full `unicode-normalization`; Cargo.lock updated |
+| MCP OAuth store | `deb28f4` | fixed tokens() transpose + legacy migration dropping credential |
+| `mcp_servers` prompt section | `0509bd8` | 14 tests; dependency-free input |
+| typed session re-encode | `929e167` | 38 golden lines byte-exact through typed view |
+| `mcp.json` config loader | `8efc885` | 19 tests; 3 stale expectations fixed vs upstream |
+| pi-ai stream hooks | `9733495` | built-in adapters invoke hooks; 63 tests |
+| `pi mcp` CLI | `bdebab3` | full CLI; fixed inverted Levenshtein cost + stale tests |
+
+**Still open (wiring, not module code):** `/mcp` dispatch/mount/pump in
+`interactive_mode.rs`, `pi mcp` dispatch in `main.rs`/`cli/args.rs`, credential
+store → `mcp_manager` OAuth attachment, resources → `client.rs` hooks, config
+snapshot → system-prompt builder. The module layers compile and test; only the
+host integration is deferred. All `WIRING.md` notes were preserved under
+`/tmp/opencode/*-WIRING.md` (tmpfs — copy to docs if they must survive a reboot).
+
+**Process lesson:** subagents consistently write compilable-looking but unverified
+Rust; budget a coordinator fix round per slice (compile → clippy → tests). Two
+real bugs were found only by the gates: an inverted Levenshtein substitution
+cost and an OAuth legacy-credential migration that dropped the token.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
