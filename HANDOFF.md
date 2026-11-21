@@ -3607,6 +3607,31 @@ compressed snapshot to the disk volume per gate (`scripts/ram-build.sh`). One
 RAM gate at a time (host has ~2.4 GB free RAM + heavy swap). Verified: `cargo
 check -p pi-mcp` in tmpfs = 15 s / 142 MB, exit 0. Documented in AGENTS.md.
 
+## 2026-11-21 — parallel MCP/P7 wave + workflow fix (in progress)
+
+Six subagents were launched in RAM worktrees (`/tmp/opencode/pi-rs-wt-<name>`),
+each authoring a disjoint module layer + tests with NO cargo commands (the
+coordinator gates serially; the host is memory-starved and repeated daemon
+restarts cancel long builds). Per operator order, no further subagents.
+
+- **Landed**: `/mcp` manager selector component (`mcp_selector.rs`, 811 lines,
+  13 tests) cherry-picked from `feat/mcp-ui` as `0e0dbf4` (+ registration in
+  `components/mod.rs`); clippy + 19 test binaries green in the RAM container.
+  Its `WIRING.md` is preserved at `/tmp/opencode/mcp-ui-WIRING.md`; the `/mcp`
+  dispatch, mount, pump-drain and MCP data-source wiring are STILL OPEN — they
+  need the manager/config layer from the store/CLI/resources slices.
+- **In flight** (worktrees at base `2d0ee8e`, files appearing): `mcp-oauth-store`
+  (F2b credential store), `mcp-cli` (`pi mcp`), `mcp-resources`, `p7-crash-log`,
+  `p7-telemetry`. Integrate each: review diff (no shared files), cherry-pick,
+  add module registration, targeted RAM clippy+test, then coordinator wiring.
+- **Workflow fix** (`ce18dd2`): `CARGO_PROFILE_DEV_DEBUGINFO` is silently
+  ignored by Cargo; the RAM gate now sets `DEV/TEST/BENCH DEBUG=0`. Before the
+  fix, a full gate emitted `-C debuginfo=2` and filled the 1.8 GB tmpfs at the
+  test step (rustc SIGBUS / ENOSPC). Targeted gates now pass; full-gate
+  authority is CI (run 119+), since local long runs get cancelled by restarts.
+- **Constraint**: /tmp tmpfs is ~2.0 GB free of 7.8 GB; never enlarge the RAM
+  container's tmpfs or run two heavy gates in parallel.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
