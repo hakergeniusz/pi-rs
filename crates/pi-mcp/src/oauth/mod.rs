@@ -1,7 +1,7 @@
 //! The OAuth client for MCP servers (`packages/mcp/src/oauth/`, the
 //! module list of `index.ts`): discovery, wire types and their errors, the
-//! flows, the state provider, client settings, the loopback callback, and
-//! the two sign-in halves.
+//! flows, the state provider, client settings, the loopback callback, the
+//! two sign-in halves, and the file-backed `mcp-auth.json` credential store.
 //!
 //! Deviations of the port, module-wide: there are no `AbortSignal`s —
 //! sign-in cancellation rides [`tokio_util::sync::CancellationToken`] and
@@ -20,6 +20,7 @@ pub mod flow;
 pub mod loopback;
 pub mod provider;
 pub mod sign_in;
+pub mod store;
 pub mod types;
 
 pub use auth_provider::{McpAuthProvider, McpAuthProviderOptions, RefreshStoredOptions};
@@ -56,6 +57,9 @@ pub use provider::{
 pub use sign_in::{
     McpAuthorizationResponse, McpSignInOptions, McpSignInRedirect, McpSignInStart,
     complete_mcp_sign_in, start_mcp_sign_in,
+};
+pub use store::{
+    MCP_AUTH_FILE_NAME, McpOAuthCredentialStore, ServerOAuthStore, default_store_path, store_keys,
 };
 pub use types::{
     AuthorizationServerMetadata, OAuthChallenge, OAuthClientInformationFull, OAuthClientMetadata,
