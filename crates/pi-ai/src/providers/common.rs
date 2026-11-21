@@ -142,7 +142,7 @@ pub fn is_leading_system(messages: &[Message], index: usize) -> bool {
 /// (TS `headersToRecord`, `packages/ai/src/utils/headers.ts:3-9`).
 pub fn response_metadata(response: &reqwest::Response) -> ProviderResponse {
     let mut headers = BTreeMap::new();
-    for (name, value) in response.headers().iter() {
+    for (name, value) in response.headers() {
         headers.insert(
             name.as_str().to_ascii_lowercase(),
             value.to_str().map(str::to_string).unwrap_or_default(),

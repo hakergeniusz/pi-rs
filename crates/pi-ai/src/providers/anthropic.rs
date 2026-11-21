@@ -111,6 +111,7 @@ async fn request_and_stream(
 
     // `onPayload` runs on the built params before each send (the TS adapter
     // calls it inside its request loop; the port sends once).
+    let body = build_request_body(model, context, options)?;
     let body = apply_payload_hook(&options.on_payload, body, model).await?;
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
 

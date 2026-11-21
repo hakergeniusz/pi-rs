@@ -117,6 +117,7 @@ async fn request_and_stream(
 
     // `onPayload` runs on the fully built payload, before the request is sent;
     // a replacement payload (if any) is what actually goes over the wire.
+    let body = build_request_body(model, context, options)?;
     let body = apply_payload_hook(&options.on_payload, body, model).await?;
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
 

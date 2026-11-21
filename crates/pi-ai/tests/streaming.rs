@@ -617,7 +617,7 @@ fn install_response_hook(options: &mut StreamOptions, log: HookLog, error: Optio
     options.on_response = ProviderHook::new(hook);
 }
 
-/// The event label is the OpenAI chunk id, the provider event `type`, or the
+/// The event label is the `OpenAI` chunk `id`, the provider event `type`, or the
 /// raw string for a `[DONE]` sentinel — enough to assert shape and order.
 fn event_label(event: &pi_ai::types::JsonValue) -> String {
     if let Some(text) = event.as_str() {
@@ -670,7 +670,7 @@ fn assert_log(log: &HookLog, expected: &[&str]) {
 const HOOK_OPENAI_SSE: &str = concat!(
     r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
     "\n\n",
-    r#"data: {"id":"c2","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+    r#"data: {"id":"c2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
     "\n\n",
     "data: [DONE]\n\n",
 );

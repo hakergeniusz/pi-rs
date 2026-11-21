@@ -1236,6 +1236,7 @@ async fn request_and_stream(
 
     // `onPayload` may replace the built request body before it is sent
     // (TS `openai-codex-responses.ts:287-290`).
+    let body = build_request_body(model, context, options);
     let body = apply_payload_hook(&options.on_payload, body, model).await?;
     let url = resolve_codex_url(&model.base_url);
 
