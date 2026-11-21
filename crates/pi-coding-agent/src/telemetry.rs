@@ -62,6 +62,7 @@
 //!   exponent notation (≥ 1e21) use Rust's decimal display instead.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -589,7 +590,7 @@ fn escaped(text: &str) -> String {
     for character in text.chars() {
         let code = u32::from(character);
         if code <= 0x1f || (0x7f..=0x9f).contains(&code) {
-            out.push_str(&format!("\\u{code:04x}"));
+            let _ = write!(out, "\\u{code:04x}");
         } else {
             out.push(character);
         }
@@ -612,7 +613,7 @@ fn json_quote(text: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             character if u32::from(character) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", u32::from(character)));
+                let _ = write!(out, "\\u{:04x}", u32::from(character));
             }
             character => out.push(character),
         }
@@ -667,10 +668,11 @@ fn json_stringify(value: &AttributeValue) -> String {
 
 /// `formatAttributes` (`render.ts:17-21`).
 fn format_attributes(attributes: &SpanAttributes) -> String {
-    attributes
-        .iter()
-        .map(|(key, value)| format!(" {}={}", escaped(key), json_stringify(value)))
-        .collect()
+    let mut out = String::new();
+    for (key, value) in attributes {
+        let _ = write!(out, " {}={}", escaped(key), json_stringify(value));
+    }
+    out
 }
 
 /// Strict-equality match for query attributes (upstream `===`,
@@ -923,7 +925,7 @@ fn start_in_memory_span(
     let outcome = catch_unwind(AssertUnwindSafe(|| callback(&handle)));
     {
         // Lock order is always state → span (also used by `stored_spans`).
-        let mut recorder = state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = state.lock().unwrap_or_else(PoisonError::into_inner);
         let mut span = recorded.lock().unwrap_or_else(PoisonError::into_inner);
         if outcome.is_err() && !span.explicit_status {
             span.status = SpanStatus::Error { error: None }; // :266-270
@@ -931,8 +933,8 @@ fn start_in_memory_span(
         let elapsed = span.clock.elapsed().as_secs_f64() * 1000.0;
         span.ended_ms = Some(js_micros(span.started_ms + elapsed)); // :274
         span.settled = true;
-        span.end_sequence = Some(recorder.next_end_sequence);
-        recorder.next_end_sequence += 1; // :275
+        span.end_sequence = Some(guard.next_end_sequence);
+        guard.next_end_sequence += 1; // :275
     }
     if let Err(payload) = outcome {
         resume_unwind(payload);
@@ -1003,6 +1005,7 @@ impl TelemetrySpan for MemorySpan {
 }
 
 /// `createMeasurementRecorder` (`memory.ts:279-307`).
+#[allow(clippy::too_many_arguments)] // mirrors the TS factory signature; split when extending
 fn record_measurement(
     state: &Arc<Mutex<InMemoryState>>,
     kind: MetricKind,
@@ -1328,6 +1331,7 @@ impl Telemetry for InMemoryTelemetry {
         }) // :394-397
     }
 
+    #[allow(clippy::float_cmp)] // mirrors upstream's === on ms timestamps
     fn find_traces(&self, query: &TraceQuery) -> TracePage {
         let limit = query.limit.unwrap_or(20); // :400
         if limit == 0 {
@@ -1470,6 +1474,13 @@ mod tests {
     use super::*;
 
     fn attrs(pairs: &[(&str, AttributeValue)]) -> SpanAttributes {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect()
+    }
+
+    fn query_attrs(pairs: &[(&str, QueryValue)]) -> BTreeMap<String, QueryValue> {
         pairs
             .iter()
             .map(|(key, value)| ((*key).to_string(), value.clone()))
@@ -1729,7 +1740,7 @@ mod tests {
 
         let rows = telemetry.find_metrics(&MetricQuery {
             name: "tokens".to_string(),
-            attributes: attrs(&[("model", AttributeValue::String("a".into()))]),
+            attributes: query_attrs(&[("model", QueryValue::String("a".into()))]),
             ..MetricQuery::default()
         });
         assert_eq!(rows.len(), 1);
@@ -1740,7 +1751,7 @@ mod tests {
 
         let missing = telemetry.find_metrics(&MetricQuery {
             name: "tokens".to_string(),
-            attributes: attrs(&[("model", AttributeValue::Number(1.0))]),
+            attributes: query_attrs(&[("model", QueryValue::Number(1.0))]),
             ..MetricQuery::default()
         });
         assert_eq!(missing.len(), 0);

@@ -68,6 +68,8 @@ pub mod runtime;
 pub mod session;
 /// Skill discovery and packaging (`core/skills.ts`).
 pub mod skills;
+/// Telemetry contract, noop and in-memory implementations (`packages/telemetry`).
+pub mod telemetry;
 /// The built-in tools — read, bash, edit, write, ls, find, grep — plus renderers.
 pub mod tools;
 /// Virtual models: catalog entries routing each request to a physical model
