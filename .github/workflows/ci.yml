@@ -114,11 +114,11 @@ jobs:
           path: target/release/pi
           if-no-files-found: error
 
-  # Build the exact four assets scripts/install.sh expects. Native runners
-  # avoid cross-compiling quickjs-ng's C code; ubuntu-24.04-arm is GitHub's
-  # hosted ARM runner. If that runner is unavailable for this private repo,
-  # swap it for ubuntu-latest + taiki-e/install-action(tool: cross) and
-  # `cross build --release --target aarch64-unknown-linux-gnu`.
+  # Build the Linux assets scripts/install.sh consumes. Native Linux runners
+  # avoid cross-compiling quickjs-ng's C code. macOS runners are not available
+  # to this private repository (jobs sat queued until cancelled), so darwin
+  # assets are published manually when a runner is available — see
+  # docs/RELEASE.md. Re-add macos-13/macos-14 rows below if that changes.
   build-release-assets:
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
@@ -133,14 +133,6 @@ jobs:
             os: linux
             arch: aarch64
             target: aarch64-unknown-linux-gnu
-          - runner: macos-13
-            os: darwin
-            arch: x86_64
-            target: x86_64-apple-darwin
-          - runner: macos-14
-            os: darwin
-            arch: aarch64
-            target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     env:
       CARGO_PROFILE_RELEASE_DEBUG: 0
@@ -184,11 +176,10 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
-      - name: Verify we have four binaries and four checksums
+      - name: Verify we have two binaries and two checksums
         run: |
           set -eu
-          for asset in pi-linux-x86_64 pi-linux-aarch64 \
-                       pi-darwin-x86_64 pi-darwin-aarch64; do
+          for asset in pi-linux-x86_64 pi-linux-aarch64; do
             test -s "dist/$asset"
             test -s "dist/$asset.sha256"
           done

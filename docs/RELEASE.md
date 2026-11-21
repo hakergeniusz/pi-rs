@@ -1,11 +1,25 @@
 # Cutting a pi-rs release
 
 This is the release runbook. It complements `PLAN.md` (P7 exit: "tagged
-v0.1.0") and `AGENTS.md` (git/release policy). The exact, ordered cut steps —
-including which ones need user confirmation — live in [`WIRING.md`](../WIRING.md).
-The installer contract (`scripts/install.sh`) is defined at the bottom of this
-document; the workflow changes needed to satisfy it are proposed (not applied)
-in `WIRING.md` §2.
+v0.1.0") and `AGENTS.md` (git/release policy). The installer contract
+(`scripts/install.sh`) is defined at the bottom of this document.
+
+## v0.1.0 — actual release state (2026-11-21)
+
+The `v0.1.0` tag was pushed on the green version commit `7bb47d6` and the
+GitHub Release was created with **two Linux assets** (`pi-linux-x86_64`,
+`pi-linux-aarch64`) plus their `.sha256` files; all checksums verified. The
+tag workflow's macOS jobs sat queued indefinitely (no hosted macOS capacity
+for this private repo), so the run was cancelled and the release published
+with the two completed Linux artifacts via `gh release create` — the manual
+fallback described below.
+
+Consequently the release workflow was amended to build only the two Linux
+targets; re-add `macos-13` / `macos-14` matrix rows and restore the four-asset
+verification in `publish-release` if hosted macOS runners become available.
+Until then macOS users get a clear "asset not found" error from the installer,
+and `gh release upload v0.1.0 <darwin assets…>` is the documented way to add
+them.
 
 > **Privacy/access note:** `hakergeniusz/pi-rs` is currently **private**. A
 > private repo's Release assets are not anonymously downloadable, so the
