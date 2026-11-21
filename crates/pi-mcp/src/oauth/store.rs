@@ -47,7 +47,7 @@ use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -112,8 +112,7 @@ fn agent_dir() -> PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|base| !base.is_empty() && Path::new(base).is_absolute())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".config"));
+        .map_or_else(|| home_dir().join(".config"), PathBuf::from);
     base.join(CONFIG_DIR_NAME)
 }
 
@@ -260,7 +259,7 @@ fn acquire_backend_lock(path: &Path) -> Result<FileLockGuard> {
             Ok(guard) => return Ok(guard),
             Err(FileLockError::Io(error)) => return Err(McpError::Io(error)),
             Err(FileLockError::Busy) if Instant::now() < deadline => {
-                thread::sleep(BACKEND_LOCK_RETRY)
+                thread::sleep(BACKEND_LOCK_RETRY);
             }
             Err(FileLockError::Busy) => {
                 return Err(other(format!(
@@ -313,6 +312,7 @@ fn ensure_file_exists(path: &Path) -> Result<()> {
         OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .mode(0o600)
             .open(path)?
             .write_all(b"{}")?;
@@ -448,10 +448,12 @@ impl McpOAuthCredentialStore {
                 .cloned();
             Ok((value, None))
         })?;
-        tokens.map(|value| {
-            serde_json::from_value(value)
-                .map_err(|error| other(format!("Invalid {MCP_AUTH_FILE_NAME} tokens: {error}")))
-        })
+        tokens
+            .map(|value| {
+                serde_json::from_value(value)
+                    .map_err(|error| other(format!("Invalid {MCP_AUTH_FILE_NAME} tokens: {error}")))
+            })
+            .transpose()
     }
 
     /// Remove one server's credentials, including legacy state it would have
@@ -487,7 +489,7 @@ impl McpOAuthCredentialStore {
     ) -> Result<T> {
         let _in_process = IN_PROCESS_LOCK
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(PoisonError::into_inner);
         ensure_parent_dir(&self.inner.path)?;
         let guard = acquire_backend_lock(&self.inner.path)?;
         ensure_file_exists(&self.inner.path)?;
@@ -528,6 +530,10 @@ impl McpOAuthStateStore for ServerOAuthStore {
                     return Ok((None, None));
                 };
                 let state = decode_state(&legacy)?;
+                // The legacy URL-only entry is MOVED to this server's
+                // namespaced key; removing it without reinserting would drop
+                // the credential for every later reader.
+                next.insert(key.clone(), legacy);
                 Ok((Some(state), Some(serialize_states(&next)?)))
             })
         })
@@ -690,7 +696,7 @@ mod tests {
             assert_eq!(
                 loaded
                     .tokens
-                    .and_then(|tokens| tokens.access_token)
+                    .map(|tokens| tokens.access_token)
                     .as_deref(),
                 Some("work-token-2")
             );
@@ -775,7 +781,7 @@ mod tests {
         assert_eq!(
             loaded
                 .tokens
-                .and_then(|tokens| tokens.access_token)
+                .map(|tokens| tokens.access_token)
                 .as_deref(),
             Some("legacy-token")
         );
