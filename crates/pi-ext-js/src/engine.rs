@@ -255,6 +255,9 @@ pub struct HostCore {
     /// The native MCP server manager (connections to the registered
     /// servers; `mcp_manager`).
     pub mcp_manager: crate::mcp_manager::McpManager,
+    /// Agent config dir whose `mcp-auth.json` holds MCP OAuth states
+    /// (`mcp-auth.ts`); the host sets it before the manager first connects.
+    pub mcp_auth_dir: Option<std::path::PathBuf>,
     /// The provider / virtual-model registry (`pi.registerProvider` and
     /// friends).
     pub providers: ProviderRegistry,

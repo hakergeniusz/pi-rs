@@ -2,10 +2,12 @@
 //! (upstream `client.ts:204-250`, over either transport).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
 
+use crate::auth_provider::AuthProvider;
 use crate::error::McpError;
 use crate::http::{StreamableHttpOptions, StreamableHttpTransport};
 use crate::transport::{SpawnOptions, StdioTransport};
@@ -53,11 +55,13 @@ enum ActiveTransport {
 
 impl ActiveTransport {
     /// Builds the configured transport (`createDefaultTransport`,
-    /// `runtime.ts:103-124`).
-    ///
-    /// # Errors
-    /// On spawn or transport-construction failures.
-    fn build(config: &McpTransportConfig) -> Result<Self, McpError> {
+    /// `runtime.ts:103-124`) with an optional HTTP credential provider. The
+    /// provider is stored on the transport so every request (and the 401
+    /// recovery) sees it.
+    fn build_with_auth(
+        config: &McpTransportConfig,
+        auth: Option<Arc<dyn AuthProvider>>,
+    ) -> Result<Self, McpError> {
         match config {
             McpTransportConfig::Stdio {
                 command,
@@ -74,6 +78,7 @@ impl ActiveTransport {
                 StreamableHttpTransport::new(StreamableHttpOptions {
                     url: url.clone(),
                     headers: headers.clone(),
+                    auth,
                     ..StreamableHttpOptions::default()
                 })?,
             )),
@@ -159,7 +164,22 @@ impl McpClient {
         config: &McpServerConfig,
         timeout: Duration,
     ) -> Result<Self, McpError> {
-        let transport = ActiveTransport::build(&config.transport)?;
+        Self::connect_with_auth(config, None, timeout).await
+    }
+
+    /// [`McpClient::connect_with_timeout`] with an HTTP credential provider
+    /// (`createDefaultTransport`'s `authProvider`, `runtime.ts:100-124`). A
+    /// `None` provider keeps the unauthenticated transport behavior.
+    ///
+    /// # Errors
+    /// Spawn failures, handshake errors, or a protocol version the server
+    /// refuses.
+    pub async fn connect_with_auth(
+        config: &McpServerConfig,
+        auth: Option<Arc<dyn AuthProvider>>,
+        timeout: Duration,
+    ) -> Result<Self, McpError> {
+        let transport = ActiveTransport::build_with_auth(&config.transport, auth)?;
         match handshake(&transport, timeout).await {
             Ok(initialized) => {
                 // The negotiated version rides `MCP-Protocol-Version` on

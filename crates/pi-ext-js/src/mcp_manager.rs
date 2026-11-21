@@ -43,6 +43,9 @@ use std::time::Duration;
 
 use serde_json::{Value as Json, json};
 
+use pi_mcp::auth_provider::AuthProvider;
+use pi_mcp::oauth::auth_provider::{McpAuthProvider, McpAuthProviderOptions};
+use pi_mcp::oauth::{MCP_AUTH_FILE_NAME, McpOAuthCredentialStore, McpOAuthSettings};
 use pi_mcp::types::ContentBlock;
 use pi_mcp::{CallToolResult, McpClient, McpError, McpServerConfig, McpTransportConfig};
 
@@ -124,13 +127,22 @@ pub struct McpManager {
     /// Per-server request timeouts, recorded by the worker on connect so
     /// the caller's reply window covers the worker's internal wait.
     timeouts: Arc<Mutex<HashMap<String, Duration>>>,
+    /// Agent config dir holding `mcp-auth.json`; `None` disables OAuth
+    /// attachment (headless engines that do not host credentials).
+    auth_dir: Option<std::path::PathBuf>,
 }
 
 impl McpManager {
+    /// Attach the config dir whose `mcp-auth.json` holds MCP OAuth states.
+    /// Must be called before the first connection (the worker starts lazily).
+    pub fn set_auth_dir(&mut self, dir: std::path::PathBuf) {
+        self.auth_dir = Some(dir);
+    }
+
     /// The worker's request channel, spawning the thread on first use.
     fn sender(&self) -> std::sync::mpsc::Sender<Request> {
         self.requests
-            .get_or_init(|| Mutex::new(spawn_worker(self.timeouts.clone())))
+            .get_or_init(|| Mutex::new(spawn_worker(self.timeouts.clone(), self.auth_dir.clone())))
             .lock()
             .expect("mcp manager mutex poisoned")
             .clone()
@@ -234,11 +246,12 @@ fn config_default_window() -> Duration {
 /// Spawns the worker thread; returns its request channel.
 fn spawn_worker(
     timeouts: Arc<Mutex<HashMap<String, Duration>>>,
+    auth_dir: Option<std::path::PathBuf>,
 ) -> std::sync::mpsc::Sender<Request> {
     let (sender, receiver) = std::sync::mpsc::channel::<Request>();
     std::thread::Builder::new()
         .name("pi-ext-js-mcp".to_string())
-        .spawn(move || worker_loop(&receiver, &timeouts))
+        .spawn(move || worker_loop(&receiver, &timeouts, auth_dir.as_deref()))
         .expect("spawn MCP manager worker thread");
     sender
 }
@@ -249,6 +262,7 @@ fn spawn_worker(
 fn worker_loop(
     receiver: &std::sync::mpsc::Receiver<Request>,
     timeouts: &Arc<Mutex<HashMap<String, Duration>>>,
+    auth_dir: Option<&std::path::Path>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -266,7 +280,14 @@ fn worker_loop(
                 let timeout = config_timeout(&config);
                 let outcome = match spawn_config(&name, &config, &cwd) {
                     Ok(spawn) => {
-                        match connect_with_retries(&runtime, &mut servers, &name, &spawn, timeout) {
+                        match connect_with_retries(
+                            &runtime,
+                            &mut servers,
+                            &name,
+                            &spawn,
+                            timeout,
+                            auth_dir,
+                        ) {
                             Ok(outcome) => Ok(outcome),
                             Err(error) => Err(error.to_string()),
                         }
@@ -292,7 +313,7 @@ fn worker_loop(
                 args,
                 reply,
             } => {
-                let outcome = call_tool_on(&runtime, &mut servers, &server, &tool, args);
+                let outcome = call_tool_on(&runtime, &mut servers, &server, &tool, args, auth_dir);
                 let _ = reply.send(outcome);
             }
             Request::Drop { name } => {
@@ -327,13 +348,14 @@ fn connect_with_retries(
     name: &str,
     spawn: &McpServerConfig,
     timeout: Duration,
+    auth_dir: Option<&std::path::Path>,
 ) -> Result<ConnectOutcome, McpError> {
     let retries: &[u64] = match spawn.transport {
         McpTransportConfig::Http { .. } => &CONNECT_RETRY_DELAYS_MS,
         McpTransportConfig::Stdio { .. } => &[],
     };
     for attempt in 0.. {
-        match connect_with_spawn(runtime, servers, name, spawn.clone(), timeout) {
+        match connect_with_spawn(runtime, servers, name, spawn.clone(), timeout, auth_dir) {
             Ok(outcome) => return Ok(outcome),
             Err(error) => {
                 let Some(delay_ms) = retries.get(attempt) else {
@@ -366,6 +388,31 @@ fn error_is_transient(error: &McpError) -> bool {
     }
 }
 
+/// Attach the `mcp-auth.json` credential provider to an HTTP server
+/// (`createMcpAuthProvider`, `auth-provider.ts:55-134`). Stored OAuth
+/// states are read per server; a missing/corrupt file simply yields a
+/// provider with no token, which the transport treats as unauthenticated.
+fn http_auth_provider(
+    name: &str,
+    spawn: &McpServerConfig,
+    auth_dir: &std::path::Path,
+) -> Option<Arc<dyn AuthProvider>> {
+    let McpTransportConfig::Http { url, .. } = &spawn.transport else {
+        return None;
+    };
+    let store = McpOAuthCredentialStore::with_path(auth_dir.join(MCP_AUTH_FILE_NAME));
+    let server_store = store.for_server(name, url).ok()?;
+    Some(Arc::new(McpAuthProvider::new(McpAuthProviderOptions {
+        server_url: url.clone(),
+        store: Arc::new(server_store),
+        settings: Arc::new(McpOAuthSettings::default),
+        client_name: "pi".to_string(),
+        client_metadata_documents: None,
+        on_challenge: Arc::new(|_| {}),
+        redirect_url: None,
+    })))
+}
+
 /// Connects (or reconnects) one server, replacing any existing entry
 /// (`connectOnce`, `runtime.ts:381-409`).
 fn connect_with_spawn(
@@ -374,9 +421,11 @@ fn connect_with_spawn(
     name: &str,
     spawn: McpServerConfig,
     timeout: Duration,
+    auth_dir: Option<&std::path::Path>,
 ) -> Result<ConnectOutcome, McpError> {
+    let auth = auth_dir.and_then(|dir| http_auth_provider(name, &spawn, dir));
     let attempt = runtime.block_on(async {
-        let client = McpClient::connect_with_timeout(&spawn, timeout).await?;
+        let client = McpClient::connect_with_auth(&spawn, auth, timeout).await?;
         // Servers without the tools capability (prompts or resources only)
         // do not answer tools/list (`runtime.ts:387-388`).
         let tools = if client.capabilities.tools.is_some() {
@@ -459,6 +508,7 @@ fn call_tool_on(
     server: &str,
     tool: &str,
     args: Json,
+    auth_dir: Option<&std::path::Path>,
 ) -> Result<Json, String> {
     // `!current` and disabled both answer the disabled error
     // (`index.ts:427-428`); the runner hides a disabled server's tools, so
@@ -473,7 +523,7 @@ fn call_tool_on(
     if let Some((spawn, timeout)) = reconnect {
         // Lazy reconnect: the next call opens a fresh connection
         // (`withClient` → `getClient` → `open`, `runtime.ts:280-303`).
-        if connect_with_spawn(runtime, servers, server, spawn, timeout).is_err()
+        if connect_with_spawn(runtime, servers, server, spawn, timeout, auth_dir).is_err()
             && let ServerState::Failed { error, .. } = &servers[server].state
         {
             // `connectFailed`'s error text (`runtime.ts:419`).
@@ -528,7 +578,7 @@ fn call_tool_on(
                         return Err(format!("MCP server \"{server}\" is disabled."));
                     }
                 };
-                connect_with_spawn(runtime, servers, server, spawn, timeout)
+                connect_with_spawn(runtime, servers, server, spawn, timeout, auth_dir)
                     .map_err(|error| error.to_string())?;
             }
             Err(error) => return Err(error.to_string()),
@@ -1371,5 +1421,31 @@ mod tests {
     fn base64_decode_round_trips_ascii_and_utf8() {
         assert_eq!(base64_decode("SGVsbG8="), b"Hello".to_vec());
         assert_eq!(base64_decode("4pyT"), "✓".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn http_auth_provider_attaches_only_to_http_servers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let http = McpServerConfig {
+            name: "web".to_string(),
+            transport: McpTransportConfig::Http {
+                url: "https://example.test/mcp".to_string(),
+                headers: std::collections::HashMap::new(),
+            },
+        };
+        let provider = http_auth_provider("web", &http, dir.path());
+        assert!(provider.is_some(), "HTTP servers get an OAuth provider");
+
+        // A stdio server has no URL to hold credentials for.
+        let stdio = McpServerConfig {
+            name: "local".to_string(),
+            transport: McpTransportConfig::Stdio {
+                command: "x".to_string(),
+                args: Vec::new(),
+                env: std::collections::HashMap::new(),
+                working_dir: None,
+            },
+        };
+        assert!(http_auth_provider("local", &stdio, dir.path()).is_none());
     }
 }

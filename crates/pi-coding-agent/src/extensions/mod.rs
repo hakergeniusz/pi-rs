@@ -823,6 +823,7 @@ fn load_with_engine(
         cwd: cwd.to_string_lossy().into_owned(),
         mode: mode.to_string(),
         settings: Value::Object(startup_settings.get_settings()),
+        mcp_auth_dir: Some(agent_dir.to_path_buf()),
         ..Default::default()
     })
     .map_err(|err| format!("Failed to initialize the extension runtime: {err}"))?;

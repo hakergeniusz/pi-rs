@@ -576,7 +576,12 @@ pub struct ExtensionRunner {
 
 impl ExtensionRunner {
     /// Creates a runner over a fresh host with the given core state.
-    pub fn new(core: HostCore) -> Result<Self, JsHostError> {
+    pub fn new(mut core: HostCore) -> Result<Self, JsHostError> {
+        // Attach the OAuth credential store before the manager's worker
+        // starts (it starts lazily on the first connect).
+        if let Some(dir) = core.mcp_auth_dir.clone() {
+            core.mcp_manager.set_auth_dir(dir);
+        }
         let core = {
             let host = JsHost::new(core)?;
             let core = host.core().clone();
