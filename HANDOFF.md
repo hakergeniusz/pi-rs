@@ -3660,6 +3660,11 @@ snapshot → system-prompt builder. The module layers compile and test; only the
 host integration is deferred. All `WIRING.md` notes were preserved under
 `/tmp/opencode/*-WIRING.md` (tmpfs — copy to docs if they must survive a reboot).
 
+**CI green** on `b3dc9ec`: all 7 jobs (clippy, test, fmt, NDF, audit, msrv,
+release) pass. Two CI-only issues fixed after the integrations: `fmt --check`
+(after hand-written fixes) and a race in `extension_ui_notify_renders_by_type`
+(stopped pumping before the queued UI requests were drained).
+
 **Process lesson:** subagents consistently write compilable-looking but unverified
 Rust; budget a coordinator fix round per slice (compile → clippy → tests). Two
 real bugs were found only by the gates: an inverted Levenshtein substitution
