@@ -9,11 +9,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-pi-schema = { workspace = true }
+# The same QuickJS-NG engine as pi-ext-js; already in Cargo.lock, so no new
+# transitive dependency is introduced by this crate.
+rquickjs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 
 [lints]
 workspace = true
