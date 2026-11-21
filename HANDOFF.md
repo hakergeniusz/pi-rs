@@ -3672,14 +3672,20 @@ reconnects (`b9aa4cb`). `McpClient` gained async `resources_list[_page]`,
 `resource_read`; the manager records `has_resources` on connect and exposes
 `servers_with_resources()` (`d3dcff2`).
 
-**Still open:** the extension-facing resource tools (three tool definitions,
-their host ops and the worker request variants described in
-`mcp-resources-WIRING.md` §2b–2d). Two flaky pre-existing interactive tests
-were stabilized: a notify test that stopped pumping before its UI requests
-drained, and a global-theme assertion that raced with sibling tests
-re-initializing the process-wide theme. All `WIRING.md` notes were preserved
-under `/tmp/opencode/*-WIRING.md` (tmpfs — copy to docs if they must survive a
-reboot).
+The manager also gained five resource worker requests + matching public
+methods (`list_resources[_page]`, `list_resource_templates[_page]`,
+`read_resource`) using the same `{"result": …}` / `{"error": …}` reply shape
+as `callTool` (`a829f37`). Reads currently require an already-connected
+server — upstream's lazy reconnect for reads is a follow-up.
+
+**Still open:** the extension-facing resource tools — three tool definitions,
+their host ops / execute wrappers, and the final `limitMcpContent` result
+assembly described in `mcp-resources-WIRING.md` §2c–2d. Two flaky pre-existing
+interactive tests were stabilized: a notify test that stopped pumping before
+its UI requests drained, and a global-theme assertion that raced with sibling
+tests re-initializing the process-wide theme. All `WIRING.md` notes were
+preserved under `/tmp/opencode/*-WIRING.md` (tmpfs — copy to docs if they must
+survive a reboot).
 
 **CI green** on `b3dc9ec`: all 7 jobs (clippy, test, fmt, NDF, audit, msrv,
 release) pass. Two CI-only issues fixed after the integrations: `fmt --check`
