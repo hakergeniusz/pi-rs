@@ -237,7 +237,7 @@ fn read_config_file(path: &Path, scope: McpServerScope, state: &mut McpConfigSta
                     for (key, value) in value.as_object().unwrap() {
                         merged.insert(key.clone(), value.clone());
                     }
-                    match validate_mcp_server_config(name, &merged) {
+                    match validate_mcp_server_config(name, &Value::Object(merged.clone())) {
                         Ok(config) => {
                             let mut entry = state.servers[position].clone();
                             entry.config = config;
@@ -385,13 +385,13 @@ fn validate_server_fields(
             "server \"{name}\": legacy SSE transport is not supported; use the streamable HTTP URL"
         ));
     }
-    if let Some(url) = url {
-        if transport_type.is_none() || matches!(transport_type, Some("http" | "streamable-http")) {
-            if let Some(error) = validate_http_fields(&resolved, url) {
-                return Err(format!("server \"{name}\": {error}"));
-            }
-            return Ok((ServerKind::Http, resolved));
+    if let Some(url) = url
+        && (transport_type.is_none() || matches!(transport_type, Some("http" | "streamable-http")))
+    {
+        if let Some(error) = validate_http_fields(&resolved, url) {
+            return Err(format!("server \"{name}\": {error}"));
         }
+        return Ok((ServerKind::Http, resolved));
     }
     if has_command && (transport_type.is_none() || transport_type == Some("stdio")) {
         if let Some(error) = validate_stdio_fields(&resolved) {
@@ -458,10 +458,10 @@ fn validate_base_fields(entry: &McpConfigObject) -> Option<String> {
     {
         return Some("description must be a string".to_string());
     }
-    if let Some(timeout) = entry.get("timeout") {
-        if !timeout.as_f64().is_some_and(|seconds| seconds > 0.0) {
-            return Some("timeout must be a positive number of seconds".to_string());
-        }
+    if let Some(timeout) = entry.get("timeout")
+        && !timeout.as_f64().is_some_and(|seconds| seconds > 0.0)
+    {
+        return Some("timeout must be a positive number of seconds".to_string());
     }
     None
 }
@@ -519,13 +519,12 @@ fn validate_oauth(value: Option<&Value>) -> Option<String> {
     if object.get("clientSecret").is_some_and(|v| !v.is_string()) {
         return Some("oauth.clientSecret must be a string".to_string());
     }
-    if let Some(port) = object.get("callbackPort") {
-        if !port
+    if let Some(port) = object.get("callbackPort")
+        && !port
             .as_u64()
             .is_some_and(|port| (1..=65_535).contains(&port))
-        {
-            return Some("oauth.callbackPort must be a port number".to_string());
-        }
+    {
+        return Some("oauth.callbackPort must be a port number".to_string());
     }
     if let Some(callback_url) = object.get("callbackUrl") {
         let Some(url) = callback_url
@@ -539,12 +538,12 @@ fn validate_oauth(value: Option<&Value>) -> Option<String> {
         };
         let url_port = parse_url(url).and_then(|parts| parts.port);
         let configured_port = object.get("callbackPort").and_then(Value::as_u64);
-        if let (Some(url_port), Some(configured_port)) = (url_port, configured_port) {
-            if u64::from(url_port) != configured_port {
-                return Some(
-                    "oauth.callbackUrl and oauth.callbackPort name different ports".to_string(),
-                );
-            }
+        if let (Some(url_port), Some(configured_port)) = (url_port, configured_port)
+            && u64::from(url_port) != configured_port
+        {
+            return Some(
+                "oauth.callbackUrl and oauth.callbackPort name different ports".to_string(),
+            );
         }
     }
     if object.get("scope").is_some_and(|v| !v.is_string()) {
@@ -552,7 +551,7 @@ fn validate_oauth(value: Option<&Value>) -> Option<String> {
     }
     if object
         .get("clientName")
-        .is_some_and(|v| !v.as_str().is_some_and(|name| !name.trim().is_empty()))
+        .is_some_and(|v| v.as_str().is_none_or(|name| name.trim().is_empty()))
     {
         return Some("oauth.clientName must be a non-empty string".to_string());
     }
@@ -618,13 +617,12 @@ fn is_client_metadata_document_callback(callback_url: Option<&str>) -> bool {
 fn check_exposures(entry: &McpConfigObject) -> Option<String> {
     const EXPOSURES: [&str; 4] = ["codemode", "deferred", "direct", "hidden"];
     const LIST: &str = "\"codemode\", \"deferred\", \"direct\", \"hidden\"";
-    if let Some(exposure) = entry.get("exposure") {
-        if !exposure
+    if let Some(exposure) = entry.get("exposure")
+        && !exposure
             .as_str()
             .is_some_and(|name| EXPOSURES.contains(&name))
-        {
-            return Some(format!("exposure must be one of {LIST}"));
-        }
+    {
+        return Some(format!("exposure must be one of {LIST}"));
     }
     if let Some(tool_exposure) = entry.get("toolExposure") {
         let Some(map) = tool_exposure.as_object() else {
@@ -644,9 +642,7 @@ fn check_exposures(entry: &McpConfigObject) -> Option<String> {
 
 /// Port of `checkAuth` (`mcp-servers.ts:197-207`).
 fn check_auth(auth: Option<&Value>, url: &str) -> Option<String> {
-    let Some(auth) = auth else {
-        return None;
-    };
+    let auth = auth?;
     let provider = auth
         .as_object()
         .and_then(|object| object.get("provider"))
@@ -766,17 +762,18 @@ where
     root = edit(servers, root)?;
 
     let indent = detect_indent(text.as_deref());
-    let mut output = String::new();
+    // serde_json's Serializer writes to an io::Write, not a String.
+    let mut output = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
     let mut serializer = serde_json::Serializer::with_formatter(&mut output, formatter);
     Value::Object(root)
         .serialize(&mut serializer)
-        .map_err(ToString::to_string)?;
-    output.push('\n');
+        .map_err(|error| error.to_string())?;
+    output.push(b'\n');
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(ToString::to_string)?;
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    std::fs::write(path, output).map_err(ToString::to_string)
+    std::fs::write(path, output).map_err(|error| error.to_string())
 }
 
 /// The regex `/^([ \t]+)\S/m` from `config.ts:231`, falling back to two spaces.
@@ -803,7 +800,7 @@ fn detect_indent(text: Option<&str>) -> String {
 pub fn update_mcp_server_config(
     path: &Path,
     name: &str,
-    patch: &McpServerConfigPatch,
+    changes: &McpServerConfigPatch,
     options: &UpdateMcpServerConfigOptions,
 ) -> Result<(), String> {
     edit_mcp_servers(path, |servers, mut parsed| {
@@ -818,14 +815,14 @@ pub fn update_mcp_server_config(
             }
         };
         let keep_defaults = is_mcp_server_override(&server);
-        if let Some(enabled) = patch.enabled {
+        if let Some(enabled) = changes.enabled {
             if enabled && !keep_defaults {
                 server.remove("enabled");
             } else {
                 server.insert("enabled".to_string(), Value::Bool(enabled));
             }
         }
-        if let Some(exposure) = patch.exposure {
+        if let Some(exposure) = changes.exposure {
             if exposure == McpExposure::Codemode && !keep_defaults {
                 server.remove("exposure");
             } else {
@@ -921,10 +918,16 @@ mod tests {
     fn missing_files_yield_empty_config() {
         let dir = tempfile::tempdir().unwrap();
         let loaded = load_mcp_config(&options(dir.path(), dir.path(), true));
-        assert!(loaded.servers.is_empty());
-        assert!(loaded.errors.is_empty());
+        assert_eq!(loaded.servers, Vec::<McpServerEntry>::new());
+        assert_eq!(loaded.errors, Vec::<String>::new());
         assert_eq!(loaded.auto_enable_codemode, None);
-        assert_eq!(loaded.project_config, None);
+        // Upstream reports the project config path whenever the project is
+        // trusted, even when the file does not exist (`config.ts:140-146`).
+        let expected_project = dir.path().join(".pi/mcp.json");
+        assert_eq!(
+            loaded.project_config.as_deref(),
+            expected_project.to_str()
+        );
     }
 
     #[test]
@@ -936,7 +939,7 @@ mod tests {
             r#"{"mcpServers":{"filesystem":{"command":"npx","args":["-y","server-fs"]}}}"#,
         );
         let loaded = load_mcp_config(&options(dir.path(), dir.path(), false));
-        assert!(loaded.errors.is_empty());
+        assert_eq!(loaded.errors, Vec::<String>::new());
         let server = entry(&loaded, "filesystem");
         assert_eq!(server.scope, McpServerScope::Global);
         assert_eq!(server.source, path.to_string_lossy().into_owned());
@@ -967,7 +970,7 @@ mod tests {
         assert_eq!(untrusted.project_config, None);
 
         let trusted = load_mcp_config(&options(dir.path(), dir.path(), true));
-        assert!(trusted.errors.is_empty());
+        assert_eq!(trusted.errors, Vec::<String>::new());
         assert_eq!(trusted.servers.len(), 2);
         let server = entry(&trusted, "project");
         assert_eq!(server.scope, McpServerScope::Project);
@@ -992,7 +995,7 @@ mod tests {
             r#"{"mcpServers":{"srv":{"command":"local"}}}"#,
         );
         let loaded = load_mcp_config(&options(dir.path(), dir.path(), true));
-        assert!(loaded.errors.is_empty());
+        assert_eq!(loaded.errors, Vec::<String>::new());
         assert_eq!(loaded.servers.len(), 1);
         let server = entry(&loaded, "srv");
         assert_eq!(
@@ -1018,7 +1021,7 @@ mod tests {
             r#"{"mcpServers":{"internal":{"enabled":false,"exposure":"direct"}}}"#,
         );
         let loaded = load_mcp_config(&options(dir.path(), dir.path(), true));
-        assert!(loaded.errors.is_empty());
+        assert_eq!(loaded.errors, Vec::<String>::new());
         let server = entry(&loaded, "internal");
         assert_eq!(
             server.config.get("enabled").and_then(Value::as_bool),
@@ -1052,7 +1055,7 @@ mod tests {
             r#"{"mcpServers":{"srv":{"enabled":false}}}"#,
         );
         let loaded = load_mcp_config(&options(dir.path(), dir.path(), true));
-        assert!(loaded.servers.is_empty());
+        assert_eq!(loaded.servers, Vec::<McpServerEntry>::new());
         assert_eq!(loaded.errors.len(), 1);
         assert_eq!(
             loaded.errors[0],
@@ -1074,7 +1077,9 @@ mod tests {
         let project = write_config(
             dir.path(),
             ".pi/mcp.json",
-            r#"{"mcpServers":{"srv":{"enabled":false,"command":"sneaky"}}}"#,
+            // An "override" must omit command/url/type; an extra key like
+            // `description` is what upstream rejects (`mcp/src/config.ts:241`).
+            r#"{"mcpServers":{"srv":{"enabled":false,"description":"sneaky"}}}"#,
         );
         let loaded = load_mcp_config(&options(dir.path(), dir.path(), true));
         assert_eq!(loaded.errors.len(), 1);
@@ -1103,7 +1108,7 @@ mod tests {
             r#"{"mcpServers":{"srv":{"url":"https://example.com/mcp","auth":{"provider":"openai"}}}}"#,
         );
         let loaded = load_mcp_config(&options(dir.path(), dir.path(), true));
-        assert!(loaded.servers.is_empty());
+        assert_eq!(loaded.servers, Vec::<McpServerEntry>::new());
         assert_eq!(
             loaded.errors,
             vec![format!(
@@ -1197,7 +1202,7 @@ mod tests {
         let cases = [
             (
                 r#"{"description":"no transport"}"#,
-                "server \"ok\": needs either \"command\" (stdio) or \"url\" (streamable HTTP)",
+                "server \"ok\" needs either \"command\" (stdio) or \"url\" (streamable HTTP)",
             ),
             (r#""not an object""#, "server \"ok\" must be an object"),
             (
@@ -1314,7 +1319,7 @@ mod tests {
             "\u{feff}{\"mcpServers\":{\"srv\":{\"command\":\"x\"}}}",
         );
         let loaded = load_mcp_config(&options(dir.path(), dir.path(), false));
-        assert!(loaded.errors.is_empty());
+        assert_eq!(loaded.errors, Vec::<String>::new());
         assert_eq!(loaded.servers.len(), 1);
     }
 
@@ -1353,10 +1358,9 @@ mod tests {
 
         assert!(remove_mcp_server_config(&path, "srv").unwrap());
         assert!(!remove_mcp_server_config(&path, "srv").unwrap());
-        assert!(
-            load_mcp_config(&options(dir.path(), dir.path(), false))
-                .servers
-                .is_empty()
+        assert_eq!(
+            load_mcp_config(&options(dir.path(), dir.path(), false)).servers,
+            Vec::<McpServerEntry>::new()
         );
     }
 
@@ -1403,7 +1407,7 @@ mod tests {
         );
         assert!(!add_mcp_server_config(&path, "srv", &config).unwrap());
         let loaded = load_mcp_config(&options(&agent, dir.path(), false));
-        assert!(loaded.errors.is_empty());
+        assert_eq!(loaded.errors, Vec::<String>::new());
         assert_eq!(entry(&loaded, "srv").scope, McpServerScope::Global);
     }
 }

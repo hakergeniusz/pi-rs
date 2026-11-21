@@ -37,6 +37,8 @@ pub mod config;
 pub mod crash_log;
 /// Runtime-agnostic extension host seam (runtime decision pending at the P5 gate).
 pub mod extensions;
+/// MCP `mcp.json` discovery and loader (`extensions/mcp/config.ts`).
+pub mod mcp_config;
 /// Model reference resolution and scope patterns
 /// (`core/model-resolver.ts`).
 pub mod model_resolver;
