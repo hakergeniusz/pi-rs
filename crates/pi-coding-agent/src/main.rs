@@ -44,6 +44,46 @@ fn main() {
         std::process::exit(code);
     }
 
+    // `pi mcp` routes before mode startup like the package commands
+    // (upstream `main.ts:665-667`): `runMcpCommand(args.slice(1), { cwd,
+    // agentDir })`. The CLI's own `parse_args` must never see the `mcp` word.
+    if raw.first().is_some_and(|word| word == "mcp") {
+        use pi_coding_agent::cli::mcp_command::{McpCommandOptions, StdoutOutput, run_mcp_command};
+        use pi_coding_agent::cli::mcp_runtime::CliMcpRuntime;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let agent_dir = config::get_agent_dir();
+        let runtime = CliMcpRuntime;
+        let open_browser = |url: &str| {
+            let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+        };
+        let interactive = std::io::stdin().is_terminal();
+        let prompt_redirect = |text: &str| -> Option<String> {
+            if !interactive {
+                return None;
+            }
+            eprintln!("{text}");
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                return None;
+            }
+            let answer = line.trim().to_string();
+            (!answer.is_empty()).then_some(answer)
+        };
+        let status = run_mcp_command(
+            &raw[1..],
+            &McpCommandOptions {
+                cwd: &cwd,
+                agent_dir: &agent_dir,
+                runtime: &runtime,
+                open_url: &open_browser,
+                interactive,
+                prompt_redirect: Some(&prompt_redirect),
+                output: &StdoutOutput,
+            },
+        );
+        std::process::exit(status);
+    }
+
     let args = parse_args(&raw);
 
     let errors: Vec<&_> = args
