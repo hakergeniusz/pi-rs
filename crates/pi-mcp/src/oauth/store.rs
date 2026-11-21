@@ -694,10 +694,7 @@ mod tests {
                 .expect("work again");
             let loaded = work.load().await.expect("load").expect("state");
             assert_eq!(
-                loaded
-                    .tokens
-                    .map(|tokens| tokens.access_token)
-                    .as_deref(),
+                loaded.tokens.map(|tokens| tokens.access_token).as_deref(),
                 Some("work-token-2")
             );
         });
@@ -779,10 +776,7 @@ mod tests {
             .expect("load")
             .expect("state");
         assert_eq!(
-            loaded
-                .tokens
-                .map(|tokens| tokens.access_token)
-                .as_deref(),
+            loaded.tokens.map(|tokens| tokens.access_token).as_deref(),
             Some("legacy-token")
         );
         // Names differing only in `-` and `_` share the namespace.

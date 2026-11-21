@@ -29,8 +29,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use serde_json::{Map, Value as Json, json};
 use serde_json::ser::{PrettyFormatter, Serializer};
+use serde_json::{Map, Value as Json, json};
 
 use crate::cli::project_trust::ProjectTrustStore;
 use crate::config::{APP_NAME, CONFIG_DIR_NAME, PROJECT_CONFIG_DIR_NAME};
@@ -264,7 +264,11 @@ fn parse_options(
     let mut index = 0usize;
     while index < args.len() {
         let typed = &args[index];
-        let arg = if typed == "-l" { "--local" } else { typed.as_str() };
+        let arg = if typed == "-l" {
+            "--local"
+        } else {
+            typed.as_str()
+        };
         if arg == "--" || parsed.positional.len() >= max_positionals {
             let from = if arg == "--" { index + 1 } else { index };
             parsed.positional.extend_from_slice(&args[from..]);
@@ -276,7 +280,11 @@ fn parse_options(
             continue;
         }
         let name = &arg[2..];
-        let Some(kind) = known.iter().find(|(key, _)| *key == name).map(|(_, kind)| *kind) else {
+        let Some(kind) = known
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, kind)| *kind)
+        else {
             output.error(&format!("Unknown option {typed}.\n{HELP_HINT}"));
             return None;
         };
@@ -343,7 +351,10 @@ fn parse_pairs(
             output.error(&format!("--{option} expects KEY=VALUE, got \"{pair}\"."));
             return None;
         }
-        record.insert(pair[..separator].to_string(), pair[separator + 1..].to_string());
+        record.insert(
+            pair[..separator].to_string(),
+            pair[separator + 1..].to_string(),
+        );
     }
     Some(record)
 }
@@ -353,14 +364,20 @@ fn describe_transport(config: &Json) -> String {
     if let Some(url) = config.get("url").and_then(Json::as_str) {
         return url.to_string();
     }
-    let command = config.get("command").and_then(Json::as_str).unwrap_or_default();
+    let command = config
+        .get("command")
+        .and_then(Json::as_str)
+        .unwrap_or_default();
     let args = config
         .get("args")
         .and_then(Json::as_array)
         .into_iter()
         .flatten()
         .filter_map(Json::as_str);
-    std::iter::once(command).chain(args).collect::<Vec<_>>().join(" ")
+    std::iter::once(command)
+        .chain(args)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `getAuthProvider` (`cli.ts:125-127`).
@@ -411,7 +428,12 @@ impl ServerReport {
         if !self.tool_exposure.is_empty() {
             fields.insert(
                 "toolExposure".to_string(),
-                json!(self.tool_exposure.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<Map<String, Json>>()),
+                json!(
+                    self.tool_exposure
+                        .iter()
+                        .map(|(k, v)| (k.clone(), json!(v)))
+                        .collect::<Map<String, Json>>()
+                ),
             );
         }
         if self.resources {
@@ -593,7 +615,9 @@ fn is_http_url(url: &str) -> bool {
 
 fn validate_stdio_fields(entry: &Map<String, Json>) -> Result<(), String> {
     if let Some(args) = entry.get("args")
-        && !args.as_array().is_some_and(|args| args.iter().all(Json::is_string))
+        && !args
+            .as_array()
+            .is_some_and(|args| args.iter().all(Json::is_string))
     {
         return Err("args must be an array of strings".to_string());
     }
@@ -634,7 +658,9 @@ fn validate_oauth(value: Option<&Json>) -> Result<(), String> {
         return Err("oauth.clientSecret must be a string".to_string());
     }
     if let Some(port) = oauth.get("callbackPort")
-        && !port.as_i64().is_some_and(|port| (1..=65535).contains(&port))
+        && !port
+            .as_i64()
+            .is_some_and(|port| (1..=65535).contains(&port))
     {
         return Err("oauth.callbackPort must be a port number".to_string());
     }
@@ -648,7 +674,9 @@ fn check_exposures(entry: &Map<String, Json>) -> Option<String> {
         .collect::<Vec<_>>()
         .join(", ");
     if let Some(exposure) = entry.get("exposure")
-        && !exposure.as_str().is_some_and(|text| EXPOSURES.contains(&text))
+        && !exposure
+            .as_str()
+            .is_some_and(|text| EXPOSURES.contains(&text))
     {
         return Some(format!("exposure must be one of {choices}"));
     }
@@ -694,9 +722,10 @@ fn url_host(url: &str) -> String {
     };
     let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
     if authority.starts_with('[') {
-        return authority
-            .find(']')
-            .map_or_else(|| authority.to_string(), |end| authority[..=end].to_string());
+        return authority.find(']').map_or_else(
+            || authority.to_string(),
+            |end| authority[..=end].to_string(),
+        );
     }
     authority.split(':').next().unwrap_or_default().to_string()
 }
@@ -724,17 +753,17 @@ fn read_config_file(path: &Path, scope: McpScope, state: &mut McpConfigState) {
         }
     };
     let Some(root) = parsed.as_object() else {
-        state
-            .errors
-            .push(format!("{path_text}: expected an object with an \"mcpServers\" object"));
+        state.errors.push(format!(
+            "{path_text}: expected an object with an \"mcpServers\" object"
+        ));
         return;
     };
     if let Some(servers) = root.get("mcpServers")
         && !is_record(servers)
     {
-        state
-            .errors
-            .push(format!("{path_text}: expected an object with an \"mcpServers\" object"));
+        state.errors.push(format!(
+            "{path_text}: expected an object with an \"mcpServers\" object"
+        ));
         return;
     }
     match root.get("autoEnableCodemode") {
@@ -782,7 +811,9 @@ fn read_config_file(path: &Path, scope: McpScope, state: &mut McpConfigState) {
             }
             match validate_mcp_server_config(name, &Json::Object(merged)) {
                 Ok(config) => {
-                    state.servers.retain(|server| server.name.as_str() != name.as_str());
+                    state
+                        .servers
+                        .retain(|server| server.name.as_str() != name.as_str());
                     state.servers.push(McpServerEntry {
                         name: name.clone(),
                         config,
@@ -835,7 +866,8 @@ fn read_config_file(path: &Path, scope: McpScope, state: &mut McpConfigState) {
 fn load_mcp_config(agent_dir: &Path, cwd: &Path, project_trusted: bool) -> LoadedMcpConfig {
     let mut state = McpConfigState::default();
     read_config_file(&agent_dir.join("mcp.json"), McpScope::Global, &mut state);
-    let project_config = project_trusted.then(|| cwd.join(PROJECT_CONFIG_DIR_NAME).join("mcp.json"));
+    let project_config =
+        project_trusted.then(|| cwd.join(PROJECT_CONFIG_DIR_NAME).join("mcp.json"));
     if let Some(project_config) = &project_config {
         read_config_file(project_config, McpScope::Project, &mut state);
     }
@@ -861,13 +893,15 @@ where
     };
     let text = raw.as_deref().map(strip_bom);
     let mut parsed: Json = match &text {
-        Some(text) => serde_json::from_str(text).map_err(|error| format!("{error_text}: {error}"))?,
+        Some(text) => {
+            serde_json::from_str(text).map_err(|error| format!("{error_text}: {error}"))?
+        }
         None => Json::Object(Map::new()),
     };
     let should_write = {
-        let root = parsed
-            .as_object_mut()
-            .ok_or_else(|| format!("{error_text}: expected an object with an \"mcpServers\" object"))?;
+        let root = parsed.as_object_mut().ok_or_else(|| {
+            format!("{error_text}: expected an object with an \"mcpServers\" object")
+        })?;
         if let Some(servers) = root.get("mcpServers")
             && !is_record(servers)
         {
@@ -964,7 +998,9 @@ fn connection_snapshot(
     entry: &McpServerEntry,
     options: &McpCommandOptions<'_>,
 ) -> ConnectionSnapshot {
-    options.runtime.connect(entry, options.cwd, options.agent_dir)
+    options
+        .runtime
+        .connect(entry, options.cwd, options.agent_dir)
 }
 
 /// Whether the project is trusted (`cli.ts:240`): upstream's
@@ -1022,7 +1058,9 @@ pub fn run_mcp_command(args: &[String], options: &McpCommandOptions<'_>) -> i32 
 
     match command.as_str() {
         "list" => {
-            let Some(parsed) = parse_options(rest, &[("json", OptionKind::Flag)], output, usize::MAX) else {
+            let Some(parsed) =
+                parse_options(rest, &[("json", OptionKind::Flag)], output, usize::MAX)
+            else {
                 return 1;
             };
             if !parsed.positional.is_empty() {
@@ -1060,7 +1098,11 @@ pub fn run_mcp_command(args: &[String], options: &McpCommandOptions<'_>) -> i32 
                 .iter()
                 .find(|server| server.name.as_str() == name.as_str())
             else {
-                let names: Vec<&str> = loaded.servers.iter().map(|server| server.name.as_str()).collect();
+                let names: Vec<&str> = loaded
+                    .servers
+                    .iter()
+                    .map(|server| server.name.as_str())
+                    .collect();
                 let suggestion = names
                     .iter()
                     .copied()
@@ -1095,7 +1137,10 @@ pub fn run_mcp_command(args: &[String], options: &McpCommandOptions<'_>) -> i32 
                 ));
                 return 1;
             }
-            let Some(url) = options.runtime.oauth_url(entry, options.cwd, options.agent_dir) else {
+            let Some(url) = options
+                .runtime
+                .oauth_url(entry, options.cwd, options.agent_dir)
+            else {
                 output.error(&format!(
                     "MCP server \"{name}\" does not use OAuth. Only HTTP servers without an Authorization header do."
                 ));
@@ -1183,7 +1228,11 @@ fn add(args: &[String], project_config: &Path, options: &McpCommandOptions<'_>) 
     if let Some(misplaced) = candidates.iter().find(|option| parsed.has(option)) {
         output.error(&format!(
             "--{misplaced} only applies to {}.",
-            if url_absent { "HTTP servers (--url)" } else { "stdio servers" }
+            if url_absent {
+                "HTTP servers (--url)"
+            } else {
+                "stdio servers"
+            }
         ));
         return 1;
     }
@@ -1194,10 +1243,7 @@ fn add(args: &[String], project_config: &Path, options: &McpCommandOptions<'_>) 
             return 1;
         };
         if let Some(bearer) = parsed.value("bearer-token-env-var") {
-            headers.insert(
-                "Authorization".to_string(),
-                format!("Bearer ${{{bearer}}}"),
-            );
+            headers.insert("Authorization".to_string(), format!("Bearer ${{{bearer}}}"));
         }
         let mut oauth = Map::new();
         for (option, field) in [
@@ -1222,7 +1268,12 @@ fn add(args: &[String], project_config: &Path, options: &McpCommandOptions<'_>) 
         if !headers.is_empty() {
             config.insert(
                 "headers".to_string(),
-                json!(headers.into_iter().map(|(k, v)| (k, json!(v))).collect::<Map<String, Json>>()),
+                json!(
+                    headers
+                        .into_iter()
+                        .map(|(k, v)| (k, json!(v)))
+                        .collect::<Map<String, Json>>()
+                ),
             );
         }
         if !oauth.is_empty() {
@@ -1237,13 +1288,22 @@ fn add(args: &[String], project_config: &Path, options: &McpCommandOptions<'_>) 
         if !command_args.is_empty() {
             config.insert(
                 "args".to_string(),
-                json!(command_args.iter().map(|arg| json!(arg)).collect::<Vec<Json>>()),
+                json!(
+                    command_args
+                        .iter()
+                        .map(|arg| json!(arg))
+                        .collect::<Vec<Json>>()
+                ),
             );
         }
         if !env.is_empty() {
             config.insert(
                 "env".to_string(),
-                json!(env.into_iter().map(|(k, v)| (k, json!(v))).collect::<Map<String, Json>>()),
+                json!(
+                    env.into_iter()
+                        .map(|(k, v)| (k, json!(v)))
+                        .collect::<Map<String, Json>>()
+                ),
             );
         }
         if let Some(cwd) = parsed.value("cwd") {
@@ -1292,7 +1352,11 @@ fn add(args: &[String], project_config: &Path, options: &McpCommandOptions<'_>) 
         && !validated
             .get("headers")
             .and_then(Json::as_object)
-            .is_some_and(|headers| headers.keys().any(|key| key.eq_ignore_ascii_case("authorization")));
+            .is_some_and(|headers| {
+                headers
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("authorization"))
+            });
     let hint = if may_need_sign_in {
         format!(". If it requires sign-in: {APP_NAME} mcp login {name}")
     } else {
@@ -1305,7 +1369,8 @@ fn add(args: &[String], project_config: &Path, options: &McpCommandOptions<'_>) 
 /// `remove` (`cli.ts:472-508`).
 fn remove(args: &[String], project_config: &Path, options: &McpCommandOptions<'_>) -> i32 {
     let output = options.output;
-    let Some(parsed) = parse_options(args, &[("local", OptionKind::Flag)], output, usize::MAX) else {
+    let Some(parsed) = parse_options(args, &[("local", OptionKind::Flag)], output, usize::MAX)
+    else {
         return 1;
     };
     let name = parsed.positional.first();
@@ -1340,8 +1405,13 @@ fn remove(args: &[String], project_config: &Path, options: &McpCommandOptions<'_
     let other = load_mcp_config(options.agent_dir, options.cwd, true)
         .servers
         .into_iter()
-        .find(|server| server.name.as_str() == name && server.scope.map(McpScope::as_str) != Some(scope));
-    let mut message = format!("No {scope} MCP server named \"{name}\" in {}.", path.display());
+        .find(|server| {
+            server.name.as_str() == name && server.scope.map(McpScope::as_str) != Some(scope)
+        });
+    let mut message = format!(
+        "No {scope} MCP server named \"{name}\" in {}.",
+        path.display()
+    );
     if let Some(other) = other {
         let _ = write!(
             message,
@@ -1373,13 +1443,20 @@ fn list(
         .map(|entry| ServerReport::from_entry(entry, options))
         .collect();
     let failed = !loaded.errors.is_empty()
-        || reports.iter().any(|report| report.enabled && report.state != "connected");
+        || reports
+            .iter()
+            .any(|report| report.enabled && report.state != "connected");
 
     if json {
         let mut fields = Map::new();
         fields.insert(
             "servers".to_string(),
-            json!(reports.iter().map(ServerReport::to_json).collect::<Vec<Json>>()),
+            json!(
+                reports
+                    .iter()
+                    .map(ServerReport::to_json)
+                    .collect::<Vec<Json>>()
+            ),
         );
         fields.insert("errors".to_string(), json!(loaded.errors));
         if let Some(note) = note {
@@ -1435,7 +1512,10 @@ fn list(
             output.log("  offers resources");
         }
         if let Some(error) = &report.error {
-            output.log(&format!("  {}", error.split('\n').collect::<Vec<_>>().join("\n  ")));
+            output.log(&format!(
+                "  {}",
+                error.split('\n').collect::<Vec<_>>().join("\n  ")
+            ));
         }
     }
     for error in &loaded.errors {
@@ -1531,20 +1611,18 @@ fn login(
         (options.open_url)(authorization_url);
     };
     let mut redirect = || {
-        let prompt = "If the browser cannot reach this machine, paste the URL it was redirected to: ";
+        let prompt =
+            "If the browser cannot reach this machine, paste the URL it was redirected to: ";
         if options.interactive {
             options.prompt_redirect.and_then(|answer| answer(prompt))
         } else {
             None
         }
     };
-    let result = options.runtime.sign_in(
-        name,
-        url,
-        timeout_ms as u64,
-        &mut show_url,
-        &mut redirect,
-    );
+    let result =
+        options
+            .runtime
+            .sign_in(name, url, timeout_ms as u64, &mut show_url, &mut redirect);
     if let Err(error) = result {
         match error {
             SignInError::Cancelled => output.error(&format!(
@@ -1646,18 +1724,22 @@ mod tests {
     }
 
     impl McpRuntime for FakeRuntime {
-        fn oauth_url(&self, entry: &McpServerEntry, _cwd: &Path, _agent_dir: &Path) -> Option<String> {
-            self.oauth_urls
-                .get(&entry.name)
-                .cloned()
-                .flatten()
+        fn oauth_url(
+            &self,
+            entry: &McpServerEntry,
+            _cwd: &Path,
+            _agent_dir: &Path,
+        ) -> Option<String> {
+            self.oauth_urls.get(&entry.name).cloned().flatten()
         }
 
-        fn connect(&self, entry: &McpServerEntry, _cwd: &Path, _agent_dir: &Path) -> ConnectionSnapshot {
-            self.snapshots
-                .get(&entry.name)
-                .cloned()
-                .unwrap_or_default()
+        fn connect(
+            &self,
+            entry: &McpServerEntry,
+            _cwd: &Path,
+            _agent_dir: &Path,
+        ) -> ConnectionSnapshot {
+            self.snapshots.get(&entry.name).cloned().unwrap_or_default()
         }
 
         fn close(&self, _entry: &McpServerEntry, _cwd: &Path, _agent_dir: &Path) {}
@@ -1716,10 +1798,20 @@ mod tests {
     fn help_text_is_verbatim() {
         let help = help_text();
         assert!(help.starts_with("Usage:\n  pi mcp add <server>"), "{help}");
-        assert!(help.contains("Reads ~/pi-rs/agent/mcp.json and, in trusted projects, .pi/mcp.json."));
+        assert!(
+            help.contains("Reads ~/pi-rs/agent/mcp.json and, in trusted projects, .pi/mcp.json.")
+        );
         assert!(help.contains("Send \"Authorization: Bearer ${NAME}\""));
-        assert!(help.contains("--exposure <mode>       codemode (default), deferred, direct, or hidden"));
-        assert!(help.ends_with("--timeout <seconds>     Time limit for the whole sign-in (default: 300)"));
+        assert!(
+            help.contains(
+                "--exposure <mode>       codemode (default), deferred, direct, or hidden"
+            )
+        );
+        assert!(
+            help.ends_with(
+                "--timeout <seconds>     Time limit for the whole sign-in (default: 300)"
+            )
+        );
         assert_eq!(HELP_HINT, "Use \"pi mcp --help\" for usage.");
         // Help wins for the `help` word and for `-h`/`--help` anywhere.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1728,7 +1820,10 @@ mod tests {
         let options = make_options(dir.path(), dir.path(), &runtime, &capture);
         for argv in [args(&["help"]), args(&["--help"]), args(&["list", "-h"])] {
             assert_eq!(run_mcp_command(&argv, &options), 0);
-            assert_eq!(capture.lines.borrow().last().map(String::as_str), Some(help.as_str()));
+            assert_eq!(
+                capture.lines.borrow().last().map(String::as_str),
+                Some(help.as_str())
+            );
         }
         assert_eq!(run_mcp_command(&[], &options), 0);
     }
@@ -1758,10 +1853,12 @@ mod tests {
         assert_eq!(parsed.positional, args(&["--url", "kept"]));
 
         // Reaching maxPositionals passes a command's own flags through.
-        let parsed = parse_options(&args(&["srv", "run", "--flag"]), &known, &capture, 2).expect("parse");
+        let parsed =
+            parse_options(&args(&["srv", "run", "--flag"]), &known, &capture, 2).expect("parse");
         assert_eq!(parsed.positional, args(&["srv", "run", "--flag"]));
 
-        let parsed = parse_options(&args(&["--url", "http://x"]), &known, &capture, usize::MAX).expect("parse");
+        let parsed = parse_options(&args(&["--url", "http://x"]), &known, &capture, usize::MAX)
+            .expect("parse");
         assert_eq!(parsed.value("url"), Some("http://x"));
 
         assert!(parse_options(&args(&["--bogus"]), &known, &capture, usize::MAX).is_none());
@@ -1787,12 +1884,8 @@ mod tests {
         assert_eq!(edit_distance("abc", "abc"), 0);
         assert_eq!(edit_distance("a", "xyz"), 3);
         let capture = Capture::new();
-        let pairs = parse_pairs(
-            "env",
-            Some(&args(&["A=1", "EMPTY=", "X=a=b"])),
-            &capture,
-        )
-        .expect("pairs");
+        let pairs =
+            parse_pairs("env", Some(&args(&["A=1", "EMPTY=", "X=a=b"])), &capture).expect("pairs");
         assert_eq!(pairs.get("A").map(String::as_str), Some("1"));
         assert_eq!(pairs.get("EMPTY").map(String::as_str), Some(""));
         assert_eq!(pairs.get("X").map(String::as_str), Some("a=b"));
@@ -1830,7 +1923,10 @@ mod tests {
         // unrelated top-level keys.
         let added = add_mcp_server_config(&global, "fs", &json!({"command": "node"})).expect("add");
         assert!(added);
-        assert!(!add_mcp_server_config(&global, "web", &json!({"url": "https://e.com/mcp"})).expect("add"));
+        assert!(
+            !add_mcp_server_config(&global, "web", &json!({"url": "https://e.com/mcp"}))
+                .expect("add")
+        );
         let raw = std::fs::read_to_string(&global).expect("read");
         assert!(raw.contains("\"other\": 1"), "{raw}");
         assert!(raw.contains("\"command\": \"node\""), "{raw}");
@@ -1848,7 +1944,11 @@ mod tests {
         );
         let loaded = load_mcp_config(&agent, &project, true);
         assert!(loaded.project_config.is_some());
-        let web = loaded.servers.iter().find(|server| server.name == "web").expect("web");
+        let web = loaded
+            .servers
+            .iter()
+            .find(|server| server.name == "web")
+            .expect("web");
         assert_eq!(web.scope, Some(McpScope::Global));
         assert!(web.override_path.is_some());
         assert_eq!(web.config["command"], json!(null));
@@ -1877,10 +1977,17 @@ mod tests {
         let agent2 = dir2.path().join("agent");
         let project2 = dir2.path().join("proj");
         std::fs::create_dir_all(&agent2).expect("mkdir");
-        config_file(&project2.join(".pi"), "{\"mcpServers\":{\"orphan\":{\"enabled\":false}}}");
+        config_file(
+            &project2.join(".pi"),
+            "{\"mcpServers\":{\"orphan\":{\"enabled\":false}}}",
+        );
         let loaded = load_mcp_config(&agent2, &project2, true);
         assert_eq!(loaded.errors.len(), 1);
-        assert!(loaded.errors[0].contains("needs \"command\" or \"url\""), "{:?}", loaded.errors);
+        assert!(
+            loaded.errors[0].contains("needs \"command\" or \"url\""),
+            "{:?}",
+            loaded.errors
+        );
     }
 
     #[test]
@@ -1890,7 +1997,8 @@ mod tests {
             "invalid server name \"bad name\" (use letters, digits, \"_\" and \"-\")"
         );
         assert_eq!(
-            validate_mcp_server_config("x", &json!({"command": "x", "args": ["ok", 2]})).unwrap_err(),
+            validate_mcp_server_config("x", &json!({"command": "x", "args": ["ok", 2]}))
+                .unwrap_err(),
             "server \"x\": args must be an array of strings"
         );
         assert_eq!(
@@ -1911,7 +2019,10 @@ mod tests {
             auth_provider(&json!({"url": "http://x", "auth": {"provider": "openai"}})).as_deref(),
             Some("openai")
         );
-        assert_eq!(tool_exposure(&json!({"toolExposure": {"t*": "direct"}}), "tool"), "direct");
+        assert_eq!(
+            tool_exposure(&json!({"toolExposure": {"t*": "direct"}}), "tool"),
+            "direct"
+        );
         assert_eq!(tool_exposure(&json!({}), "tool"), "codemode");
     }
 
@@ -1919,7 +2030,10 @@ mod tests {
     fn list_text_output_is_verbatim() {
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = dir.path().join("agent");
-        config_file(&agent, "{\"mcpServers\":{\"fs\":{\"command\":\"npx\",\"exposure\":\"direct\"}}}");
+        config_file(
+            &agent,
+            "{\"mcpServers\":{\"fs\":{\"command\":\"npx\",\"exposure\":\"direct\"}}}",
+        );
         let runtime = FakeRuntime::new().with("fs", "connected", &["read", "write"]);
         let capture = Capture::new();
         let options = make_options(dir.path(), &agent, &runtime, &capture);
@@ -1956,7 +2070,13 @@ mod tests {
         assert_eq!(list(&empty, false, None, &options), 0);
         assert_eq!(
             capture.lines.borrow().first().map(String::as_str),
-            Some(format!("No MCP servers configured. Add them to {} or .pi/mcp.json.", agent.join("mcp.json").display()).as_str())
+            Some(
+                format!(
+                    "No MCP servers configured. Add them to {} or .pi/mcp.json.",
+                    agent.join("mcp.json").display()
+                )
+                .as_str()
+            )
         );
     }
 
@@ -1983,13 +2103,22 @@ mod tests {
             Some(format!("Usage: pi mcp add <server> [options] (--url <url> | -- <command> [args...])\n{HELP_HINT}").as_str())
         );
         // A stdio-only flag on an HTTP add.
-        assert_eq!(run_mcp_command(&args(&["add", "srv", "--env", "A=1", "--url", "http://x"]), &options), 1);
+        assert_eq!(
+            run_mcp_command(
+                &args(&["add", "srv", "--env", "A=1", "--url", "http://x"]),
+                &options
+            ),
+            1
+        );
         assert_eq!(
             capture.errors.borrow().last().map(String::as_str),
             Some("--env only applies to stdio servers.")
         );
         // A malformed pair.
-        assert_eq!(run_mcp_command(&args(&["add", "srv", "--cmd", "--env", "BAD"]), &options), 1);
+        assert_eq!(
+            run_mcp_command(&args(&["add", "srv", "--cmd", "--env", "BAD"]), &options),
+            1
+        );
 
         let before = capture.errors.borrow().len();
         assert_eq!(
@@ -2004,7 +2133,10 @@ mod tests {
             Some("Check it with: pi mcp list")
         );
         // Re-adding replaces.
-        assert_eq!(run_mcp_command(&args(&["add", "srv", "--url", "https://x/mcp"]), &options), 0);
+        assert_eq!(
+            run_mcp_command(&args(&["add", "srv", "--url", "https://x/mcp"]), &options),
+            0
+        );
         let replaced = format!(
             "Replaced global MCP server \"srv\" in {}.",
             agent.join("mcp.json").display()
@@ -2024,12 +2156,22 @@ mod tests {
         assert_eq!(run_mcp_command(&args(&["remove", "srv"]), &options), 1);
         assert_eq!(
             capture.errors.borrow().last().map(String::as_str),
-            Some(format!("No global MCP server named \"srv\" in {}.", agent.join("mcp.json").display()).as_str())
+            Some(
+                format!(
+                    "No global MCP server named \"srv\" in {}.",
+                    agent.join("mcp.json").display()
+                )
+                .as_str()
+            )
         );
         let remove_usage_index = capture.errors.borrow().len();
         assert_eq!(run_mcp_command(&args(&["remove"]), &options), 1);
         assert_eq!(
-            capture.errors.borrow().get(remove_usage_index).map(String::as_str),
+            capture
+                .errors
+                .borrow()
+                .get(remove_usage_index)
+                .map(String::as_str),
             Some("Usage: pi mcp remove <server> [-l]\nUse \"pi mcp --help\" for usage.")
         );
     }
@@ -2043,7 +2185,9 @@ mod tests {
             "{\"mcpServers\":{\"web\":{\"url\":\"https://e.com/mcp\"},\"fs\":{\"command\":\"npx\"}}}",
         );
         let mut runtime = FakeRuntime::new().with("web", "needs-auth", &[]);
-        runtime.oauth_urls.insert("web".to_string(), Some("https://e.com/mcp".to_string()));
+        runtime
+            .oauth_urls
+            .insert("web".to_string(), Some("https://e.com/mcp".to_string()));
         let capture = Capture::new();
         let options = make_options(dir.path(), &agent, &runtime, &capture);
 
@@ -2061,29 +2205,49 @@ mod tests {
             Some("No MCP server named \"webl\". Did you mean \"web\"? Configured: web, fs.")
         );
         // --local on a global server.
-        assert_eq!(run_mcp_command(&args(&["logout", "web", "-l"]), &options), 1);
+        assert_eq!(
+            run_mcp_command(&args(&["logout", "web", "-l"]), &options),
+            1
+        );
         assert_eq!(
             capture.errors.borrow().last().map(String::as_str),
-            Some(format!(
-                "MCP server \"web\" is defined in {}, not in the project; omit --local.",
-                agent.join("mcp.json").display()
-            ).as_str())
+            Some(
+                format!(
+                    "MCP server \"web\" is defined in {}, not in the project; omit --local.",
+                    agent.join("mcp.json").display()
+                )
+                .as_str()
+            )
         );
         // A stdio server has no OAuth URL.
         assert_eq!(run_mcp_command(&args(&["login", "fs"]), &options), 1);
         assert_eq!(
             capture.errors.borrow().last().map(String::as_str),
-            Some("MCP server \"fs\" does not use OAuth. Only HTTP servers without an Authorization header do.")
+            Some(
+                "MCP server \"fs\" does not use OAuth. Only HTTP servers without an Authorization header do."
+            )
         );
         // Invalid timeout.
-        assert_eq!(run_mcp_command(&args(&["login", "web", "--timeout", "abc"]), &options), 1);
-        assert_eq!(run_mcp_command(&args(&["login", "web", "--timeout", "0"]), &options), 1);
+        assert_eq!(
+            run_mcp_command(&args(&["login", "web", "--timeout", "abc"]), &options),
+            1
+        );
+        assert_eq!(
+            run_mcp_command(&args(&["login", "web", "--timeout", "0"]), &options),
+            1
+        );
         assert_eq!(
             capture.errors.borrow().last().map(String::as_str),
             Some("--timeout must be a positive number of seconds.")
         );
-        assert_eq!(run_mcp_command(&args(&["login", "web", "--timeout"]), &options), 1);
-        assert_eq!(run_mcp_command(&args(&["logout", "web", "extra"]), &options), 1);
+        assert_eq!(
+            run_mcp_command(&args(&["login", "web", "--timeout"]), &options),
+            1
+        );
+        assert_eq!(
+            run_mcp_command(&args(&["logout", "web", "extra"]), &options),
+            1
+        );
 
         // Logout removes credentials.
         assert_eq!(run_mcp_command(&args(&["logout", "web"]), &options), 0);
@@ -2098,11 +2262,16 @@ mod tests {
     fn login_flows_already_signed_in_and_sign_in() {
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = dir.path().join("agent");
-        config_file(&agent, "{\"mcpServers\":{\"web\":{\"url\":\"https://e.com/mcp\"}}}");
+        config_file(
+            &agent,
+            "{\"mcpServers\":{\"web\":{\"url\":\"https://e.com/mcp\"}}}",
+        );
         let capture = Capture::new();
 
         let mut connected = FakeRuntime::new().with("web", "connected", &["a", "b"]);
-        connected.oauth_urls.insert("web".to_string(), Some("https://e.com/mcp".to_string()));
+        connected
+            .oauth_urls
+            .insert("web".to_string(), Some("https://e.com/mcp".to_string()));
         let options = make_options(dir.path(), &agent, &connected, &capture);
         assert_eq!(run_mcp_command(&args(&["login", "web"]), &options), 0);
         assert_eq!(
@@ -2111,7 +2280,9 @@ mod tests {
         );
 
         let mut signing = FakeRuntime::new().with("web", "needs-auth", &[]);
-        signing.oauth_urls.insert("web".to_string(), Some("https://e.com/mcp".to_string()));
+        signing
+            .oauth_urls
+            .insert("web".to_string(), Some("https://e.com/mcp".to_string()));
         signing.sign_in_tools = 3;
         // The reconnect snapshot stays `needs-auth` (the fake does not
         // mutate), so this is the "Signed in, but ..." arm; assert the
@@ -2121,7 +2292,9 @@ mod tests {
         assert_eq!(run_mcp_command(&args(&["login", "web"]), &options2), 1);
         assert_eq!(
             capture2.lines.borrow().first().map(String::as_str),
-            Some("Sign in to MCP server \"web\" in your browser:\nhttps://example.com/authorize?state=x")
+            Some(
+                "Sign in to MCP server \"web\" in your browser:\nhttps://example.com/authorize?state=x"
+            )
         );
         assert!(
             capture2
@@ -2132,11 +2305,16 @@ mod tests {
         );
 
         let mut cancelled = FakeRuntime::new().with("web", "needs-auth", &[]);
-        cancelled.oauth_urls.insert("web".to_string(), Some("https://e.com/mcp".to_string()));
+        cancelled
+            .oauth_urls
+            .insert("web".to_string(), Some("https://e.com/mcp".to_string()));
         cancelled.sign_in_cancelled = true;
         let capture3 = Capture::new();
         let options3 = make_options(dir.path(), &agent, &cancelled, &capture3);
-        assert_eq!(run_mcp_command(&args(&["login", "web", "--timeout", "10"]), &options3), 1);
+        assert_eq!(
+            run_mcp_command(&args(&["login", "web", "--timeout", "10"]), &options3),
+            1
+        );
         assert_eq!(
             capture3.errors.borrow().last().map(String::as_str),
             Some("Sign-in to MCP server \"web\" was cancelled or not completed within 10 seconds.")

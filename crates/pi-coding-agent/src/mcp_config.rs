@@ -924,10 +924,7 @@ mod tests {
         // Upstream reports the project config path whenever the project is
         // trusted, even when the file does not exist (`config.ts:140-146`).
         let expected_project = dir.path().join(".pi/mcp.json");
-        assert_eq!(
-            loaded.project_config.as_deref(),
-            expected_project.to_str()
-        );
+        assert_eq!(loaded.project_config.as_deref(), expected_project.to_str());
     }
 
     #[test]

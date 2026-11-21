@@ -230,8 +230,7 @@ pub fn error_message(error: &McpError) -> String {
 /// `isResource` (`client.ts:113-114`).
 pub fn is_resource(item: &Value) -> bool {
     item.as_object().is_some_and(|map| {
-        map.get("uri").is_some_and(Value::is_string)
-            && map.get("name").is_none_or(Value::is_string)
+        map.get("uri").is_some_and(Value::is_string) && map.get("name").is_none_or(Value::is_string)
     })
 }
 
@@ -302,7 +301,8 @@ pub fn to_resource_template(item: &Value) -> Result<ResourceTemplate, McpError> 
     {
         map.insert("name".to_string(), Value::String(template.to_string()));
     }
-    serde_json::from_value(item).map_err(|error| invalid(format!("Invalid resource template: {error}")))
+    serde_json::from_value(item)
+        .map_err(|error| invalid(format!("Invalid resource template: {error}")))
 }
 
 /// `validateReadResourceResult` (`client.ts:130-142`) plus the typed
@@ -328,7 +328,9 @@ pub fn parse_read_resource_result(value: &Value) -> Result<ReadResourceResult, M
         .iter()
         .map(|item| {
             serde_json::from_value::<ResourceContents>(item.clone()).map_err(|error| {
-                invalid(format!("Invalid contents in MCP resources/read result: {error}"))
+                invalid(format!(
+                    "Invalid contents in MCP resources/read result: {error}"
+                ))
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -419,7 +421,13 @@ pub fn list_resources_page<T: ResourceTransport>(
     transport: &T,
     cursor: Option<&str>,
 ) -> Result<ListResourcesResult, McpError> {
-    let page = page_request(transport, "resources/list", "resources", cursor, is_resource)?;
+    let page = page_request(
+        transport,
+        "resources/list",
+        "resources",
+        cursor,
+        is_resource,
+    )?;
     Ok(ListResourcesResult {
         resources: page
             .items
@@ -434,7 +442,13 @@ pub fn list_resources_page<T: ResourceTransport>(
 /// `listResources` (`client.ts:301-303`): every resource, all pages.
 pub fn list_resources<T: ResourceTransport>(transport: &T) -> Result<Vec<Resource>, McpError> {
     let items = list_all("resources/list", |cursor| {
-        page_request(transport, "resources/list", "resources", cursor, is_resource)
+        page_request(
+            transport,
+            "resources/list",
+            "resources",
+            cursor,
+            is_resource,
+        )
     })?;
     items.iter().map(to_resource).collect()
 }
@@ -498,7 +512,10 @@ fn has_mcp_app_profile(value: &str) -> bool {
         while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
             index += 1;
         }
-        if lower.get(index..).is_some_and(|rest| rest.starts_with("profile")) {
+        if lower
+            .get(index..)
+            .is_some_and(|rest| rest.starts_with("profile"))
+        {
             index += "profile".len();
             while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
                 index += 1;
@@ -511,7 +528,10 @@ fn has_mcp_app_profile(value: &str) -> bool {
                 if bytes.get(index) == Some(&b'"') {
                     index += 1;
                 }
-                if lower.get(index..).is_some_and(|rest| rest.starts_with("mcp-app")) {
+                if lower
+                    .get(index..)
+                    .is_some_and(|rest| rest.starts_with("mcp-app"))
+                {
                     return true;
                 }
             }
@@ -529,8 +549,7 @@ pub fn is_mcp_app_resource(
     mime_type: Option<&str>,
 ) -> bool {
     let identifier = uri.or(uri_template).unwrap_or_default();
-    identifier.starts_with("ui://")
-        || mime_type.is_some_and(has_mcp_app_profile)
+    identifier.starts_with("ui://") || mime_type.is_some_and(has_mcp_app_profile)
 }
 
 /// `isMcpAppResource` applied to a raw listed item.
@@ -678,10 +697,7 @@ pub fn format_size(bytes: f64) -> String {
 
 /// `extensionOf` (`tools.ts:160-163`): the URI's file extension, else `.bin`.
 pub fn extension_of(uri: &str) -> String {
-    let path = Url::parse(uri).map_or_else(
-        |_| uri.to_string(),
-        |parsed| parsed.path().to_string(),
-    );
+    let path = Url::parse(uri).map_or_else(|_| uri.to_string(), |parsed| parsed.path().to_string());
     path.rfind('.').map_or_else(
         || ".bin".to_string(),
         |index| {
@@ -702,7 +718,12 @@ pub fn is_text_mime_type(mime_type: Option<&str>) -> bool {
     let Some(mime_type) = mime_type else {
         return false;
     };
-    let base = mime_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+    let base = mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     base.starts_with("text/")
         || base == "application/json"
         || base.ends_with("+json")
@@ -721,11 +742,7 @@ fn base64_decode(blob: &str) -> Vec<u8> {
 /// the way `tools.ts:173-212` converts embedded resource blocks. `saver`
 /// stands in for `saveToTempFile` (a temp file in the real extension), so
 /// the flow runs without touching the filesystem.
-pub fn contents_to_model_blocks<F>(
-    result: &ReadResourceResult,
-    uri: &str,
-    saver: F,
-) -> Vec<Value>
+pub fn contents_to_model_blocks<F>(result: &ReadResourceResult, uri: &str, saver: F) -> Vec<Value>
 where
     F: Fn(&[u8], &str) -> Result<String, String>,
 {
@@ -766,10 +783,9 @@ where
                     );
                     let extension = extension_of(&blob.uri);
                     let text = match saver(&data, &extension) {
-                        Ok(path) => format!(
-                            "[Binary resource {} ({kind}) saved to {path}]",
-                            blob.uri
-                        ),
+                        Ok(path) => {
+                            format!("[Binary resource {} ({kind}) saved to {path}]", blob.uri)
+                        }
                         Err(reason) => format!(
                             "[Binary resource {} ({kind}) could not be saved: {reason}]",
                             blob.uri
@@ -958,9 +974,8 @@ mod tests {
         let state = RefCell::new(calls.into_iter());
         move |method: &str, params: Option<Value>| -> Result<Value, McpError> {
             let mut calls = state.borrow_mut();
-            let (expected_method, expected_params, result) = calls
-                .next()
-                .expect("unexpected request");
+            let (expected_method, expected_params, result) =
+                calls.next().expect("unexpected request");
             assert_eq!(method, expected_method);
             assert_eq!(params, expected_params);
             Ok(result)
@@ -1016,39 +1031,78 @@ mod tests {
             "Invalid MCP resources/read result"
         );
         assert_eq!(
-            error_message(&parse_read_resource_result(&json!({"contents": [{"uri": "x"}]})).unwrap_err()),
+            error_message(
+                &parse_read_resource_result(&json!({"contents": [{"uri": "x"}]})).unwrap_err()
+            ),
             "Invalid contents in MCP resources/read result"
         );
     }
 
     #[test]
     fn list_page_validation_normalizes_and_errors_verbatim() {
-        let page = validate_list_page("resources/list", "resources", &json!({
-            "resources": [{"uri": "u", "name": "n"}], "nextCursor": null
-        }), is_resource).expect("page");
+        let page = validate_list_page(
+            "resources/list",
+            "resources",
+            &json!({
+                "resources": [{"uri": "u", "name": "n"}], "nextCursor": null
+            }),
+            is_resource,
+        )
+        .expect("page");
         assert_eq!(page.next_cursor, None);
-        let page = validate_list_page("resources/list", "resources", &json!({
-            "resources": [], "nextCursor": ""
-        }), is_resource).expect("page");
+        let page = validate_list_page(
+            "resources/list",
+            "resources",
+            &json!({
+                "resources": [], "nextCursor": ""
+            }),
+            is_resource,
+        )
+        .expect("page");
         assert_eq!(page.next_cursor, None);
-        let page = validate_list_page("resources/list", "resources", &json!({
-            "resources": [], "nextCursor": "next"
-        }), is_resource).expect("page");
+        let page = validate_list_page(
+            "resources/list",
+            "resources",
+            &json!({
+                "resources": [], "nextCursor": "next"
+            }),
+            is_resource,
+        )
+        .expect("page");
         assert_eq!(page.next_cursor.as_deref(), Some("next"));
         assert_eq!(
-            error_message(&validate_list_page("resources/list", "resources", &json!({}), is_resource).unwrap_err()),
+            error_message(
+                &validate_list_page("resources/list", "resources", &json!({}), is_resource)
+                    .unwrap_err()
+            ),
             "Invalid MCP resources/list result"
         );
         assert_eq!(
-            error_message(&validate_list_page("resources/list", "resources", &json!({
-                "resources": [{"name": "no uri"}]
-            }), is_resource).unwrap_err()),
+            error_message(
+                &validate_list_page(
+                    "resources/list",
+                    "resources",
+                    &json!({
+                        "resources": [{"name": "no uri"}]
+                    }),
+                    is_resource
+                )
+                .unwrap_err()
+            ),
             "Invalid entry in MCP resources/list result"
         );
         assert_eq!(
-            error_message(&validate_list_page("resources/list", "resources", &json!({
-                "resources": [], "nextCursor": 7
-            }), is_resource).unwrap_err()),
+            error_message(
+                &validate_list_page(
+                    "resources/list",
+                    "resources",
+                    &json!({
+                        "resources": [], "nextCursor": 7
+                    }),
+                    is_resource
+                )
+                .unwrap_err()
+            ),
             "Invalid MCP resources/list cursor"
         );
     }
@@ -1086,7 +1140,10 @@ mod tests {
                 _ => panic!("unexpected cursor"),
             }
         };
-        assert_eq!(list_all("resources/list", pages).expect("all"), vec![json!("a"), json!("b")]);
+        assert_eq!(
+            list_all("resources/list", pages).expect("all"),
+            vec![json!("a"), json!("b")]
+        );
         let looping = |_: Option<&str>| -> Result<Page, McpError> {
             Ok(Page {
                 items: Vec::new(),
@@ -1123,7 +1180,10 @@ mod tests {
             ),
         ]);
         let resources = list_resources(&all).expect("all");
-        assert_eq!(resources.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>(), ["u1", "u2"]);
+        assert_eq!(
+            resources.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>(),
+            ["u1", "u2"]
+        );
 
         let templates = transport_for(vec![(
             "resources/templates/list",
@@ -1144,22 +1204,49 @@ mod tests {
 
     #[test]
     fn mcp_app_detection_covers_uri_and_profile_variants() {
-        assert!(is_mcp_app_resource(Some("ui://widget/index.html"), None, None));
+        assert!(is_mcp_app_resource(
+            Some("ui://widget/index.html"),
+            None,
+            None
+        ));
         assert!(is_mcp_app_resource(None, Some("ui://x/{id}"), None));
-        assert!(is_mcp_app_resource(None, None, Some("text/html;profile=mcp-app")));
-        assert!(is_mcp_app_resource(None, None, Some("text/html; PROFILE = \"mcp-app\"")));
-        assert!(is_mcp_app_resource(None, None, Some("text/html; profile=mcp-app; charset=utf-8")));
-        assert!(!is_mcp_app_resource(Some("file:///a.txt"), None, Some("text/plain")));
-        assert!(!is_mcp_app_resource(None, None, Some("text/html; profile=other")));
+        assert!(is_mcp_app_resource(
+            None,
+            None,
+            Some("text/html;profile=mcp-app")
+        ));
+        assert!(is_mcp_app_resource(
+            None,
+            None,
+            Some("text/html; PROFILE = \"mcp-app\"")
+        ));
+        assert!(is_mcp_app_resource(
+            None,
+            None,
+            Some("text/html; profile=mcp-app; charset=utf-8")
+        ));
+        assert!(!is_mcp_app_resource(
+            Some("file:///a.txt"),
+            None,
+            Some("text/plain")
+        ));
+        assert!(!is_mcp_app_resource(
+            None,
+            None,
+            Some("text/html; profile=other")
+        ));
         assert!(is_mcp_app_value(&json!({"uri": "ui://x", "name": "x"})));
         assert!(!is_mcp_app_value(&json!({"uri": "file:///x", "name": "x"})));
     }
 
     #[test]
     fn listed_strips_meta_and_icons_and_tags_the_server() {
-        let value = listed("alpha", &json!({
-            "uri": "u", "name": "n", "_meta": {"x": 1}, "icons": [{"src": "i"}]
-        }));
+        let value = listed(
+            "alpha",
+            &json!({
+                "uri": "u", "name": "n", "_meta": {"x": 1}, "icons": [{"src": "i"}]
+            }),
+        );
         assert_eq!(value["server"], "alpha");
         assert_eq!(value.get("_meta"), None);
         assert_eq!(value.get("icons"), None);
@@ -1171,9 +1258,20 @@ mod tests {
     #[test]
     fn string_arguments_trim_and_reject_non_strings() {
         let params = json!({"server": "  alpha  ", "cursor": null, "uri": 5});
-        assert_eq!(string_argument(Some(&params), "server").expect("server").as_deref(), Some("alpha"));
-        assert_eq!(string_argument(Some(&params), "cursor").expect("cursor"), None);
-        assert_eq!(string_argument(Some(&params), "missing").expect("missing"), None);
+        assert_eq!(
+            string_argument(Some(&params), "server")
+                .expect("server")
+                .as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            string_argument(Some(&params), "cursor").expect("cursor"),
+            None
+        );
+        assert_eq!(
+            string_argument(Some(&params), "missing").expect("missing"),
+            None
+        );
         assert_eq!(
             error_message(&string_argument(Some(&params), "uri").unwrap_err()),
             "uri must be a string"
@@ -1232,7 +1330,16 @@ mod tests {
         assert_eq!(every.get("nextCursor"), None);
 
         assert_eq!(
-            error_message(&list_payload(Some(&json!({"cursor": "c"})), "resources", &servers, page, all).unwrap_err()),
+            error_message(
+                &list_payload(
+                    Some(&json!({"cursor": "c"})),
+                    "resources",
+                    &servers,
+                    page,
+                    all
+                )
+                .unwrap_err()
+            ),
             "cursor can only be used when a server is specified"
         );
     }
@@ -1298,9 +1405,15 @@ mod tests {
 
     #[test]
     fn schemas_expose_upstream_shapes() {
-        assert_eq!(list_parameters_schema()["additionalProperties"], json!(false));
+        assert_eq!(
+            list_parameters_schema()["additionalProperties"],
+            json!(false)
+        );
         assert_eq!(list_output_schema()["required"][0], "resources");
-        assert_eq!(list_templates_output_schema()["properties"]["resourceTemplates"]["type"], "array");
+        assert_eq!(
+            list_templates_output_schema()["properties"]["resourceTemplates"]["type"],
+            "array"
+        );
         assert_eq!(read_parameters_schema()["required"][1], "uri");
         let schema = read_output_schema();
         let any_of = schema["properties"]["contents"]["items"]["anyOf"]

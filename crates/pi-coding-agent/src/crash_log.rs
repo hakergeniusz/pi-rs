@@ -216,8 +216,7 @@ static SECRET_ASSIGNMENT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLoc
 });
 /// `Bearer <token>` in an error message or stack frame.
 static BEARER_TOKEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}")
-        .expect("bearer token regex")
+    regex::Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}").expect("bearer token regex")
 });
 /// Common provider key shapes (OpenAI/Anthropic, GitHub, Slack).
 const KEY_SHAPE: &str = r"\b(?:sk-ant-|sk-|gh[pousr]_|xox[baprs]-)[A-Za-z0-9_-]{8,}";
@@ -495,13 +494,12 @@ pub fn find_extension_stack_matches(
         let single_file_package = extension.source_info.origin == SourceOrigin::Package
             && !is_remote_source(extension.source_info.source)
             && is_js_ts_file(extension.source_info.source);
-        let package_root = if extension.source_info.origin == SourceOrigin::Package
-            && !single_file_package
-        {
-            extension.source_info.base_dir
-        } else {
-            None
-        };
+        let package_root =
+            if extension.source_info.origin == SourceOrigin::Package && !single_file_package {
+                extension.source_info.base_dir
+            } else {
+                None
+            };
         let directory_entry = is_index_entry(&resolved_path);
         let is_match = if let Some(root) = package_root {
             stack_contains_path(&normalized_stack, root, true)
@@ -888,7 +886,10 @@ mod tests {
         let hint = format_crash_extension_hint(&matches).expect("hint");
         assert!(hint.contains("loaded extension `npm:my-ext`"));
         assert_eq!(format_crash_extension_hint(&[]), None);
-        assert_eq!(find_extension_stack_matches(None, &[package]), Vec::<String>::new());
+        assert_eq!(
+            find_extension_stack_matches(None, &[package]),
+            Vec::<String>::new()
+        );
     }
 
     /// The two verbatim notice strings used by the binary wiring.
