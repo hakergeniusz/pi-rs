@@ -1217,22 +1217,22 @@ mod tests {
             Some(&json!({"server": "beta", "cursor": "c"})),
             "resources",
             &servers,
-            &page,
-            &all,
+            page,
+            all,
         )
         .expect("one");
         assert_eq!(one["server"], "beta");
         assert_eq!(one["resources"][0]["server"], "beta");
         assert_eq!(one["nextCursor"], "next");
 
-        let every = list_payload(None, "resources", &servers, &page, &all).expect("all");
+        let every = list_payload(None, "resources", &servers, page, all).expect("all");
         assert_eq!(every["resources"][0]["uri"], "a");
         assert_eq!(every["errors"][0]["server"], "beta");
         assert_eq!(every["errors"][0]["error"], "offline");
         assert_eq!(every.get("nextCursor"), None);
 
         assert_eq!(
-            error_message(&list_payload(Some(&json!({"cursor": "c"})), "resources", &servers, &page, &all).unwrap_err()),
+            error_message(&list_payload(Some(&json!({"cursor": "c"})), "resources", &servers, page, all).unwrap_err()),
             "cursor can only be used when a server is specified"
         );
     }
@@ -1302,7 +1302,8 @@ mod tests {
         assert_eq!(list_output_schema()["required"][0], "resources");
         assert_eq!(list_templates_output_schema()["properties"]["resourceTemplates"]["type"], "array");
         assert_eq!(read_parameters_schema()["required"][1], "uri");
-        let any_of = read_output_schema()["properties"]["contents"]["items"]["anyOf"]
+        let schema = read_output_schema();
+        let any_of = schema["properties"]["contents"]["items"]["anyOf"]
             .as_array()
             .expect("anyOf");
         assert_eq!(any_of.len(), 2);
