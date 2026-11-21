@@ -1,7 +1,14 @@
-//! Shared provider-adapter helpers: message assembly, finalization, abort.
+//! Shared provider-adapter helpers: message assembly, finalization, abort, and
+//! the `onPayload`/`onResponse`/`onProviderStreamEvent` hook bridges used by
+//! every built-in adapter (TS `packages/ai/src/types.ts:161-232`,
+//! `api/simple-options.ts:49-80`).
 
 use crate::cost::calculate_cost;
-use crate::types::{AssistantMessage, Message, Model, StopReason, SystemMessage, Usage, now_ms};
+use crate::types::{
+    AssistantMessage, JsonValue, Message, Model, PayloadHook, ProviderHook, ProviderResponse,
+    ResponseHook, StopReason, StreamEventHook, SystemMessage, Usage, now_ms,
+};
+use std::collections::BTreeMap;
 
 /// Base assistant message for stream accumulation.
 pub fn initial_output(model: &Model) -> AssistantMessage {
@@ -131,10 +138,133 @@ pub fn is_leading_system(messages: &[Message], index: usize) -> bool {
         .all(|m| matches!(m, Message::System(_)))
 }
 
+/// Capture the status/headers of a received response for `onResponse`
+/// (TS `headersToRecord`, `packages/ai/src/utils/headers.ts:3-9`).
+pub fn response_metadata(response: &reqwest::Response) -> ProviderResponse {
+    let mut headers = BTreeMap::new();
+    for (name, value) in response.headers().iter() {
+        headers.insert(
+            name.as_str().to_ascii_lowercase(),
+            value.to_str().map(str::to_string).unwrap_or_default(),
+        );
+    }
+    ProviderResponse {
+        status: response.status().as_u16(),
+        headers,
+    }
+}
+
+/// Run `onPayload` before the request is sent (TS `openai-completions.ts:375-378`,
+/// `anthropic-messages.ts:905-908`, `openai-codex-responses.ts:287-290`): a
+/// `None` return keeps the built payload; an `Err` is the stream's terminal
+/// error, like a rejected upstream promise.
+pub async fn apply_payload_hook(
+    hook: &ProviderHook<PayloadHook>,
+    payload: JsonValue,
+    model: &Model,
+) -> Result<JsonValue, String> {
+    let Some(callback) = hook.get() else {
+        return Ok(payload);
+    };
+    let original = payload.clone();
+    match callback(payload, model.clone()).await? {
+        Some(replacement) => Ok(replacement),
+        None => Ok(original),
+    }
+}
+
+/// Run `onResponse` after the HTTP headers arrive and before the body stream
+/// is consumed (TS `openai-completions.ts:392`, `anthropic-messages.ts:943`,
+/// `openai-codex-responses.ts:433-436`).
+pub async fn apply_response_hook(
+    hook: &ProviderHook<ResponseHook>,
+    response: ProviderResponse,
+    model: &Model,
+) -> Result<(), String> {
+    if let Some(callback) = hook.get() {
+        callback(response, model.clone()).await?;
+    }
+    Ok(())
+}
+
+/// Run `onProviderStreamEvent` for each parsed provider event before Pi
+/// normalizes it (TS `openai-completions.ts:545`, `anthropic-messages.ts:954`,
+/// `openai-codex-responses.ts:772`).
+pub async fn apply_stream_event_hook(
+    hook: &ProviderHook<StreamEventHook>,
+    event: JsonValue,
+    model: &Model,
+) -> Result<(), String> {
+    if let Some(callback) = hook.get() {
+        callback(event, model.clone()).await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{Tool, ToolReference};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn hook_slots_default_to_noop() {
+        let payload = serde_json::json!({"model": "original"});
+        let model = Model::default();
+        assert_eq!(
+            apply_payload_hook(&ProviderHook::default(), payload.clone(), &model)
+                .await
+                .unwrap(),
+            payload
+        );
+        apply_response_hook(
+            &ProviderHook::default(),
+            ProviderResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+            },
+            &model,
+        )
+        .await
+        .unwrap();
+        apply_stream_event_hook(&ProviderHook::default(), payload, &model)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn payload_hook_replaces_and_hook_errors_propagate() {
+        let model = Model::default();
+        let payload = serde_json::json!({"model": "original"});
+
+        let replacing: Arc<PayloadHook> = Arc::new(|payload, _model| {
+            Box::pin(async move {
+                let mut next = payload;
+                next["model"] = serde_json::json!("replacement");
+                Ok(Some(next))
+            })
+        });
+        let slot = ProviderHook::new(replacing);
+        assert_eq!(
+            apply_payload_hook(&slot, payload, &model).await.unwrap()["model"],
+            "replacement"
+        );
+
+        let failing: Arc<ResponseHook> =
+            Arc::new(|_response, _model| Box::pin(async move { Err("rejected".to_string()) }));
+        let slot = ProviderHook::new(failing);
+        let error = apply_response_hook(
+            &slot,
+            ProviderResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+            },
+            &model,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "rejected");
+    }
 
     fn system(content: &str, tools_added: Vec<Tool>, tools_removed: Vec<&str>) -> Message {
         Message::System(SystemMessage {

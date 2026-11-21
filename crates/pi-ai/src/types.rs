@@ -3,9 +3,14 @@
 //! Rust port of the type surface in TS `packages/ai/src/types.ts`. Serde field
 //! names mirror the TypeScript wire format (camelCase, `"type"`/`"role"` tags)
 //! so session JSONL and RPC payloads stay compatible with the TS implementation.
+//! The `StreamOptions` hook slots port `ProviderRequestOptions`/`StreamOptions`
+//! (`packages/ai/src/types.ts:155-158,161-232`) and `buildBaseOptions`
+//! (`packages/ai/src/api/simple-options.ts:49-80`).
 
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// JSON value (mirrors TS `JsonValue`).
 pub type JsonValue = serde_json::Value;
@@ -659,6 +664,82 @@ pub struct TranscriptContext {
     pub messages: Vec<Message>,
 }
 
+/// Response metadata handed to `onResponse` (TS `ProviderResponse`,
+/// `packages/ai/src/types.ts:155-158`). Header names are lowercased and the
+/// last value wins, mirroring the JS `Headers` iteration in `headersToRecord`
+/// (`packages/ai/src/utils/headers.ts:3-9`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+}
+
+/// A hook's awaitable result (upstream hooks may be sync or promise-returning;
+/// Rust hooks are always awaitable so both shapes are representable).
+pub type HookFuture<'a, T> = BoxFuture<'a, T>;
+
+/// `onPayload` callback (TS `ProviderRequestOptions.onPayload`,
+/// `types.ts:179-182`): receives the built request payload and model, and may
+/// return a replacement payload; `None` keeps the built one. `Err` fails the
+/// stream exactly like a rejected upstream promise.
+pub type PayloadHook = dyn Fn(JsonValue, Model) -> HookFuture<'static, Result<Option<JsonValue>, String>>
+    + Send
+    + Sync;
+
+/// `onResponse` callback (TS `StreamOptions.onResponse`, `types.ts:223-226`):
+/// one-way observer called after the HTTP response arrives and before its body
+/// stream is consumed.
+pub type ResponseHook =
+    dyn Fn(ProviderResponse, Model) -> HookFuture<'static, Result<(), String>> + Send + Sync;
+
+/// `onProviderStreamEvent` callback (TS `StreamOptions.onProviderStreamEvent`,
+/// `types.ts:227-232`): one-way observer of each parsed provider stream event
+/// before Pi normalization.
+pub type StreamEventHook =
+    dyn Fn(JsonValue, Model) -> HookFuture<'static, Result<(), String>> + Send + Sync;
+
+/// An optional callback slot that keeps `StreamOptions` `Debug`, `Clone` and
+/// `Default`: trait-object callbacks are opaque to `Debug`, and upstream hook
+/// functions likewise never cross serialized options (`custom-provider.md`).
+pub struct ProviderHook<T: ?Sized>(Option<Arc<T>>);
+
+impl<T: ?Sized> Default for ProviderHook<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<T: ?Sized> Clone for ProviderHook<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T: ?Sized> std::fmt::Debug for ProviderHook<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Some(<hook>)"
+        } else {
+            "None"
+        })
+    }
+}
+
+impl<T: ?Sized> ProviderHook<T> {
+    /// Install a callback.
+    pub fn new(callback: Arc<T>) -> Self {
+        Self(Some(callback))
+    }
+    /// Borrow the installed callback, if any.
+    pub fn get(&self) -> Option<&T> {
+        self.0.as_deref()
+    }
+    /// Whether a callback is installed.
+    pub fn is_set(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
 /// Streaming options shared by all providers (subset of TS `StreamOptions`
 /// needed for P1; provider-specific extras extend via `extra`).
 #[derive(Debug, Clone, Default)]
@@ -680,6 +761,12 @@ pub struct StreamOptions {
     /// Provider-neutral tool selection (TS `SimpleStreamOptions.toolChoice`).
     pub tool_choice: Option<ToolChoice>,
     pub metadata: Option<JsonObject>,
+    /// Built-in adapter instrumentation. The JS extension path decorates its
+    /// own options with these hooks in `pi-ext-js`; these slots make the Rust
+    /// adapters call them at the same upstream points.
+    pub on_payload: ProviderHook<PayloadHook>,
+    pub on_response: ProviderHook<ResponseHook>,
+    pub on_provider_stream_event: ProviderHook<StreamEventHook>,
 }
 
 /// Provider-neutral tool selection (TS `ToolChoice`).

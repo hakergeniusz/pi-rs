@@ -40,7 +40,8 @@ pub use constrained_sampling::{ConstrainedSampling, GrammarFormat, GrammarVarian
 pub use event_stream::AssistantMessageEventStream;
 pub use types::get_supported_thinking_levels;
 pub use types::{
-    AssistantContent, AssistantMessage, AssistantMessageEvent, ContentBlock, Context, InputContent,
-    KnownApi, Message, Model, StopReason, StreamOptions, SystemMessage, ThinkingLevel, Tool,
+    AssistantContent, AssistantMessage, AssistantMessageEvent, ContentBlock, Context, HookFuture,
+    InputContent, KnownApi, Message, Model, PayloadHook, ProviderHook, ProviderResponse,
+    ResponseHook, StopReason, StreamEventHook, StreamOptions, SystemMessage, ThinkingLevel, Tool,
     ToolCall, ToolChoice, ToolResultMessage, TranscriptContext, Usage, UserContent, UserMessage,
 };

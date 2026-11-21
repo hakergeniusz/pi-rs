@@ -3,12 +3,14 @@
 //!
 //! P1 scope: api-key auth, request building (system/messages/tools/thinking
 //! budgets), SSE streaming mapped to the unified protocol, stop-reason and
-//! usage mapping, catalog-priced cost. Deferred: OAuth, Claude Code name
-//! mapping, model fallbacks, threads, retries, `OpenRouter` billing.
+//! usage mapping, catalog-priced cost. The hook bridges mirror
+//! `api/anthropic-messages.ts:905-908,943,954`. Deferred: OAuth, Claude Code
+//! name mapping, model fallbacks, threads, retries, `OpenRouter` billing.
 
 use crate::event_stream::{AssistantMessageEventStream, EventSender};
 use crate::providers::common::{
-    finalize, initial_output, is_leading_system, system_text, system_update_text,
+    apply_payload_hook, apply_response_hook, apply_stream_event_hook, finalize, initial_output,
+    is_leading_system, response_metadata, system_text, system_update_text,
 };
 use crate::sse::{SseError, read_sse_stream};
 use crate::streaming_json::parse_tool_call_arguments;
@@ -107,7 +109,9 @@ async fn request_and_stream(
         return Err("Anthropic API key not set (set ANTHROPIC_API_KEY)".to_string());
     }
 
-    let body = build_request_body(model, context, options)?;
+    // `onPayload` runs on the built params before each send (the TS adapter
+    // calls it inside its request loop; the port sends once).
+    let body = apply_payload_hook(&options.on_payload, body, model).await?;
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
 
     let client = reqwest::Client::builder()
@@ -128,6 +132,13 @@ async fn request_and_stream(
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
+
+    // `onResponse` observes the raw status/headers before the body is consumed
+    // and before the `start` event (TS line 943). Upstream's SDK throws on
+    // non-2xx before `asResponse()` returns, so errors skip the hook.
+    if response.status().is_success() {
+        apply_response_hook(&options.on_response, response_metadata(&response), model).await?;
+    }
 
     let sse = read_sse_stream(response).await.map_err(|e| e.to_string())?;
     let _ = sender
@@ -154,6 +165,9 @@ async fn request_and_stream(
             Ok(event) => event,
             Err(error) => return Err(format!("could not parse Anthropic SSE event: {error}")),
         };
+        // Observer runs on every parsed event before Pi maps it; SSE `error`
+        // events throw above, before any event is yielded (TS line 954).
+        apply_stream_event_hook(&options.on_provider_stream_event, event.clone(), model).await?;
         match event
             .get("type")
             .and_then(Value::as_str)

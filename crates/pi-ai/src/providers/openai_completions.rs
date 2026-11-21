@@ -5,12 +5,15 @@
 //! P1 scope: bearer auth, request building (messages/tools/temperature/
 //! `max_tokens`/`stream_options`), SSE streaming with `reasoning_content` support,
 //! tool-call delta accumulation, finish-reason and usage mapping.
+//! The `onPayload`/`onResponse`/`onProviderStreamEvent` bridges mirror
+//! `api/openai-completions.ts:375-378,392,545`.
 //! Deferred: compat autodetection matrix, grammar tools, prompt-cache keys.
 //! `OpenAI`-wire-compatible providers: llama.cpp, vLLM, `OpenRouter`, Groq, …
 
 use crate::event_stream::{AssistantMessageEventStream, EventSender};
 use crate::providers::common::{
-    finalize, initial_output, is_leading_system, system_text, system_update_text, tools_at_point,
+    apply_payload_hook, apply_response_hook, apply_stream_event_hook, finalize, initial_output,
+    is_leading_system, response_metadata, system_text, system_update_text, tools_at_point,
 };
 use crate::sse::{SseError, read_sse_stream};
 use crate::streaming_json::parse_tool_call_arguments;
@@ -112,7 +115,9 @@ async fn request_and_stream(
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
         .ok_or_else(|| "OpenAI API key not set (set OPENAI_API_KEY)".to_string())?;
 
-    let body = build_request_body(model, context, options)?;
+    // `onPayload` runs on the fully built payload, before the request is sent;
+    // a replacement payload (if any) is what actually goes over the wire.
+    let body = apply_payload_hook(&options.on_payload, body, model).await?;
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
 
     let client = reqwest::Client::builder()
@@ -127,6 +132,13 @@ async fn request_and_stream(
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
+
+    // `onResponse` sees the raw status/headers before the body is consumed
+    // (and before the `start` event). Upstream's SDK throws on non-2xx before
+    // `withResponse()` returns, so the hook is only reached on success here.
+    if response.status().is_success() {
+        apply_response_hook(&options.on_response, response_metadata(&response), model).await?;
+    }
 
     let sse = read_sse_stream(response).await.map_err(|e| e.to_string())?;
     let _ = sender
@@ -146,16 +158,25 @@ async fn request_and_stream(
             Err(SseError::Http(message)) => return Err(message),
         };
         let data = message.data.trim();
-        if data == "[DONE]" {
-            break;
-        }
         if data.is_empty() {
             continue;
+        }
+        // The OpenAI SDK yields a `[DONE]` sentinel to its iterator before Pi
+        // normalizes chunks; the observer sees it too (TS line 545).
+        if data == "[DONE]" {
+            apply_stream_event_hook(
+                &options.on_provider_stream_event,
+                Value::String("[DONE]".to_string()),
+                model,
+            )
+            .await?;
+            break;
         }
         let chunk: Value = match serde_json::from_str(data) {
             Ok(chunk) => chunk,
             Err(error) => return Err(format!("could not parse OpenAI SSE chunk: {error}")),
         };
+        apply_stream_event_hook(&options.on_provider_stream_event, chunk.clone(), model).await?;
 
         if let Some(id) = chunk.get("id").and_then(Value::as_str)
             && output.response_id.is_none()

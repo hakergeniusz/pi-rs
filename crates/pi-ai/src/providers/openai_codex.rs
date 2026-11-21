@@ -5,7 +5,9 @@
 //! `stream: true`) with the full `ResponseStreamEvent` →
 //! [`AssistantMessageEvent`] mapping: reasoning summaries, text, function and
 //! custom (grammar) tool calls, usage/stop-reason mapping, reasoning-replay
-//! signatures, and `store: false` multi-turn replay state.
+//! signatures, and `store: false` multi-turn replay state. The
+//! `onPayload`/`onResponse`/`onProviderStreamEvent` bridges mirror
+//! `api/openai-codex-responses.ts:287-290,433-436,772`.
 //!
 //! Documented deviations from upstream:
 //! - Transport is SSE only. Upstream prefers a WebSocket transport and falls
@@ -30,7 +32,8 @@ use serde_json::{Value, json};
 
 use crate::event_stream::{AssistantMessageEventStream, EventSender};
 use crate::providers::common::{
-    finalize, initial_output, is_leading_system, system_text, system_update_text, tools_at_point,
+    apply_payload_hook, apply_response_hook, apply_stream_event_hook, finalize, initial_output,
+    is_leading_system, response_metadata, system_text, system_update_text, tools_at_point,
 };
 use crate::sse::{SseError, read_sse_stream};
 use crate::streaming_json::parse_tool_call_arguments;
@@ -1231,7 +1234,9 @@ async fn request_and_stream(
         .ok_or_else(|| format!("No API key for provider: {}", model.provider))?;
     let account_id = extract_account_id(&token)?;
 
-    let body = build_request_body(model, context, options);
+    // `onPayload` may replace the built request body before it is sent
+    // (TS `openai-codex-responses.ts:287-290`).
+    let body = apply_payload_hook(&options.on_payload, body, model).await?;
     let url = resolve_codex_url(&model.base_url);
 
     let client = reqwest::Client::builder()
@@ -1292,6 +1297,10 @@ async fn request_and_stream(
         .await
         .map_err(|e| format!("request failed: {e}"))?;
 
+    // `onResponse` sees the raw response before the body stream is consumed,
+    // including non-2xx statuses (TS line 433-436).
+    apply_response_hook(&options.on_response, response_metadata(&response), model).await?;
+
     let sse = read_sse_stream(response).await.map_err(|e| match e {
         SseError::Status { status, body } => format!("HTTP {status}: {body}"),
         SseError::Http(message) => message,
@@ -1318,6 +1327,7 @@ async fn request_and_stream(
             Ok(event) => event,
             Err(error) => return Err(format!("could not parse Codex SSE event: {error}")),
         };
+        apply_stream_event_hook(&options.on_provider_stream_event, event.clone(), model).await?;
         state.apply(&event, output, sender).await?;
     }
 
