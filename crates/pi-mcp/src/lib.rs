@@ -16,6 +16,8 @@
 //! * [`oauth`] — the OAuth flows: discovery, client settings, state
 //!   provider, sign-in, loopback callback.
 //! * [`client`] — `initialize` handshake, tool discovery and calls.
+//! * [`resources`] — MCP resources/list/read and the resource tools' payloads
+//!   (`resources.ts`, `client.ts` resource methods).
 //! * [`error`] — the error surface.
 
 /// The bearer-token + recovery hook of the HTTP transport
@@ -30,6 +32,9 @@ pub mod http;
 /// The OAuth flows (`oauth/`): discovery, client settings, state provider,
 /// sign-in, loopback callback.
 pub mod oauth;
+/// MCP resources: `resources/list`, `resources/read`, templates, and the
+/// resource tools' types and payloads.
+pub mod resources;
 /// Subprocess stdio framing with request/response correlation.
 pub mod transport;
 /// JSON-RPC 2.0 envelope + MCP message types.
@@ -64,6 +69,11 @@ pub use auth_provider::{AuthProvider, McpFetch, UnauthorizedContext};
 pub use client::{McpClient, McpServerConfig, McpTransportConfig};
 pub use error::McpError;
 pub use http::StreamableHttpTransport;
+pub use resources::{
+    BlobResourceContents, ListResourceTemplatesResult, ListResourcesResult, Page,
+    ReadResourceResult, Resource, ResourceContents, ResourceTemplate, ResourceTransport,
+    TextResourceContents,
+};
 pub use types::{
     CallToolResult, ContentBlock, McpTool, ToolsListResult, normalize_mcp_input_schema,
 };
