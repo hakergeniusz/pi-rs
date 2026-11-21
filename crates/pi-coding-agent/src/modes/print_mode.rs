@@ -954,14 +954,81 @@ fn is_tool_modifier_entry(entry: &str) -> bool {
     entry.starts_with('+') || entry.starts_with('-')
 }
 
+/// Map a normalized config exposure to the prompt section's own enum.
+fn prompt_exposure(value: Option<&str>) -> crate::prompt::mcp_section::McpExposure {
+    use crate::prompt::mcp_section::McpExposure as E;
+    match value.unwrap_or("codemode") {
+        "deferred" => E::Deferred,
+        "direct" => E::Direct,
+        "hidden" => E::Hidden,
+        // `mcp_config` normalizes the legacy `codemode-deferred` alias.
+        _ => E::Codemode,
+    }
+}
+
 /// Build the runtime's system prompt with CLI overrides.
 /// `--system-prompt` replaces the prefix; `--append-system-prompt` entries
-/// append (joined with newlines, matching the CLI's startup join).
-pub fn system_prompt_for(args: &Args, cwd: &str) -> Result<String, String> {
+/// append (joined with newlines, matching the CLI's startup join). The
+/// `mcp_servers` section is derived from the same `mcp.json` snapshot the
+/// manager uses (`extensions/mcp/index.ts:156-222`).
+pub fn system_prompt_for(
+    args: &Args,
+    cwd: &str,
+    agent_dir: &Path,
+    project_trusted: bool,
+) -> Result<String, String> {
     let mut options = crate::prompt::BuildSystemPromptOptions::new(cwd);
     options.custom_prompt.clone_from(&args.system_prompt);
     if let Some(appends) = &args.append_system_prompt {
         options.append_system_prompt = Some(appends.join("\n"));
+    }
+    let snapshot = crate::mcp_config::load_mcp_config(&crate::mcp_config::LoadMcpConfigOptions {
+        agent_dir: agent_dir.to_path_buf(),
+        cwd: std::path::PathBuf::from(cwd),
+        project_trusted,
+    });
+    let listings: Vec<crate::prompt::mcp_section::McpServerListing> = snapshot
+        .servers
+        .iter()
+        .map(|entry| {
+            let tool_exposure = entry
+                .config
+                .get("toolExposure")
+                .and_then(serde_json::Value::as_object)
+                .map(|values| {
+                    values
+                        .values()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(|value| prompt_exposure(Some(value)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            crate::prompt::mcp_section::McpServerListing {
+                name: entry.name.clone(),
+                enabled: entry.config.get("enabled") != Some(&serde_json::Value::Bool(false)),
+                exposure: prompt_exposure(
+                    entry
+                        .config
+                        .get("exposure")
+                        .and_then(serde_json::Value::as_str),
+                ),
+                tool_exposure,
+                description: entry
+                    .config
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                // Connection instructions are only available after a live
+                // connect; the config snapshot never carries them.
+                instructions: None,
+            }
+        })
+        .collect();
+    if let Some(text) = crate::prompt::mcp_section::render_servers_section(&listings) {
+        options.sections.push((
+            crate::prompt::mcp_section::MCP_SERVERS_SECTION.to_string(),
+            text,
+        ));
     }
     crate::prompt::build_system_prompt(&options)
 }

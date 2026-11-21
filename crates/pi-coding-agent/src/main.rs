@@ -591,7 +591,7 @@ fn build_runtime_with_ui(
     let executor = extensions.host.executor(&selected, cwd_string);
 
     // System prompt.
-    let system_prompt = system_prompt_for(args, cwd_string)?;
+    let system_prompt = system_prompt_for(args, cwd_string, &agent_dir, project_trusted)?;
 
     // Thinking level (`createAgentSession`, `core/sdk.ts:253-278`): the
     // `--thinking` flag wins; else a resumed session restores its recorded
