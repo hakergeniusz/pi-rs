@@ -93,6 +93,32 @@ The full gate as run on that machine:
 podman exec pi-rs-build sh -c 'export CARGO_TARGET_DIR=/build-target CARGO_BUILD_JOBS=8 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUGINFO=0; cd /work; nice -n 19 sh -c "cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace -- --test-threads=4 && cargo fmt --all -- --check"'
 ```
 
+#### RAM-first build / low-TBW workflow (2026-11-21)
+
+The old gate wrote a 16 GB cargo target dir directly to the NVMe SSD, one
+small file at a time. Use the RAM-first variant instead: a second container
+`pi-rs-build-ram` (built from `pi-rs-build-base`, the committed toolchain
+layer) mounts a 1.8 GB tmpfs at `/ramdisk`, bind-mounts `/work` and the cargo
+registry **read-only**, and sets `CARGO_NET_OFFLINE=true`. All cargo artifacts
+and test caches live in `/ramdisk`; the SSD volume is touched just once per
+gate by a single compressed snapshot (`scripts/ram-build.sh snapshot`).
+
+```sh
+podman exec pi-rs-build-ram sh /work/scripts/ram-build.sh check -p pi-mcp
+podman exec pi-rs-build-ram sh /work/scripts/ram-build.sh test -p pi-mcp
+podman exec pi-rs-build-ram sh /work/scripts/ram-build.sh gate
+podman exec pi-rs-build-ram sh /work/scripts/ram-build.sh snapshot
+```
+
+`scripts/ram-build.sh` is the single source of truth for the env and the
+gate steps (it also runs `cargo check --no-default-features`, which CI skips).
+Targeted crate checks need only ~150 MB of tmpfs and ~15 s; a full workspace
+build fits the 1.8 GB tmpfs only with `DEBUGINFO=0` + `CARGO_INCREMENTAL=0`
+(and does not touch disk until `snapshot`). Keep scratch files, subagent
+worktrees and test fixtures under `/tmp/...` (host tmpfs). The host has little
+spare RAM (~2.4 GB free, heavy swap use) — never enlarge the tmpfs or run two
+heavy gates in parallel; one RAM gate at a time.
+
 ## Git workflow
 
 - **Topic branch per unit of work**: `feat/<slice>`, `fix/<slice>`,

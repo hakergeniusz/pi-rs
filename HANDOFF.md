@@ -3597,6 +3597,16 @@ manager wiring are F2b; `pi mcp` + `/mcp` are F2c.
   `CARGO_BUILD_JOBS=4` per the OOM protocol). Test totals: 1981
   workspace tests, 0 failed.
 
+## 2026-11-21 — Low-TBW build workflow (operator request)
+
+The old gate wrote a 16 GB cargo target dir to the NVMe SSD one small file at
+a time. New workflow: `pi-rs-build-ram` container (from the committed
+`pi-rs-build-base` image) with a 1.8 GB tmpfs at `/ramdisk`, read-only registry
+bind + `CARGO_NET_OFFLINE=true`, all artifacts/caches in RAM, and a SINGLE
+compressed snapshot to the disk volume per gate (`scripts/ram-build.sh`). One
+RAM gate at a time (host has ~2.4 GB free RAM + heavy swap). Verified: `cargo
+check -p pi-mcp` in tmpfs = 15 s / 142 MB, exit 0. Documented in AGENTS.md.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
