@@ -608,18 +608,30 @@ fn worker_loop(
                 cursor,
                 reply,
             } => {
-                let outcome = resource_reply(&servers, &server, |client, timeout| {
-                    let page =
-                        runtime.block_on(client.resources_list_page(cursor.as_deref(), timeout))?;
-                    Ok(serde_json::to_value(page).unwrap_or(Json::Null))
-                });
+                let outcome = resource_reply(
+                    &runtime,
+                    &mut servers,
+                    &server,
+                    auth_dir,
+                    |client, timeout| {
+                        let page = runtime
+                            .block_on(client.resources_list_page(cursor.as_deref(), timeout))?;
+                        Ok(serde_json::to_value(page).unwrap_or(Json::Null))
+                    },
+                );
                 let _ = reply.send(outcome);
             }
             Request::ListResources { server, reply } => {
-                let outcome = resource_reply(&servers, &server, |client, timeout| {
-                    let items = runtime.block_on(client.resources_list(timeout))?;
-                    Ok(serde_json::to_value(items).unwrap_or(Json::Null))
-                });
+                let outcome = resource_reply(
+                    &runtime,
+                    &mut servers,
+                    &server,
+                    auth_dir,
+                    |client, timeout| {
+                        let items = runtime.block_on(client.resources_list(timeout))?;
+                        Ok(serde_json::to_value(items).unwrap_or(Json::Null))
+                    },
+                );
                 let _ = reply.send(outcome);
             }
             Request::ListTemplatePage {
@@ -627,26 +639,44 @@ fn worker_loop(
                 cursor,
                 reply,
             } => {
-                let outcome = resource_reply(&servers, &server, |client, timeout| {
-                    let page = runtime.block_on(
-                        client.resources_templates_list_page(cursor.as_deref(), timeout),
-                    )?;
-                    Ok(serde_json::to_value(page).unwrap_or(Json::Null))
-                });
+                let outcome = resource_reply(
+                    &runtime,
+                    &mut servers,
+                    &server,
+                    auth_dir,
+                    |client, timeout| {
+                        let page = runtime.block_on(
+                            client.resources_templates_list_page(cursor.as_deref(), timeout),
+                        )?;
+                        Ok(serde_json::to_value(page).unwrap_or(Json::Null))
+                    },
+                );
                 let _ = reply.send(outcome);
             }
             Request::ListTemplates { server, reply } => {
-                let outcome = resource_reply(&servers, &server, |client, timeout| {
-                    let items = runtime.block_on(client.resources_templates_list(timeout))?;
-                    Ok(serde_json::to_value(items).unwrap_or(Json::Null))
-                });
+                let outcome = resource_reply(
+                    &runtime,
+                    &mut servers,
+                    &server,
+                    auth_dir,
+                    |client, timeout| {
+                        let items = runtime.block_on(client.resources_templates_list(timeout))?;
+                        Ok(serde_json::to_value(items).unwrap_or(Json::Null))
+                    },
+                );
                 let _ = reply.send(outcome);
             }
             Request::ReadResource { server, uri, reply } => {
-                let outcome = resource_reply(&servers, &server, |client, timeout| {
-                    let result = runtime.block_on(client.resource_read(&uri, timeout))?;
-                    Ok(serde_json::to_value(result).unwrap_or(Json::Null))
-                });
+                let outcome = resource_reply(
+                    &runtime,
+                    &mut servers,
+                    &server,
+                    auth_dir,
+                    |client, timeout| {
+                        let result = runtime.block_on(client.resource_read(&uri, timeout))?;
+                        Ok(serde_json::to_value(result).unwrap_or(Json::Null))
+                    },
+                );
                 let _ = reply.send(outcome);
             }
             Request::Drop { name } => {
@@ -854,15 +884,25 @@ fn shutdown_all(runtime: &tokio::runtime::Runtime, servers: &mut HashMap<String,
 
 /// One tool call with the execution-time guards, then the wire call
 /// (`withClient`, `runtime.ts:276-303`).
-/// Run one read-only resource request against a connected server. Reads do
-/// not reconnect a failed server here (upstream's `withClient(…, true)` lazy
-/// reconnect is a follow-up); a missing/disconnected server answers with the
-/// upstream-style disabled error.
+/// Run one read-only resource request against a connected server. A failed
+/// server is lazily reconnected first (`withClient(…, true)`,
+/// `runtime.ts:280-303`); reads are idempotent, so one reconnect is enough.
 fn resource_reply(
-    servers: &HashMap<String, ServerEntry>,
+    runtime: &tokio::runtime::Runtime,
+    servers: &mut HashMap<String, ServerEntry>,
     server: &str,
+    auth_dir: Option<&std::path::Path>,
     op: impl FnOnce(&McpClient, Duration) -> Result<Json, McpError>,
 ) -> Result<Json, String> {
+    let reconnect = match servers.get(server).map(|entry| &entry.state) {
+        Some(ServerState::Failed { spawn, timeout, .. }) => Some((spawn.clone(), *timeout)),
+        Some(ServerState::Connected { .. }) => None,
+        None => return Err(format!("MCP server \"{server}\" is not connected")),
+    };
+    if let Some((spawn, timeout)) = reconnect {
+        connect_with_spawn(runtime, servers, server, spawn, timeout, auth_dir)
+            .map_err(|error| error.to_string())?;
+    }
     let entry = servers
         .get(server)
         .ok_or_else(|| format!("MCP server \"{server}\" is not connected"))?;
