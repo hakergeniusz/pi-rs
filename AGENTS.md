@@ -146,27 +146,21 @@ heavy gates in parallel; one RAM gate at a time.
 
 ## Current status
 
-`HANDOFF.md` has the details; `README.md` the summary. Landed through the
-full extensions arc E0→E2 (QuickJS host, headless core with upstream
-dispatch semantics, UI-over-protocol wiring, dynamic providers: models.json,
-composed catalog, OAuth `/login`, streamSimple + stream hooks, auto-retry,
-auto-compaction), golden session fixtures (P4 exit criterion), the P5
-remainder (RPC envelope reconciliation, MCP server-manager + tool bridge,
-package-manager git/local arms), every built-in slash command except /share
-and /bug (both deliberately omitted — Radius upload policy), and all five
-user-tested fidelity bugs (settings full port, tool-call streaming args,
-`!` bash border, Shift+Tab thinking cycle, terminal-resize tick). Open
-work, in the recorded priority order:
+`HANDOFF.md` has the details; `README.md` the summary. **v0.1.0 is tagged and
+released** (Linux x86_64/aarch64 assets + checksums). Landed: the full
+extensions arc E0→E3 (QuickJS host, headless core with upstream dispatch
+semantics, UI-over-protocol wiring, dynamic providers, OAuth `/login`,
+streamSimple + hooks, auto-retry/compaction, extension shortcuts, markdown/
+entry/message/tool renderers, `ctx.ui.custom` + overlays, editor, autocomplete,
+themes), golden session fixtures, the P5 remainder (RPC envelope, MCP
+server-manager/tool bridge, package-manager git/local/npm arms), the MCP opens
+(HTTP/OAuth, resources, `/mcp` UI, mcp.json, `pi mcp list`), the real
+`pi-codemode` crate, crash log + telemetry + output guard + piped stdin, and
+all user-tested fidelity fixes. `/share` and `/bug` stay deliberately omitted
+(Radius upload policy). Remaining 1:1 gaps, in flight as parallel slices:
 
-1. **E3 TUI bridging** — the largest open chunk: extension shortcuts,
-   message/entry/tool renderers, markdown transformers,
-   widgets-as-components, `ctx.ui.custom` with overlay handles, editor
-   component, autocomplete, themes ([docs/EXTENSIONS.md](docs/EXTENSIONS.md)
-   E0–E4).
-2. **P7 tail**: `!` bash via PTY, pi-ai adapter payload/response hooks,
-   crash log, telemetry subset, cache warmer, docs port, release binary +
-   install script + v0.1.0 tag.
-3. **MCP opens**: HTTP transport/OAuth, resources, `/mcp` UI, mcp.json,
-   `pi mcp list`.
-4. **package-manager npm arm**; **pi-codemode** (stub — the JS engine
-   exists).
+1. **P7 tail**: cache warmer, `!` bash via PTY, upstream docs port.
+2. **RPC parity**: the 10 remaining commands (`new_session`, `bash`, `fork`,
+   `clone`, `export_html`, …).
+3. **E4 extension completeness**: `node:*` builtins / host packages.
+4. **Fidelity**: serde_json `float_roundtrip`, codemode host wiring.
