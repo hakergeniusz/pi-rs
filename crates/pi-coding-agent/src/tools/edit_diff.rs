@@ -7,7 +7,9 @@
 //!
 //! * the fuzzy matcher that finds `oldText` in a file (exact first, then a
 //!   normalized pass that ignores trailing whitespace, smart quotes, unicode
-//!   dashes, and exotic spaces),
+//!   dashes, and exotic spaces); the compatibility pass is full Unicode NFKC
+//!   via the `unicode-normalization` crate, matching upstream's
+//!   `String.prototype.normalize("NFKC")` (`edit-diff.ts:81`),
 //! * `apply_edits_to_normalized_content`, which enforces the uniqueness and
 //!   non-overlap rules and reports pi's errors verbatim,
 //! * `apply_replacements_to_original`, which splices replacements into the
@@ -21,6 +23,8 @@
 //! is what this module implements, with jsdiff's part ordering (removals
 //! before insertions at a change, contiguous runs merged), its hunk-cutting
 //! rules, and its `\ No newline at end of file` markers.
+
+use unicode_normalization::UnicodeNormalization;
 
 /// pi's `Edit` (`edit-diff.ts:232-235`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,23 +88,20 @@ pub fn split_bom(content: &str) -> (String, String) {
 
 /// pi's `normalizeForFuzzyMatch` (`edit-diff.ts:77-98`).
 ///
-/// The TS version starts with `String.prototype.normalize("NFKC")`
-/// (`edit-diff.ts:81`). A full NFKC needs the whole Unicode decomposition and
-/// composition tables; this port ships the subset that covers the
-/// compatibility-equivalent forms a model writing ASCII/NFC meets in real
-/// files — fullwidth forms, precomposed Latin letters (Latin-1 Supplement and
-/// Latin Extended-A), Greek monotonic accents, common Cyrillic pairs,
-/// ligatures, and superscript/subscript digits — applied as
-/// decomposition-only. Both the file content and the model's old text go
-/// through the same mapping, so compatibility-equivalent texts still compare
-/// equal and every case in the TS suite behaves identically. Residual gaps
-/// against a full NFKC (Hangul jamo, CJK compatibility forms, multi-mark
-/// canonical reordering, the rest of the UCD) are recorded as a deviation in
-/// the P4 report; the `unicode-normalization` crate is the drop-in upgrade.
+/// Upstream starts with `String.prototype.normalize("NFKC")`
+/// (`edit-diff.ts:81`). This uses the `unicode-normalization` crate's `nfkc()`,
+/// i.e. the full Unicode decomposition, canonical-ordering and composition
+/// tables — not the hand-transcribed subset this function used to ship. Both
+/// the file content and the model's `oldText` go through the same mapping, so
+/// compatibility-equivalent spellings compare equal (smart quotes, unicode
+/// dashes, ligatures, fullwidth/compat forms, precomposed vs combining marks).
+/// NFKC is idempotent, so the second pass in [`count_occurrences`] is harmless,
+/// and it never introduces a line break, so line spans survive the mapping.
+/// The three replacements below mirror `edit-diff.ts:86-96` and run on the
+/// NFKC output in upstream's order.
 pub fn normalize_for_fuzzy_match(text: &str) -> String {
-    let nfkc_subset: String = text.chars().map(nfkc_subset_char).collect();
-    nfkc_subset
-        .split('\n')
+    let nfkc: String = text.nfkc().collect();
+    nfkc.split('\n')
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
@@ -118,258 +119,6 @@ pub fn normalize_for_fuzzy_match(text: &str) -> String {
         })
         .collect()
 }
-
-/// The NFKC subset [`normalize_for_fuzzy_match`] applies per character.
-fn nfkc_subset_char(character: char) -> String {
-    // Fullwidth forms U+FF01–U+FF5E have a uniform compatibility mapping to
-    // ASCII (Ａ → A, ， → ,, ！ → ! …): subtract 0xFEE0.
-    if ('\u{FF01}'..='\u{FF5E}').contains(&character) {
-        return char::from_u32(character as u32 - 0xFEE0)
-            .expect("fullwidth offset lands in ASCII")
-            .to_string();
-    }
-    if let Ok(index) = CANONICAL_DECOMPOSITIONS.binary_search_by_key(&character, |entry| entry.0) {
-        return CANONICAL_DECOMPOSITIONS[index].1.to_string();
-    }
-    if let Ok(index) =
-        COMPATIBILITY_DECOMPOSITIONS.binary_search_by_key(&character, |entry| entry.0)
-    {
-        return COMPATIBILITY_DECOMPOSITIONS[index].1.to_string();
-    }
-    character.to_string()
-}
-
-/// Canonical decompositions for the precomposed letters the fuzzy matcher
-/// needs (NFKC = decompose, reorder, recompose; both sides of the comparison
-/// get the same decomposition, so recomposition is not required for equality).
-/// Sorted by code point for `binary_search`; tables transcribed from the
-/// Unicode Character Database (`DerivedDecompositionType` = Canonical).
-const CANONICAL_DECOMPOSITIONS: &[(char, &str)] = &[
-    // Latin-1 Supplement.
-    ('À', "A\u{300}"),
-    ('Á', "A\u{301}"),
-    ('Â', "A\u{302}"),
-    ('Ã', "A\u{303}"),
-    ('Ä', "A\u{308}"),
-    ('Å', "A\u{30A}"),
-    ('Ç', "C\u{327}"),
-    ('È', "E\u{300}"),
-    ('É', "E\u{301}"),
-    ('Ê', "E\u{302}"),
-    ('Ë', "E\u{308}"),
-    ('Ì', "I\u{300}"),
-    ('Í', "I\u{301}"),
-    ('Î', "I\u{302}"),
-    ('Ï', "I\u{308}"),
-    ('Ñ', "N\u{303}"),
-    ('Ò', "O\u{300}"),
-    ('Ó', "O\u{301}"),
-    ('Ô', "O\u{302}"),
-    ('Õ', "O\u{303}"),
-    ('Ö', "O\u{308}"),
-    ('Ù', "U\u{300}"),
-    ('Ú', "U\u{301}"),
-    ('Û', "U\u{302}"),
-    ('Ü', "U\u{308}"),
-    ('Ý', "Y\u{301}"),
-    ('à', "a\u{300}"),
-    ('á', "a\u{301}"),
-    ('â', "a\u{302}"),
-    ('ã', "a\u{303}"),
-    ('ä', "a\u{308}"),
-    ('å', "a\u{30A}"),
-    ('ç', "c\u{327}"),
-    ('è', "e\u{300}"),
-    ('é', "e\u{301}"),
-    ('ê', "e\u{302}"),
-    ('ë', "e\u{308}"),
-    ('ì', "i\u{300}"),
-    ('í', "i\u{301}"),
-    ('î', "i\u{302}"),
-    ('ï', "i\u{308}"),
-    ('ñ', "n\u{303}"),
-    ('ò', "o\u{300}"),
-    ('ó', "o\u{301}"),
-    ('ô', "o\u{302}"),
-    ('õ', "o\u{303}"),
-    ('ö', "o\u{308}"),
-    ('ù', "u\u{300}"),
-    ('ú', "u\u{301}"),
-    ('û', "u\u{302}"),
-    ('ü', "u\u{308}"),
-    ('ý', "y\u{301}"),
-    ('ÿ', "y\u{308}"),
-    // Latin Extended-A (the letters with canonical decompositions; ß, æ, ø,
-    // đ, ł, ŧ, ħ, œ, ð, þ, ı have none).
-    ('Ā', "A\u{304}"),
-    ('ā', "a\u{304}"),
-    ('Ă', "A\u{306}"),
-    ('ă', "a\u{306}"),
-    ('Ą', "A\u{328}"),
-    ('ą', "a\u{328}"),
-    ('Ć', "C\u{301}"),
-    ('ć', "c\u{301}"),
-    ('Ĉ', "C\u{302}"),
-    ('ĉ', "c\u{302}"),
-    ('Ċ', "C\u{307}"),
-    ('ċ', "c\u{307}"),
-    ('Č', "C\u{30C}"),
-    ('č', "c\u{30C}"),
-    ('Ď', "D\u{30C}"),
-    ('ď', "d\u{30C}"),
-    ('Ē', "E\u{304}"),
-    ('ē', "e\u{304}"),
-    ('Ė', "E\u{307}"),
-    ('ė', "e\u{307}"),
-    ('Ę', "E\u{328}"),
-    ('ę', "e\u{328}"),
-    ('Ě', "E\u{30C}"),
-    ('ě', "e\u{30C}"),
-    ('Ĝ', "G\u{302}"),
-    ('ĝ', "g\u{302}"),
-    ('Ğ', "G\u{306}"),
-    ('ğ', "g\u{306}"),
-    ('Ġ', "G\u{307}"),
-    ('ġ', "g\u{307}"),
-    ('Ģ', "G\u{327}"),
-    ('ģ', "g\u{327}"),
-    ('Ĥ', "H\u{302}"),
-    ('ĥ', "h\u{302}"),
-    ('Ĩ', "I\u{303}"),
-    ('ĩ', "i\u{303}"),
-    ('Ī', "I\u{304}"),
-    ('ī', "i\u{304}"),
-    ('Ĭ', "I\u{306}"),
-    ('ĭ', "i\u{306}"),
-    ('Į', "I\u{328}"),
-    ('į', "i\u{328}"),
-    ('İ', "I\u{307}"),
-    ('Ĵ', "J\u{302}"),
-    ('ĵ', "j\u{302}"),
-    ('Ķ', "K\u{327}"),
-    ('ķ', "k\u{327}"),
-    ('Ĺ', "L\u{301}"),
-    ('ĺ', "l\u{301}"),
-    ('Ļ', "L\u{327}"),
-    ('ļ', "l\u{327}"),
-    ('Ľ', "L\u{30C}"),
-    ('ľ', "l\u{30C}"),
-    ('Ń', "N\u{301}"),
-    ('ń', "n\u{301}"),
-    ('Ņ', "N\u{327}"),
-    ('ņ', "n\u{327}"),
-    ('Ň', "N\u{30C}"),
-    ('ň', "n\u{30C}"),
-    ('Ō', "O\u{304}"),
-    ('ō', "o\u{304}"),
-    ('Ŏ', "O\u{306}"),
-    ('ŏ', "o\u{306}"),
-    ('Ő', "O\u{30B}"),
-    ('ő', "o\u{30B}"),
-    ('Ŕ', "R\u{301}"),
-    ('ŕ', "r\u{301}"),
-    ('Ŗ', "R\u{327}"),
-    ('ŗ', "r\u{327}"),
-    ('Ř', "R\u{30C}"),
-    ('ř', "r\u{30C}"),
-    ('Ś', "S\u{301}"),
-    ('ś', "s\u{301}"),
-    ('Ŝ', "S\u{302}"),
-    ('ŝ', "s\u{302}"),
-    ('Ş', "S\u{327}"),
-    ('ş', "s\u{327}"),
-    ('Š', "S\u{30C}"),
-    ('š', "s\u{30C}"),
-    ('Ţ', "T\u{327}"),
-    ('ţ', "t\u{327}"),
-    ('Ť', "T\u{30C}"),
-    ('ť', "t\u{30C}"),
-    ('Ū', "U\u{304}"),
-    ('ū', "u\u{304}"),
-    ('Ŭ', "U\u{306}"),
-    ('ŭ', "u\u{306}"),
-    ('Ů', "U\u{30A}"),
-    ('ů', "u\u{30A}"),
-    ('Ű', "U\u{30B}"),
-    ('ű', "u\u{30B}"),
-    ('Ų', "U\u{328}"),
-    ('ų', "u\u{328}"),
-    ('Ŵ', "W\u{302}"),
-    ('ŵ', "w\u{302}"),
-    ('Ŷ', "Y\u{302}"),
-    ('ŷ', "y\u{302}"),
-    ('Ÿ', "Y\u{308}"),
-    ('Ź', "Z\u{301}"),
-    ('ź', "z\u{301}"),
-    ('Ż', "Z\u{307}"),
-    ('ż', "z\u{307}"),
-    ('Ž', "Z\u{30C}"),
-    ('ž', "z\u{30C}"),
-    // Greek monotonic accents.
-    ('Ά', "\u{391}\u{301}"),
-    ('Έ', "\u{395}\u{301}"),
-    ('Ή', "\u{397}\u{301}"),
-    ('Ί', "\u{399}\u{301}"),
-    ('Ό', "\u{39F}\u{301}"),
-    ('Ύ', "\u{3A5}\u{301}"),
-    ('Ώ', "\u{3A9}\u{301}"),
-    ('ΐ', "\u{3B9}\u{308}\u{301}"),
-    ('Ϊ', "\u{399}\u{308}"),
-    ('Ϋ', "\u{3A5}\u{308}"),
-    ('ά', "\u{3B1}\u{301}"),
-    ('έ', "\u{3B5}\u{301}"),
-    ('ή', "\u{3B7}\u{301}"),
-    ('ί', "\u{3B9}\u{301}"),
-    ('ΰ', "\u{3C5}\u{308}\u{301}"),
-    ('ϊ', "\u{3B9}\u{308}"),
-    ('ϋ', "\u{3C5}\u{308}"),
-    ('ό', "\u{3BF}\u{301}"),
-    ('ύ', "\u{3C5}\u{301}"),
-    ('ώ', "\u{3C9}\u{301}"),
-    // Cyrillic (the acute/diaeresis/breve pairs that decompose).
-    ('Ё', "\u{415}\u{308}"),
-    ('Ў', "\u{423}\u{306}"),
-    ('Й', "\u{418}\u{306}"),
-    ('ё', "\u{435}\u{308}"),
-    ('й', "\u{438}\u{306}"),
-    ('ў', "\u{443}\u{306}"),
-];
-
-/// Compatibility decompositions with ASCII targets (UCD
-/// `DerivedDecompositionType` = Compatibility), same shape and sorting as
-/// [`CANONICAL_DECOMPOSITIONS`].
-const COMPATIBILITY_DECOMPOSITIONS: &[(char, &str)] = &[
-    ('²', "2"),
-    ('³', "3"),
-    ('¹', "1"),
-    ('⁰', "0"),
-    ('⁴', "4"),
-    ('⁵', "5"),
-    ('⁶', "6"),
-    ('⁷', "7"),
-    ('⁸', "8"),
-    ('⁹', "9"),
-    ('₀', "0"),
-    ('₁', "1"),
-    ('₂', "2"),
-    ('₃', "3"),
-    ('₄', "4"),
-    ('₅', "5"),
-    ('₆', "6"),
-    ('₇', "7"),
-    ('₈', "8"),
-    ('₉', "9"),
-    ('\u{2126}', "\u{3A9}"),
-    ('\u{212A}', "k"),
-    ('\u{212B}', "A\u{30A}"),
-    ('ﬀ', "ff"),
-    ('ﬁ', "fi"),
-    ('ﬂ', "fl"),
-    ('ﬃ', "ffi"),
-    ('ﬄ', "ffl"),
-    ('ﬅ', "st"),
-    ('ﬆ', "st"),
-];
 
 /// pi's `fuzzyFindText` (`edit-diff.ts:250-288`).
 pub fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {

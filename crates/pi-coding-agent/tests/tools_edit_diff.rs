@@ -3,7 +3,8 @@
 
 use pi_coding_agent::tools::edit_diff::{
     Edit, TextReplacement, apply_edits_to_normalized_content, apply_replacements_to_original,
-    generate_diff_string, generate_edit_diff, generate_unified_patch, normalize_to_lf,
+    fuzzy_find_text, generate_diff_string, generate_edit_diff, generate_unified_patch,
+    normalize_for_fuzzy_match, normalize_to_lf,
 };
 use std::fmt::Write as _;
 
@@ -322,4 +323,116 @@ fn patch_is_parseable_unified_diff() {
     assert!(edit_diff.patch.contains("@@"));
     assert!(edit_diff.patch.contains("-Hello, world!"));
     assert!(edit_diff.patch.contains("+Hello, testing!"));
+}
+
+// --- Full Unicode NFKC for fuzzy matching (edit-diff.ts:77-98) ---------------
+
+#[test]
+fn nfkc_normalizes_fullwidth_forms() {
+    assert_eq!(normalize_for_fuzzy_match("ＡＢＣ！"), "ABC!");
+    assert_eq!(normalize_for_fuzzy_match("ｆｏｏ　ｂａｒ"), "foo bar");
+}
+
+#[test]
+fn nfkc_normalizes_ligatures() {
+    assert_eq!(normalize_for_fuzzy_match("ﬁle"), "file");
+    assert_eq!(normalize_for_fuzzy_match("ﬂow ﬀ ﬃ"), "flow ff ffi");
+}
+
+#[test]
+fn nfkc_composes_precomposed_and_combining_marks_alike() {
+    // The old decomposition-only subset produced `cafe\u{301}` for both;
+    // full NFKC composes both into the same `café`.
+    assert_eq!(
+        normalize_for_fuzzy_match("café"),
+        normalize_for_fuzzy_match("cafe\u{301}")
+    );
+    assert_eq!(normalize_for_fuzzy_match("café"), "café");
+}
+
+#[test]
+fn nfkc_reorders_combining_marks_canonically() {
+    // U+032B (ccc 220) must sort before U+0301 (ccc 230); the two spellings are
+    // canonically equivalent and full NFKC gives them identical output.
+    assert_eq!(
+        normalize_for_fuzzy_match("a\u{301}\u{32b}"),
+        normalize_for_fuzzy_match("a\u{32b}\u{301}")
+    );
+}
+
+#[test]
+fn nfkc_normalizes_compatibility_forms_outside_the_old_subset() {
+    // Roman numerals and astral mathematical letters were absent from the
+    // hand-transcribed tables; full NFKC handles both.
+    assert_eq!(normalize_for_fuzzy_match("\u{2160}"), "I");
+    assert_eq!(normalize_for_fuzzy_match("\u{1d400}\u{1d41b}"), "Ab");
+}
+
+#[test]
+fn fuzzy_normalization_keeps_smart_quote_and_dash_mappings() {
+    assert_eq!(normalize_for_fuzzy_match("\u{2018}hi\u{2019}"), "'hi'");
+    assert_eq!(normalize_for_fuzzy_match("\u{201c}hi\u{201d}"), "\"hi\"");
+    assert_eq!(normalize_for_fuzzy_match("a\u{2011}b"), "a-b");
+    assert_eq!(
+        normalize_for_fuzzy_match("a\u{2013}b\u{2014}c\u{2212}d"),
+        "a-b-c-d"
+    );
+}
+
+#[test]
+fn fuzzy_normalization_strips_trailing_whitespace_and_special_spaces() {
+    assert_eq!(
+        normalize_for_fuzzy_match("first   \nsecond\t\nthird"),
+        "first\nsecond\nthird"
+    );
+    assert_eq!(normalize_for_fuzzy_match("a\u{00a0}b\u{2003}c"), "a b c");
+}
+
+#[test]
+fn exact_ascii_substring_wins_over_fuzzy_matching() {
+    let matched = fuzzy_find_text("hello world\n", "world");
+    assert!(matched.found);
+    assert!(!matched.used_fuzzy_match);
+    assert_eq!(matched.index, 6);
+    assert_eq!(matched.match_length, 5);
+    assert_eq!(matched.content_for_replacement, "hello world\n");
+}
+
+#[test]
+fn no_fuzzy_fallback_when_normalized_text_still_differs() {
+    let matched = fuzzy_find_text("alpha beta", "gamma");
+    assert!(!matched.found);
+    assert_eq!(matched.index, 0);
+    assert_eq!(matched.match_length, 0);
+    assert!(!matched.used_fuzzy_match);
+    assert_eq!(matched.content_for_replacement, "alpha beta");
+}
+
+#[test]
+fn fullwidth_old_text_matches_ascii_file_through_fuzzy_path() {
+    let applied = apply_edits_to_normalized_content(
+        "let x = 1;\n",
+        &[edit("ｌｅｔ ｘ ＝ １;", "let x = 2;")],
+        "f.txt",
+    )
+    .expect("applies");
+    assert_eq!(applied.new_content, "let x = 2;\n");
+}
+
+#[test]
+fn ligature_and_smart_quote_old_texts_match_through_fuzzy_path() {
+    let ligature = fuzzy_find_text("the file is here", "ﬁle");
+    assert!(ligature.found);
+    assert!(ligature.used_fuzzy_match);
+
+    let quotes = fuzzy_find_text("He said \"hi\" - ok", "\u{201c}hi\u{201d} \u{2014} ok");
+    assert!(quotes.found);
+    assert!(quotes.used_fuzzy_match);
+}
+
+#[test]
+fn decomposed_old_text_matches_precomposed_file_through_fuzzy_path() {
+    let matched = fuzzy_find_text("café time", "cafe\u{301}");
+    assert!(matched.found);
+    assert!(matched.used_fuzzy_match);
 }
