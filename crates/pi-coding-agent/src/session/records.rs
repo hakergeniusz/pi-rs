@@ -417,10 +417,10 @@ fn serialize_message_ordered(message: &AgentMessage, section_order: Option<Vec<S
         _ => return value,
     };
     let mut reordered = reorder_object(object, order);
-    if role == "system" {
-        if let (Some(sections), Some(hint)) = (reordered.get_mut("sections"), section_order) {
-            reorder_sections(sections, Some(hint));
-        }
+    if role == "system"
+        && let (Some(sections), Some(hint)) = (reordered.get_mut("sections"), section_order)
+    {
+        reorder_sections(sections, Some(hint));
     }
     Value::Object(reordered)
 }
