@@ -13398,7 +13398,21 @@ export default function (pi) {
             std::thread::sleep(Duration::from_millis(10));
         }
         emitter.join().expect("emit thread");
-        mode.tui.render_now(false);
+        // The emitter finishing does not mean the pump has drained its queued
+        // UI requests yet — keep pumping until the notify lines are rendered
+        // (the old single render raced and failed under CI CPU contention).
+        for _ in 0..50 {
+            mode.pump();
+            mode.tui.render_now(false);
+            let rendered = strip_terminal_sequences(&capture.output());
+            if rendered.contains("plain note")
+                && rendered.contains("Warning: careful")
+                && rendered.contains("Error: bad")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let plain = strip_terminal_sequences(&capture.output());
         assert!(plain.contains("plain note"), "{plain}");
         assert!(plain.contains("Warning: careful"), "{plain}");
