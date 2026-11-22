@@ -15,11 +15,12 @@
 //! [`SessionEntry`] views must decode the expected entry kinds and fields.
 //! Byte equality rides on the canonical [`Record`] form: TS writes nested
 //! message objects in write-site key order (assistant `usage` before
-//! `responseId`, system `timestamp` before `toolsAdded`), which a typed view
-//! re-serializes in Rust declaration order, so message entries are asserted
-//! against the raw records while pi's flat entries (whose field order matches
-//! the Rust declaration order) are additionally asserted to rewrite exactly
-//! through the typed view.
+//! `responseId`, system `timestamp` before `toolsAdded`). The typed views now
+//! carry the parsed wire message in a private hint, so *every* entry — message
+//! entries included — rewrites byte-identically while its typed payload is
+//! unchanged. Synthetic tests below cover the shape details the fixtures do
+//! not exercise: tolerant `content: null` defaults and unknown keys inside
+//! nested messages.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -88,14 +89,12 @@ fn assert_byte_round_trip(name: &str, records: &[Record]) {
     assert_eq!(serialize_entries(records), original);
 }
 
-/// pi's flat entries carry their payload in the same order the Rust views
-/// declare, so the typed view must rewrite them byte-identically. `message`
-/// entries are exempt (nested write-site key order, see the module doc).
-fn assert_simple_typed_views_rewrite(records: &[Record]) {
+/// Every entry — `message` entries included — must rewrite byte-identically
+/// through its typed view. The nested write-site key order, `sections` insertion
+/// order, tolerant defaults and unknown keys are all carried by private wire
+/// hints that are never emitted (see `crate::session::records`).
+fn assert_typed_views_rewrite(records: &[Record]) {
     for record in records {
-        if record.kind() == "message" {
-            continue;
-        }
         let entry = SessionEntry::from_record(record);
         assert_eq!(
             entry.to_record().to_line(),
@@ -143,7 +142,7 @@ fn golden_plain_exchange_round_trips_byte_exactly() {
     );
     assert_linear_chain(&records);
     assert_byte_round_trip(PLAIN, &records);
-    assert_simple_typed_views_rewrite(&records);
+    assert_typed_views_rewrite(&records);
 
     let SessionEntry::ModelChange(change) = &entries[1] else {
         panic!("expected model_change");
@@ -245,7 +244,7 @@ fn golden_tool_round_trip_decodes_call_and_result() {
     );
     assert_linear_chain(&records);
     assert_byte_round_trip(TOOL_READ, &records);
-    assert_simple_typed_views_rewrite(&records);
+    assert_typed_views_rewrite(&records);
 
     let SessionEntry::Message(entry) = &entries[5] else {
         panic!("expected the tool-calling assistant message");
@@ -309,7 +308,7 @@ fn golden_second_model_and_low_thinking_are_recorded() {
     );
     assert_linear_chain(&records);
     assert_byte_round_trip(MODEL_THINKING, &records);
-    assert_simple_typed_views_rewrite(&records);
+    assert_typed_views_rewrite(&records);
 
     let SessionEntry::ModelChange(change) = &entries[1] else {
         panic!("expected model_change");
@@ -354,7 +353,7 @@ fn golden_multi_turn_session_keeps_session_info_and_two_turns() {
     );
     assert_linear_chain(&records);
     assert_byte_round_trip(MULTI_TURN, &records);
-    assert_simple_typed_views_rewrite(&records);
+    assert_typed_views_rewrite(&records);
 
     // `--name` lands before the model selection entries and roots the tree.
     let SessionEntry::SessionInfo(info) = &entries[1] else {
@@ -433,7 +432,7 @@ fn golden_resume_appends_mid_branch_thinking_level_change() {
     );
     assert_linear_chain(&records);
     assert_byte_round_trip(RESUME_THINKING, &records);
-    assert_simple_typed_views_rewrite(&records);
+    assert_typed_views_rewrite(&records);
 
     // `-c --thinking low` records the switch after the first turn.
     let SessionEntry::ThinkingLevelChange(level) = &entries[6] else {
@@ -502,5 +501,49 @@ fn golden_fixtures_open_in_the_manager_without_a_rewrite() {
 
         // Opening a current-version session must not touch the file.
         assert_eq!(fs::read_to_string(&copy).unwrap(), fixture_text(name));
+    }
+}
+
+/// A tolerant decode must not change the wire shape: TypeScript keeps the
+/// parsed JS object and rewrites it, so `content: null` (or an absent content)
+/// has to stay that way through a load→typed→rewrite cycle.
+#[test]
+fn tolerant_decoded_fields_rewrite_byte_exactly_through_the_typed_view() {
+    for line in [
+        r#"{"type":"message","id":"a","parentId":null,"timestamp":"t","message":{"role":"user","content":null,"timestamp":1}}"#,
+        r#"{"type":"message","id":"b","parentId":null,"timestamp":"t","message":{"role":"assistant","content":null,"api":"openai-completions","provider":"p","model":"m","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1}}"#,
+        r#"{"type":"custom_message","customType":"ct","content":null,"display":true,"id":"c","parentId":null,"timestamp":"t"}"#,
+    ] {
+        let record = Record::parse_line_strict(line).unwrap();
+        assert_eq!(
+            SessionEntry::from_record(&record).to_record().to_line(),
+            line
+        );
+    }
+}
+
+/// Unknown keys inside a nested `message` (including inside a content block)
+/// are dropped by pi-ai's typed structs; the private wire hint must restore
+/// them verbatim, for both message and compaction entries.
+#[test]
+fn unknown_keys_inside_nested_messages_rewrite_byte_exactly() {
+    for line in [
+        concat!(
+            r#"{"type":"message","id":"d","parentId":null,"timestamp":"t","message":{"#,
+            r#""role":"user","content":[{"type":"text","text":"hi","futureBlockField":7}],"#,
+            r#""timestamp":1,"extensionMessageField":{"nested":[1,2]}}}"#
+        ),
+        concat!(
+            r#"{"type":"compaction","id":"e","parentId":null,"timestamp":"t","#,
+            r#""summary":"s","firstKeptEntryId":"e","tokensBefore":1,"#,
+            r#""systemMessage":{"role":"system","content":"","sections":{"z":"1","a":"2"},"#,
+            r#""timestamp":1,"extensionField":true}}"#
+        ),
+    ] {
+        let record = Record::parse_line_strict(line).unwrap();
+        assert_eq!(
+            SessionEntry::from_record(&record).to_record().to_line(),
+            line
+        );
     }
 }

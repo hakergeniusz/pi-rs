@@ -40,7 +40,22 @@
 //! Nested message keys are reordered by [`serialize_message_ordered`]; the
 //! one thing a `BTreeMap` cannot rebuild — `sections` insertion order — is
 //! captured from the wire in `unknown` under [`SECTION_ORDER_KEY`] and restored
-//! on the way out. See `WIRING.md` for the golden-fixture proof.
+//! on the way out.
+//!
+//! # Verbatim wire shape for loaded messages
+//!
+//! TypeScript keeps the parsed JS object as `entry.message` and hands it to
+//! `JSON.stringify` unchanged (`session-manager.ts:_persist`/`_rewriteFile`).
+//! A load→rewrite cycle therefore also has to preserve *shape* details the
+//! typed structs cannot represent: keys pi-ai drops, tolerant defaults
+//! (`content: null` decodes to `[]`), and write-site slots no fixture pins.
+//! For entries decoded by [`SessionEntry::from_record`] we stash the raw
+//! `message`, `systemMessage` and `customContent` values in the `unknown` bag
+//! under [`MESSAGE_WIRE_KEY`]. [`SessionEntry::to_record`] emits that raw value
+//! verbatim while the typed view is unchanged, and falls back to
+//! [`serialize_message_ordered`] (with the captured `sections` hint) once a
+//! caller mutates the message. Private hints are never emitted as JSON fields.
+//! See `WIRING.md` for the golden-fixture proof and the remaining divergences.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
@@ -280,6 +295,14 @@ impl Serialize for EntryBase {
 /// as a JSON field — it only drives the reordered `sections` value.
 const SECTION_ORDER_KEY: &str = "\u{0}pi-rs.sections-order";
 
+/// Reserved `unknown` key carrying the verbatim wire values of a decoded
+/// entry's message payloads. TypeScript keeps the parsed JS object as
+/// `entry.message` and re-serializes it unchanged; pi-ai's typed structs drop
+/// unknown keys and normalize tolerant defaults, so we stash the raw values
+/// here and emit them whenever the typed view is unchanged. Never emitted as a
+/// JSON field.
+const MESSAGE_WIRE_KEY: &str = "\u{0}pi-rs.message-wire";
+
 /// Pull the ordered list of `sections` keys captured for `which` at decode time.
 fn section_hint(unknown: &JsonObject, which: &str) -> Option<Vec<String>> {
     let hints = unknown.get(SECTION_ORDER_KEY)?.as_object()?;
@@ -357,6 +380,34 @@ fn reorder_sections(value: &mut Value, hint: Option<Vec<String>>) {
     };
     let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
     *object = reorder_object(object, &refs);
+}
+
+/// Pull a captured raw payload (`"message"`, `"systemMessage"` or
+/// `"customContent"`) out of an entry's `unknown` bag.
+fn wire_value<'a>(unknown: &'a JsonObject, which: &str) -> Option<&'a Value> {
+    unknown.get(MESSAGE_WIRE_KEY)?.as_object()?.get(which)
+}
+
+/// Capture the raw message payloads of a record so a load→typed→serialize
+/// cycle can reproduce the parsed JS object TypeScript would have stringified.
+fn capture_message_wire(record: &Record) -> Option<Value> {
+    let mut hints = JsonObject::new();
+    if let Some(message) = record.get("message") {
+        hints.insert("message".to_string(), message.clone());
+    }
+    if let Some(system) = record.get("systemMessage") {
+        hints.insert("systemMessage".to_string(), system.clone());
+    }
+    if record.kind() == "custom_message"
+        && let Some(content) = record.get("content")
+    {
+        hints.insert("customContent".to_string(), content.clone());
+    }
+    if hints.is_empty() {
+        None
+    } else {
+        Some(Value::Object(hints))
+    }
 }
 
 /// Serialize an [`AgentMessage`] with the key order its upstream write site
@@ -438,10 +489,10 @@ fn base_fields(base: &EntryBase) -> [(&'static str, Value); 3] {
 }
 
 /// Append the order-preserving `unknown` tail, skipping the discriminator
-/// (always emitted first) and the private section-order hint.
+/// (always emitted first) and every private NUL-prefixed wire hint.
 fn finish_entry(mut object: JsonObject, unknown: &JsonObject) -> JsonObject {
     for (key, value) in unknown {
-        if key == "type" || key == SECTION_ORDER_KEY || object.contains_key(key) {
+        if key == "type" || key.starts_with('\u{0}') || object.contains_key(key) {
             continue;
         }
         object.insert(key.clone(), value.clone());
@@ -724,8 +775,16 @@ fn field<T: Serialize + ?Sized>(value: &T) -> Value {
 
 impl Serialize for SessionMessageEntry {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let hint = section_hint(&self.unknown, "message");
-        let message = serialize_message_ordered(&self.message, hint);
+        // TS rewrites the parsed object unchanged: emit the captured wire value
+        // while the typed view still matches it, so unknown keys, tolerant
+        // defaults and every write-site slot survive a load→rewrite cycle.
+        let message = match wire_value(&self.unknown, "message") {
+            Some(raw) if tolerant_agent_message(raw) == self.message => raw.clone(),
+            _ => {
+                let hint = section_hint(&self.unknown, "message");
+                serialize_message_ordered(&self.message, hint)
+            }
+        };
         base_then_payload(
             "message",
             &self.base,
@@ -795,8 +854,18 @@ impl Serialize for CompactionEntry {
             fields.push(("fromHook", Value::Bool(from_hook)));
         }
         if let Some(system) = &self.system_message {
-            let hint = section_hint(&self.unknown, "systemMessage");
-            let ordered = serialize_message_ordered(&AgentMessage::System(system.0.clone()), hint);
+            let ordered = match wire_value(&self.unknown, "systemMessage") {
+                Some(raw)
+                    if serde_json::from_value::<SystemMessage>(raw.clone())
+                        .is_ok_and(|baseline| baseline == system.0) =>
+                {
+                    raw.clone()
+                }
+                _ => {
+                    let hint = section_hint(&self.unknown, "systemMessage");
+                    serialize_message_ordered(&AgentMessage::System(system.0.clone()), hint)
+                }
+            };
             fields.push(("systemMessage", ordered));
         }
         base_then_payload("compaction", &self.base, &fields, &self.unknown).serialize(serializer)
@@ -835,9 +904,17 @@ impl Serialize for CustomEntry {
 
 impl Serialize for CustomMessageEntry {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let content = match wire_value(&self.unknown, "customContent") {
+            Some(raw)
+                if tolerant_content(raw.clone()).is_ok_and(|baseline| baseline == self.content) =>
+            {
+                raw.clone()
+            }
+            _ => field(&self.content),
+        };
         let mut fields = vec![
             ("customType", field(&self.custom_type)),
-            ("content", field(&self.content)),
+            ("content", content),
             ("display", Value::Bool(self.display)),
         ];
         if let Some(details) = &self.details {
@@ -973,11 +1050,15 @@ impl SessionEntry {
         let mut decoded = decoded.unwrap_or_else(|| SessionEntry::Other(record.clone()));
         // pi-ai's BTreeMap loses the JS insertion order of `sections`. Stash the
         // wire order in `unknown`; the manual serializer restores it on the way
-        // out so a load→typed→serialize cycle is byte-identical.
+        // out so a load→typed→serialize cycle is byte-identical. The raw message
+        // payloads additionally carry every shape detail the typed structs drop.
         if let Some(unknown) = entry_unknown_mut(&mut decoded) {
             let hint = capture_section_order(record);
             if hint.as_object().is_some_and(|object| !object.is_empty()) {
                 unknown.insert(SECTION_ORDER_KEY.to_string(), hint);
+            }
+            if let Some(wire) = capture_message_wire(record) {
+                unknown.insert(MESSAGE_WIRE_KEY.to_string(), wire);
             }
         }
         decoded
@@ -1168,15 +1249,19 @@ fn deserialize_tolerant_message<'de, D: Deserializer<'de>>(
 }
 
 /// `entry.content ?? []` for custom-message entries (`:455-457`): a missing or
-/// null content decodes to an empty block list instead of failing.
-fn deserialize_tolerant_content<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<UserContent, D::Error> {
-    let value = Value::deserialize(deserializer)?;
+/// null content decodes to an empty block list instead of failing. Shared with
+/// the wire-hint baseline check so decode and re-encode normalize identically.
+fn tolerant_content(value: Value) -> Result<UserContent, String> {
     if value.is_null() {
         return Ok(UserContent::Blocks(Vec::new()));
     }
-    UserContent::deserialize(value).map_err(serde::de::Error::custom)
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+fn deserialize_tolerant_content<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<UserContent, D::Error> {
+    tolerant_content(Value::deserialize(deserializer)?).map_err(serde::de::Error::custom)
 }
 
 /// `generateId` (`:277-284`): 8 lowercase hex chars from a UUID prefix,
@@ -1537,5 +1622,90 @@ mod tests {
             panic!("expected compaction entry");
         };
         assert_eq!(SessionEntry::Compaction(entry).to_record().to_line(), line);
+    }
+
+    #[test]
+    fn tolerant_null_and_missing_content_keep_their_wire_shape() {
+        for line in [
+            r#"{"type":"message","id":"a","parentId":null,"timestamp":"t","message":{"role":"user","content":null,"timestamp":1}}"#,
+            r#"{"type":"message","id":"b","parentId":null,"timestamp":"t","message":{"role":"assistant","content":null,"api":"x","provider":"y","model":"z","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1}}"#,
+            r#"{"type":"message","id":"c","parentId":null,"timestamp":"t","message":{"role":"user","timestamp":1}}"#,
+        ] {
+            let record = Record::parse_line_strict(line).unwrap();
+            let entry = SessionEntry::from_record(&record);
+            assert_eq!(entry.to_record().to_line(), line, "line changed: {line}");
+        }
+    }
+
+    #[test]
+    fn unknown_keys_inside_nested_messages_survive_the_typed_view() {
+        let line = concat!(
+            r#"{"type":"message","id":"u","parentId":null,"timestamp":"t","message":{"#,
+            r#""role":"user","content":[{"type":"text","text":"hi","futureBlockField":7}],"#,
+            r#""timestamp":1,"extensionMessageField":{"nested":[1,2]}}}"#
+        );
+        let record = Record::parse_line_strict(line).unwrap();
+        let SessionEntry::Message(entry) = SessionEntry::from_record(&record) else {
+            panic!("expected message entry");
+        };
+        // pi-ai's typed struct really did drop the key; only the raw wire hint
+        // can put it back on the way out.
+        assert!(
+            entry
+                .message
+                .to_value()
+                .get("extensionMessageField")
+                .is_none()
+        );
+        assert_eq!(SessionEntry::Message(entry).to_record().to_line(), line);
+    }
+
+    #[test]
+    fn custom_message_null_content_keeps_its_wire_shape() {
+        let line = r#"{"type":"custom_message","customType":"ct","content":null,"display":false,"id":"cm","parentId":null,"timestamp":"t"}"#;
+        let record = Record::parse_line_strict(line).unwrap();
+        let SessionEntry::CustomMessage(entry) = SessionEntry::from_record(&record) else {
+            panic!("expected custom_message entry");
+        };
+        assert_eq!(entry.content, UserContent::Blocks(Vec::new()));
+        assert_eq!(
+            SessionEntry::CustomMessage(entry).to_record().to_line(),
+            line
+        );
+    }
+
+    #[test]
+    fn system_message_unknown_keys_and_section_order_survive_the_typed_view() {
+        let line = concat!(
+            r#"{"type":"compaction","id":"cp","parentId":null,"timestamp":"t","#,
+            r#""summary":"s","firstKeptEntryId":"cp","tokensBefore":1,"#,
+            r#""systemMessage":{"role":"system","content":"","sections":{"z":"1","a":"2"},"#,
+            r#""timestamp":1,"extensionField":true}}"#
+        );
+        let record = Record::parse_line_strict(line).unwrap();
+        assert_eq!(
+            SessionEntry::from_record(&record).to_record().to_line(),
+            line
+        );
+    }
+
+    #[test]
+    fn mutating_a_loaded_message_falls_back_to_write_site_order() {
+        let line = r#"{"type":"message","id":"m","parentId":null,"timestamp":"t","message":{"role":"user","content":null,"timestamp":1}}"#;
+        let record = Record::parse_line_strict(line).unwrap();
+        let mut entry = SessionEntry::from_record(&record);
+        let SessionEntry::Message(ref mut message) = entry else {
+            panic!("expected message entry");
+        };
+        message.message = AgentMessage::User(pi_ai::types::UserMessage {
+            content: UserContent::Text("changed".to_string()),
+            timestamp: 2,
+        });
+        let out = entry.to_record().to_line();
+        assert_eq!(
+            out,
+            r#"{"type":"message","id":"m","parentId":null,"timestamp":"t","message":{"role":"user","content":"changed","timestamp":2}}"#
+        );
+        assert!(!out.contains("pi-rs"), "private wire hint leaked: {out}");
     }
 }
