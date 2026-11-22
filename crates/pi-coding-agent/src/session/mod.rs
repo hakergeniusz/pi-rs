@@ -21,6 +21,9 @@
 //!   loading/header discovery, listing, and the context-building functions.
 //! * [`json`] — the `JSON.stringify`-compatible writer that keeps rewritten
 //!   files byte-identical to what pi writes.
+//! * [`cache_warmer`] — prompt-cache warming state machine
+//!   (`core/cache-warmer.ts`, `packages/ai/src/cache-warming.ts`); its I/O is
+//!   injected behind a trait so it can be tested without a live provider.
 //! * [`cwd`] — the stored-cwd existence gate (`core/session-cwd.ts`).
 //! * [`export`] — branch export to a portable JSONL file
 //!   (`core/session-export.ts`).
@@ -33,6 +36,7 @@ use std::path::PathBuf;
 
 pub mod branch_summarization;
 pub mod cache_stats;
+pub mod cache_warmer;
 pub mod compaction;
 pub mod cwd;
 pub mod export;
