@@ -31,6 +31,9 @@ pub mod changelog;
 pub mod cli;
 /// Clipboard writes for `/copy` (`utils/clipboard-command.ts` + `utils/clipboard.ts`).
 pub mod clipboard;
+/// The `codemode` tool host: declarations, nested tool adapters, and the
+/// `execute.ts` orchestration (`extensions/codemode/{tool,execute,index}.ts`).
+pub mod codemode_host;
 /// Global + project config loading (`config.ts`).
 pub mod config;
 /// Crash log record store and panic hook (`core/crash-log.ts`).
