@@ -6804,6 +6804,15 @@ done
         let mut runner = runner_with(&[source.as_str()]);
         runner.connect_mcp_servers().expect("connect");
         settle_mcp(&mut runner);
+        // The `list_changed` notification is drained by a later tick, so it
+        // can arrive just after startup settles. Drive the host tick until the
+        // refreshed tool shows up (bounded, like the startup wait).
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while runner.tool("mcp__changing__new").is_none() {
+            assert!(Instant::now() < deadline, "list_changed tool never arrived");
+            runner.mcp_tick(Instant::now()).expect("tick");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         // The notification-driven refresh replaced the original tool; the
         // withdrawn name stays registered but hidden (`index.ts:447-450`).
         let tool = runner.tool("mcp__changing__new").expect("new tool");
