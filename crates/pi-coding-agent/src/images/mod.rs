@@ -19,10 +19,12 @@ pub mod resize;
 pub mod sniff;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use pi_ai::types::{ContentBlock, ImageContent, TextContent};
+use pi_agent::agent_message::AgentMessage;
+use pi_ai::types::{ContentBlock, ImageContent, InputContent, TextContent};
 
 use crate::config::settings::{
     DEFAULT_IMAGES_AUTO_RESIZE, DEFAULT_IMAGES_BLOCK_IMAGES, DEFAULT_TERMINAL_IMAGE_WIDTH_CELLS,
@@ -301,6 +303,75 @@ pub fn filter_blocked_images(blocks: &[ContentBlock], block_images: bool) -> Vec
         }
     }
     out
+}
+
+/// Fold a converted message's `TextContent | ImageContent` block back into
+/// the `InputContent` shape user/tool-result messages carry. Thinking and
+/// tool-call blocks cannot appear there, so they are dropped.
+fn input_content_from_block(block: ContentBlock) -> Option<InputContent> {
+    match block {
+        ContentBlock::Text(text) => Some(InputContent::Text(text)),
+        ContentBlock::Image(image) => Some(InputContent::Image(image)),
+        ContentBlock::Thinking(_) | ContentBlock::ToolCall(_) => None,
+    }
+}
+
+/// `sdk.ts:296-331`: the `blockImages` defense-in-depth filter applied to the
+/// output of `defaultConvertToLlm`. It runs after the session's custom roles
+/// have been folded into user messages, replaces every image block in user
+/// and tool-result messages with upstream's "Image reading is disabled."
+/// text, and dedupes consecutive placeholders. When `block_images` is false
+/// the messages are returned unchanged.
+fn filter_blocked_messages(messages: Vec<AgentMessage>, block_images: bool) -> Vec<AgentMessage> {
+    if !block_images {
+        return messages;
+    }
+    messages
+        .into_iter()
+        .map(|message| match message {
+            AgentMessage::User(mut user) => {
+                if let pi_ai::types::UserContent::Blocks(blocks) = &user.content {
+                    let loose: Vec<ContentBlock> =
+                        blocks.iter().cloned().map(ContentBlock::from).collect();
+                    let filtered = filter_blocked_images(&loose, true);
+                    user.content = pi_ai::types::UserContent::Blocks(
+                        filtered
+                            .into_iter()
+                            .filter_map(input_content_from_block)
+                            .collect(),
+                    );
+                }
+                AgentMessage::User(user)
+            }
+            AgentMessage::ToolResult(mut result) => {
+                let loose: Vec<ContentBlock> = result
+                    .content
+                    .iter()
+                    .cloned()
+                    .map(ContentBlock::from)
+                    .collect();
+                let filtered = filter_blocked_images(&loose, true);
+                result.content = filtered
+                    .into_iter()
+                    .filter_map(input_content_from_block)
+                    .collect();
+                AgentMessage::ToolResult(result)
+            }
+            other => other,
+        })
+        .collect()
+}
+
+/// The `convertToLlm` seam (`sdk.ts:296-331`) with the `blockImages` filter
+/// installed over `default_convert_to_llm`. Every headless host (print, JSON,
+/// RPC) uses this same builder; the interactive host snapshots the setting
+/// per run in its own loop config. Upstream checks the setting on every call;
+/// these modes are single-run, so the host snapshots it once at startup.
+#[must_use]
+pub fn block_images_converter(block_images: bool) -> Arc<dyn pi_agent::ConvertToLlm> {
+    Arc::new(move |messages: Vec<AgentMessage>| {
+        filter_blocked_messages(pi_agent::default_convert_to_llm(messages), block_images)
+    })
 }
 
 /// `normalizeToolResultImages` (`tool-result-images.ts:24-67`): normalize
@@ -591,6 +662,68 @@ mod tests {
         );
         assert_eq!(filtered[1], text);
         assert_eq!(filter_blocked_images(&blocks, false), blocks);
+    }
+
+    /// The installed `convertToLlm` seam itself (the shared builder every
+    /// headless mode uses), not just the block-level filter.
+    fn image_bearing_messages() -> Vec<AgentMessage> {
+        use pi_ai::types::{InputContent, ToolResultMessage, UserContent, UserMessage};
+        let image = InputContent::Image(ImageContent {
+            data: "abc".to_string(),
+            mime_type: "image/png".to_string(),
+        });
+        let text = InputContent::Text(TextContent {
+            text: "hello".to_string(),
+            text_signature: None,
+        });
+        vec![
+            AgentMessage::User(UserMessage {
+                content: UserContent::Blocks(vec![image.clone(), image.clone(), text.clone()]),
+                timestamp: 1,
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![image, text.clone()],
+                details: None,
+                usage: None,
+                nested_calls: None,
+                is_error: false,
+                timestamp: 2,
+                duration_ms: None,
+            }),
+        ]
+    }
+
+    #[test]
+    fn block_images_converter_replaces_and_dedupes_when_enabled() {
+        use pi_ai::types::UserContent;
+        let messages = image_bearing_messages();
+        let converted =
+            crate::runtime::block_on(block_images_converter(true).call(messages.clone()));
+        let AgentMessage::User(user) = &converted[0] else {
+            panic!("first message stays a user message");
+        };
+        let UserContent::Blocks(blocks) = &user.content else {
+            panic!("user content stays blocks");
+        };
+        assert_eq!(blocks.len(), 2, "consecutive placeholders are deduped");
+        assert_eq!(blocks[0].as_text(), Some(IMAGE_READING_DISABLED));
+        assert_eq!(blocks[1].as_text(), Some("hello"));
+        let AgentMessage::ToolResult(result) = &converted[1] else {
+            panic!("second message stays a tool result");
+        };
+        assert_eq!(result.content.len(), 2);
+        assert_eq!(result.content[0].as_text(), Some(IMAGE_READING_DISABLED));
+        assert_eq!(result.content[1].as_text(), Some("hello"));
+    }
+
+    #[test]
+    fn block_images_converter_preserves_images_when_disabled() {
+        let messages = image_bearing_messages();
+        let converted =
+            crate::runtime::block_on(block_images_converter(false).call(messages.clone()));
+        assert_eq!(converted, messages);
     }
 
     #[test]

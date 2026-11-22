@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use pi_agent::agent_loop::{AgentLoopConfig, DefaultConvertToLlm};
+use pi_agent::agent_loop::AgentLoopConfig;
 use pi_agent::agent_message::AgentMessage;
 use pi_agent::events::{AgentEventSink, CollectingSink};
 use pi_agent::queues::Queues;
@@ -106,6 +106,7 @@ impl PrintRuntime {
 pub fn run_print_mode(
     runtime: &mut PrintRuntime,
     options: &PrintModeOptions,
+    block_images: bool,
 ) -> Result<i32, String> {
     if options.mode == Mode::Json {
         return Err("json mode is not implemented yet (phase P5); use text mode".to_string());
@@ -204,7 +205,10 @@ pub fn run_print_mode(
         prepare_request: None,
         prepare_next_turn: None,
         transform_context: runtime.transform_context(),
-        convert_to_llm: Arc::new(DefaultConvertToLlm),
+        // `blockImages` is a convertToLlm-time filter (sdk.ts:296-331), not
+        // applied when the image block is created. The snapshot comes from
+        // settings via the host, mirroring interactive's per-run snapshot.
+        convert_to_llm: crate::images::block_images_converter(block_images),
     };
 
     #[cfg(feature = "ext-js")]
@@ -1087,6 +1091,81 @@ pub fn system_prompt_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Print/JSON/RPC all install the same `block_images_converter` seam; this
+    /// checks the seam does its job after `default_convert_to_llm` has folded a
+    /// custom role into a user message (sdk.ts:296-331).
+    #[test]
+    fn print_convert_to_llm_honors_block_images_snapshot() {
+        use pi_agent::agent_message::CustomMessage;
+        use pi_ai::types::{ImageContent, InputContent, TextContent, UserContent};
+
+        let image = InputContent::Image(ImageContent {
+            data: "abc".to_string(),
+            mime_type: "image/png".to_string(),
+        });
+        let text = InputContent::Text(TextContent {
+            text: "hello".to_string(),
+            text_signature: None,
+        });
+        let custom = AgentMessage::Custom(CustomMessage {
+            custom_type: "note".to_string(),
+            content: UserContent::Blocks(vec![image.clone(), image, text.clone()]),
+            display: true,
+            details: None,
+            timestamp: 7,
+        });
+
+        let blocked =
+            crate::runtime::block_on(crate::images::block_images_converter(true).call(vec![
+                custom.clone(),
+                pi_agent::transcript::user_message("plain", 8),
+            ]));
+        let AgentMessage::User(user) = &blocked[0] else {
+            panic!("custom role folds into a user message");
+        };
+        let UserContent::Blocks(blocks) = &user.content else {
+            panic!("blocks stay blocks");
+        };
+        assert_eq!(blocks.len(), 2, "consecutive placeholders are deduped");
+        assert_eq!(
+            blocks[0].as_text(),
+            Some(crate::images::IMAGE_READING_DISABLED)
+        );
+        assert_eq!(blocks[1].as_text(), Some("hello"));
+        assert_eq!(blocked[1], messages_plain_user());
+
+        let passed =
+            crate::runtime::block_on(crate::images::block_images_converter(false).call(vec![
+                custom.clone(),
+                pi_agent::transcript::user_message("plain", 8),
+            ]));
+        let AgentMessage::User(unchanged) = &passed[0] else {
+            panic!("custom role folds into a user message");
+        };
+        assert_eq!(unchanged.content, custom_content());
+        assert_eq!(passed[1], messages_plain_user());
+    }
+
+    fn messages_plain_user() -> AgentMessage {
+        pi_agent::transcript::user_message("plain", 8)
+    }
+
+    fn custom_content() -> pi_ai::types::UserContent {
+        use pi_ai::types::{ImageContent, InputContent, TextContent, UserContent};
+        let image = InputContent::Image(ImageContent {
+            data: "abc".to_string(),
+            mime_type: "image/png".to_string(),
+        });
+        UserContent::Blocks(vec![
+            image.clone(),
+            image,
+            InputContent::Text(TextContent {
+                text: "hello".to_string(),
+                text_signature: None,
+            }),
+        ])
+    }
 
     #[test]
     fn model_patterns_split_provider_and_thinking() {

@@ -53,7 +53,7 @@ use std::sync::{Mutex, mpsc};
 #[cfg(feature = "ext-js")]
 use std::time::Duration;
 
-use pi_agent::agent_loop::{AgentLoopConfig, DefaultConvertToLlm};
+use pi_agent::agent_loop::AgentLoopConfig;
 use pi_agent::agent_message::{AgentMessage, BashExecutionMessage};
 use pi_agent::events::{AgentEvent, AgentEventSink};
 use pi_agent::queues::Queues;
@@ -1804,7 +1804,11 @@ impl pi_ext_js::UiSink for RpcUiSink {
 /// command's extension events cross the stream (`setUIContext` applies at
 /// load, upstream's `rebindSession` re-binds per session — the port has
 /// one session per run).
-pub fn run_rpc_mode(runtime: &mut PrintRuntime, bridge: &mut RpcBridge) -> Result<i32, String> {
+pub fn run_rpc_mode(
+    runtime: &mut PrintRuntime,
+    bridge: &mut RpcBridge,
+    block_images: bool,
+) -> Result<i32, String> {
     while let Ok(line) = bridge.commands.recv() {
         let (incoming, id, type_name) = match parse_request(&line) {
             Ok(parsed) => parsed,
@@ -1838,7 +1842,7 @@ pub fn run_rpc_mode(runtime: &mut PrintRuntime, bridge: &mut RpcBridge) -> Resul
                 continue;
             }
         };
-        match handle_command(runtime, bridge, incoming, id.as_deref()) {
+        match handle_command(runtime, bridge, incoming, id.as_deref(), block_images) {
             Ok(CommandOutcome::Success(data)) => {
                 write_line(
                     &bridge.out,
@@ -1902,6 +1906,7 @@ fn handle_command(
     bridge: &mut RpcBridge,
     command: RpcCommand,
     id: Option<&str>,
+    block_images: bool,
 ) -> Result<CommandOutcome, String> {
     let out = Arc::clone(&bridge.out);
     match command {
@@ -1948,6 +1953,7 @@ fn handle_command(
                 &mut bridge.queues,
                 Arc::clone(&out),
                 Arc::clone(&bridge.queued_texts),
+                block_images,
             )
             .is_err()
             {
@@ -2592,6 +2598,7 @@ fn run_agent_turn(
     queues: &mut Queues,
     output: RpcOut,
     queued_texts: Arc<Mutex<QueuedTexts>>,
+    block_images: bool,
 ) -> Result<(), String> {
     let executor = runtime.executor.clone();
     let specs: Vec<ToolSpec> = executor.tools();
@@ -2637,7 +2644,8 @@ fn run_agent_turn(
         prepare_request: None,
         prepare_next_turn: None,
         transform_context: runtime.transform_context(),
-        convert_to_llm: Arc::new(DefaultConvertToLlm),
+        // Same `blockImages` convertToLlm seam as print/JSON (sdk.ts:296-331).
+        convert_to_llm: crate::images::block_images_converter(block_images),
     };
 
     #[cfg(feature = "ext-js")]
@@ -2930,13 +2938,21 @@ mod tests {
 
     impl ModeThread {
         fn start(runtime: PrintRuntime, bridge: RpcBridge) -> Self {
+            Self::start_with_block_images(runtime, bridge, false)
+        }
+
+        fn start_with_block_images(
+            runtime: PrintRuntime,
+            bridge: RpcBridge,
+            block_images: bool,
+        ) -> Self {
             Self(
                 std::thread::Builder::new()
                     .name("rpc-mode".to_string())
                     .spawn(move || {
                         let mut runtime = runtime;
                         let mut bridge = bridge;
-                        run_rpc_mode(&mut runtime, &mut bridge)
+                        run_rpc_mode(&mut runtime, &mut bridge, block_images)
                     })
                     .expect("spawn rpc mode"),
             )
@@ -3059,6 +3075,59 @@ mod tests {
             _request: pi_agent::types::StreamRequest,
         ) -> futures::stream::BoxStream<'static, pi_ai::types::AssistantMessageEvent> {
             unreachable!("state-only commands never stream");
+        }
+    }
+
+    /// Captures the normalized messages the agent loop sends to the provider
+    /// so a test can assert the `blockImages` convertToLlm filter ran.
+    #[derive(Default)]
+    struct CapturingStream {
+        seen: Arc<Mutex<Vec<Vec<AgentMessage>>>>,
+    }
+
+    impl pi_agent::types::StreamFn for CapturingStream {
+        fn stream(
+            &self,
+            request: pi_agent::types::StreamRequest,
+        ) -> futures::stream::BoxStream<'static, pi_ai::types::AssistantMessageEvent> {
+            self.seen
+                .lock()
+                .expect("capture")
+                .push(request.messages.clone());
+            let partial = serde_json::from_value::<pi_ai::types::AssistantMessage>(json!({
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "ok" }],
+                "api": "test",
+                "provider": "test",
+                "model": "test-model",
+                "usage": {
+                    "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                    "totalTokens": 0,
+                    "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0,
+                              "cacheWrite": 0.0, "total": 0.0 }
+                },
+                "stopReason": "stop",
+                "timestamp": 0
+            }))
+            .expect("assistant message");
+            Box::pin(futures::stream::iter(vec![
+                pi_ai::types::AssistantMessageEvent::Start {
+                    partial: partial.clone(),
+                },
+                pi_ai::types::AssistantMessageEvent::TextStart {
+                    content_index: 0,
+                    partial: partial.clone(),
+                },
+                pi_ai::types::AssistantMessageEvent::TextEnd {
+                    content_index: 0,
+                    content: "ok".to_string(),
+                    partial: partial.clone(),
+                },
+                pi_ai::types::AssistantMessageEvent::Done {
+                    reason: StopReason::Stop,
+                    message: partial,
+                },
+            ]))
         }
     }
 
@@ -4804,5 +4873,67 @@ mod tests {
                 "Extension command \"/deploy\" cannot be queued. Use prompt() or execute the command when not streaming."
             );
         }
+    }
+
+    /// The RPC prompt path installs the same `blockImages` seam as print/JSON:
+    /// assert on the normalized messages the provider actually receives, for
+    /// both a blocking and a non-blocking settings snapshot.
+    #[test]
+    fn rpc_prompt_honors_block_images_convert_to_llm_snapshot() {
+        fn prompt_user_blocks(messages: &[AgentMessage]) -> Vec<pi_ai::types::InputContent> {
+            messages
+                .iter()
+                .find_map(|message| match message {
+                    AgentMessage::User(user) => match &user.content {
+                        pi_ai::types::UserContent::Blocks(blocks) => Some(blocks.clone()),
+                        pi_ai::types::UserContent::Text(_) => None,
+                    },
+                    _ => None,
+                })
+                .expect("prompt user message with blocks")
+        }
+
+        let run = |block_images: bool| {
+            let mut fixture = BridgeFixture::new();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let stream = Arc::new(CapturingStream {
+                seen: Arc::clone(&seen),
+            });
+            let runtime = test_runtime(dir.path(), stream);
+            let bridge = fixture.take_bridge();
+            let mode = ModeThread::start_with_block_images(runtime, bridge, block_images);
+            fixture.write_line(
+                r#"{"type":"prompt","id":"p1","message":"look","images":[{"data":"abc","mimeType":"image/png"}]}"#,
+            );
+            let _ = wait_for_settle(&fixture);
+            drop(fixture.writer);
+            mode.join();
+            let calls = seen.lock().expect("capture").clone();
+            assert_eq!(calls.len(), 1, "one provider call");
+            prompt_user_blocks(&calls[0])
+        };
+
+        let blocked = run(true);
+        assert!(
+            blocked
+                .iter()
+                .any(|block| block.as_text() == Some(crate::images::IMAGE_READING_DISABLED)),
+            "image replaced by the placeholder: {blocked:?}"
+        );
+        assert!(
+            blocked
+                .iter()
+                .all(|block| !matches!(block, pi_ai::types::InputContent::Image(_))),
+            "no image survives: {blocked:?}"
+        );
+
+        let passed = run(false);
+        assert!(
+            passed
+                .iter()
+                .any(|block| matches!(block, pi_ai::types::InputContent::Image(_))),
+            "image preserved when blocking is off: {passed:?}"
+        );
     }
 }

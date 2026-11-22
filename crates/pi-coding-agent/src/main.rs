@@ -342,7 +342,7 @@ fn build_runtime(
     cwd: &std::path::Path,
     cwd_string: &str,
     mode: &str,
-) -> Result<(PrintRuntime, HostTelemetry), String> {
+) -> Result<(PrintRuntime, HostTelemetry, bool), String> {
     build_runtime_with_ui(args, cwd, cwd_string, mode, ModeUi::default())
 }
 
@@ -357,7 +357,7 @@ fn build_runtime_with_ui(
     cwd_string: &str,
     mode: &str,
     ui: ModeUi,
-) -> Result<(PrintRuntime, HostTelemetry), String> {
+) -> Result<(PrintRuntime, HostTelemetry, bool), String> {
     let agent_dir = config::get_agent_dir();
     let trust_store = ProjectTrustStore::new(&agent_dir);
     let startup_settings = SettingsManager::create(
@@ -687,6 +687,10 @@ fn build_runtime_with_ui(
     let compaction_settings = settings
         .get_compaction_settings(Some((model.provider.as_str(), model.id.as_str())))
         .unwrap_or(pi_coding_agent::session::compaction::DEFAULT_COMPACTION_SETTINGS);
+    // `images.blockImages` is a convertToLlm-time defense-in-depth filter
+    // (sdk.ts:296-331). Snapshot it here like retry/compaction; the interactive
+    // host takes its own per-run snapshot from the settings selector.
+    let block_images = settings.get_block_images();
     Ok((
         PrintRuntime {
             model,
@@ -704,6 +708,7 @@ fn build_runtime_with_ui(
             extension_runner: extensions.host.runner(),
         },
         host_telemetry,
+        block_images,
     ))
 }
 
@@ -757,7 +762,8 @@ fn run_print(
     cwd_string: &str,
     stdin_content: Option<&str>,
 ) -> Result<i32, String> {
-    let (mut runtime, host_telemetry) = build_runtime(args, cwd, cwd_string, "print")?;
+    let (mut runtime, host_telemetry, block_images) =
+        build_runtime(args, cwd, cwd_string, "print")?;
     let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd, stdin_content)?;
     let options = PrintModeOptions {
         mode: Mode::Text,
@@ -767,7 +773,7 @@ fn run_print(
     };
     // `restoreStdout()` after the mode returns (`main.ts:1059`; no theme
     // watcher to stop first).
-    let outcome = run_print_mode(&mut runtime, &options);
+    let outcome = run_print_mode(&mut runtime, &options, block_images);
     host_telemetry.shutdown();
     restore_stdout();
     outcome
@@ -785,7 +791,7 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
         pi_coding_agent::modes::interactive::extension_ui::ExtensionUiBridge::new(),
     );
     #[cfg(feature = "ext-js")]
-    let (mut runtime, host_telemetry) = build_runtime_with_ui(
+    let (mut runtime, host_telemetry, _block_images) = build_runtime_with_ui(
         args,
         cwd,
         cwd_string,
@@ -793,7 +799,8 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
         Some(Arc::clone(&extension_ui) as Arc<dyn pi_ext_js::UiSink>),
     )?;
     #[cfg(not(feature = "ext-js"))]
-    let (mut runtime, host_telemetry) = build_runtime(args, cwd, cwd_string, "interactive")?;
+    let (mut runtime, host_telemetry, _block_images) =
+        build_runtime(args, cwd, cwd_string, "interactive")?;
     // The trust ladder resolved once in build_runtime — extensions may have
     // decided through the `project_trust` hook.
     let project_trusted = runtime.project_trusted;
@@ -843,7 +850,7 @@ fn run_json(
     cwd_string: &str,
     stdin_content: Option<&str>,
 ) -> Result<i32, String> {
-    let (mut runtime, host_telemetry) = build_runtime(args, cwd, cwd_string, "json")?;
+    let (mut runtime, host_telemetry, block_images) = build_runtime(args, cwd, cwd_string, "json")?;
     let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd, stdin_content)?;
     let options = PrintModeOptions {
         mode: Mode::Json,
@@ -852,7 +859,7 @@ fn run_json(
         initial_images: images,
     };
     // `restoreStdout()` after the mode returns (`main.ts:1059`).
-    let outcome = run_json_mode(&mut runtime, &options);
+    let outcome = run_json_mode(&mut runtime, &options, block_images);
     host_telemetry.shutdown();
     restore_stdout();
     outcome
@@ -872,11 +879,11 @@ fn run_rpc(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, 
         Box::new(pi_coding_agent::modes::rpc::RpcStdout::new()),
     );
     #[cfg(feature = "ext-js")]
-    let (mut runtime, host_telemetry) =
+    let (mut runtime, host_telemetry, block_images) =
         build_runtime_with_ui(args, cwd, cwd_string, "rpc", Some(Arc::clone(&bridge.sink)))?;
     #[cfg(not(feature = "ext-js"))]
-    let (mut runtime, host_telemetry) = build_runtime(args, cwd, cwd_string, "rpc")?;
-    let outcome = run_rpc_mode(&mut runtime, &mut bridge);
+    let (mut runtime, host_telemetry, block_images) = build_runtime(args, cwd, cwd_string, "rpc")?;
+    let outcome = run_rpc_mode(&mut runtime, &mut bridge, block_images);
     host_telemetry.shutdown();
     outcome
 }

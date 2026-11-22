@@ -10,7 +10,7 @@ for current coverage.
 
 | File | Contents |
 |---|---|
-| `mod.rs` | `ImageSettings`, `process_image`, `ImageProcessResult`, read-note builders, `ImageContent` construction, `filter_blocked_images` (`blockImages`), `normalize_tool_result_images`, temp-file spill helpers. |
+| `mod.rs` | `ImageSettings`, `process_image`, `ImageProcessResult`, read-note builders, `ImageContent` construction, `filter_blocked_images` (`blockImages`), `block_images_converter` (the shared `convertToLlm` seam), `normalize_tool_result_images`, temp-file spill helpers. |
 | `sniff.rs` | Magic-byte detection for jpeg/png/gif/webp/bmp (port of `utils/mime.ts:1-116`) plus header dimension readers. |
 | `resize.rs` | `ResizeOptions` (+ `From<ModelImageResizeOptions>`), the 2000×2000 / 4.5 MB resize policy ported from `utils/image-resize-core.ts`, `formatDimensionNote`, and the `ImageTransformer` seam. |
 
@@ -77,7 +77,25 @@ image blocks. The recipe below is retained for those tails.
   `convertToLlm`-time filter. Call `images::filter_blocked_images(&blocks,
   settings.block_images)` where the port builds provider messages from
   `ContentBlock`s (TS `sdk.ts:296-331`, `interactive_mode.rs` call sites at
-  `:3161`, `:3409`, `:8733`, `:9546`).
+  `:3161`, `:3409`, `:8733`, `:9546`). The interactive host snapshots
+  `settings.get_block_images()` per run and wraps
+  `default_convert_to_llm` in its own message-level filter.
+
+### `crates/pi-coding-agent/src/modes/{print_mode,json_event,rpc}.rs` + `main.rs`
+
+- All three headless modes now install `images::block_images_converter(block_images)`
+  as `AgentLoopConfig::convert_to_llm` instead of `DefaultConvertToLlm`. The
+  builder runs `default_convert_to_llm` first, then the same
+  `filter_blocked_images` logic on user/tool-result messages, so the setting
+  is a defense-in-depth filter over the converted transcript (`sdk.ts:296-331`).
+- The host snapshots `settings.get_block_images()` once in
+  `build_runtime_with_ui` (next to `retry_settings` / `compaction_settings`)
+  and threads the bool through `run_print_mode`, `run_json_mode`,
+  `run_rpc_mode` → `handle_command` → `run_agent_turn`. This mirrors the
+  interactive per-run snapshot; upstream re-reads the setting on every call.
+- Tests: enabled/disabled cases at the block level (`mod.rs`), at the installed
+  seam (`mod.rs`, print/JSON tests), and end-to-end through an RPC prompt with
+  a capturing stream (`rpc.rs`).
 - Call `images::normalize_tool_result_images` once as extension/MCP/tool image
   blocks enter session history (TS `tool-result-images.ts:24-67`).
 

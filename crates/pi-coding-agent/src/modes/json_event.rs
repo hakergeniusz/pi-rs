@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use pi_agent::agent_loop::{AgentLoopConfig, DefaultConvertToLlm};
+use pi_agent::agent_loop::AgentLoopConfig;
 use pi_agent::agent_message::AgentMessage;
 use pi_agent::events::{AgentEvent, AgentEventSink};
 use pi_agent::queues::Queues;
@@ -298,6 +298,7 @@ impl AgentEventSink for JsonEventSink {
 pub fn run_json_mode(
     runtime: &mut PrintRuntime,
     options: &PrintModeOptions,
+    block_images: bool,
 ) -> Result<i32, String> {
     let executor = runtime.executor.clone();
     let specs: Vec<ToolSpec> = executor.tools();
@@ -393,7 +394,8 @@ pub fn run_json_mode(
         prepare_request: None,
         prepare_next_turn: None,
         transform_context: runtime.transform_context(),
-        convert_to_llm: Arc::new(DefaultConvertToLlm),
+        // Same `blockImages` convertToLlm seam as print/RPC (sdk.ts:296-331).
+        convert_to_llm: crate::images::block_images_converter(block_images),
     };
 
     #[cfg(feature = "ext-js")]
@@ -593,4 +595,49 @@ pub fn run_json_mode(
     // a flush error overrides the outcome, like a rejected finally.
     crate::output_guard::flush_raw_stdout().map_err(|error| error.to_string())?;
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// JSON mode installs the same shared `block_images_converter` seam as
+    /// print/RPC; this guards its enabled/disabled behavior at the mode level.
+    #[test]
+    fn json_convert_to_llm_honors_block_images_snapshot() {
+        use pi_ai::types::{ImageContent, InputContent, TextContent, UserContent, UserMessage};
+        let image = InputContent::Image(ImageContent {
+            data: "abc".to_string(),
+            mime_type: "image/png".to_string(),
+        });
+        let text = InputContent::Text(TextContent {
+            text: "hello".to_string(),
+            text_signature: None,
+        });
+        let message = AgentMessage::User(UserMessage {
+            content: UserContent::Blocks(vec![image.clone(), image, text]),
+            timestamp: 1,
+        });
+
+        let blocked = crate::runtime::block_on(
+            crate::images::block_images_converter(true).call(vec![message.clone()]),
+        );
+        let AgentMessage::User(user) = &blocked[0] else {
+            panic!("user message stays a user message");
+        };
+        let UserContent::Blocks(blocks) = &user.content else {
+            panic!("blocks stay blocks");
+        };
+        assert_eq!(blocks.len(), 2, "consecutive placeholders are deduped");
+        assert_eq!(
+            blocks[0].as_text(),
+            Some(crate::images::IMAGE_READING_DISABLED)
+        );
+        assert_eq!(blocks[1].as_text(), Some("hello"));
+
+        let passed = crate::runtime::block_on(
+            crate::images::block_images_converter(false).call(vec![message.clone()]),
+        );
+        assert_eq!(passed, vec![message]);
+    }
 }
