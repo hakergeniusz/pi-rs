@@ -37,12 +37,21 @@
 //! * `startupWaitMs` and the bounded first-prompt wait (`index.ts:87-94`,
 //!   `:145-148`, `:294-296`, `:1154-1175`): [`McpManager::begin_connect`]
 //!   starts a connection without blocking and [`StartupWait`] is a host-driven
-//!   tick (no timers) that reports `Ready`/`Waiting`/`TimedOut`.
+//!   tick (no timers) that reports `Ready`/`Waiting`/`TimedOut`. Upstream's
+//!   per-server `ready` promise (`index.ts:112-113`, `:594-608`) outlives that
+//!   one-shot bound: the worker publishes every background connect outcome to
+//!   the manager's shared queue, so a server that settles *after* the bound
+//!   still reaches the host through [`McpManager::take_settled_connects`] on a
+//!   later tick and registers its tools (`index.ts:1160-1162`).
 //! * `notifications/tools/list_changed` (`runtime.ts:382-384`, `:432-442`):
-//!   [`McpManager::poll_notifications`] drains the transports' inbound
-//!   channels, re-lists tools, and publishes [`ToolChange`]s for
-//!   re-registration. A failed refresh records upstream's exact
-//!   `Failed to refresh tools: …` text.
+//!   [`McpManager::try_drain_notifications`] asks the worker to run the
+//!   non-blocking `try_recv_inbound` loop, re-list tools, and publish
+//!   [`ToolChange`]s for re-registration; the host drains that shared queue
+//!   with [`McpManager::take_tool_changes`]. The drain is an event on the
+//!   worker's own request loop — there is no blocking barrier round-trip.
+//!   [`McpManager::poll_notifications`] is the older, ack-waiting form kept for
+//!   hosts that want the drain to be synchronous. A failed refresh records
+//!   upstream's exact `Failed to refresh tools: …` text.
 //! * The stderr tail on connect failures (`runtime.ts:51`, `:400-405`,
 //!   `:411-420`): stdio servers get a bounded (2 000-char) stderr tail that
 //!   is appended to the connect error as upstream does.
@@ -129,7 +138,11 @@ enum Request {
         name: String,
         config: Json,
         cwd: String,
-        reply: std::sync::mpsc::Sender<Result<ConnectOutcome, String>>,
+        reply: Option<std::sync::mpsc::Sender<Result<ConnectOutcome, String>>>,
+        /// Background connects (`begin_connect`) also publish their outcome
+        /// to the manager's per-server readiness queue, so it survives the
+        /// one-shot startup wait. Synchronous `connect` calls do not.
+        publish_settled: bool,
     },
     CallTool {
         server: String,
@@ -171,9 +184,14 @@ enum Request {
     ServersWithResources {
         reply: std::sync::mpsc::Sender<Vec<String>>,
     },
-    /// Host-driven tick: drain server-initiated notifications and re-list
-    /// tools on `notifications/tools/list_changed` (`runtime.ts:382-384`).
-    PollNotifications,
+    /// Host-driven event: drain server-initiated notifications with the
+    /// worker's non-blocking `try_recv_inbound` loop and re-list tools on
+    /// `notifications/tools/list_changed` (`runtime.ts:382-384`). The ack is
+    /// sent after the changes are published to the shared queue; hosts that
+    /// do not need the barrier drop it immediately.
+    DrainNotifications {
+        reply: std::sync::mpsc::Sender<()>,
+    },
     ShutdownAll,
 }
 
@@ -190,7 +208,7 @@ pub struct ToolChange {
 
 /// A successful connect: the offered tools as JSON (decoded `McpTool`s) and
 /// the server's `initialize` instructions.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConnectOutcome {
     pub tools: Vec<Json>,
     pub instructions: Option<String>,
@@ -198,13 +216,18 @@ pub struct ConnectOutcome {
     pub has_resources: bool,
 }
 
+/// One background connection's outcome, keyed by server name. The manager
+/// owns the queue so a connection settling after the startup bound still
+/// reaches the host (`index.ts:112-113`, `:594-608`).
+pub type SettledConnects = Vec<(String, Result<ConnectOutcome, String>)>;
+
 /// Handle to the worker thread sharing one worker per host core.
 ///
 /// `Clone` shares the worker; dropping the last handle closes the request
 /// channel and the worker kills the connected server processes.
 #[derive(Clone, Default)]
 pub struct McpManager {
-    requests: Arc<OnceLock<Mutex<std::sync::mpsc::Sender<Request>>>>,
+    requests: Arc<OnceLock<Mutex<tokio::sync::mpsc::UnboundedSender<Request>>>>,
     /// Per-server request timeouts, recorded by the worker on connect so
     /// the caller's reply window covers the worker's internal wait.
     timeouts: Arc<Mutex<HashMap<String, Duration>>>,
@@ -214,6 +237,14 @@ pub struct McpManager {
     /// Tool re-registrations from `tools/list_changed`, drained by the host
     /// (`runtime.ts:432-442`).
     tool_changes: Arc<Mutex<Vec<ToolChange>>>,
+    /// Outcomes of background connects not yet drained by the host. Keyed by
+    /// server name (upstream's per-server `ready`) so late connections are
+    /// delivered on a later tick instead of being lost with a dropped wait.
+    settled_connects: Arc<Mutex<SettledConnects>>,
+    /// Acks of [`Self::try_drain_notifications`] requests, reaped without
+    /// blocking on the next tick. The changes themselves live in
+    /// `tool_changes`; an ack only means "this drain ran".
+    pending_drains: Arc<Mutex<Vec<std::sync::mpsc::Receiver<()>>>>,
 }
 
 impl McpManager {
@@ -224,12 +255,13 @@ impl McpManager {
     }
 
     /// The worker's request channel, spawning the thread on first use.
-    fn sender(&self) -> std::sync::mpsc::Sender<Request> {
+    fn sender(&self) -> tokio::sync::mpsc::UnboundedSender<Request> {
         self.requests
             .get_or_init(|| {
                 Mutex::new(spawn_worker(
                     self.timeouts.clone(),
                     self.tool_changes.clone(),
+                    self.settled_connects.clone(),
                     self.auth_dir.clone(),
                 ))
             })
@@ -240,32 +272,97 @@ impl McpManager {
 
     /// Starts one connection without waiting for it, returning a handle the
     /// host's [`StartupWait`] polls (`index.ts:1142` starts connections in
-    /// the background). The reply carries the same outcome as [`Self::connect`].
+    /// the background). The outcome is published to the manager's shared queue
+    /// (upstream's per-server `ready`, `index.ts:112-113`, `:594-608`), so it
+    /// is still available to [`Self::take_settled_connects`] after the bounded
+    /// startup wait has been dropped.
     pub fn begin_connect(&self, name: &str, config: &Json, cwd: &str) -> PendingConnect {
-        let (reply, receiver) = channel();
-        // If the worker is gone the reply sender drops with the request, and
-        // `StartupWait::tick` records the disconnection as a settled error.
-        let _ = self.sender().send(Request::Connect {
-            name: name.to_string(),
-            config: config.clone(),
-            cwd: cwd.to_string(),
-            reply,
-        });
+        // A dead worker cannot settle anything; record the failure in the
+        // same queue so the host still gets a per-server report.
+        let sent = self
+            .sender()
+            .send(Request::Connect {
+                name: name.to_string(),
+                config: config.clone(),
+                cwd: cwd.to_string(),
+                reply: None,
+                publish_settled: true,
+            })
+            .is_ok();
+        if !sent {
+            self.settled_connects
+                .lock()
+                .expect("mcp settled connects mutex poisoned")
+                .push((
+                    name.to_string(),
+                    Err("MCP manager is not running".to_string()),
+                ));
+        }
         PendingConnect {
             name: name.to_string(),
-            reply: receiver,
+            settled: self.settled_connects.clone(),
         }
     }
 
-    /// Host-driven tick for server-initiated notifications. The worker
-    /// re-lists tools on `notifications/tools/list_changed`; the host then
-    /// drains the resulting [`ToolChange`]s with [`Self::take_tool_changes`].
-    pub fn poll_notifications(&self) {
-        let _ = self.sender().send(Request::PollNotifications);
+    /// Outcomes of background connections that have settled and not yet been
+    /// drained by the host. Non-blocking; late connections appear here even
+    /// after [`StartupWait`] timed out.
+    pub fn take_settled_connects(&self) -> SettledConnects {
+        std::mem::take(
+            &mut *self
+                .settled_connects
+                .lock()
+                .expect("mcp settled connects mutex poisoned"),
+        )
     }
 
-    /// Tool re-registrations accumulated since the last drain.
+    /// Non-blocking notification drain. The worker's `try_recv_inbound` loop
+    /// runs as an event on its own request channel; the host never waits on a
+    /// barrier here. Acks of earlier drains are reaped on the same pass
+    /// ([`Self::take_tool_changes`] also reaps them).
+    pub fn try_drain_notifications(&self) {
+        let (reply, receiver) = channel();
+        if self
+            .sender()
+            .send(Request::DrainNotifications { reply })
+            .is_ok()
+        {
+            self.pending_drains
+                .lock()
+                .expect("mcp pending drains mutex poisoned")
+                .push(receiver);
+        }
+        self.reap_drains();
+    }
+
+    /// The synchronous form of [`Self::try_drain_notifications`], kept for
+    /// hosts that used `poll_notifications` as a barrier. It waits for this
+    /// drain's own ack instead of an unrelated manager round-trip.
+    pub fn poll_notifications(&self) {
+        let (reply, receiver) = channel();
+        if self
+            .sender()
+            .send(Request::DrainNotifications { reply })
+            .is_ok()
+        {
+            let _ = receiver.recv_timeout(REPLY_SLACK);
+        }
+        self.reap_drains();
+    }
+
+    /// Drops acks of drains that already ran (or whose worker is gone).
+    fn reap_drains(&self) {
+        self.pending_drains
+            .lock()
+            .expect("mcp pending drains mutex poisoned")
+            .retain(|receiver| matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// Tool re-registrations accumulated since the last drain. Non-blocking:
+    /// the worker publishes them into this shared queue as soon as a drain
+    /// observes `notifications/tools/list_changed`.
     pub fn take_tool_changes(&self) -> Vec<ToolChange> {
+        self.reap_drains();
         std::mem::take(
             &mut *self
                 .tool_changes
@@ -298,7 +395,8 @@ impl McpManager {
                 name: name.to_string(),
                 config: config.clone(),
                 cwd: cwd.to_string(),
-                reply,
+                reply: Some(reply),
+                publish_settled: false,
             })
             .map_err(|_| "MCP manager is not running".to_string())?;
         reply_rx
@@ -593,27 +691,40 @@ impl McpManager {
         let _ = self.sender().send(Request::Drop {
             name: name.to_string(),
         });
+        self.settled_connects
+            .lock()
+            .expect("mcp settled connects mutex poisoned")
+            .retain(|(settled_name, _)| settled_name != name);
     }
 
     /// Drops every connection (the `session_shutdown` close,
     /// `index.ts:1250-1256`).
     pub fn shutdown_all(&self) {
         let _ = self.sender().send(Request::ShutdownAll);
+        self.settled_connects
+            .lock()
+            .expect("mcp settled connects mutex poisoned")
+            .clear();
     }
 }
 
 /// One in-flight startup connection, polled by [`StartupWait`] instead of
 /// blocking the host (upstream's `server.ready` promise, `index.ts:113`,
-/// `:1160-1162`).
+/// `:1160-1162`). The handle only names the server and shares the manager's
+/// outcome queue; dropping it after the startup bound cannot lose the
+/// connection's result, which stays available to
+/// [`McpManager::take_settled_connects`].
 pub struct PendingConnect {
     name: String,
-    reply: std::sync::mpsc::Receiver<Result<ConnectOutcome, String>>,
+    settled: Arc<Mutex<SettledConnects>>,
 }
 
 /// The bounded wait the first prompt performs for servers whose tools are
 /// declared to the model (`index.ts:87-94`, `:145-148`, `:294-296`,
 /// `:1154-1175`). Entirely host-driven: the host supplies `now` on each
-/// tick, so no timer thread or `sleep` is involved.
+/// tick, so no timer thread or `sleep` is involved. The wait is one-shot,
+/// but the connections it polls are not: their outcomes live in the
+/// manager's queue and are drained by the host on later ticks.
 pub struct StartupWait {
     started: Instant,
     wait: Duration,
@@ -663,18 +774,26 @@ impl StartupWait {
     /// Advances the wait. Settled connections move into [`Self::drain_settled`];
     /// the first prompt proceeds when none remain or the bound elapsed. A
     /// second call is a no-op, matching upstream's one-shot `waitedForStartup`.
+    /// Outcomes still in the queue after the wait is dropped are picked up by
+    /// [`McpManager::take_settled_connects`] on a later host tick.
     pub fn tick(&mut self, now: Instant) -> StartupTick {
         if self.waited {
             return StartupTick::Ready;
         }
         let mut pending = Vec::new();
         for connect in self.pending.drain(..) {
-            match connect.reply.try_recv() {
-                Ok(outcome) => self.settled.push((connect.name, outcome)),
-                Err(TryRecvError::Empty) => pending.push(connect),
-                Err(TryRecvError::Disconnected) => self
-                    .settled
-                    .push((connect.name, Err("MCP manager is not running".to_string()))),
+            // The manager publishes the outcome under the server's name;
+            // non-blocking, like upstream's settled `ready` promise.
+            let mut queue = connect
+                .settled
+                .lock()
+                .expect("mcp settled connects mutex poisoned");
+            let position = queue.iter().position(|(name, _)| name == &connect.name);
+            if let Some(position) = position {
+                self.settled.push((connect.name, queue.remove(position).1));
+            } else {
+                drop(queue);
+                pending.push(connect);
             }
         }
         self.pending = pending;
@@ -733,12 +852,25 @@ fn config_default_window() -> Duration {
 fn spawn_worker(
     timeouts: Arc<Mutex<HashMap<String, Duration>>>,
     tool_changes: Arc<Mutex<Vec<ToolChange>>>,
+    settled_connects: Arc<Mutex<SettledConnects>>,
     auth_dir: Option<std::path::PathBuf>,
-) -> std::sync::mpsc::Sender<Request> {
-    let (sender, receiver) = std::sync::mpsc::channel::<Request>();
+) -> tokio::sync::mpsc::UnboundedSender<Request> {
+    // A tokio request channel lets the worker `block_on(recv())`: its
+    // current-thread runtime keeps driving the transports' reader tasks
+    // while idle, so a notification arriving *between* host ticks is queued
+    // for the next non-blocking drain. A std `recv()` froze those tasks.
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Request>();
     std::thread::Builder::new()
         .name("pi-ext-js-mcp".to_string())
-        .spawn(move || worker_loop(&receiver, &timeouts, &tool_changes, auth_dir.as_deref()))
+        .spawn(move || {
+            worker_loop(
+                &mut receiver,
+                &timeouts,
+                &tool_changes,
+                &settled_connects,
+                auth_dir.as_deref(),
+            );
+        })
         .expect("spawn MCP manager worker thread");
     sender
 }
@@ -751,6 +883,7 @@ fn worker_loop(
     receiver: &std::sync::mpsc::Receiver<Request>,
     timeouts: &Arc<Mutex<HashMap<String, Duration>>>,
     tool_changes: &Arc<Mutex<Vec<ToolChange>>>,
+    settled_connects: &Arc<Mutex<SettledConnects>>,
     auth_dir: Option<&std::path::Path>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -759,15 +892,16 @@ fn worker_loop(
         .expect("build MCP manager runtime");
     let mut servers: HashMap<String, ServerEntry> = HashMap::new();
     while let Ok(request) = receiver.recv() {
-        // Server-initiated messages can arrive while the worker is idle;
-        // drain them on every wake-up, not just on an explicit poll.
-        collect_tool_changes(&runtime, &mut servers, tool_changes);
+        // Notifications are an explicit host-tick event now
+        // (`Request::DrainNotifications`), not a side effect of an unrelated
+        // wake-up; the drain runs the non-blocking try_recv loop there.
         match request {
             Request::Connect {
                 name,
                 config,
                 cwd,
                 reply,
+                publish_settled,
             } => {
                 let timeout = config_timeout(&config);
                 let outcome = match spawn_config(&name, &config, &cwd) {
@@ -802,7 +936,22 @@ fn worker_loop(
                         .expect("mcp timeouts mutex poisoned")
                         .remove(&name);
                 }
-                let _ = reply.send(outcome);
+                if publish_settled {
+                    // Per-server readiness outlives the one-shot startup
+                    // wait (`index.ts:112-113`, `:594-608`): a late result
+                    // is still delivered to the host's next tick.
+                    let published = match &outcome {
+                        Ok(value) => Ok(value.clone()),
+                        Err(error) => Err(error.clone()),
+                    };
+                    settled_connects
+                        .lock()
+                        .expect("mcp settled connects mutex poisoned")
+                        .push((name.clone(), published));
+                }
+                if let Some(reply) = reply {
+                    let _ = reply.send(outcome);
+                }
             }
             Request::CallTool {
                 server,
@@ -912,8 +1061,13 @@ fn worker_loop(
                     .collect();
                 let _ = reply.send(names);
             }
-            Request::PollNotifications => {
-                // The drain at the top of the loop already handled them.
+            Request::DrainNotifications { reply } => {
+                // The try_recv loop in `collect_tool_changes` is the port's
+                // notification listener (`runtime.ts:382-384`): it never
+                // blocks, and the changes are published to the shared queue
+                // before the ack is sent.
+                collect_tool_changes(&runtime, &mut servers, tool_changes);
+                let _ = reply.send(());
             }
             Request::ShutdownAll => {
                 shutdown_all(&runtime, &mut servers);
@@ -2068,6 +2222,74 @@ while IFS= read -r line; do
 done
 "#;
 
+/// A synthetic server that sleeps before its handshake, so a connection can
+/// settle after the startup bound has elapsed (`index.ts:594-608`).
+#[cfg(test)]
+pub(crate) const SLOW_SERVER_SCRIPT: &str = r#"#!/bin/sh
+sleep 1
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"slow","version":"1.0.0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"late","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+  esac
+done
+"#;
+
+/// A synthetic server that emits `list_changed` after a delay, so the
+/// notification lands between two host ticks (`runtime.ts:382-384`).
+#[cfg(test)]
+pub(crate) const LATE_NOTIFICATION_SERVER_SCRIPT: &str = r#"#!/bin/sh
+lists=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"later","version":"1.0.0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      lists=$((lists + 1))
+      if [ "$lists" -eq 1 ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"old","inputSchema":{"type":"object"}}]}}\n' "$id"
+        ( sleep 0.3; printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n' ) &
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"new","inputSchema":{"type":"object"}}]}}\n' "$id"
+      fi ;;
+  esac
+done
+"#;
+
+/// Writes the slow fixture server to `directory` as an executable script.
+#[cfg(test)]
+pub(crate) fn write_late_server(
+    directory: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
+    let path = directory.join("slow-server.sh");
+    std::fs::write(&path, SLOW_SERVER_SCRIPT)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(path)
+}
+
+/// Writes the delayed-notification fixture server to `directory`.
+#[cfg(test)]
+pub(crate) fn write_late_notification_server(
+    directory: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
+    let path = directory.join("later-server.sh");
+    std::fs::write(&path, LATE_NOTIFICATION_SERVER_SCRIPT)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(path)
+}
+
 /// Writes the fixture server to `directory` as an executable script and
 /// returns its path (the bridge tests point the server config at it).
 #[cfg(test)]
@@ -2417,11 +2639,11 @@ done
     #[test]
     fn startup_wait_is_bounded_and_one_shot() {
         let now = Instant::now();
-        let (keep_open, receiver) = channel::<Result<ConnectOutcome, String>>();
+        let settled = Arc::new(Mutex::new(Vec::new()));
         let mut wait = StartupWait::new_with_start(100, now);
         wait.pending.push(PendingConnect {
             name: "slow".to_string(),
-            reply: receiver,
+            settled: settled.clone(),
         });
         assert_eq!(
             wait.tick(now),
@@ -2445,7 +2667,89 @@ done
             wait.tick(now + Duration::from_millis(500)),
             StartupTick::Ready
         );
-        drop(keep_open);
+        // The bound is one-shot, but the outcome is not owned by the wait:
+        // settling late leaves it in the manager's queue for the host.
+        settled.lock().expect("settled lock").push((
+            "slow".to_string(),
+            Ok(ConnectOutcome {
+                tools: Vec::new(),
+                instructions: None,
+                has_resources: false,
+            }),
+        ));
+        drop(wait);
+        assert_eq!(settled.lock().expect("settled lock").len(), 1);
+    }
+
+    #[test]
+    fn late_connect_is_delivered_after_the_startup_bound_elapsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = write_late_server(dir.path()).expect("fixture");
+        let config = json!({"command": script.to_string_lossy(), "timeout": 5});
+        let manager = McpManager::default();
+        let mut wait = StartupWait::new(20);
+        wait.add("slow", &config, dir.path().to_str().expect("cwd"), &manager);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match wait.tick(Instant::now()) {
+                StartupTick::TimedOut => break,
+                StartupTick::Waiting { .. } => {
+                    assert!(Instant::now() < deadline, "startup wait never elapsed");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                StartupTick::Ready => panic!("the server is still sleeping"),
+            }
+        }
+        assert!(wait.waited());
+        assert_eq!(wait.pending(), 1);
+        // The host drops the one-shot wait; the manager still owns the
+        // in-flight connection and its eventual outcome.
+        drop(wait);
+        let outcome = loop {
+            if let Some((name, outcome)) = manager.take_settled_connects().into_iter().next() {
+                assert_eq!(name, "slow");
+                break outcome;
+            }
+            assert!(Instant::now() < deadline, "late connect was lost");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let outcome = outcome.expect("late connect succeeded");
+        assert_eq!(outcome.tools.len(), 1);
+        assert_eq!(outcome.tools[0]["name"], "late");
+        manager.shutdown_all();
+    }
+
+    #[test]
+    fn notification_arriving_between_ticks_is_drained_without_a_barrier() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = write_late_notification_server(dir.path()).expect("fixture");
+        let config = json!({"command": script.to_string_lossy(), "timeout": 5});
+        let manager = McpManager::default();
+        let initial = manager
+            .connect("later", &config, dir.path().to_str().expect("cwd"))
+            .expect("connect");
+        assert_eq!(initial.tools[0]["name"], "old");
+
+        // Before the notification arrives a drain publishes nothing.
+        manager.try_drain_notifications();
+        assert_eq!(manager.take_tool_changes().len(), 0);
+        // Let the notification land between two host ticks.
+        std::thread::sleep(Duration::from_millis(500));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let changes = loop {
+            manager.try_drain_notifications();
+            let changes = manager.take_tool_changes();
+            if !changes.is_empty() {
+                break changes;
+            }
+            assert!(Instant::now() < deadline, "notification was never drained");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].server, "later");
+        assert!(changes[0].error.is_none(), "{changes:?}");
+        assert_eq!(changes[0].tools[0]["name"], "new");
+        manager.shutdown_all();
     }
 
     #[test]

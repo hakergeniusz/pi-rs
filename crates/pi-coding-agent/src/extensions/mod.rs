@@ -209,9 +209,12 @@ impl ExtensionHost {
 
     /// One host-driven MCP tick (`index.ts:1154-1175`,
     /// `runtime.ts:382-384`, `:432-442`): advance the bounded startup wait,
-    /// register the tools of settled connections, and drain
-    /// `notifications/tools/list_changed` re-registrations. The host decides
-    /// when to call this — no timer thread or `sleep` lives in the runner.
+    /// register the tools of settled connections — including servers whose
+    /// per-server `ready` settles after the wait timed out (`index.ts:112-113`,
+    /// `:594-608`) — and drain `notifications/tools/list_changed`
+    /// re-registrations through the worker's non-blocking drain event. The
+    /// host decides when to call this — no timer thread or `sleep` lives in
+    /// the runner.
     #[cfg(feature = "ext-js")]
     pub fn mcp_tick(&self, now: Instant) -> Result<pi_ext_js::runner::McpTickOutcome, String> {
         let Some(runner) = &self.runner else {

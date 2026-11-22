@@ -38,8 +38,12 @@
 //! every dispatch (the change listener, `runner.ts:465-466`). Connections
 //! start in the background and the first prompt's bounded wait is driven by
 //! the host through [`ExtensionRunner::mcp_tick`] (`index.ts:1142`,
-//! `:1154-1175`); the same tick drains `notifications/tools/list_changed`
-//! and re-registers the refreshed tools (`runtime.ts:382-384`, `:432-442`).
+//! `:1154-1175`); the wait is one-shot, but the manager owns each connection's
+//! readiness (`index.ts:112-113`, `:594-608`), so a late connection still
+//! registers its tools on a later tick. The same tick fires the worker's
+//! non-blocking notification drain and re-registers the tools refreshed by
+//! `notifications/tools/list_changed` (`runtime.ts:382-384`, `:432-442`) —
+//! no blocking barrier round-trip.
 //! The UI
 //! surface (E3 slices 6a/6b) is the host half of `wrapUIPromptContext`
 //! (`runner.ts:577-613`): dialog methods emit the depth-gated
@@ -929,9 +933,13 @@ impl ExtensionRunner {
 
         // Take the wait out so the rest of the runner is free while tools
         // are registered; it goes back only while the bound is still live.
+        let manager = {
+            let core = self.core.lock().expect("host core mutex poisoned");
+            core.mcp_manager.clone()
+        };
         let mut wait = self.mcp_startup.take();
         let mut keep_waiting = false;
-        let settled = if let Some(wait) = wait.as_mut() {
+        let mut settled = if let Some(wait) = wait.as_mut() {
             let tick = wait.tick(now);
             keep_waiting = matches!(tick, StartupTick::Waiting { .. });
             outcome.startup = Some(tick);
@@ -942,10 +950,12 @@ impl ExtensionRunner {
         if keep_waiting {
             self.mcp_startup = wait;
         }
-        // When the bound elapses the wait is one-shot: upstream's late
-        // connections still register through their own ready promise, but
-        // the host-facing `StartupWait` cannot drain after `waited` flips.
-        // Those connections stay owned by the manager's worker.
+        // The wait is one-shot, but each connection is not: upstream's
+        // `server.ready` promise settles whenever the server connects
+        // (`index.ts:112-113`, `:594-608`). The manager keeps those outcomes
+        // in its shared queue, so a late server still registers its tools on
+        // a later tick even after `StartupWait` reported `TimedOut`.
+        settled.extend(manager.take_settled_connects());
 
         let mut resources_changed = false;
         for (name, result) in settled {
@@ -998,19 +1008,13 @@ impl ExtensionRunner {
         if self.mcp_servers.is_empty() {
             return Ok(outcome);
         }
-        let changes = {
-            let manager = {
-                let core = self.core.lock().expect("host core mutex poisoned");
-                core.mcp_manager.clone()
-            };
-            // The manager's worker drains inbound messages at the top of
-            // every request iteration. `poll_notifications` is fire-and-
-            // forget, so a blocking round-trip is the barrier that makes the
-            // drain below deterministic (`mcp_manager.rs`, `worker_loop`).
-            manager.poll_notifications();
-            let _ = manager.servers_with_resources();
-            manager.take_tool_changes()
-        };
+        // Event-driven drain: the host tick fires the worker's notification
+        // event and then reads the shared queue without blocking. The worker
+        // re-lists tools on `notifications/tools/list_changed` and publishes
+        // the change before its ack (`runtime.ts:382-384`, `:432-442`).
+        // There is no `servers_with_resources()` barrier round-trip.
+        manager.try_drain_notifications();
+        let changes = manager.take_tool_changes();
         for change in changes {
             let Some(index) = self
                 .mcp_servers
@@ -6824,6 +6828,64 @@ done
             1,
             "the refreshed list has one tool"
         );
+    }
+
+    #[test]
+    fn mcp_tick_registers_tools_of_a_connection_that_settles_after_the_bound() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let server = crate::mcp_manager::write_late_server(directory.path()).expect("fixture");
+        let command = server.to_string_lossy();
+        let source = format!(
+            r#"export default function (pi) {{
+  pi.registerMcpServer("slow", {{ command: "{command}", exposure: "direct", timeout: 5 }});
+}}"#
+        );
+        let mut runner = runner_with(&[source.as_str()]);
+        runner.connect_mcp_servers().expect("connect");
+        // Force the one-shot startup bound to elapse while the fixture server
+        // is still sleeping (`index.ts:1154-1175`).
+        let outcome = runner
+            .mcp_tick(Instant::now() + std::time::Duration::from_secs(60))
+            .expect("tick");
+        assert_eq!(outcome.startup, Some(StartupTick::TimedOut));
+        assert_eq!(outcome.settled.len(), 0);
+        // The per-server readiness survives the dropped wait: a later tick
+        // registers the tool the late connection offers (`index.ts:594-608`).
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while runner.tool("mcp__slow__late").is_none() {
+            assert!(Instant::now() < deadline, "late tools never registered");
+            runner.mcp_tick(Instant::now()).expect("tick");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(runner.mcp_server_reports()[0].tool_count, 1);
+    }
+
+    #[test]
+    fn mcp_tick_drains_a_notification_that_arrives_between_ticks() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let server =
+            crate::mcp_manager::write_late_notification_server(directory.path()).expect("fixture");
+        let command = server.to_string_lossy();
+        let source = format!(
+            r#"export default function (pi) {{
+  pi.registerMcpServer("later", {{ command: "{command}", exposure: "direct", timeout: 5 }});
+}}"#
+        );
+        let mut runner = runner_with(&[source.as_str()]);
+        runner.connect_mcp_servers().expect("connect");
+        settle_mcp(&mut runner);
+        assert!(runner.tool("mcp__later__old").is_some());
+        // The fixture emits `list_changed` after a delay. Let it arrive with
+        // no host tick running, then let ordinary ticks pick it up without a
+        // blocking `servers_with_resources()` barrier.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while runner.tool("mcp__later__new").is_none() {
+            assert!(Instant::now() < deadline, "between-tick notification lost");
+            runner.mcp_tick(Instant::now()).expect("tick");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(runner.mcp_server_reports()[0].tool_count, 1);
     }
 
     /// The extension source registering the fixture server; `extra` adds
