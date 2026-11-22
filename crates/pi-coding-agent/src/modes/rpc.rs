@@ -44,15 +44,43 @@
 //! Upstream sends `model_select` only to extension listeners — never to
 //! `session.subscribe` — so the default emits it through the extension runner,
 //! not onto RPC stdout. `WIRING.md` records the host contract.
+//!
+//! Command dispatch mirrors upstream's fire-and-forget `void handleInputLine`
+//! (`rpc-mode.ts:768-824,832-834`): the stdin reader forwards each line to a
+//! bounded, FIFO-ordered gate that spawns one scoped thread per command, so
+//! the receive loop is never blocked by a slow command and several commands
+//! can be in flight together. Execution itself is serialized on the shared
+//! `&mut PrintRuntime` (the port's agent run is synchronous, unlike upstream's
+//! `await`), preserving the response order the protocol tests require; an
+//! `activeCommands` counter (`:90,801,807`) is exposed on [`RpcBridge`] for
+//! hosts that gate extension shutdown on it. This is the bounded concurrent
+//! path — see `HANDOFF.md` for the remaining delta versus upstream's fully
+//! overlapping async commands.
+//!
+//! Session replacement (`new_session`/`fork`/`switch_session`/`clone`) routes
+//! through [`rebind_session`] after a successful swap, mirroring upstream's
+//! `rebindSession()` (`rpc-mode.ts:317-371`): the RPC dialog surface is
+//! re-bound to the new session's runner and per-session queue state resets.
+//!
+//! The `blockImages` seam is re-read on every `convertToLlm` call
+//! (`sdk.ts:296-331`) through [`dynamic_block_images_converter`], which loads
+//! a shared atomic per invocation instead of capturing a startup snapshot.
+//! RPC has no mid-session settings channel, so the flag is seeded from the
+//! startup value; a host with a live `SettingsManager` can flip it. Every
+//! dispatched command also pumps one host MCP tick
+//! (`pi-ext-js/src/runner.rs:927`, `extensions/mod.rs:216`) so `session_start`
+//! connections and `list_changed` re-registrations settle without a timer.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Condvar, Mutex, mpsc};
 #[cfg(feature = "ext-js")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use futures::FutureExt;
 use pi_agent::agent_loop::AgentLoopConfig;
 use pi_agent::agent_message::{AgentMessage, BashExecutionMessage};
 use pi_agent::events::{AgentEvent, AgentEventSink};
@@ -1627,12 +1655,57 @@ impl QueuedTexts {
     }
 }
 
+/// The `activeCommands` mirror of upstream's dispatch loop
+/// (`rpc-mode.ts:90,801,807`) plus the high-water mark used to bound how many
+/// command tasks a host can leave in flight. Shared with the bridge so a
+/// coordinator can gate extension shutdown the way upstream's
+/// `checkShutdownRequested` does (`:763-766`).
+#[derive(Debug, Default)]
+pub struct RpcDispatchStats {
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    started: AtomicUsize,
+}
+
+impl RpcDispatchStats {
+    /// Registers a command as in flight (`activeCommands++`, `:414,801`).
+    fn enter(&self) {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        self.started.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Retires a finished command (`activeCommands--`, `:431,807`).
+    fn leave(&self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Commands currently in flight — upstream's `activeCommands`.
+    #[must_use]
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    /// Peak number of simultaneously in-flight commands.
+    #[must_use]
+    pub fn max_active(&self) -> usize {
+        self.max_active.load(Ordering::SeqCst)
+    }
+
+    /// Total commands accepted by the dispatch loop.
+    #[must_use]
+    pub fn started(&self) -> usize {
+        self.started.load(Ordering::SeqCst)
+    }
+}
+
 /// The RPC plumbing shared by the command loop and the dialog bridge.
 pub struct RpcBridge {
     /// Command lines the reader thread forwards — everything that is not
     /// an `extension_ui_response` (`rpc-mode.ts:782-799` routes by type on
-    /// one stdin stream).
-    pub commands: Receiver<String>,
+    /// one stdin stream). Behind a mutex so the receive loop can block on
+    /// `recv()` without holding the bridge lock a worker needs.
+    pub commands: Arc<Mutex<Receiver<String>>>,
     /// The RPC stream, shared with the dialog sink.
     pub out: RpcOut,
     /// The agent queues, persistent across commands like upstream's
@@ -1652,6 +1725,10 @@ pub struct RpcBridge {
     /// (`agent-session.ts:1181-1198`). Enqueues record text here; the event
     /// sink removes it at `message_start`.
     pub queued_texts: Arc<Mutex<QueuedTexts>>,
+    /// In-flight command mirror — upstream's `activeCommands`
+    /// (`rpc-mode.ts:90,801,807`). Also read by tests that assert overlapping
+    /// commands can be accepted while an earlier command is still running.
+    pub dispatch_stats: Arc<RpcDispatchStats>,
 }
 
 /// Wires the bridge: the reader thread owns the input and routes by
@@ -1701,7 +1778,7 @@ pub fn create_bridge(input: Box<dyn BufRead + Send>, output: Box<dyn Write + Sen
         })
         .expect("spawn the rpc stdin reader");
     RpcBridge {
-        commands: commands_rx,
+        commands: Arc::new(Mutex::new(commands_rx)),
         out: Arc::clone(&out),
         queues: Queues::new(),
         #[cfg(feature = "ext-js")]
@@ -1713,6 +1790,7 @@ pub fn create_bridge(input: Box<dyn BufRead + Send>, output: Box<dyn Write + Sen
         }),
         host: Box::new(LocalRpcHost),
         queued_texts: Arc::new(Mutex::new(QueuedTexts::default())),
+        dispatch_stats: Arc::new(RpcDispatchStats::default()),
     }
 }
 
@@ -1799,67 +1877,210 @@ impl pi_ext_js::UiSink for RpcUiSink {
     }
 }
 
+/// The most command tasks the dispatcher leaves in flight at once. Upstream
+/// has no such cap (`void handleInputLine` spawns one promise per line), but
+/// each port task owns a thread, so the bound keeps a hostile stdin from
+/// exhausting them while still allowing commands to overlap.
+const MAX_IN_FLIGHT: usize = 8;
+
+/// Strict FIFO turnstile over the shared runtime. Upstream's
+/// `void handleInputLine(line)` (`:833`) lets commands overlap on its event
+/// loop; the port's agent run is synchronous over `&mut PrintRuntime`, so
+/// execution is serialized here while the receive loop keeps reading. Holding
+/// `next` across the whole command makes the serialization input-ordered, so
+/// the response/event stream stays in command order as the protocol tests
+/// require. A panicking command still advances the gate (RAII), so later
+/// commands cannot deadlock behind it.
+struct DispatchGate {
+    next: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl DispatchGate {
+    fn new() -> Self {
+        Self {
+            next: Mutex::new(0),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn run_ordered<T>(&self, seq: usize, f: impl FnOnce() -> T) -> T {
+        struct Advance<'a>(&'a DispatchGate);
+        impl Drop for Advance<'_> {
+            fn drop(&mut self) {
+                let mut next = self.0.next.lock().expect("rpc dispatch gate");
+                *next += 1;
+                self.0.cv.notify_all();
+            }
+        }
+
+        let mut next = self.next.lock().expect("rpc dispatch gate");
+        while *next < seq {
+            next = self.cv.wait(next).expect("rpc dispatch gate");
+        }
+        let advance = Advance(self);
+        drop(next);
+        let result = f();
+        drop(advance);
+        result
+    }
+}
+
+/// Retires a command from the in-flight mirror even if its worker unwinds.
+struct DispatchLeave<'a>(&'a RpcDispatchStats);
+
+impl Drop for DispatchLeave<'_> {
+    fn drop(&mut self) {
+        self.0.leave();
+    }
+}
+
+fn wait_for_capacity(stats: &RpcDispatchStats) {
+    while stats.active() >= MAX_IN_FLIGHT {
+        std::thread::yield_now();
+    }
+}
+
 /// Serves commands until stdin closes (`onInputEnd`, `rpc-mode.ts:826-839`).
-/// The extension UI stays bound for the whole run: dialogs opened by any
-/// command's extension events cross the stream (`setUIContext` applies at
-/// load, upstream's `rebindSession` re-binds per session — the port has
-/// one session per run).
+/// Each line is dispatched on its own scoped thread (`void handleInputLine`,
+/// `:832-834`) behind a bounded, FIFO gate; the receive loop never waits for
+/// a command to finish. The extension UI stays bound for the whole run:
+/// dialogs opened by any command's extension events cross the stream, and
+/// [`rebind_session`] re-binds it after a session replacement.
 pub fn run_rpc_mode(
     runtime: &mut PrintRuntime,
     bridge: &mut RpcBridge,
     block_images: bool,
 ) -> Result<i32, String> {
-    while let Ok(line) = bridge.commands.recv() {
-        let (incoming, id, type_name) = match parse_request(&line) {
-            Ok(parsed) => parsed,
-            Err(message) => {
-                // The `parse` failure (`rpc-mode.ts:772-782`): no `id` echo,
-                // the parse error message verbatim.
-                write_line(
-                    &bridge.out,
-                    &RpcResponse::failure(None, Some("parse"), message),
-                )?;
-                continue;
-            }
-        };
-        let incoming = match incoming {
-            Incoming::Command(command) => command,
-            Incoming::Unknown(raw_type) => {
-                // `rpc-mode.ts:734-737`: the raw `type` echoes into both the
-                // `command` field and the message; a missing one prints
-                // `undefined` and drops the `command` key.
-                write_line(
-                    &bridge.out,
-                    &RpcResponse::failure(
-                        id.as_deref(),
-                        raw_type.as_deref(),
-                        format!(
-                            "Unknown command: {}",
-                            raw_type.as_deref().unwrap_or("undefined")
-                        ),
-                    ),
-                )?;
-                continue;
-            }
-        };
-        match handle_command(runtime, bridge, incoming, id.as_deref(), block_images) {
-            Ok(CommandOutcome::Success(data)) => {
-                write_line(
-                    &bridge.out,
-                    &RpcResponse::success(id.as_deref(), type_name.as_deref().unwrap_or(""), data),
-                )?;
-            }
-            Ok(CommandOutcome::Replied) => {}
-            Err(error) => {
-                write_line(
-                    &bridge.out,
-                    &RpcResponse::failure(id.as_deref(), type_name.as_deref(), error),
-                )?;
-            }
+    let gate = DispatchGate::new();
+    let runtime = Arc::new(Mutex::new(&mut *runtime));
+    let bridge = Arc::new(Mutex::new(&mut *bridge));
+    // Seeded from the startup setting; `dynamic_block_images_converter`
+    // re-reads it per convertToLlm call (sdk.ts:296-331).
+    let block_flag = Arc::new(AtomicBool::new(block_images));
+    let first_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let (stats, commands) = {
+        let guard = bridge.lock().expect("rpc bridge");
+        (
+            Arc::clone(&guard.dispatch_stats),
+            Arc::clone(&guard.commands),
+        )
+    };
+
+    let result: Result<(), String> = std::thread::scope(|scope| {
+        let mut seq = 0usize;
+        loop {
+            let line = commands.lock().expect("rpc commands").recv();
+            let Ok(line) = line else { break };
+            wait_for_capacity(&stats);
+            stats.enter();
+            let my_seq = seq;
+            seq += 1;
+            let runtime = Arc::clone(&runtime);
+            let bridge = Arc::clone(&bridge);
+            let flag = Arc::clone(&block_flag);
+            let first_error = Arc::clone(&first_error);
+            let stats = Arc::clone(&stats);
+            let gate = &gate;
+            scope.spawn(move || {
+                let _leave = DispatchLeave(&stats);
+                gate.run_ordered(my_seq, || {
+                    let mut rt = runtime.lock().expect("rpc runtime");
+                    let mut br = bridge.lock().expect("rpc bridge");
+                    if let Err(error) = dispatch_line(&mut **rt, &mut **br, &line, &flag) {
+                        let mut slot = first_error.lock().expect("rpc first error");
+                        if slot.is_none() {
+                            *slot = Some(error);
+                        }
+                    }
+                });
+            });
         }
+        Ok(())
+    });
+
+    // All workers have joined at this point: unbind the dialog surface exactly
+    // once (`setUIContext(undefined)` at shutdown).
+    {
+        let rt = runtime.lock().expect("rpc runtime");
+        clear_extension_ui(&**rt);
     }
-    clear_extension_ui(runtime);
+    if let Some(error) = first_error.lock().expect("rpc first error").take() {
+        return Err(error);
+    }
+    result?;
     Ok(0)
+}
+
+/// One input line end-to-end (`handleInputLine`, `rpc-mode.ts:768-824`): parse
+/// the envelope and run one command, emitting its response. A parse failure
+/// echoes no `id` (`:772-782`); an unknown command echoes its raw `type` into
+/// both the `command` field and the message (`:734-737`). After every command
+/// the host MCP pump advances one tick (`pi-ext-js/src/runner.rs:927`).
+fn dispatch_line(
+    runtime: &mut PrintRuntime,
+    bridge: &mut RpcBridge,
+    line: &str,
+    block_flag: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let (incoming, id, type_name) = match parse_request(line) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            write_line(
+                &bridge.out,
+                &RpcResponse::failure(None, Some("parse"), message),
+            )?;
+            tick_mcp(runtime);
+            return Ok(());
+        }
+    };
+    let incoming = match incoming {
+        Incoming::Command(command) => command,
+        Incoming::Unknown(raw_type) => {
+            write_line(
+                &bridge.out,
+                &RpcResponse::failure(
+                    id.as_deref(),
+                    raw_type.as_deref(),
+                    format!(
+                        "Unknown command: {}",
+                        raw_type.as_deref().unwrap_or("undefined")
+                    ),
+                ),
+            )?;
+            tick_mcp(runtime);
+            return Ok(());
+        }
+    };
+    match handle_command(runtime, bridge, incoming, id.as_deref(), block_flag) {
+        Ok(CommandOutcome::Success(data)) => write_line(
+            &bridge.out,
+            &RpcResponse::success(id.as_deref(), type_name.as_deref().unwrap_or(""), data),
+        ),
+        Ok(CommandOutcome::Replied) => Ok(()),
+        Err(error) => write_line(
+            &bridge.out,
+            &RpcResponse::failure(id.as_deref(), type_name.as_deref(), error),
+        ),
+    }?;
+    tick_mcp(runtime);
+    Ok(())
+}
+
+/// One host-driven MCP tick (`pi-ext-js/src/runner.rs:927`,
+/// `extensions/mod.rs:216`): advance the bounded `session_start` wait,
+/// register the tools of settled connections, and drain `list_changed`
+/// re-registrations. The RPC loop has no timer, so it pumps once per command.
+fn tick_mcp(runtime: &PrintRuntime) {
+    #[cfg(feature = "ext-js")]
+    if let Some(runner) = &runtime.extension_runner
+        && let Ok(mut runner) = runner.lock()
+    {
+        let _ = runner.mcp_tick(Instant::now());
+    }
+    #[cfg(not(feature = "ext-js"))]
+    let _ = runtime;
 }
 
 /// Unbinds the dialog surface (`setUIContext(undefined)`) — the runner
@@ -1877,6 +2098,30 @@ fn clear_extension_ui(runtime: &PrintRuntime) {
 #[cfg(not(feature = "ext-js"))]
 fn clear_extension_ui(runtime: &PrintRuntime) {
     let _ = runtime;
+}
+
+/// Rebinds the RPC surface after a live session replacement — upstream's
+/// `rebindSession()` (`rpc-mode.ts:317-371`), installed via
+/// `runtimeHost.setRebindSession` and called after `new_session`,
+/// `switch_session`, `fork`, and `clone` (`:456-463,624-650`). Upstream
+/// reassigns its local `session`, re-binds `bindExtensions` with a fresh UI
+/// context (`mode: "rpc"`), and re-subscribes to session/agent events. The
+/// port mutates `runtime.session` in place and emits events per command, so
+/// the observable pieces are the UI rebind, the fresh-agent queue reset, and
+/// an MCP tick so connections opened by the new `session_start` settle.
+fn rebind_session(runtime: &mut PrintRuntime, bridge: &mut RpcBridge) {
+    #[cfg(feature = "ext-js")]
+    if let Some(runner) = &runtime.extension_runner {
+        runner
+            .lock()
+            .expect("extension runner mutex poisoned")
+            .set_ui_context(Arc::clone(&bridge.sink), "rpc");
+    }
+    // A replaced session starts with an empty `Agent`, hence empty queues
+    // (`agent-session-runtime.ts:317-326`). The delivery mirror resets with it.
+    bridge.queues = Queues::new();
+    *bridge.queued_texts.lock().expect("rpc queued texts") = QueuedTexts::default();
+    tick_mcp(runtime);
 }
 
 fn write_line(out: &RpcOut, response: &RpcResponse) -> Result<(), String> {
@@ -1906,7 +2151,7 @@ fn handle_command(
     bridge: &mut RpcBridge,
     command: RpcCommand,
     id: Option<&str>,
-    block_images: bool,
+    block_flag: &Arc<AtomicBool>,
 ) -> Result<CommandOutcome, String> {
     let out = Arc::clone(&bridge.out);
     match command {
@@ -1953,7 +2198,7 @@ fn handle_command(
                 &mut bridge.queues,
                 Arc::clone(&out),
                 Arc::clone(&bridge.queued_texts),
-                block_images,
+                Arc::clone(block_flag),
             )
             .is_err()
             {
@@ -2366,8 +2611,7 @@ fn handle_command(
                 .host
                 .new_session(runtime, parent_session.as_deref())?;
             if !cancelled {
-                bridge.queues = Queues::new();
-                *bridge.queued_texts.lock().expect("rpc queued texts") = QueuedTexts::default();
+                rebind_session(runtime, bridge);
             }
             Ok(CommandOutcome::Success(Some(
                 serde_json::json!({ "cancelled": cancelled }),
@@ -2486,8 +2730,7 @@ fn handle_command(
             };
             let cancelled = bridge.host.switch_session(runtime, &session_path)?;
             if !cancelled {
-                bridge.queues = Queues::new();
-                *bridge.queued_texts.lock().expect("rpc queued texts") = QueuedTexts::default();
+                rebind_session(runtime, bridge);
             }
             Ok(CommandOutcome::Success(Some(
                 serde_json::json!({ "cancelled": cancelled }),
@@ -2504,8 +2747,7 @@ fn handle_command(
                 .host
                 .fork(runtime, &entry_id, RpcForkPosition::Before)?;
             if !result.cancelled {
-                bridge.queues = Queues::new();
-                *bridge.queued_texts.lock().expect("rpc queued texts") = QueuedTexts::default();
+                rebind_session(runtime, bridge);
             }
             let mut data = serde_json::Map::new();
             if let Some(text) = result.selected_text {
@@ -2522,8 +2764,7 @@ fn handle_command(
             };
             let result = bridge.host.fork(runtime, &leaf_id, RpcForkPosition::At)?;
             if !result.cancelled {
-                bridge.queues = Queues::new();
-                *bridge.queued_texts.lock().expect("rpc queued texts") = QueuedTexts::default();
+                rebind_session(runtime, bridge);
             }
             Ok(CommandOutcome::Success(Some(
                 serde_json::json!({ "cancelled": result.cancelled }),
@@ -2590,6 +2831,26 @@ fn tree_node_json(node: &SessionTreeNode) -> Value {
     object
 }
 
+/// The shared `convertToLlm` seam (`sdk.ts:296-331`) with the `blockImages`
+/// value re-read on every call. Upstream checks `settingsManager.getBlockImages()`
+/// inside the wrapper, not once when the run is built, so a change between two
+/// provider requests is honored by the next one. The port's
+/// [`crate::images::block_images_converter`] captures a `bool`; this adapter
+/// wraps it over a shared atomic so the value is loaded per invocation. The
+/// converter is synchronous (the sync `Fn` impl of `ConvertToLlm`), so polling
+/// its already-ready future needs no nested executor.
+pub(crate) fn dynamic_block_images_converter(
+    flag: Arc<AtomicBool>,
+) -> Arc<dyn pi_agent::ConvertToLlm> {
+    Arc::new(move |messages: Vec<AgentMessage>| {
+        let enabled = flag.load(Ordering::Relaxed);
+        crate::images::block_images_converter(enabled)
+            .call(messages)
+            .now_or_never()
+            .unwrap_or_default()
+    })
+}
+
 /// One full agent run, events streamed to `output` as they happen.
 #[allow(clippy::too_many_lines)] // mirrors the TS run loop; split when extending
 fn run_agent_turn(
@@ -2598,7 +2859,7 @@ fn run_agent_turn(
     queues: &mut Queues,
     output: RpcOut,
     queued_texts: Arc<Mutex<QueuedTexts>>,
-    block_images: bool,
+    block_flag: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let executor = runtime.executor.clone();
     let specs: Vec<ToolSpec> = executor.tools();
@@ -2644,8 +2905,9 @@ fn run_agent_turn(
         prepare_request: None,
         prepare_next_turn: None,
         transform_context: runtime.transform_context(),
-        // Same `blockImages` convertToLlm seam as print/JSON (sdk.ts:296-331).
-        convert_to_llm: crate::images::block_images_converter(block_images),
+        // Same `blockImages` convertToLlm seam as print/JSON (sdk.ts:296-331),
+        // but re-read per call instead of capturing the startup value.
+        convert_to_llm: dynamic_block_images_converter(block_flag),
     };
 
     #[cfg(feature = "ext-js")]
@@ -2840,7 +3102,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::BufReader;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Condvar;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// A process pipe pair drives the bridge deterministically: the test
     /// writes lines on the writer side while the reader thread consumes.
@@ -3078,6 +3341,32 @@ mod tests {
         }
     }
 
+    /// Blocks its first provider call until the test opens the gate, so a
+    /// prompt worker stays in flight while another command is dispatched.
+    struct GatedStream {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        entered: Arc<AtomicBool>,
+        first: AtomicBool,
+        inner: TextScript,
+    }
+
+    impl pi_agent::types::StreamFn for GatedStream {
+        fn stream(
+            &self,
+            request: pi_agent::types::StreamRequest,
+        ) -> futures::stream::BoxStream<'static, pi_ai::types::AssistantMessageEvent> {
+            if !self.first.swap(false, Ordering::SeqCst) {
+                self.entered.store(true, Ordering::SeqCst);
+                let (lock, cv) = &*self.gate;
+                let mut open = lock.lock().expect("gate");
+                while !*open {
+                    open = cv.wait(open).expect("gate");
+                }
+            }
+            self.inner.stream(request)
+        }
+    }
+
     /// Captures the normalized messages the agent loop sends to the provider
     /// so a test can assert the `blockImages` convertToLlm filter ran.
     #[derive(Default)]
@@ -3237,13 +3526,23 @@ mod tests {
         fixture.write_line(r#"{"type":"extension_ui_response","id":"ui-9","value":"x"}"#);
         fixture.write_line(r#"{"type":"get_state","id":2}"#);
         let bridge = fixture.take_bridge();
-        let first = bridge.commands.recv().expect("command");
+        let first = bridge
+            .commands
+            .lock()
+            .expect("commands")
+            .recv()
+            .expect("command");
         assert!(first.contains(r#""type":"get_state""#));
-        let second = bridge.commands.recv().expect("command");
+        let second = bridge
+            .commands
+            .lock()
+            .expect("commands")
+            .recv()
+            .expect("command");
         assert!(second.contains(r#""id":2"#));
         drop(fixture.writer);
         assert!(
-            bridge.commands.recv().is_err(),
+            bridge.commands.lock().expect("commands").recv().is_err(),
             "stdin close ends the command stream"
         );
     }
@@ -4935,5 +5234,176 @@ mod tests {
                 .any(|block| matches!(block, pi_ai::types::InputContent::Image(_))),
             "image preserved when blocking is off: {passed:?}"
         );
+    }
+
+    /// Upstream fires `void handleInputLine(line)` per line (`:833`), so the
+    /// reader never waits for an in-flight prompt. The port's dispatch mirrors
+    /// that with one task per command behind a FIFO gate: a second command is
+    /// accepted and counted while the prompt's provider call is still blocked,
+    /// and the wire stays in input order when the gate opens.
+    #[test]
+    fn rpc_mode_accepts_overlapping_commands_in_fifo_order() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered = Arc::new(AtomicBool::new(false));
+        let stream = GatedStream {
+            gate: Arc::clone(&gate),
+            entered: Arc::clone(&entered),
+            first: AtomicBool::new(true),
+            inner: TextScript {
+                calls: AtomicUsize::new(0),
+            },
+        };
+        let runtime = test_runtime(dir.path(), Arc::new(stream));
+        let stats = Arc::clone(&fixture.bridge().dispatch_stats);
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        fixture.write_line(r#"{"type":"prompt","id":"p1","message":"first"}"#);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prompt never reached the provider"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // The prompt worker is still in its (blocked) provider call. A second
+        // line is read and dispatched anyway; both commands are now in flight.
+        fixture.write_line(r#"{"type":"get_state","id":"s1"}"#);
+        while stats.active() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second command never became in flight: {}",
+                stats.active()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            stats.max_active() >= 2,
+            "the dispatcher must overlap commands: {}",
+            stats.max_active()
+        );
+        assert!(
+            !fixture
+                .output_lines()
+                .iter()
+                .any(|line| line.contains(r#""id":"s1""#)),
+            "the FIFO gate holds the second response until the prompt retires"
+        );
+
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().expect("gate") = true;
+            cv.notify_all();
+        }
+        let lines = loop {
+            let lines = fixture.output_lines();
+            if lines.iter().any(|line| line.contains(r#""id":"s1""#)) {
+                break lines;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "state response never arrived: {lines:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        drop(fixture.writer);
+        mode.join();
+
+        let prompt = lines
+            .iter()
+            .position(|line| line.contains(r#""id":"p1""#))
+            .expect("prompt response");
+        let state = lines
+            .iter()
+            .position(|line| line.contains(r#""id":"s1""#))
+            .expect("state response");
+        assert!(prompt < state, "responses follow input order: {lines:?}");
+        assert_eq!(stats.started(), 2);
+        assert_eq!(stats.active(), 0, "both commands retired");
+    }
+
+    /// `sdk.ts:296-331` checks `getBlockImages()` inside `convertToLlm`, so the
+    /// flag is read on every call, not captured when the run is built. Flipping
+    /// the shared atomic between conversions must change the result.
+    #[test]
+    fn dynamic_block_images_converter_rereads_the_flag_per_call() {
+        use pi_ai::types::{ImageContent, InputContent, TextContent, UserContent, UserMessage};
+        let image = InputContent::Image(ImageContent {
+            data: "abc".to_string(),
+            mime_type: "image/png".to_string(),
+        });
+        let text = InputContent::Text(TextContent {
+            text: "hello".to_string(),
+            text_signature: None,
+        });
+        let message = AgentMessage::User(UserMessage {
+            content: UserContent::Blocks(vec![image, text]),
+            timestamp: 1,
+        });
+        let flag = Arc::new(AtomicBool::new(false));
+        let converter = dynamic_block_images_converter(Arc::clone(&flag));
+        let convert = || crate::runtime::block_on(converter.call(vec![message.clone()]));
+
+        let has_image = |messages: &[AgentMessage]| {
+            messages.iter().any(|message| match message {
+                AgentMessage::User(user) => match &user.content {
+                    UserContent::Blocks(blocks) => blocks
+                        .iter()
+                        .any(|block| matches!(block, InputContent::Image(_))),
+                    UserContent::Text(_) => false,
+                },
+                _ => false,
+            })
+        };
+        assert!(has_image(&convert()), "flag off: the image survives");
+        flag.store(true, Ordering::SeqCst);
+        let blocked = convert();
+        assert!(!has_image(&blocked), "flag on: the image is stripped");
+        let AgentMessage::User(user) = &blocked[0] else {
+            panic!("user message stays a user message");
+        };
+        let UserContent::Blocks(blocks) = &user.content else {
+            panic!("blocks stay blocks");
+        };
+        assert_eq!(
+            blocks[0].as_text(),
+            Some(crate::images::IMAGE_READING_DISABLED)
+        );
+        flag.store(false, Ordering::SeqCst);
+        assert!(
+            has_image(&convert()),
+            "flag off again: a fresh read takes effect"
+        );
+    }
+
+    /// The port's `rebindSession()` clears the queues of the replaced session's
+    /// `Agent` and rebinds the dialog surface. Called directly so the reset is
+    /// asserted without depending on a hosted session-manager fixture.
+    #[test]
+    fn rebind_session_resets_per_session_state() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        {
+            let bridge = fixture.bridge.as_mut().expect("bridge still in fixture");
+            bridge
+                .queues
+                .steer([pi_agent::transcript::user_message("queued", 1)]);
+            bridge
+                .queued_texts
+                .lock()
+                .expect("queued texts")
+                .steering
+                .push("queued".to_string());
+            rebind_session(&mut runtime, bridge);
+            assert!(!bridge.queues.has_items(), "steering queue reset");
+            let mirror = bridge.queued_texts.lock().expect("queued texts");
+            assert_eq!(mirror.steering.len(), 0);
+            assert_eq!(mirror.follow_up.len(), 0);
+        }
     }
 }

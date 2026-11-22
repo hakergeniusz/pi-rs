@@ -12,9 +12,13 @@
 //! [`crate::output_guard`] (the `core/output-guard.ts` port):
 //! `writeRawStdout` per line (`print-mode.ts:117`, `:132`) and
 //! `flushRawStdout` at the tail (`:180`) — the same visible byte stream
-//! for a non-aborted run.
+//! for a non-aborted run. The `blockImages` `convertToLlm` seam
+//! (`core/sdk.ts:296-331`) uses the shared per-call adapter from
+//! [`crate::modes::rpc::dynamic_block_images_converter`], so the setting is
+//! re-read on every conversion rather than captured at startup.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use pi_agent::agent_loop::AgentLoopConfig;
 use pi_agent::agent_message::AgentMessage;
@@ -395,7 +399,12 @@ pub fn run_json_mode(
         prepare_next_turn: None,
         transform_context: runtime.transform_context(),
         // Same `blockImages` convertToLlm seam as print/RPC (sdk.ts:296-331).
-        convert_to_llm: crate::images::block_images_converter(block_images),
+        // The shared adapter re-reads the flag on every conversion, like
+        // upstream's `settingsManager.getBlockImages()` check; JSON mode is
+        // single-shot so the flag is seeded once from the startup setting.
+        convert_to_llm: crate::modes::rpc::dynamic_block_images_converter(Arc::new(
+            AtomicBool::new(block_images),
+        )),
     };
 
     #[cfg(feature = "ext-js")]
