@@ -731,7 +731,10 @@ async fn stream_assistant_response(
     let final_message = match partial {
         Some(mut message) => {
             message.stop_reason = StopReason::Error;
-            message.error_message = Some("stream ended without a terminal event".to_string());
+            message.error_message = Some(format!(
+                "{} stream ended without a terminal event",
+                model.provider
+            ));
             message
         }
         None => AssistantMessage {
@@ -740,7 +743,10 @@ async fn stream_assistant_response(
             model: model.id.clone(),
             usage: Usage::default(),
             stop_reason: StopReason::Error,
-            error_message: Some("stream produced no events".to_string()),
+            error_message: Some(format!(
+                "{} stream ended without a terminal event",
+                model.provider
+            )),
             timestamp: now_millis(),
             ..empty_assistant_message()
         },
