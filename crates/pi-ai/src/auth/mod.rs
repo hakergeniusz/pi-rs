@@ -20,7 +20,9 @@
 //! - `oauth/github-copilot.ts` — domain/token helpers (`:42-88`), device flow
 //!   (`:207-305`), refresh/model catalogue (`:307-361`), login (`:428-501`),
 //!   `fetchWithRateLimitRetry`'s bounded 429 back-off (`:139-167`) and the
-//!   `toAuth` proxy base URL (`:494-500`).
+//!   `toAuth` proxy base URL (`:494-500`); `getGitHubCopilotBaseUrl`'s
+//!   token-proxy / enterprise fallback (`:70-88`) is exposed through
+//!   [`base_url_for_wire_credential`] so the wire path can carry it.
 //!
 //! Deviations (see `WIRING.md` at the worktree root):
 //! - The app-owned interaction callbacks become the concrete
@@ -531,11 +533,20 @@ pub fn to_auth(provider_id: &str, credential: &OAuthCredential) -> (String, Opti
     (credential.access.clone(), base_url)
 }
 
-/// The request base URL `toAuth` derives for Copilot from a bare wire token
-/// (`github-copilot.ts:68-88`, `:494-500`). Other providers return `None`
-/// (their model catalog carries the base URL).
+/// The request base URL `toAuth` derives for Copilot from a wire token plus
+/// the credential's `enterpriseUrl` (`github-copilot.ts:68-88`, `:494-500`):
+/// the token's `proxy-ep` wins, else the normalized enterprise domain supplies
+/// `https://copilot-api.<domain>`, else the individual endpoint. Other
+/// providers return `None` (their model catalog carries the base URL).
 #[must_use]
-pub fn base_url_for_wire_token(provider_id: &str, token: &str) -> Option<String> {
+pub fn base_url_for_wire_credential(
+    provider_id: &str,
+    token: &str,
+    enterprise_url: Option<&str>,
+) -> Option<String> {
+    if provider_id != "github-copilot" {
+        return None;
+    }
     to_auth(
         provider_id,
         &OAuthCredential {
@@ -543,11 +554,18 @@ pub fn base_url_for_wire_token(provider_id: &str, token: &str) -> Option<String>
             refresh: String::new(),
             expires: 0,
             account_id: None,
-            enterprise_url: None,
+            enterprise_url: enterprise_url.map(str::to_string),
             available_model_ids: Vec::new(),
         },
     )
     .1
+}
+
+/// [`base_url_for_wire_credential`] without an enterprise domain (the bare
+/// wire token case). Kept as the narrow upstream-shaped helper.
+#[must_use]
+pub fn base_url_for_wire_token(provider_id: &str, token: &str) -> Option<String> {
+    base_url_for_wire_credential(provider_id, token, None)
 }
 
 /// `Date.now()` in milliseconds — injected here so tests can assert expiry
@@ -648,6 +666,26 @@ mod tests {
             Some("https://api.acme.dev".to_string())
         );
         assert_eq!(base_url_for_wire_token("anthropic", "tok"), None);
+    }
+
+    /// The wire-path helper carries the enterprise fallback the bare-token
+    /// helper cannot know about (`github-copilot.ts:70-88`, `:494-500`).
+    #[test]
+    fn base_url_for_wire_credential_honors_the_enterprise_domain() {
+        assert_eq!(
+            base_url_for_wire_credential("github-copilot", "tok", Some("https://ghe.company.com/")),
+            Some("https://copilot-api.ghe.company.com".to_string())
+        );
+        // A token `proxy-ep` still wins over the enterprise fallback.
+        assert_eq!(
+            base_url_for_wire_credential(
+                "github-copilot",
+                "tid=1;proxy-ep=proxy.acme.dev;",
+                Some("ghe.company.com")
+            ),
+            Some("https://api.acme.dev".to_string())
+        );
+        assert_eq!(base_url_for_wire_credential("anthropic", "tok", None), None);
     }
 
     #[tokio::test]

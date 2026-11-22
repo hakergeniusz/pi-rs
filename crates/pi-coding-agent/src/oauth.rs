@@ -28,7 +28,11 @@
 //!   (`:119-155`, double-checked under the store lock, returning nothing when
 //!   logged out / throwing `ModelsError("oauth", "OAuth refresh failed for
 //!   <provider>")` on failure), then derives the wire auth with `toAuth`
-//!   (`:186-190`). The refresh wait is bounded by
+//!   (`:186-190`). The typed failure is carried to the wire ladder by
+//!   [`OAuthRefreshOutcome`]; the legacy `Option` seam stays as a wrapper.
+//!   `toAuth`'s Copilot base URL (`github-copilot.ts:494-500`) is carried by
+//!   `wire_auth_for_stored` and re-derived at the stream seam by
+//!   [`wire_base_url`]. The refresh wait is bounded by
 //!   `DEFAULT_OAUTH_REFRESH_TIMEOUT_MS` (`:103`, fifteen seconds).
 //! - `auth/helpers.ts` — `envApiKeyAuth` (`:8-33`) is the standard
 //!   stored-key-then-env-var API-key auth with a secret-prompt login;
@@ -1188,24 +1192,65 @@ fn run_builtin_refresh(
     }
 }
 
+/// The observable outcome of `resolveStoredOAuth`'s refresh
+/// (`auth/resolve.ts:119-191`): the credential to put on the wire, an honest
+/// "unavailable" (logged out meanwhile, no ported flow, or another process
+/// refreshed under the lock), or the typed `ModelsError` upstream throws on a
+/// real refresh failure (`:143,147`). The wire ladder surfaces the latter;
+/// `refresh_stored_oauth` keeps the legacy `Option` view for unchanged
+/// callers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OAuthRefreshOutcome {
+    /// The credential the request should use (fresh or rotated).
+    Credential(Credential),
+    /// No wire credential, but not an error: logged out / no ported flow /
+    /// already refreshed elsewhere.
+    Unavailable,
+    /// Upstream's typed refresh failure.
+    Failed(ModelsError),
+}
+
+impl OAuthRefreshOutcome {
+    /// The legacy `Option` seam: upstream's "no stale token, no env fallback"
+    /// posture collapses both unavailability and failure to `None`.
+    #[must_use]
+    pub fn credential(self) -> Option<Credential> {
+        match self {
+            Self::Credential(credential) => Some(credential),
+            Self::Unavailable | Self::Failed(_) => None,
+        }
+    }
+}
+
 /// The wire-ladder refresh hook (`resolve_wire_credential_composed`'s seam —
 /// [`crate::modes::print_mode::resolve_wire_credential_composed`]): refresh a
 /// stored OAuth credential when it is about to expire, persisting the rotated
-/// token under the store lock, and return the credential the request should
-/// use.
+/// token under the store lock. A credential that logged out meanwhile or a
+/// failed refresh yields no wire credential; a still-valid credential is
+/// returned unchanged without I/O.
 ///
-/// Failure semantics mirror upstream: a credential that logged out meanwhile
-/// or a failed refresh resolves to `None` (no raw/stale token is used, and no
-/// env fallback follows). Providers without a ported built-in flow cannot be
-/// renewed — an expired token for one resolves to nothing rather than going
-/// out stale. A still-valid credential is returned unchanged without I/O.
+/// Compatibility wrapper for callers that only need the `Option` view. New
+/// callers should use [`refresh_stored_oauth_checked`] to surface
+/// [`ModelsError`] instead of collapsing every failure to "no API key".
 #[must_use]
 pub fn refresh_stored_oauth(
     provider: &str,
     credential: &Credential,
     auth_path: &Path,
 ) -> Option<Credential> {
-    refresh_stored_oauth_with_flow(
+    refresh_stored_oauth_checked(provider, credential, auth_path).credential()
+}
+
+/// [`refresh_stored_oauth`] with the typed failure preserved, so the wire
+/// ladder can surface upstream's `ModelsError("oauth", "OAuth refresh failed
+/// for <provider>")` instead of a generic "no API key found".
+#[must_use]
+pub fn refresh_stored_oauth_checked(
+    provider: &str,
+    credential: &Credential,
+    auth_path: &Path,
+) -> OAuthRefreshOutcome {
+    refresh_stored_oauth_checked_with_flow(
         provider,
         credential,
         auth_path,
@@ -1213,14 +1258,14 @@ pub fn refresh_stored_oauth(
     )
 }
 
-/// [`refresh_stored_oauth`] with pi-ai's flow endpoints injected, so tests can
-/// drive the real refresh against a synthetic loopback server.
-fn refresh_stored_oauth_with_flow(
+/// [`refresh_stored_oauth_checked`] with pi-ai's flow endpoints injected, so
+/// tests can drive the real refresh against a synthetic loopback server.
+fn refresh_stored_oauth_checked_with_flow(
     provider: &str,
     credential: &Credential,
     auth_path: &Path,
     config: &pi_ai::auth::FlowConfig,
-) -> Option<Credential> {
+) -> OAuthRefreshOutcome {
     let is_fresh = || match credential {
         Credential::Oauth { expires, .. } => !oauth_expires_soon(*expires, pi_ai::auth::now_ms()),
         Credential::ApiKey { .. } => true,
@@ -1231,41 +1276,96 @@ fn refresh_stored_oauth_with_flow(
     // honest upstream-shaped error and cannot renew an expired token.
     if !pi_ai::auth::is_builtin_oauth_provider(provider) {
         return if is_fresh() {
-            Some(credential.clone())
+            OAuthRefreshOutcome::Credential(credential.clone())
         } else {
-            None
+            OAuthRefreshOutcome::Unavailable
         };
     }
     // The optimistic check (upstream's first `expiresSoon` at
     // `auth/resolve.ts:173`); the authoritative one runs under the lock.
     if is_fresh() {
-        return Some(credential.clone());
+        return OAuthRefreshOutcome::Credential(credential.clone());
     }
     let storage = crate::auth::AuthStorage::create(auth_path);
-    let post = storage
-        .modify(provider, |current| {
-            let Some(Credential::Oauth {
-                access,
-                refresh,
-                expires,
-                unknown,
-            }) = current
-            else {
-                return Ok(None); // logged out meanwhile
-            };
-            if oauth_expires_soon(expires, pi_ai::auth::now_ms()) {
-                let pi = stored_oauth_to_pi(&access, &refresh, expires, &unknown);
-                let refreshed = run_builtin_refresh(provider, &pi, config)?;
-                Ok(Some(credential_from_pi(refreshed)))
-            } else {
-                Ok(None) // another process/request refreshed already
-            }
-        })
-        .ok()?;
+    let post = storage.modify(provider, |current| {
+        let Some(Credential::Oauth {
+            access,
+            refresh,
+            expires,
+            unknown,
+        }) = current
+        else {
+            return Ok(None); // logged out meanwhile
+        };
+        if oauth_expires_soon(expires, pi_ai::auth::now_ms()) {
+            let pi = stored_oauth_to_pi(&access, &refresh, expires, &unknown);
+            let refreshed = run_builtin_refresh(provider, &pi, config)?;
+            Ok(Some(credential_from_pi(refreshed)))
+        } else {
+            Ok(None) // another process/request refreshed already
+        }
+    });
     match post {
-        Some(credential @ Credential::Oauth { .. }) => Some(credential),
-        _ => None,
+        // The closure's only `Err` is a failed refresh; surface it as the
+        // typed upstream error (`auth/resolve.ts:142-144`).
+        Err(crate::auth::AuthError::Callback(cause)) => {
+            OAuthRefreshOutcome::Failed(ModelsError::oauth_refresh_failed(provider, Some(cause)))
+        }
+        Err(error) => OAuthRefreshOutcome::Failed(ModelsError::credential_store_failed(
+            provider,
+            Some(error.to_string()),
+        )),
+        Ok(Some(credential @ Credential::Oauth { .. })) => {
+            OAuthRefreshOutcome::Credential(credential)
+        }
+        Ok(_) => OAuthRefreshOutcome::Unavailable,
     }
+}
+
+/// Derive the wire auth from a stored credential with `toAuth`
+/// (`github-copilot.ts:494-500`): the access token plus the request base URL
+/// (Copilot's proxy/enterprise endpoint, `None` elsewhere). The
+/// provider-specific fields in `unknown` (notably `enterpriseUrl`) reach
+/// `toAuth` so the enterprise fallback is preserved after a refresh.
+#[must_use]
+pub(crate) fn wire_auth_for_stored(
+    provider: &str,
+    credential: &Credential,
+) -> (String, Option<String>) {
+    match credential {
+        Credential::Oauth {
+            access,
+            refresh,
+            expires,
+            unknown,
+        } => pi_ai::auth::to_auth(
+            provider,
+            &stored_oauth_to_pi(access, refresh, *expires, unknown),
+        ),
+        Credential::ApiKey { key, .. } => (key.clone().unwrap_or_default(), None),
+    }
+}
+
+/// The request base URL to apply at the stream seam for a wire token
+/// (`github-copilot.ts:70-88`, `:494-500`). `PrintRuntime` carries only the
+/// token, so the enterprise domain the credential stores is recovered from
+/// the (already rotated, if refreshed) stored credential. Non-Copilot
+/// credentials carry no derived base URL and are left untouched.
+#[must_use]
+pub fn wire_base_url(provider: &str, token: &str, auth_path: &Path) -> Option<String> {
+    if provider != "github-copilot" {
+        return None;
+    }
+    let enterprise_url = read_stored_credential(provider, auth_path).and_then(|credential| {
+        let Credential::Oauth { unknown, .. } = credential else {
+            return None;
+        };
+        unknown
+            .get("enterpriseUrl")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    });
+    pi_ai::auth::base_url_for_wire_credential(provider, token, enterprise_url.as_deref())
 }
 
 #[cfg(test)]
@@ -2039,8 +2139,10 @@ mod tests {
             ..pi_ai::auth::FlowConfig::default()
         };
         let stored = read_stored_credential("anthropic", &path).expect("stored credential");
-        let refreshed = refresh_stored_oauth_with_flow("anthropic", &stored, &path, &config)
-            .expect("refreshed credential");
+        let refreshed =
+            refresh_stored_oauth_checked_with_flow("anthropic", &stored, &path, &config)
+                .credential()
+                .expect("refreshed credential");
         let Credential::Oauth {
             access,
             refresh,
@@ -2060,6 +2162,86 @@ mod tests {
             refreshed
         );
         server.join().expect("token server thread");
+        drop(dir);
+    }
+
+    /// A failed refresh carries upstream's typed `ModelsError` to the wire
+    /// ladder instead of collapsing into a generic "no API key" outcome:
+    /// `ModelsError("oauth", "OAuth refresh failed for <provider>")` with the
+    /// flow error kept as the cause (`auth/resolve.ts:142-144`).
+    #[test]
+    fn failed_refresh_reports_the_typed_models_error() {
+        let (dir, path) = auth_path(&json!({
+            "anthropic": {"type": "oauth", "access": "stale", "refresh": "old-refresh", "expires": 0i64},
+        }));
+        // A deterministic loopback failure: 200 with a non-JSON body makes
+        // pi-ai's Anthropic refresh fail at the parse step.
+        let (base, server) = fake_token_server("not-json");
+        let config = pi_ai::auth::FlowConfig {
+            anthropic: pi_ai::auth::EndpointConfig {
+                token_url: format!("{base}/token"),
+                ..pi_ai::auth::EndpointConfig::default()
+            },
+            ..pi_ai::auth::FlowConfig::default()
+        };
+        let stored = read_stored_credential("anthropic", &path).expect("stored credential");
+        let outcome = refresh_stored_oauth_checked_with_flow("anthropic", &stored, &path, &config);
+        let OAuthRefreshOutcome::Failed(error) = outcome else {
+            panic!("expected a typed failure, got {outcome:?}");
+        };
+        assert_eq!(error.kind, "oauth");
+        assert_eq!(error.message, "OAuth refresh failed for anthropic");
+        assert_eq!(error.to_string(), "OAuth refresh failed for anthropic");
+        assert!(
+            error
+                .cause
+                .as_deref()
+                .is_some_and(|cause| cause.contains("invalid JSON"))
+        );
+        // The legacy seam still reports "nothing on failure".
+        let stored = read_stored_credential("anthropic", &path).expect("stored credential");
+        assert_eq!(
+            refresh_stored_oauth_checked_with_flow("anthropic", &stored, &path, &config)
+                .credential(),
+            None
+        );
+        server.join().expect("token server thread");
+        drop(dir);
+    }
+
+    /// `toAuth`'s derived base URL rides the wire credential, and the stream
+    /// seam re-derives it from the wire token plus the stored enterprise URL
+    /// (`github-copilot.ts:70-88`, `:494-500`). Other providers carry none.
+    #[test]
+    fn wire_auth_carries_the_copilot_base_url() {
+        let copilot = Credential::Oauth {
+            access: "tid=1;proxy-ep=proxy.individual.githubcopilot.com;".to_string(),
+            refresh: "r".to_string(),
+            expires: 0,
+            unknown: serde_json::Map::new(),
+        };
+        let (key, base_url) = wire_auth_for_stored("github-copilot", &copilot);
+        assert_eq!(key, "tid=1;proxy-ep=proxy.individual.githubcopilot.com;");
+        assert_eq!(
+            base_url.as_deref(),
+            Some("https://api.individual.githubcopilot.com")
+        );
+        assert_eq!(wire_auth_for_stored("anthropic", &copilot).1, None);
+
+        let (dir, path) = auth_path(&json!({
+            "github-copilot": {
+                "type": "oauth",
+                "access": "tok",
+                "refresh": "r",
+                "expires": 9_000_000_000_000i64,
+                "enterpriseUrl": "https://ghe.company.com/",
+            },
+        }));
+        assert_eq!(
+            wire_base_url("github-copilot", "tok", &path).as_deref(),
+            Some("https://copilot-api.ghe.company.com")
+        );
+        assert_eq!(wire_base_url("anthropic", "tok", &path), None);
         drop(dir);
     }
 }

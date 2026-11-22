@@ -9,6 +9,16 @@
 //! `writeRawStdout` (`:158`) and the `flushRawStdout` tail (`:180`);
 //! JSON event output lives in `modes/json_event.rs` (P5). `@file`
 //! attachments are handled (`cli/file-processor.ts`).
+//!
+//! The credential ladder keeps its `Option`-returning entry points for the
+//! existing hosts, but the OAuth refresh seam now carries upstream's typed
+//! `ModelsError` (`auth/resolve.ts:142-147`) through
+//! [`resolve_wire_credential_checked`]: a failed refresh surfaces
+//! `OAuth refresh failed for <provider>` instead of collapsing to "no API
+//! key". `toAuth`'s per-credential `baseUrl` (`github-copilot.ts:494-500`) is
+//! carried in [`WireCredentialResolution::base_url`] and applied to the model
+//! at the stream seam (`model_with_wire_base_url`), so Copilot's proxy /
+//! enterprise endpoint actually reaches the provider adapter.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -462,6 +472,19 @@ impl pi_agent::types::StreamFn for ProviderStreamFn {
             .filter_map(AgentMessage::to_llm_message)
             .collect();
         let context = pi_ai::types::TranscriptContext { messages };
+        // The wire token carries `toAuth`'s derived base URL for Copilot;
+        // apply it where the provider stream is dispatched so the adapter
+        // actually requests the proxy / enterprise endpoint.
+        let provider = request.model.provider.clone();
+        let model = model_with_wire_base_url(
+            request.model,
+            &provider,
+            request
+                .access_token
+                .as_deref()
+                .or(request.api_key.as_deref()),
+            &crate::config::get_auth_path(),
+        );
         let options = pi_ai::types::StreamOptions {
             api_key: request.api_key,
             access_token: request.access_token,
@@ -477,7 +500,7 @@ impl pi_agent::types::StreamFn for ProviderStreamFn {
             session_id: request.session_id,
             ..pi_ai::types::StreamOptions::default()
         };
-        let event_stream = (self.0)(&request.model, &context, &options);
+        let event_stream = (self.0)(&model, &context, &options);
         Box::pin(event_stream)
     }
 }
@@ -694,6 +717,33 @@ pub enum WireCredential {
     AccessToken(String),
 }
 
+/// The ladder's full result: the wire credential, its source label, and the
+/// request base URL `toAuth` derives from the credential
+/// (`github-copilot.ts:494-500`). `base_url` is `None` for every non-Copilot
+/// credential — those models use the URL from the catalog — and for
+/// extension-OAuth keys, whose handler owns the whole wire shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireCredentialResolution {
+    pub credential: WireCredential,
+    pub source: &'static str,
+    pub base_url: Option<String>,
+}
+
+impl WireCredentialResolution {
+    fn new(credential: WireCredential, source: &'static str) -> Self {
+        Self {
+            credential,
+            source,
+            base_url: None,
+        }
+    }
+
+    /// The legacy `(credential, source)` view for the unchanged hosts.
+    fn pair(self) -> (WireCredential, &'static str) {
+        (self.credential, self.source)
+    }
+}
+
 /// The auth ladder for one request (`providers/anthropic.ts:30-45` and
 /// friends, composed through `auth/resolve.ts:33-93` and
 /// `provider-composer.ts:422-511`): the `--api-key` flag (the port's runtime
@@ -713,11 +763,29 @@ pub fn resolve_wire_credential(
     flag_key: Option<&str>,
     auth_path: &Path,
 ) -> Option<(WireCredential, &'static str)> {
+    // The typed result is the production seam; this is the compatibility
+    // wrapper for hosts that only consume the credential.
+    resolve_wire_credential_checked(provider, flag_key, auth_path)
+        .ok()
+        .flatten()
+        .map(WireCredentialResolution::pair)
+}
+
+/// [`resolve_wire_credential`] with the typed OAuth failure preserved. A
+/// failed refresh returns upstream's `ModelsError("oauth", "OAuth refresh
+/// failed for <provider>")` (`auth/resolve.ts:142-144`) instead of `None`, so
+/// callers can surface the specific error; ordinary "unconfigured" outcomes
+/// stay `Ok(None)`.
+pub fn resolve_wire_credential_checked(
+    provider: &str,
+    flag_key: Option<&str>,
+    auth_path: &Path,
+) -> Result<Option<WireCredentialResolution>, crate::oauth::ModelsError> {
     // The composed config layers (`model-runtime.ts`'s `this.config` and
     // `extensionProviders`); `None` before a refresh — the engine-free shape.
     let config = crate::models_state::models_json_provider(provider);
     let extension = crate::models_state::extension_provider_config(provider);
-    resolve_wire_credential_composed(
+    resolve_wire_credential_checked_composed(
         provider,
         flag_key,
         auth_path,
@@ -726,8 +794,23 @@ pub fn resolve_wire_credential(
     )
 }
 
-/// [`resolve_wire_credential`] over explicit config layers (the tests' seam;
-/// the production path reads the composed snapshots).
+/// [`resolve_wire_credential_checked`] over explicit config layers (the
+/// tests' seam; the production path reads the composed snapshots).
+fn resolve_wire_credential_checked_composed(
+    provider: &str,
+    flag_key: Option<&str>,
+    auth_path: &Path,
+    config: Option<&crate::models_config::ModelsJsonProvider>,
+    extension: Option<&crate::models_config::ExtensionProviderConfig>,
+) -> Result<Option<WireCredentialResolution>, crate::oauth::ModelsError> {
+    let refresh = |provider: &str, credential: &Credential, auth_path: &Path| {
+        crate::oauth::refresh_stored_oauth_checked(provider, credential, auth_path)
+    };
+    resolve_wire_credential_checked_with(provider, flag_key, auth_path, config, extension, &refresh)
+}
+
+/// [`resolve_wire_credential_composed`] over explicit config layers (the
+/// tests' seam; the production path reads the composed snapshots).
 pub fn resolve_wire_credential_composed(
     provider: &str,
     flag_key: Option<&str>,
@@ -745,10 +828,11 @@ pub fn resolve_wire_credential_composed(
     )
 }
 
-/// [`resolve_wire_credential_composed`] with the OAuth refresh hook injected.
-/// Production passes [`crate::oauth::refresh_stored_oauth`] (pi-ai's built-in
-/// flows); tests pass a synthetic hook so the expiry/failure ladder can be
-/// exercised without a network round-trip.
+/// [`resolve_wire_credential_composed`] with the `Option`-returning OAuth
+/// refresh hook injected. Production passes
+/// [`crate::oauth::refresh_stored_oauth`]; tests pass a synthetic hook so the
+/// expiry/failure ladder can be exercised without a network round-trip. The
+/// typed result is available through [`resolve_wire_credential_checked_with`].
 fn resolve_wire_credential_composed_with(
     provider: &str,
     flag_key: Option<&str>,
@@ -757,6 +841,31 @@ fn resolve_wire_credential_composed_with(
     extension: Option<&crate::models_config::ExtensionProviderConfig>,
     refresh: &dyn Fn(&str, &Credential, &Path) -> Option<Credential>,
 ) -> Option<(WireCredential, &'static str)> {
+    let checked = |provider: &str, credential: &Credential, auth_path: &Path| match refresh(
+        provider, credential, auth_path,
+    ) {
+        Some(credential) => crate::oauth::OAuthRefreshOutcome::Credential(credential),
+        None => crate::oauth::OAuthRefreshOutcome::Unavailable,
+    };
+    resolve_wire_credential_checked_with(provider, flag_key, auth_path, config, extension, &checked)
+        .ok()
+        .flatten()
+        .map(WireCredentialResolution::pair)
+}
+
+/// The ladder's core with the typed OAuth refresh hook injected. Production
+/// passes [`crate::oauth::refresh_stored_oauth_checked`]; tests pass a
+/// synthetic outcome so both the failure text and the expiry ladder can be
+/// checked without a network round-trip.
+fn resolve_wire_credential_checked_with(
+    provider: &str,
+    flag_key: Option<&str>,
+    auth_path: &Path,
+    config: Option<&crate::models_config::ModelsJsonProvider>,
+    extension: Option<&crate::models_config::ExtensionProviderConfig>,
+    refresh: &dyn Fn(&str, &Credential, &Path) -> crate::oauth::OAuthRefreshOutcome,
+) -> Result<Option<WireCredentialResolution>, crate::oauth::ModelsError> {
+    use crate::oauth::OAuthRefreshOutcome;
     let methods = crate::oauth::provider_auth_methods(provider, config, extension);
     let has_api_key = methods
         .iter()
@@ -771,7 +880,10 @@ fn resolve_wire_credential_composed_with(
     // (`resolve.ts:56-68`); the port keeps the unconditional P4 behavior
     // because the flag is the runtime layer here, not a request override.
     if let Some(key) = flag_key {
-        return Some((WireCredential::ApiKey(key.to_string()), "--api-key"));
+        return Ok(Some(WireCredentialResolution::new(
+            WireCredential::ApiKey(key.to_string()),
+            "--api-key",
+        )));
     }
     if let Some(credential) = auth::read_stored_credential(provider, auth_path) {
         match &credential {
@@ -779,13 +891,16 @@ fn resolve_wire_credential_composed_with(
                 // A stored API key for an OAuth-only provider resolves to
                 // nothing — no env fallback (`resolve.ts:82-86`).
                 if !has_api_key {
-                    return None;
+                    return Ok(None);
                 }
                 if let Some(resolved) = key
                     .as_deref()
                     .and_then(|key| auth::resolve_config_value(key, env.as_ref()))
                 {
-                    return Some((WireCredential::ApiKey(resolved), "stored credential"));
+                    return Ok(Some(WireCredentialResolution::new(
+                        WireCredential::ApiKey(resolved),
+                        "stored credential",
+                    )));
                 }
                 // An unresolvable stored template falls through to the env
                 // loop inside `envApiKeyAuth.resolve` (`helpers.ts:21-29`).
@@ -794,7 +909,7 @@ fn resolve_wire_credential_composed_with(
                 // A stored OAuth credential for a provider without OAuth
                 // auth resolves to nothing (`resolve.ts:72-86`).
                 if !has_oauth {
-                    return None;
+                    return Ok(None);
                 }
                 // Extension oauth providers resolve the wire key through
                 // the stashed `getApiKey(credential)` (`adaptOAuth`'s
@@ -808,37 +923,47 @@ fn resolve_wire_credential_composed_with(
                         && let Some(key) =
                             crate::models_state::extension_oauth_api_key(provider, &credential_json)
                     {
-                        return Some((WireCredential::ApiKey(key), "stored credential"));
+                        return Ok(Some(WireCredentialResolution::new(
+                            WireCredential::ApiKey(key),
+                            "stored credential",
+                        )));
                     }
                     // The handler is gone (engine reset) or failed: the
                     // provider reports unconfigured rather than falling
                     // back to the raw token.
-                    return None;
+                    return Ok(None);
                 }
                 // Upstream's `resolveStoredOAuth` (`auth/resolve.ts:157-191`)
                 // refreshes a token inside the five-minute window before
                 // deriving `toAuth`. The hook refreshes built-in credentials
                 // through pi-ai and persists the rotated token; a failed
                 // refresh (or a logged-out credential) resolves to nothing —
-                // no stale token and no env fallback. Extension oauth (above)
-                // keeps its own handler-derived key.
-                let effective = refresh(provider, &credential, auth_path)?;
-                let Credential::Oauth { access, .. } = &effective else {
-                    return None;
+                // no stale token and no env fallback — but the typed failure
+                // is threaded out for callers that can surface it. Extension
+                // oauth (above) keeps its own handler-derived key.
+                let effective = match refresh(provider, &credential, auth_path) {
+                    OAuthRefreshOutcome::Credential(credential) => credential,
+                    OAuthRefreshOutcome::Unavailable => return Ok(None),
+                    OAuthRefreshOutcome::Failed(error) => return Err(error),
                 };
-                // The built-in OAuth flows hand the access token to the
-                // request through `toAuth`: most providers yield
-                // `auth.apiKey` (the provider's standard key header —
-                // `x-api-key` for anthropic,
+                // `toAuth` hands the built-in flows' access token to the
+                // request: most providers yield `auth.apiKey` (the provider's
+                // standard key header — `x-api-key` for anthropic,
                 // `auth/oauth/anthropic.ts:304-306`); kimi-coding yields an
                 // explicit Bearer header
-                // (`auth/oauth/kimi-coding.ts:275-277`).
+                // (`auth/oauth/kimi-coding.ts:275-277`). Copilot's derived
+                // proxy/enterprise base URL rides alongside it.
+                let (key, base_url) = crate::oauth::wire_auth_for_stored(provider, &effective);
                 let wire = if provider == "kimi-coding" {
-                    WireCredential::AccessToken(access.clone())
+                    WireCredential::AccessToken(key)
                 } else {
-                    WireCredential::ApiKey(access.clone())
+                    WireCredential::ApiKey(key)
                 };
-                return Some((wire, "stored credential"));
+                return Ok(Some(WireCredentialResolution {
+                    credential: wire,
+                    source: "stored credential",
+                    base_url,
+                }));
             }
         }
     }
@@ -850,7 +975,9 @@ fn resolve_wire_credential_composed_with(
         .and_then(|extension| extension.api_key.as_deref())
         .or_else(|| config.and_then(|config| config.api_key.as_deref()));
     if let Some(raw_key) = raw_key {
-        let resolved = auth::resolve_config_value(raw_key, None)?;
+        let Some(resolved) = auth::resolve_config_value(raw_key, None) else {
+            return Ok(None);
+        };
         let source = if crate::oauth::api_key_auth_name(provider).is_some() {
             // The inherited `envApiKeyAuth.resolve` sees the configured key
             // as a stored credential (`helpers.ts:21-23`).
@@ -858,10 +985,13 @@ fn resolve_wire_credential_composed_with(
         } else {
             "configured API key"
         };
-        return Some((WireCredential::ApiKey(resolved), source));
+        return Ok(Some(WireCredentialResolution::new(
+            WireCredential::ApiKey(resolved),
+            source,
+        )));
     }
     if !has_api_key {
-        return None;
+        return Ok(None);
     }
     for variable in env_key_candidates(provider) {
         if let Ok(value) = std::env::var(variable) {
@@ -876,10 +1006,29 @@ fn resolve_wire_credential_composed_with(
             } else {
                 WireCredential::ApiKey(value)
             };
-            return Some((wire, "environment"));
+            return Ok(Some(WireCredentialResolution::new(wire, "environment")));
         }
     }
-    None
+    Ok(None)
+}
+
+/// Apply `toAuth`'s per-credential base URL to the model at the stream seam
+/// (`github-copilot.ts:494-500`). `PrintRuntime` carries only the wire token,
+/// so [`crate::oauth::wire_base_url`] re-derives the Copilot proxy / enterprise
+/// endpoint from it plus the stored `enterpriseUrl`; every other provider —
+/// and a Copilot credential without a derived URL — keeps its catalog URL.
+fn model_with_wire_base_url(
+    mut model: Model,
+    provider: &str,
+    token: Option<&str>,
+    auth_path: &Path,
+) -> Model {
+    if let Some(token) = token
+        && let Some(base_url) = crate::oauth::wire_base_url(provider, token, auth_path)
+    {
+        model.base_url = base_url;
+    }
+    model
 }
 
 /// API-key-only view of [`resolve_wire_credential`] (P4 callers and tests).
@@ -1353,6 +1502,153 @@ mod tests {
                 &refresh,
             ),
             None
+        );
+        drop(dir);
+    }
+
+    /// A failed refresh reaches the wire ladder as upstream's typed
+    /// `ModelsError` (`auth/resolve.ts:142-144`), with the exact text and
+    /// cause a caller can surface; the legacy `Option` seam still says
+    /// "unconfigured".
+    #[test]
+    fn failed_refresh_surfaces_the_typed_models_error() {
+        let (dir, auth_path) = oauth_auth_path("anthropic", "stale", 0);
+        let failed = |_: &str, _: &Credential, _: &Path| {
+            crate::oauth::OAuthRefreshOutcome::Failed(
+                crate::oauth::ModelsError::oauth_refresh_failed(
+                    "anthropic",
+                    Some("token endpoint returned 500".to_string()),
+                ),
+            )
+        };
+        let error = resolve_wire_credential_checked_with(
+            "anthropic",
+            None,
+            &auth_path,
+            None,
+            None,
+            &failed,
+        )
+        .expect_err("typed refresh failure");
+        assert_eq!(error.kind, "oauth");
+        assert_eq!(error.to_string(), "OAuth refresh failed for anthropic");
+        assert_eq!(error.cause.as_deref(), Some("token endpoint returned 500"));
+
+        // The unchanged `Option` caller sees "nothing" instead of the error.
+        let legacy = |_: &str, _: &Credential, _: &Path| -> Option<Credential> { None };
+        assert_eq!(
+            resolve_wire_credential_composed_with(
+                "anthropic",
+                None,
+                &auth_path,
+                None,
+                None,
+                &legacy,
+            ),
+            None
+        );
+        drop(dir);
+    }
+
+    /// A refreshed Copilot credential carries `toAuth`'s derived proxy /
+    /// enterprise base URL through the wire credential, while non-Copilot
+    /// credentials carry none (`github-copilot.ts:494-500`).
+    #[test]
+    fn oauth_refresh_carries_the_derived_base_url() {
+        let (dir, auth_path) = oauth_auth_path("github-copilot", "stale", 0);
+        let refreshed = |_: &str, _: &Credential, _: &Path| {
+            let mut unknown = serde_json::Map::new();
+            unknown.insert(
+                "enterpriseUrl".to_string(),
+                serde_json::json!("https://ghe.company.com/"),
+            );
+            crate::oauth::OAuthRefreshOutcome::Credential(Credential::Oauth {
+                access: "fresh".to_string(),
+                refresh: "r2".to_string(),
+                expires: pi_ai::auth::now_ms() + 60 * 60 * 1000,
+                unknown,
+            })
+        };
+        let resolution = resolve_wire_credential_checked_with(
+            "github-copilot",
+            None,
+            &auth_path,
+            None,
+            None,
+            &refreshed,
+        )
+        .expect("no typed error")
+        .expect("credential");
+        assert_eq!(
+            resolution.credential,
+            WireCredential::ApiKey("fresh".to_string())
+        );
+        assert_eq!(
+            resolution.base_url.as_deref(),
+            Some("https://copilot-api.ghe.company.com")
+        );
+
+        let (dir2, auth_path2) = oauth_auth_path("anthropic", "stale", 0);
+        let anthropic = |_: &str, _: &Credential, _: &Path| {
+            crate::oauth::OAuthRefreshOutcome::Credential(Credential::Oauth {
+                access: "fresh".to_string(),
+                refresh: "r2".to_string(),
+                expires: pi_ai::auth::now_ms() + 60 * 60 * 1000,
+                unknown: serde_json::Map::new(),
+            })
+        };
+        let plain = resolve_wire_credential_checked_with(
+            "anthropic",
+            None,
+            &auth_path2,
+            None,
+            None,
+            &anthropic,
+        )
+        .expect("no typed error")
+        .expect("credential");
+        assert_eq!(plain.base_url, None);
+        drop(dir);
+        drop(dir2);
+    }
+
+    /// The stream seam applies the derived base URL to the model the provider
+    /// adapter sees, and leaves non-Copilot models untouched.
+    #[test]
+    fn stream_model_uses_the_derived_base_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            serde_json::to_string(&serde_json::json!({
+                "github-copilot": {
+                    "type": "oauth",
+                    "access": "tok",
+                    "refresh": "r",
+                    "expires": 9_000_000_000_000i64,
+                    "enterpriseUrl": "ghe.company.com",
+                },
+            }))
+            .expect("json"),
+        )
+        .expect("write auth.json");
+        let model = Model {
+            provider: "github-copilot".to_string(),
+            base_url: "https://api.githubcopilot.com".to_string(),
+            ..Model::default()
+        };
+        let applied =
+            model_with_wire_base_url(model.clone(), "github-copilot", Some("tok"), &auth_path);
+        assert_eq!(applied.base_url, "https://copilot-api.ghe.company.com");
+        // No token: the catalog URL stands.
+        assert_eq!(
+            model_with_wire_base_url(model.clone(), "github-copilot", None, &auth_path).base_url,
+            "https://api.githubcopilot.com"
+        );
+        // A non-Copilot provider never gets a derived URL.
+        assert_eq!(
+            model_with_wire_base_url(model, "anthropic", Some("tok"), &auth_path).base_url,
+            "https://api.githubcopilot.com"
         );
         drop(dir);
     }
