@@ -1717,9 +1717,9 @@ impl Component for SettingsSelectorComponent {
     fn render(&self, width: usize) -> Vec<String> {
         let border = DynamicBorder::new();
         let mut lines = Vec::new();
-        lines.extend(border.render(0));
+        lines.extend(border.render(width));
         lines.extend(self.settings_list.render(width));
-        lines.extend(border.render(0));
+        lines.extend(border.render(width));
         lines
     }
 
@@ -1854,6 +1854,18 @@ mod tests {
             }
         }
         labels
+    }
+
+    #[test]
+    fn render_draws_full_width_borders_above_and_below_the_list() {
+        let selector = SettingsSelectorComponent::new(&config(), queue());
+        let width = 80;
+        let lines = selector.render(width);
+        let rule = "─".repeat(width);
+        for line in [lines.first(), lines.last()] {
+            let text = line.expect("border line");
+            assert!(text.contains(&rule), "expected full-width border: {text:?}");
+        }
     }
 
     #[test]
