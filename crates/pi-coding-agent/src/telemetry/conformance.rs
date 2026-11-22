@@ -507,8 +507,14 @@ fn parentage(fixture: &TelemetryAdapterFixture) {
     fixture
         .context
         .start_span(SpanOptions::new("parent"), &mut |parent| {
-            parent.start_span(SpanOptions::new("first-child"), &mut |_| {});
-            parent.start_span(SpanOptions::new("second-child"), &mut |_| {});
+            // Upstream gates `first-child` on a promise so `second-child`
+            // settles first (conformance.ts:358-385). This port is
+            // synchronous: nest `second-child` inside the first child's
+            // window to reproduce the same endSequence ordering while both
+            // remain children of `parent`.
+            parent.start_span(SpanOptions::new("first-child"), &mut |_| {
+                parent.start_span(SpanOptions::new("second-child"), &mut |_| {});
+            });
         });
     let spans = fixture.context.get_spans();
     let parent = find_span(&spans, "parent");
@@ -638,7 +644,7 @@ mod tests {
             ])
         );
         for item in &cases {
-            assert!(!item.name.is_empty());
+            assert_ne!(item.name, "");
             item.run();
         }
     }

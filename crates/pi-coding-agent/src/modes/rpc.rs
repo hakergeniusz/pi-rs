@@ -4658,9 +4658,11 @@ mod tests {
                 .iter()
                 .filter_map(|line| serde_json::from_str(line).ok())
                 .collect();
+            // No images: `agent.prompt(text)` emits `content` as a plain string,
+            // not a content-block array (`UserMessage.content: string | ...[]`).
             assert!(values.iter().any(|value| value["type"] == "message_start"
                 && value["message"]["role"] == "user"
-                && value["message"]["content"][0]["text"] == "rewritten"));
+                && value["message"]["content"] == json!("rewritten")));
         }
     }
 
@@ -4772,7 +4774,7 @@ mod tests {
             panic!("the mirror is a queue_update");
         };
         assert_eq!(steering, vec!["one"]);
-        assert!(follow_up.is_empty());
+        assert_eq!(follow_up, Vec::<String>::new());
     }
 
     #[test]

@@ -62,6 +62,8 @@ const SENSITIVE_KEYS: &[&str] = &[
     "private_key",
     "access_key",
     "session_id",
+    // Prompt text is private user content, never exported (like `session_id`).
+    "prompt",
 ];
 
 /// String prefixes that identify a credential regardless of its attribute
@@ -601,10 +603,13 @@ fn enqueue<T: Clone>(
     pending: &mut Pending<T>,
     incoming: &[T],
     config: &BatchConfig,
-) -> Option<Vec<T>> {
+) -> Vec<Vec<T>> {
     let now = Instant::now();
+    let mut ready = Vec::new();
+    // An idle queue is emitted, but the incoming items still belong to the
+    // fresh queue — the early return used to drop them entirely.
     if !pending.items.is_empty() && now.duration_since(pending.enqueued_at) >= config.flush_after {
-        return Some(std::mem::take(&mut pending.items));
+        ready.push(std::mem::take(&mut pending.items));
     }
     pending.items.extend_from_slice(incoming);
     if pending.items.len() > config.max_queue_items {
@@ -613,10 +618,9 @@ fn enqueue<T: Clone>(
     }
     pending.enqueued_at = now;
     if pending.items.len() >= config.max_items {
-        Some(std::mem::take(&mut pending.items))
-    } else {
-        None
+        ready.push(std::mem::take(&mut pending.items));
     }
+    ready
 }
 
 /// A batching wrapper around any [`TelemetryExporter`]. Failed batches are
@@ -723,7 +727,13 @@ impl SpanExporter for BatchExporter {
             let mut state = lock(&self.state);
             enqueue(&mut state.spans, spans, &self.config)
         };
-        ready.map_or(Ok(()), |batch| self.send_spans(batch))
+        let mut result = Ok(());
+        for batch in ready {
+            if let Err(error) = self.send_spans(batch) {
+                result = Err(error);
+            }
+        }
+        result
     }
 
     fn shutdown(&self) {
@@ -737,7 +747,13 @@ impl MetricExporter for BatchExporter {
             let mut state = lock(&self.state);
             enqueue(&mut state.metrics, metrics, &self.config)
         };
-        ready.map_or(Ok(()), |batch| self.send_metrics(batch))
+        let mut result = Ok(());
+        for batch in ready {
+            if let Err(error) = self.send_metrics(batch) {
+                result = Err(error);
+            }
+        }
+        result
     }
 
     fn shutdown(&self) {
