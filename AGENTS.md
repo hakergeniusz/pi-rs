@@ -148,19 +148,16 @@ heavy gates in parallel; one RAM gate at a time.
 
 `HANDOFF.md` has the details; `README.md` the summary. **v0.1.0 is tagged and
 released** (Linux x86_64/aarch64 assets + checksums). Landed: the full
-extensions arc E0→E3 (QuickJS host, headless core with upstream dispatch
-semantics, UI-over-protocol wiring, dynamic providers, OAuth `/login`,
-streamSimple + hooks, auto-retry/compaction, extension shortcuts, markdown/
-entry/message/tool renderers, `ctx.ui.custom` + overlays, editor, autocomplete,
-themes), golden session fixtures, the P5 remainder (RPC envelope, MCP
-server-manager/tool bridge, package-manager git/local/npm arms), the MCP opens
-(HTTP/OAuth, resources, `/mcp` UI, mcp.json, `pi mcp list`), the real
-`pi-codemode` crate, crash log + telemetry + output guard + piped stdin, and
-all user-tested fidelity fixes. `/share` and `/bug` stay deliberately omitted
-(Radius upload policy). Remaining 1:1 gaps, in flight as parallel slices:
+extensions arc E0→E3, all P7 items (cache warmer, PTY `!` bash, crash log,
+telemetry, output guard, piped stdin, docs port), the P5 remainder, all MCP
+opens, all 10 RPC commands, the npm arm, float-exact session JSON, the real
+`pi-codemode` crate + host wiring, and `node:*` builtins/host packages.
+Builds are host-side now (`scripts/host-build.sh`); podman was removed.
+`/share` and `/bug` stay deliberately omitted (Radius upload policy).
+Remaining mechanism-level deviations, in flight as parallel slices:
 
-1. **P7 tail**: cache warmer, `!` bash via PTY, upstream docs port.
-2. **RPC parity**: the 10 remaining commands (`new_session`, `bash`, `fork`,
-   `clone`, `export_html`, …).
-3. **E4 extension completeness**: `node:*` builtins / host packages.
-4. **Fidelity**: serde_json `float_roundtrip`, codemode host wiring.
+1. E4: CJS interop, per-path `/reload` unload, the remaining `pi-*` virtual
+   packages, and fuller WHATWG URL / `Stats` / HMAC shims.
+2. Fidelity: RPC prompt preflight and typed-session tolerant-decode/unknown-key
+   byte preservation.
+3. Environment: macOS release assets await a hosted runner.
