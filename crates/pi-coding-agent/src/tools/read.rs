@@ -593,9 +593,9 @@ mod tests {
     /// Synthetic, header-valid BMP (unsupported for inline attachment).
     fn bmp() -> Vec<u8> {
         let mut bytes = vec![b'B', b'M'];
-        bytes.extend_from_slice(&30_u32.to_le_bytes()); // declared file size
+        bytes.extend_from_slice(&200_u32.to_le_bytes()); // declared file size (no pixel data follows)
         bytes.extend_from_slice(&[0_u8; 4]); // reserved
-        bytes.extend_from_slice(&26_u32.to_le_bytes()); // pixel data offset
+        bytes.extend_from_slice(&100_u32.to_le_bytes()); // pixel data offset past EOF (unprocessable)
         bytes.extend_from_slice(&12_u32.to_le_bytes()); // BITMAPCOREHEADER
         bytes.extend_from_slice(&1_u16.to_le_bytes()); // width
         bytes.extend_from_slice(&1_u16.to_le_bytes()); // height

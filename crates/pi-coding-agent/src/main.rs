@@ -31,8 +31,8 @@ use pi_coding_agent::modes::rpc::run_rpc_mode;
 use pi_coding_agent::output_guard::{restore_stdout, take_over_stdout};
 use pi_coding_agent::session::store::{NewSessionOptions, SessionManager};
 use pi_coding_agent::telemetry::host::{
-    ChangelogPingDecision, HostTelemetry, HostTelemetryConfig, LAST_CHANGELOG_VERSION_SETTING,
-    SETTING_OTLP_ENDPOINT, WiringEnv, changelog_ping_decision,
+    ChangelogPingDecision, HostTelemetry, LAST_CHANGELOG_VERSION_SETTING, SETTING_OTLP_ENDPOINT,
+    changelog_ping_decision, install_from_env_with_settings,
 };
 use pi_coding_agent::tools::index::ToolRegistry;
 
@@ -461,13 +461,12 @@ fn build_runtime_with_ui(
     // settings manager supplies the install-telemetry setting, the additive
     // OTLP endpoint comes from the setting or `PI_RS_OTLP_ENDPOINT`, and the
     // default wiring stays inert (no ping, no HTTP transport).
-    let host_telemetry = HostTelemetry::new(HostTelemetryConfig::resolve(
+    let host_telemetry = install_from_env_with_settings(
         settings.get_enable_install_telemetry(),
         settings
             .get(SETTING_OTLP_ENDPOINT)
             .and_then(serde_json::Value::as_str),
-        &WiringEnv::from_process(),
-    ));
+    );
 
     // Model: --model pattern, else the settings default. The surface also
     // carries extension-registered virtual models (`withVirtualModels`).

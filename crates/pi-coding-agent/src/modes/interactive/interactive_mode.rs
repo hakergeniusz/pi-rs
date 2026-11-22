@@ -12278,10 +12278,14 @@ impl InteractiveMode {
         let Some(runner) = &self.extension_runner else {
             return;
         };
-        let outcome = runner
-            .lock()
-            .expect("extension runner mutex poisoned")
-            .mcp_tick(Instant::now());
+        // The runner can be held by an extension UI handler that is waiting
+        // for a dialog answer; blocking here would deadlock the pump that
+        // mounts that dialog. Skip this frame's tick instead — the next frame
+        // picks it up once the handler returns.
+        let Ok(mut runner) = runner.try_lock() else {
+            return;
+        };
+        let outcome = runner.mcp_tick(Instant::now());
         match outcome {
             // A settled connection registers tools and a `list_changed`
             // re-registration can change the visible tool list; redraw so the

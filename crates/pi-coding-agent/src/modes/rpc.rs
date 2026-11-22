@@ -3355,7 +3355,7 @@ mod tests {
             &self,
             request: pi_agent::types::StreamRequest,
         ) -> futures::stream::BoxStream<'static, pi_ai::types::AssistantMessageEvent> {
-            if !self.first.swap(false, Ordering::SeqCst) {
+            if self.first.swap(false, Ordering::SeqCst) {
                 self.entered.store(true, Ordering::SeqCst);
                 let (lock, cv) = &*self.gate;
                 let mut open = lock.lock().expect("gate");

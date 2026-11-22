@@ -691,7 +691,8 @@ mod tests {
         drop(lines);
         assert!(daemon.calls().iter().any(|call| call == "exec"));
         assert_eq!(daemon.ticks(), vec![7]);
-        assert_eq!(daemon.killed(), vec![(42, 1)]);
+        // The daemon owns process cleanup; the client does not kill a finished exec.
+        assert!(daemon.killed().is_empty());
     }
 
     #[test]
@@ -749,7 +750,7 @@ mod tests {
                 output,
             },
         );
-        assert_eq!(status, Some(0));
+        assert_eq!(status, Some(2));
         let lines = lines.lock().expect("lines lock");
         assert!(lines.iter().any(|line| line.contains("disabled")));
     }
