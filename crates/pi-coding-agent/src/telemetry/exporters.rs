@@ -16,7 +16,8 @@
 //!   [`super::ping`]); v1.5.2 has no span/metric exporter trait and no OTLP
 //!   client. The traits, batching and OTLP JSON encoder below are additive
 //!   port surface, shaped around the ported `StoredSpan`/`StoredMetric`
-//!   records. [`super::host`] records the deviation and the host wiring.
+//!   records. [`super::host`] records the deviation and the host wiring;
+//!   [`ReqwestHttpTransport`] is the opt-in real-HTTP implementation.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -368,6 +369,76 @@ impl HttpTransport for NoopHttpTransport {
         _body: &Value,
     ) -> Result<HttpResponse, ExportError> {
         Ok(HttpResponse { status: 202 })
+    }
+}
+
+/// Timeout for opt-in export POSTs, mirroring upstream's 5-second ping abort
+/// signal (`interactive-mode.ts:1485`) so a stalled collector cannot wedge the
+/// CLI's startup/shutdown path.
+pub const EXPORT_TIMEOUT_MS: u64 = 5_000;
+
+/// The opt-in reqwest-backed `OTLP/HTTP` transport. It serializes the already
+/// redacted JSON body ([`encode_spans`]/[`encode_metrics`]) and POSTs it with
+/// the exporter's headers. The telemetry gate and endpoint requirement live in
+/// [`super::host::HostTelemetryConfig`]; this type is only constructed by a host
+/// that explicitly installs real transports.
+#[derive(Clone, Debug)]
+pub struct ReqwestHttpTransport {
+    client: reqwest::Client,
+}
+
+impl Default for ReqwestHttpTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReqwestHttpTransport {
+    /// A client with the short [`EXPORT_TIMEOUT_MS`] timeout.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_timeout(Duration::from_millis(EXPORT_TIMEOUT_MS))
+    }
+
+    /// A client with an explicit timeout (used by the loopback tests).
+    #[must_use]
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .expect("build telemetry export client"),
+        }
+    }
+}
+
+impl HttpTransport for ReqwestHttpTransport {
+    fn post_json(
+        &self,
+        endpoint: &str,
+        headers: &BTreeMap<String, String>,
+        body: &Value,
+    ) -> Result<HttpResponse, ExportError> {
+        let payload = serde_json::to_vec(body).map_err(|error| ExportError {
+            message: format!("serialize telemetry payload: {error}"),
+            retryable: false,
+        })?;
+        let sent = crate::runtime::block_on(async {
+            let mut request = self.client.post(endpoint);
+            for (name, value) in headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            request.body(payload).send().await
+        });
+        match sent {
+            Ok(response) => Ok(HttpResponse {
+                status: response.status().as_u16(),
+            }),
+            Err(error) => Err(ExportError {
+                message: error.to_string(),
+                retryable: true,
+            }),
+        }
     }
 }
 
@@ -810,6 +881,77 @@ pub fn export_telemetry(
 }
 
 #[cfg(test)]
+pub(crate) mod loopback {
+    //! One-shot HTTP server on an ephemeral loopback port for transport tests.
+    //! No external network is used: both the ping and the batching exporter
+    //! tests point their request at this listener.
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    /// Bind a loopback listener and answer exactly one request with the given
+    /// status line. Returns the base URL and a handle whose output is the raw
+    /// request bytes (headers followed by the body).
+    pub(crate) fn spawn_status(status: &'static str) -> (String, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let address = listener.local_addr().expect("local addr");
+        let base = format!("http://{address}");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept loopback request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut received = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                received.extend_from_slice(&chunk[..read]);
+                let Some(end) = find(&received, b"\r\n\r\n") else {
+                    continue;
+                };
+                let header_end = end + 4;
+                let headers = String::from_utf8_lossy(&received[..header_end]);
+                let expected = header_value(&headers, "content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                if received.len() >= header_end + expected {
+                    break;
+                }
+            }
+            let response =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            String::from_utf8_lossy(&received).into_owned()
+        });
+        (base, handle)
+    }
+
+    /// A loopback server that answers `200 OK`.
+    pub(crate) fn spawn() -> (String, JoinHandle<String>) {
+        spawn_status("200 OK")
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+        headers.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::telemetry::{InMemoryTelemetry, SpanAttributes as Attrs};
@@ -1083,5 +1225,38 @@ mod tests {
         assert_eq!(report.metrics, 1);
         assert_eq!(report.errors.len(), 0);
         assert_eq!(transport.requests().len(), 2);
+    }
+
+    /// The opt-in reqwest transport POSTs the redacted OTLP JSON body with the
+    /// exporter's headers to a synthetic loopback endpoint, and reports a
+    /// non-success status for the batcher to classify/retry.
+    #[test]
+    fn real_http_transport_posts_to_loopback() {
+        let (base, server) = loopback::spawn();
+        let transport = ReqwestHttpTransport::new();
+        let headers = BTreeMap::from([
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("X-Telemetry-Test".to_string(), "on".to_string()),
+        ]);
+        let body = json!({ "resourceSpans": [] });
+        let response = transport
+            .post_json(&format!("{base}/v1/traces"), &headers, &body)
+            .expect("export reaches loopback");
+        assert_eq!(response.status, 200);
+
+        let raw = server.join().expect("loopback thread");
+        assert!(raw.starts_with("POST /v1/traces HTTP/1.1\r\n"));
+        let folded = raw.to_ascii_lowercase();
+        assert!(folded.contains("content-type: application/json\r\n"));
+        assert!(folded.contains("x-telemetry-test: on\r\n"));
+        assert!(raw.ends_with("{\"resourceSpans\":[]}"));
+
+        let (base, server) = loopback::spawn_status("503 Service Unavailable");
+        let transport = ReqwestHttpTransport::new();
+        let response = transport
+            .post_json(&base, &BTreeMap::new(), &body)
+            .expect("export reaches loopback");
+        assert_eq!(response.status, 503);
+        assert!(server.join().is_ok());
     }
 }

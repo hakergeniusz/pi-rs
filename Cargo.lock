@@ -1544,6 +1544,7 @@ dependencies = [
  "pi-schema",
  "pi-tui",
  "regex",
+ "reqwest",
  "semver",
  "serde",
  "serde_json",

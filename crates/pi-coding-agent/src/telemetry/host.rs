@@ -23,7 +23,11 @@
 //! [`HostTelemetry::with_transport`]. The ping likewise uses the inert
 //! [`ping::NoopPingTransport`] by default. With default wiring no socket is
 //! ever opened, and neither payload carries credentials, prompts or session
-//! data (the encoder redacts attributes, `exporters.rs:42-138`).
+//! data (the encoder redacts attributes, `exporters.rs:42-138`). A host can
+//! opt into real I/O with [`install_from_env`] /
+//! [`HostTelemetry::with_real_transports`], which install the reqwest-backed
+//! [`exporters::ReqwestHttpTransport`] and [`ping::HttpPingTransport`] behind
+//! exactly the same gates.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,9 +36,9 @@ use crate::changelog::{ChangelogEntry, get_new_entries};
 
 use super::exporters::{
     BatchExporter, ExportReport, HttpTransport, NoopExporter, NoopHttpTransport, OtlpHttpExporter,
-    TelemetryExporter, export_telemetry,
+    ReqwestHttpTransport, TelemetryExporter, export_telemetry,
 };
-use super::ping::{ENV_OFFLINE, NoopPingTransport, PingOutcome, PingTransport};
+use super::ping::{ENV_OFFLINE, HttpPingTransport, NoopPingTransport, PingOutcome, PingTransport};
 use super::{ENV_TELEMETRY, Telemetry, construct_telemetry, is_install_telemetry_enabled};
 
 /// Additive OTLP endpoint override. `PI_RS_` keeps it distinct from any
@@ -212,6 +216,20 @@ impl HostTelemetry {
         }
     }
 
+    /// Real, reqwest-backed transports behind the same gates. [`Self::new`]
+    /// stays inert; a host opts in to I/O by calling this (or
+    /// [`install_from_env`]). Every request still depends on the resolved
+    /// config: the ping needs telemetry enabled and no `PI_OFFLINE`, the
+    /// exporter additionally needs an explicitly configured endpoint.
+    #[must_use]
+    pub fn with_real_transports(config: HostTelemetryConfig) -> Self {
+        Self::with_transport(
+            config,
+            ReqwestHttpTransport::new(),
+            Arc::new(HttpPingTransport::new()) as Arc<dyn PingTransport>,
+        )
+    }
+
     /// The resolved gate, for diagnostics and tests.
     #[must_use]
     pub fn config(&self) -> &HostTelemetryConfig {
@@ -262,6 +280,31 @@ impl HostTelemetry {
     pub fn shutdown(&self) {
         self.exporter.shutdown();
     }
+}
+
+/// Build a [`HostTelemetry`] with real transports whose gates are resolved from
+/// the process environment plus the caller's persisted settings. This is the
+/// integration entry point for the binary: with default env and no endpoint,
+/// neither the ping nor the exporter opens a socket.
+///
+/// `settings_enabled` is the result of `settingsManager.getEnableInstallTelemetry()`;
+/// `endpoint_setting` is the additive OTLP setting (`None` means env-only).
+#[must_use]
+pub fn install_from_env_with_settings(
+    settings_enabled: bool,
+    endpoint_setting: Option<&str>,
+) -> HostTelemetry {
+    HostTelemetry::with_real_transports(HostTelemetryConfig::resolve(
+        settings_enabled,
+        endpoint_setting,
+        &WiringEnv::from_process(),
+    ))
+}
+
+/// [`install_from_env_with_settings`] without a persisted endpoint setting.
+#[must_use]
+pub fn install_from_env(settings_enabled: bool) -> HostTelemetry {
+    install_from_env_with_settings(settings_enabled, None)
 }
 
 #[cfg(test)]
@@ -490,5 +533,37 @@ mod tests {
         assert_eq!(configured.flush(), ExportReport::default());
         configured.shutdown();
         assert_eq!(http.requests().len(), 2);
+    }
+
+    /// Real transports are wired, but the resolved gate still blocks all I/O
+    /// when telemetry is disabled: no ping and no export, even though the
+    /// clients exist.
+    #[test]
+    fn real_transports_stay_gated_by_default() {
+        let host = HostTelemetry::with_real_transports(HostTelemetryConfig::resolve(
+            false,
+            None,
+            &WiringEnv::default(),
+        ));
+        assert_eq!(
+            host.report_install_ping("1.0.0"),
+            PingOutcome::SkippedDisabled
+        );
+        assert_eq!(host.flush(), ExportReport::default());
+        assert_eq!(host.exporter().exports(), 0);
+
+        // `PI_OFFLINE` is JS truthy (even "0"), so it blocks the real ping.
+        let offline = HostTelemetry::with_real_transports(HostTelemetryConfig::resolve(
+            true,
+            None,
+            &WiringEnv {
+                offline: Some("0".to_string()),
+                ..WiringEnv::default()
+            },
+        ));
+        assert_eq!(
+            offline.report_install_ping("1.0.0"),
+            PingOutcome::SkippedOffline
+        );
     }
 }

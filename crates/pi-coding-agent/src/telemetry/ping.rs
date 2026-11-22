@@ -23,7 +23,8 @@
 //! Upstream calls `fetch` unconditionally when the gates pass. This port
 //! keeps the exact gates and payload but routes the request through
 //! [`PingTransport`]; the default transport is inert, so no network call is
-//! made unless the host injects one. [`super::host`] records the wiring.
+//! made unless the host injects one. [`HttpPingTransport`] is the opt-in
+//! reqwest-backed implementation; [`super::host`] records the wiring.
 
 use std::fmt::Write;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -163,6 +164,61 @@ pub struct NoopPingTransport;
 impl PingTransport for NoopPingTransport {
     fn send(&self, _request: &InstallPingRequest) -> Result<PingResponse, PingError> {
         Ok(PingResponse { status: 202 })
+    }
+}
+
+/// The opt-in, reqwest-backed ping transport. It performs the exact `GET`
+/// upstream issues (`interactive-mode.ts:1481-1486`) — version-only URL,
+/// `User-Agent`, 5-second timeout — behind [`PingTransport`]. The gates in
+/// [`report_install_ping`] still decide whether any socket is opened, and the
+/// crate's default wiring never constructs this type ([`super::host`]).
+#[derive(Clone, Debug)]
+pub struct HttpPingTransport {
+    client: reqwest::Client,
+}
+
+impl Default for HttpPingTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HttpPingTransport {
+    /// A client whose timeout matches upstream's `AbortSignal.timeout(5000)`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_timeout(std::time::Duration::from_millis(PING_TIMEOUT_MS))
+    }
+
+    /// A client with an explicit timeout (used by the loopback tests).
+    #[must_use]
+    pub fn with_timeout(timeout: std::time::Duration) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .expect("build telemetry ping client"),
+        }
+    }
+}
+
+impl PingTransport for HttpPingTransport {
+    fn send(&self, request: &InstallPingRequest) -> Result<PingResponse, PingError> {
+        let sent = crate::runtime::block_on(async {
+            self.client
+                .get(&request.url)
+                .header(reqwest::header::USER_AGENT, request.user_agent.as_str())
+                .send()
+                .await
+        });
+        match sent {
+            Ok(response) => Ok(PingResponse {
+                status: response.status().as_u16(),
+            }),
+            Err(error) => Err(PingError {
+                message: error.to_string(),
+            }),
+        }
     }
 }
 
@@ -361,5 +417,29 @@ mod tests {
         assert_eq!(PI_ATTRIBUTION.name, "pi");
         assert_eq!(PI_ATTRIBUTION.categories, &["cli-agent"]);
         assert_eq!(PING_TIMEOUT_MS, 5000);
+    }
+
+    /// The opt-in reqwest transport performs a real GET against a synthetic
+    /// loopback server: version in the path, neutral `User-Agent`, and the
+    /// response status surfaced. No external network is contacted.
+    #[test]
+    fn real_ping_transport_sends_get_to_loopback() {
+        let (base, server) = crate::telemetry::exporters::loopback::spawn();
+        let transport = HttpPingTransport::new();
+        let request = InstallPingRequest {
+            url: format!("{base}/api/report-install?version=1.0.0"),
+            user_agent: format_user_agent("1.0.0"),
+        };
+        let response = transport.send(&request).expect("ping reaches loopback");
+        assert_eq!(response.status, 200);
+
+        let raw = server.join().expect("loopback thread");
+        assert!(raw.starts_with("GET /api/report-install?version=1.0.0 HTTP/1.1\r\n"));
+        let folded = raw.to_ascii_lowercase();
+        assert!(
+            folded
+                .contains(&format!("user-agent: {}\r\n", request.user_agent).to_ascii_lowercase())
+        );
+        assert!(!folded.contains("authorization:"));
     }
 }
