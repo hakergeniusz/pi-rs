@@ -12850,7 +12850,7 @@ impl InteractiveMode {
         // cannot overprint the footer (an `ESC[?…c` reply or stale key hints).
         let _ = write!(
             std::io::stdout(),
-            "\r\n\x1b[2mTo resume this session:\x1b[22m {command}\n"
+            "\r\n\x1b[2K\x1b[2mTo resume this session:\x1b[22m {command}\n"
         );
         Ok(())
     }
