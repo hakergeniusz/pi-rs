@@ -92,8 +92,8 @@ fn genuinely_unavailable_host_packages_keep_the_e1_error() {
             index,
             "<unavailable>",
             Some(
-                "import { Text } from \"@earendil-works/pi-tui\";\n\
-                 export default function () { void Text; }\n",
+                "import { radiusConfig } from \"@earendil-works/pi-ai/providers/radius-config\";\n\
+                 export default function () { void radiusConfig; }\n",
             ),
         )
         .expect_err("unavailable host package must reject");
@@ -119,9 +119,18 @@ fn resolver_table_matches_the_documented_coverage() {
         );
         assert!(!is_unavailable_host_module(specifier));
     }
-    assert!(is_unavailable_host_module("@earendil-works/pi-tui"));
+    for specifier in pi_ext_js::hostpkg::HOST_PACKAGE_SPECIFIERS {
+        assert!(
+            virtual_module_source(specifier).is_some(),
+            "missing host-package shim for {specifier}"
+        );
+        assert!(!is_unavailable_host_module(specifier));
+    }
+    assert!(is_unavailable_host_module(
+        "@earendil-works/pi-ai/providers/radius-config"
+    ));
     assert!(virtual_module_source("node:sqlite").is_none());
-    assert!(virtual_module_source("@earendil-works/pi-ai").is_none());
+    assert!(virtual_module_source("@earendil-works/pi-ai").is_some());
     // E1's already-served modules remain untouched.
     assert!(virtual_module_source("typebox").is_some());
     assert!(virtual_module_source("@earendil-works/pi-codemode/declarations").is_some());

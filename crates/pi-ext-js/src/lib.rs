@@ -33,6 +33,7 @@ pub mod error;
 pub mod events;
 pub mod exec;
 pub mod glue;
+pub mod hostpkg;
 pub mod loader;
 pub mod mcp_manager;
 pub mod mcp_registry;

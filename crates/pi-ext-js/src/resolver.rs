@@ -29,7 +29,7 @@ pub fn virtual_module_source(specifier: &str) -> Option<&'static str> {
     match specifier {
         "typebox" | "@sinclair/typebox" => Some(crate::glue::TYPEBOX_SHIM),
         "@earendil-works/pi-codemode/declarations" => Some(crate::glue::DECLARATIONS_SHIM),
-        _ => node::source(specifier),
+        _ => node::source(specifier).or_else(|| crate::hostpkg::source(specifier)),
     }
 }
 
@@ -38,6 +38,7 @@ pub fn virtual_module_source(specifier: &str) -> Option<&'static str> {
 /// upstream (E1) rejection string.
 pub fn is_unavailable_host_module(specifier: &str) -> bool {
     !node::HOST_PACKAGES.contains(&specifier)
+        && !crate::hostpkg::HOST_PACKAGE_SPECIFIERS.contains(&specifier)
         && (specifier.starts_with("@earendil-works/")
             || specifier.starts_with("@mariozechner/")
             || specifier.starts_with("pi-")

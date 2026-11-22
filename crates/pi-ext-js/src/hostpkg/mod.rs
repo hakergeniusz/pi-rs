@@ -155,7 +155,7 @@ SOURCE: /[\s\S]+/
         }
     }
 
-    /// Evaluates one TypeScript fixture in a standalone QuickJS runtime whose
+    /// Evaluates one TypeScript fixture in a standalone `QuickJS` runtime whose
     /// loader serves only the table under test (plus the E1 typebox shim).
     /// The fixture assigns a JSON-serialisable value to `__result`.
     fn evaluate(fixture: &str) -> Value {
