@@ -411,7 +411,7 @@ mod tests {
         json.insert("kind".into(), Value::String("directory".into()));
         json.insert("size".into(), Value::from(9));
         json.insert("mtimeSec".into(), Value::from(100.0));
-        json.insert("mtimeNsec".into(), Value::from(500_000.0));
+        json.insert("mtimeNsec".into(), Value::from(500_000_000.0));
         let info = to_info("/x/dir", &RemoteFileInfo::from_json(&json), false).expect("info");
         assert_eq!(info.name, "dir");
         assert_eq!(info.kind, FileKind::Directory);
@@ -478,7 +478,7 @@ mod tests {
             failure.message,
             "maxEntries must be a non-negative safe integer"
         );
-        assert!(daemon.calls().is_empty());
+        assert_eq!(daemon.calls(), Vec::<String>::new());
     }
 
     #[tokio::test]
@@ -490,7 +490,7 @@ mod tests {
             .await
             .expect_err("aborted");
         assert_eq!(failure.code, FileErrorCode::Aborted);
-        assert!(daemon.calls().is_empty());
+        assert_eq!(daemon.calls(), Vec::<String>::new());
     }
 
     #[test]

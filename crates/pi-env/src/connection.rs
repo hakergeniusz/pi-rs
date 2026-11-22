@@ -115,7 +115,7 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Option<(Frame, usize)>, RemoteError>
         return Ok(None);
     }
     let total = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-    if total < 9 || total > MAX_FRAME {
+    if !(9..=MAX_FRAME).contains(&total) {
         return Err(RemoteError::lost("Corrupt frame from pi-env"));
     }
     if bytes.len() < 4 + total {
@@ -370,9 +370,15 @@ pub fn with_stderr(message: &str, stderr: &str) -> String {
     let normalized = stderr.replace("\r\n", "\n").replace('\r', "\n");
     let mut text = String::new();
     let mut in_escape = false;
+    let mut skip_introducer = false;
     for character in normalized.chars() {
         if in_escape {
-            // A CSI sequence ends at its final byte (0x40..=0x7e).
+            if skip_introducer {
+                // The byte after ESC is the sequence introducer (e.g. `[` in CSI).
+                skip_introducer = false;
+                continue;
+            }
+            // The sequence ends at its final byte (0x40..=0x7e).
             if ('@'..='~').contains(&character) {
                 in_escape = false;
             }
@@ -380,10 +386,13 @@ pub fn with_stderr(message: &str, stderr: &str) -> String {
         }
         if character == '\u{1b}' {
             in_escape = true;
+            skip_introducer = true;
             continue;
         }
         let code = character as u32;
-        if character == '\n' || character == '\t' || (code >= 0x20 && (code < 0x7f || code > 0x9f))
+        if character == '\n'
+            || character == '\t'
+            || (code >= 0x20 && !(0x7f..=0x9f).contains(&code))
         {
             text.push(character);
         }
@@ -448,11 +457,11 @@ async fn write_frame(inner: &ProcessInner, bytes: Vec<u8>) -> Result<(), RemoteE
     }
 }
 
-fn teardown(inner: &ProcessInner, error: RemoteError) {
+fn teardown(inner: &ProcessInner, error: &RemoteError) {
     let (pending, mut child) = {
         let mut state = inner.state.lock().expect("connection state lock");
         state.ready = None;
-        state.lost = Some(error.clone());
+        state.lost = Some((*error).clone());
         let pending = std::mem::take(&mut state.pending)
             .into_values()
             .collect::<Vec<_>>();
@@ -462,7 +471,7 @@ fn teardown(inner: &ProcessInner, error: RemoteError) {
         let _ = child.start_kill();
     }
     for request in pending {
-        let _ = request.result.send(Err(error.clone()));
+        let _ = request.result.send(Err((*error).clone()));
     }
 }
 
@@ -528,26 +537,23 @@ async fn reader_loop(inner: Arc<ProcessInner>, stdout: ChildStdout, token: Strin
         };
         buffer.extend_from_slice(&chunk[..read]);
         if !synced {
-            match find_subslice(&buffer, &marker) {
-                Some(index) => {
-                    let noise = String::from_utf8_lossy(&buffer[..index]).trim().to_owned();
-                    if !noise.is_empty() {
-                        if let Some(log) = &inner.options.on_log {
-                            log(&noise);
-                        }
-                    }
-                    buffer.drain(..index + marker.len());
-                    synced = true;
-                    inner.state.lock().expect("connection state lock").synced = true;
+            if let Some(index) = find_subslice(&buffer, &marker) {
+                let noise = String::from_utf8_lossy(&buffer[..index]).trim().to_owned();
+                if !noise.is_empty()
+                    && let Some(log) = &inner.options.on_log
+                {
+                    log(&noise);
                 }
-                None => {
-                    if buffer.len() > 1024 * 1024 {
-                        let keep = marker.len().saturating_sub(1);
-                        let drop_count = buffer.len() - keep;
-                        buffer.drain(..drop_count);
-                    }
-                    continue;
+                buffer.drain(..index + marker.len());
+                synced = true;
+                inner.state.lock().expect("connection state lock").synced = true;
+            } else {
+                if buffer.len() > 1024 * 1024 {
+                    let keep = marker.len().saturating_sub(1);
+                    let drop_count = buffer.len() - keep;
+                    buffer.drain(..drop_count);
                 }
+                continue;
             }
         }
         loop {
@@ -558,13 +564,13 @@ async fn reader_loop(inner: Arc<ProcessInner>, stdout: ChildStdout, token: Strin
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    teardown(&inner, error);
+                    teardown(&inner, &error);
                     return;
                 }
             }
         }
     }
-    teardown(&inner, RemoteError::lost("pi-env connection lost"));
+    teardown(&inner, &RemoteError::lost("pi-env connection lost"));
 }
 
 /// A real connection to a daemon spawned as a child process. Starts lazily on
@@ -596,6 +602,7 @@ impl ProcessDaemon {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // mirrors the TS ensureStarted sequence; split when extending
     async fn ensure_started(&self) -> Result<RemoteInfo, RemoteError> {
         let _guard = self.start_lock.lock().await;
         {
@@ -693,7 +700,7 @@ impl ProcessDaemon {
                     .and_then(Value::as_u64)
                     .unwrap_or(0)
             ));
-            teardown(&self.inner, error.clone());
+            teardown(&self.inner, &error);
             return Err(error);
         }
         let info = RemoteInfo::from_json(&reply.json);
@@ -796,7 +803,7 @@ impl Daemon for ProcessDaemon {
                 .closed = true;
             teardown(
                 &self.inner,
-                RemoteError::new("unknown", "Connection closed"),
+                &RemoteError::new("unknown", "Connection closed"),
             );
         })
     }
@@ -818,7 +825,7 @@ impl Daemon for ProcessDaemon {
             if now_ms.saturating_sub(last_seen) > SILENCE_LIMIT_MS {
                 teardown(
                     &self.inner,
-                    RemoteError::lost("pi-env connection timed out"),
+                    &RemoteError::lost("pi-env connection timed out"),
                 );
                 return;
             }

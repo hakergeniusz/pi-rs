@@ -88,7 +88,7 @@ impl Platform {
 pub enum Arch {
     /// x86-64.
     X64,
-    /// ARM64 / AArch64.
+    /// ARM64 / `AArch64`.
     Arm64,
 }
 
@@ -381,11 +381,11 @@ pub async fn run_ssh(
     command: &str,
     options: SshRunOptions,
 ) -> Result<String, RemoteError> {
-    let args = match options.args {
+    let base_args = match options.args {
         Some(args) => args,
         None => ssh_arguments(target, true, &target.known_hosts_file)?,
     };
-    let mut argv = args;
+    let mut argv = base_args;
     argv.push(command.to_owned());
     let output = runner
         .run(
@@ -429,9 +429,7 @@ pub async fn run_ssh(
     let mut error = RemoteError::new("ssh_error", message);
     error.fields.insert(
         "exitCode".into(),
-        output
-            .exit_code
-            .map_or(Value::Null, |code| Value::from(code)),
+        output.exit_code.map_or(Value::Null, Value::from),
     );
     error
         .fields
@@ -602,7 +600,7 @@ pub fn apply_accept(
         .collect::<Result<Vec<_>, _>>()?;
     let mut trusted = std::collections::BTreeMap::new();
     for line in existing {
-        let mut fields = line.trim().split_whitespace();
+        let mut fields = line.split_whitespace();
         if let (Some(name), Some(key_type), Some(key)) =
             (fields.next(), fields.next(), fields.next())
             && name == alias
@@ -639,7 +637,7 @@ pub fn apply_accept(
 pub fn apply_forget(existing: &[String], alias: &str) -> Vec<String> {
     existing
         .iter()
-        .filter(|line| line.trim().split_whitespace().next() != Some(alias))
+        .filter(|line| line.split_whitespace().next() != Some(alias))
         .cloned()
         .collect()
 }
@@ -1138,15 +1136,14 @@ fn command_builder(
             };
             let verified = state.lock().expect("ssh state lock").verified.take();
             let package_root = PathBuf::from(".");
-            let file = match verified {
-                Some(file) => file,
-                None => {
-                    let binary = options
-                        .binary
-                        .clone()
-                        .unwrap_or_else(|| packaged_daemon(&remote, &package_root));
-                    deploy_daemon(runner.as_ref(), &options.target, &remote, &binary).await?
-                }
+            let file = if let Some(file) = verified {
+                file
+            } else {
+                let binary = options
+                    .binary
+                    .clone()
+                    .unwrap_or_else(|| packaged_daemon(&remote, &package_root));
+                deploy_daemon(runner.as_ref(), &options.target, &remote, &binary).await?
             };
             let mut argv = vec![options.target.ssh.clone().unwrap_or_else(|| "ssh".into())];
             argv.extend(ssh_arguments(
@@ -1163,6 +1160,8 @@ fn command_builder(
 /// A connection that does nothing until its first request
 /// (`sshConnection`, `ssh.ts:492-528`), using an injected runner.
 #[must_use]
+// By value to mirror upstream's `sshConnection(opts, runner)` public shape.
+#[allow(clippy::needless_pass_by_value)]
 pub fn ssh_connection_with(
     options: SshConnectOptions,
     runner: Arc<dyn SshRunner>,
@@ -1170,7 +1169,7 @@ pub fn ssh_connection_with(
     let state = Arc::new(Mutex::new(SshState::default()));
     let command = command_builder(options.clone(), runner, state.clone());
     let mut connection_options = ConnectionOptions::new(command);
-    connection_options.on_log = options.on_log.clone();
+    connection_options.on_log.clone_from(&options.on_log);
     SshConnection {
         daemon: ProcessDaemon::new(connection_options),
         state,
@@ -1207,7 +1206,7 @@ pub async fn connect_ssh_with(
     }));
     let command = command_builder(options.clone(), runner, state.clone());
     let mut connection_options = ConnectionOptions::new(command);
-    connection_options.on_log = options.on_log.clone();
+    connection_options.on_log.clone_from(&options.on_log);
     Ok((
         SshConnection {
             daemon: ProcessDaemon::new(connection_options),
@@ -1299,18 +1298,18 @@ mod tests {
 
     #[test]
     fn ssh_arguments_reject_unsafe_fields_with_exact_messages() {
-        let mut target = target();
-        target.host = "-oProxyCommand=evil".into();
+        let mut host_target = target();
+        host_target.host = "-oProxyCommand=evil".into();
         assert_eq!(
-            ssh_arguments(&target, true, &target.known_hosts_file)
+            ssh_arguments(&host_target, true, &host_target.known_hosts_file)
                 .expect_err("host")
                 .message,
             "Invalid host: \"-oProxyCommand=evil\""
         );
-        let mut target = target();
-        target.port = Some(70_000);
+        let mut target_port = target();
+        target_port.port = Some(70_000);
         assert_eq!(
-            ssh_arguments(&target, true, &target.known_hosts_file)
+            ssh_arguments(&target_port, true, &target_port.known_hosts_file)
                 .expect_err("port")
                 .message,
             "Invalid port: 70000"
@@ -1369,7 +1368,8 @@ mod tests {
             parse_probe("box", "no marker").expect_err("probe").message,
             "Unexpected answer from box: no marker"
         );
-        assert_eq!(termux_warnings(&probe).len(), 3);
+        // `tmpdir` is set and LD_PRELOAD lacks termux-exec: only two warnings.
+        assert_eq!(termux_warnings(&probe).len(), 2);
     }
 
     #[tokio::test]

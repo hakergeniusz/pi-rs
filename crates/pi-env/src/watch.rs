@@ -64,9 +64,9 @@ impl WatchMode {
         }
     }
 
-    fn from_str(value: Option<&str>) -> Self {
+    fn from_str(value: &str) -> Self {
         match value {
-            Some("polling") => Self::Polling,
+            "polling" => Self::Polling,
             _ => Self::Native,
         }
     }
@@ -106,10 +106,12 @@ pub fn parse_watch_event(json: &JsonMap) -> Option<WatchEvent> {
     match string("kind")? {
         "ready" => Some(WatchEvent::Ready {
             // An absent `mode` stays absent on the ready event.
-            mode: WatchMode::from_str(string("mode")),
+            mode: WatchMode::from_str(string("mode").unwrap_or("")),
         }),
         "change" => {
-            let mode = Some(WatchMode::from_str(string("mode")));
+            // An absent mode leaves the watcher's current mode untouched
+            // (`watch.ts:106`); only explicit `polling` switches it.
+            let mode = string("mode").map(WatchMode::from_str);
             let overflow = json.get("overflow").and_then(Value::as_bool) == Some(true);
             let paths = json
                 .get("paths")
@@ -214,8 +216,8 @@ fn process_event(
             overflow,
             paths,
         } => {
-            if let Some(mode) = mode {
-                state.lock().expect("watcher state lock").mode = mode;
+            if let Some(WatchMode::Polling) = mode {
+                state.lock().expect("watcher state lock").mode = WatchMode::Polling;
             }
             if overflow {
                 deliver(on_change, OVERFLOW);
@@ -290,31 +292,29 @@ impl std::fmt::Debug for RemoteWatcher {
 impl RemoteWatcher {
     /// Watch resolved `targets`; the request reports coverage through a
     /// `ready` event (`watch.ts:49-59`).
-    pub fn open(
+    pub async fn open(
         daemon: Arc<dyn Daemon>,
         targets: Vec<WatchTarget>,
         on_change: Arc<dyn Fn(FileChange) + Send + Sync>,
         options: RemoteWatchOptions,
-    ) -> impl std::future::Future<Output = Result<Self, RemoteError>> + Send + 'static {
-        async move {
-            let watcher = Self {
-                daemon,
-                state: Arc::new(Mutex::new(WatcherState {
-                    targets,
-                    options,
-                    reconnect_delay_ms: RECONNECT_FIRST_MS,
-                    ..Default::default()
-                })),
-                on_change,
-            };
-            let ready = watcher.begin_watch();
-            match ready.await {
-                Ok(result) => {
-                    result?;
-                    Ok(watcher)
-                }
-                Err(_) => Err(RemoteError::lost("pi-env connection lost")),
+    ) -> Result<Self, RemoteError> {
+        let watcher = Self {
+            daemon,
+            state: Arc::new(Mutex::new(WatcherState {
+                targets,
+                options,
+                reconnect_delay_ms: RECONNECT_FIRST_MS,
+                ..Default::default()
+            })),
+            on_change,
+        };
+        let ready = watcher.begin_watch();
+        match ready.await {
+            Ok(result) => {
+                result?;
+                Ok(watcher)
             }
+            Err(_) => Err(RemoteError::lost("pi-env connection lost")),
         }
     }
 
@@ -390,6 +390,10 @@ impl RemoteWatcher {
     /// Advance the reconnect state machine using a host-supplied monotonic
     /// millisecond clock. Upstream does this with unref'd timers; the port has
     /// no timers (`watch.ts:137-161`).
+    ///
+    /// The body is synchronous, but the `async` signature is kept so hosts can
+    /// await [`Daemon::tick`] and this call through one uniform interface.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn tick(&self, now_ms: u64) {
         let mut state = self.state.lock().expect("watcher state lock");
         if state.stopped || !state.pending_reconnect {
@@ -459,8 +463,9 @@ mod tests {
                 mode: WatchMode::Polling
             })
         );
+        let change = change_event(Some("native"), true, &[]);
         assert_eq!(
-            parse_watch_event(&change_event(Some("native"), true, &[])),
+            parse_watch_event(&change.json),
             Some(WatchEvent::Change {
                 mode: Some(WatchMode::Native),
                 overflow: true,
@@ -620,6 +625,8 @@ mod tests {
             Some(1000)
         );
         watcher.tick(1000).await;
+        // `begin_watch` records the request inside a spawned task.
+        tokio::task::yield_now().await;
         assert!(
             calls
                 .calls()

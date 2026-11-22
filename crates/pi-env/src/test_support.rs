@@ -20,6 +20,9 @@ use crate::{
     ssh::{CommandOutput, SshRunner},
 };
 
+/// One recorded SSH invocation: `(program, args, stdin)`.
+type RecordedCommand = (String, Vec<String>, Vec<u8>);
+
 /// Build the standard fake daemon info with a feature list.
 #[must_use]
 pub fn info_with_features(features: &[&str]) -> RemoteInfo {
@@ -129,7 +132,7 @@ impl FakeDaemon {
 impl Daemon for FakeDaemon {
     fn info(
         &self,
-        _abort: Option<crate::connection::AbortSignal>,
+        _abort: Option<crate::AbortSignal>,
     ) -> BoxFuture<'_, Result<RemoteInfo, RemoteError>> {
         self.calls.lock().expect("calls lock").push("info".into());
         let info = self.info.clone();
@@ -148,12 +151,12 @@ impl Daemon for FakeDaemon {
             let position = script.iter().position(|entry| entry.op == op);
             position.map(|index| script.remove(index).expect("index was found"))
         };
-        match scripted {
-            Some(entry) => Box::pin(async move {
-                if let Some((id, session)) = entry.start {
-                    if let Some(on_start) = &options.on_start {
-                        on_start(id, session);
-                    }
+        if let Some(entry) = scripted {
+            Box::pin(async move {
+                if let Some((id, session)) = entry.start
+                    && let Some(on_start) = &options.on_start
+                {
+                    on_start(id, session);
                 }
                 if let Some(on_event) = &options.on_event {
                     for event in entry.events {
@@ -161,11 +164,10 @@ impl Daemon for FakeDaemon {
                     }
                 }
                 entry.outcome
-            }),
-            None => {
-                let message = format!("No scripted reply for {op}");
-                Box::pin(async move { Err(RemoteError::lost(message)) })
-            }
+            })
+        } else {
+            let message = format!("No scripted reply for {op}");
+            Box::pin(async move { Err(RemoteError::lost(message)) })
         }
     }
 
@@ -182,7 +184,7 @@ impl Daemon for FakeDaemon {
 /// An SSH runner that replays canned command outputs.
 pub struct FakeSshRunner {
     outputs: Arc<StdMutex<VecDeque<CommandOutput>>>,
-    commands: Arc<StdMutex<Vec<(String, Vec<String>, Vec<u8>)>>>,
+    commands: Arc<StdMutex<Vec<RecordedCommand>>>,
 }
 
 impl FakeSshRunner {
@@ -212,7 +214,7 @@ impl FakeSshRunner {
 
     /// The commands seen so far: `(program, args, stdin)`.
     #[must_use]
-    pub fn commands(&self) -> Vec<(String, Vec<String>, Vec<u8>)> {
+    pub fn commands(&self) -> Vec<RecordedCommand> {
         self.commands.lock().expect("commands lock").clone()
     }
 }

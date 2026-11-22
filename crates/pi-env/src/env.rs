@@ -233,21 +233,18 @@ impl PathRules {
             3
         } else if self.windows && bytes.starts_with(b"\\\\") {
             2
-        } else if self.windows && bytes.first() == Some(&b'\\') {
-            1
         } else {
-            0
+            usize::from(self.windows && bytes.first() == Some(&b'\\'))
         };
         let prefix: String = raw.chars().take(prefix_len).collect();
         let mut parts: Vec<&str> = Vec::new();
-        for segment in raw[prefix_len..].split(|character| character == '/' || character == '\\') {
+        for segment in raw[prefix_len..].split(['/', '\\']) {
             match segment {
-                "" | "." => {}
                 ".." if !parts.is_empty() && parts.last() != Some(&"..") => {
                     parts.pop();
                 }
                 ".." if prefix_len == 0 => parts.push(".."),
-                ".." => {}
+                "" | "." | ".." => {}
                 other => parts.push(other),
             }
         }
@@ -265,7 +262,18 @@ impl PathRules {
             return self.normalize(path);
         }
         let separator = self.separator();
-        self.normalize(&format!("{base}{separator}{path}"))
+        // Win32.resolve drops the drive of a drive-relative path when the
+        // resolved base is already on that drive (`remote-env.ts:389-397`).
+        let relative = if self.windows
+            && path.len() >= 2
+            && path.as_bytes()[0].is_ascii_alphabetic()
+            && path.as_bytes()[1] == b':'
+        {
+            &path[2..]
+        } else {
+            path
+        };
+        self.normalize(&format!("{base}{separator}{relative}"))
     }
 
     /// `paths.join(...parts)` — unlike `resolve`, a leading separator on a
@@ -290,14 +298,14 @@ fn file_url_to_path(rest: &str, windows: bool) -> String {
     let bytes = path.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) =
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
                 (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
-            {
-                decoded.push(high * 16 + low);
-                index += 3;
-                continue;
-            }
+        {
+            decoded.push(high * 16 + low);
+            index += 3;
+            continue;
         }
         decoded.push(bytes[index]);
         index += 1;
@@ -324,7 +332,7 @@ pub fn resolve_remote_path(path: &str, info: &crate::connection::RemoteInfo, cwd
     let rules = PathRules::for_info(info);
     let mut normalized = path.to_owned();
     if normalized == "~" {
-        normalized = info.home.clone();
+        normalized.clone_from(&info.home);
     } else if let Some(rest) = normalized.strip_prefix("~/") {
         normalized = rules.join(&[info.home.clone(), rest.to_owned()]);
     } else if rules.windows && normalized.starts_with("~\\") {
@@ -816,11 +824,9 @@ impl RemoteExecutionEnv {
         }
         let inherit_env = options.inherit_env;
         let mut env = JsonMap::new();
-        if inherit_env {
-            if let Some(shell_env) = &self.shell_env {
-                for (key, value) in shell_env {
-                    env.insert(key.clone(), Value::String(value.clone()));
-                }
+        if inherit_env && let Some(shell_env) = &self.shell_env {
+            for (key, value) in shell_env {
+                env.insert(key.clone(), Value::String(value.clone()));
             }
         }
         for (key, value) in &options.env {
@@ -1031,7 +1037,7 @@ impl ExecutionEnv for RemoteExecutionEnv {
 mod tests {
     use super::*;
     use crate::{
-        connection::{RemoteInfo, Reply},
+        connection::RemoteInfo,
         test_support::{FakeDaemon, info_with_features, reply},
     };
 
@@ -1095,7 +1101,7 @@ mod tests {
             rules.join(&["/a".into(), "b".into(), "../c".into()]),
             "/a/c"
         );
-        assert_eq!(rules.normalize("a/b/../../c"), "../c");
+        assert_eq!(rules.normalize("a/b/../../../c"), "../c");
     }
 
     #[test]
@@ -1230,30 +1236,19 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_kills_running_commands() {
-        let daemon = FakeDaemon::new(info_with_features(&[]));
-        let mut ok = JsonMap::new();
-        ok.insert("exitCode".into(), Value::from(0));
-        daemon.push_reply(
-            "exec",
-            Reply {
-                json: ok,
-                payload: Vec::new(),
-                session: 1,
-            },
-            Vec::new(),
-            Some((11, 1)),
-        );
+        let daemon = Arc::new(FakeDaemon::new(info_with_features(&[])));
+        let erased: Arc<dyn Daemon> = daemon.clone();
         let env = RemoteExecutionEnv::new(RemoteExecutionEnvOptions {
-            daemon: Arc::new(daemon.clone()),
+            daemon: erased,
             id: "x".into(),
             cwd: "/work".into(),
             shell_path: None,
             shell_env: None,
             watch: RemoteWatchOptions::default(),
         });
-        let _ = env
-            .exec(&Command::Shell("sleep 1".into()), None, &AbortSignal::new())
-            .await;
+        // Upstream unregisters a command when `exec` settles; cleanup kills the
+        // ones still registered (e.g. from a concurrent, in-flight exec).
+        env.running.lock().expect("running lock").push((11, 1));
         env.cleanup().await;
         assert!(daemon.killed().contains(&(11, 1)));
     }

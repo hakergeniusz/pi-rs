@@ -34,6 +34,12 @@
 //! [`connection::Daemon`] and [`ssh::SshRunner`] traits so tests use fake
 //! backends and never open a real connection.
 
+// `RemoteError` is a transparent, by-value mirror of upstream's JS error
+// object (`connection.ts:31-44`). Boxing its fields to satisfy this lint would
+// change every public `Result<_, RemoteError>` signature in the port, so the
+// deliberate 1:1 shape is kept and the lint is silenced crate-wide.
+#![allow(clippy::result_large_err)]
+
 /// Request/reply correlation, frame codec and the injectable daemon transport
 /// (`connection.ts`).
 pub mod connection;
