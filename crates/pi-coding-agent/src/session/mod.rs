@@ -29,11 +29,19 @@
 //!   (`core/session-export.ts`).
 //! * [`export_html`] — the self-contained HTML viewer export
 //!   (`core/export-html/`, templates embedded byte-identically).
+//! * [`bash_execution`] — incremental `bash_execution_update` output deltas
+//!   (`core/agent-session.ts:251,4003-4035`, `core/tools/bash.ts:289-364`) and
+//!   the tool-host feed/accumulator.
+//! * [`readonly`] — the `ReadonlySessionManager` read-only view
+//!   (`core/session-manager.ts:245-262`).
+//! * [`store::SessionListProgress`] — the optional session-listing progress
+//!   callback (`core/session-manager.ts:885-890,942-975,1916-2035`).
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 
+pub mod bash_execution;
 pub mod branch_summarization;
 pub mod cache_stats;
 pub mod cache_warmer;
@@ -43,12 +51,15 @@ pub mod export;
 pub mod export_html;
 pub mod json;
 pub mod migrate;
+pub mod readonly;
 pub mod records;
 pub mod store;
 
+pub use bash_execution::{BashExecutionDeltaCollector, BashExecutionEvent};
 pub use migrate::{
     migrate_to_current_version, parse_session_entries, serialize_entries, version_of,
 };
+pub use readonly::ReadonlySessionManager;
 pub use records::{
     BranchSummaryEntry, CURRENT_SESSION_VERSION, CompactionEntry, ContextEditEntry,
     ContextReplacement, CustomEntry, CustomMessageEntry, EntryBase, LabelEntry, ModelChangeEntry,
@@ -56,13 +67,15 @@ pub use records::{
     TaggedSystemMessage, ThinkingLevelChangeEntry, UsageEntry,
 };
 pub use store::{
-    ModelRef, NewSessionOptions, ProjectedSessionEntry, SessionContext, SessionInfo, SessionLayout,
+    ALL_SESSION_LIST_PUBLISH_INTERVAL, ModelRef, NewSessionOptions, ProjectedSessionEntry,
+    SESSION_LIST_PUBLISH_INTERVAL, SessionContext, SessionInfo, SessionLayout, SessionListProgress,
     SessionManager, SessionProjection, SessionTreeNode, assert_valid_session_id,
     build_context_entries_from, build_session_context_from, build_session_path,
     build_session_projection_from, create_session_id, default_session_dir,
     default_session_dir_path, find_most_recent_session, get_latest_compaction_entry, iso_to_ms,
-    iso8601_millis, list_sessions_in_dir, load_entries_from_file, now_iso8601, paths_equal,
-    project_context_entry, read_session_header, resolve_path, session_entry_to_context_messages,
+    iso8601_millis, list_sessions_in_dir, list_sessions_in_dir_with_progress,
+    load_entries_from_file, now_iso8601, paths_equal, project_context_entry, read_session_header,
+    resolve_path, session_entry_to_context_messages,
 };
 
 /// Errors the session layer reports. Messages match the ones the TS

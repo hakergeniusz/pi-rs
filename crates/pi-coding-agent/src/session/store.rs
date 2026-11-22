@@ -503,6 +503,20 @@ pub struct SessionInfo {
     pub all_messages_text: String,
 }
 
+/// `SessionListProgress` (`session-manager.ts:885-890`): called after each
+/// session file is loaded with the running count, the total, and — on periodic
+/// publish steps only — the sessions loaded so far, sorted by activity. The
+/// optional partial list is `None` on intermediate steps so cheap callers can
+/// just display the counts.
+pub type SessionListProgress<'a> = dyn Fn(usize, usize, Option<&[SessionInfo]>) + 'a;
+
+/// `CURRENT_SESSION_LIST_PUBLISH_INTERVAL` (`:894`): publish partial results
+/// on the 1st, every 10th, and the final `SessionManager.list` load.
+pub const SESSION_LIST_PUBLISH_INTERVAL: usize = 10;
+/// `ALL_SESSION_LIST_PUBLISH_INTERVAL` (`:895`): the sparser cadence for
+/// `SessionManager.listAll` across every project directory.
+pub const ALL_SESSION_LIST_PUBLISH_INTERVAL: usize = 100;
+
 fn system_time_to_datetime(time: std::time::SystemTime) -> DateTime<Utc> {
     let millis = time
         .duration_since(std::time::UNIX_EPOCH)
@@ -621,6 +635,17 @@ fn sort_session_infos(mut sessions: Vec<SessionInfo>) -> Vec<SessionInfo> {
 
 /// `listSessionsFromDir` (`:949-982`), synchronous and without progress.
 pub fn list_sessions_in_dir(dir: &Path) -> Vec<SessionInfo> {
+    list_sessions_in_dir_with_progress(dir, None)
+}
+
+/// `listSessionsFromDir(dir, onProgress?)` (`:942-975`) with the progress
+/// callback wired in. The port loads files sequentially (upstream uses bounded
+/// concurrency), so `loaded` runs 1..=total in file order; the counts, publish
+/// cadence, and sorted partial snapshots match upstream exactly.
+pub fn list_sessions_in_dir_with_progress(
+    dir: &Path,
+    on_progress: Option<&SessionListProgress<'_>>,
+) -> Vec<SessionInfo> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -632,9 +657,25 @@ pub fn list_sessions_in_dir(dir: &Path) -> Vec<SessionInfo> {
     // TS sorts file names descending (`b.localeCompare(a)`); every path here
     // shares the directory, so the full path orders identically.
     files.sort_by_key(|path| std::cmp::Reverse(path.to_string_lossy().into_owned()));
+    let total = files.len();
+    let mut partial: Vec<SessionInfo> = Vec::new();
+    let mut loaded = 0usize;
     files
         .iter()
-        .filter_map(|path| build_session_info(path))
+        .filter_map(|path| {
+            let info = build_session_info(path);
+            loaded += 1;
+            if let Some(info) = &info {
+                partial.push(info.clone());
+            }
+            if let Some(callback) = on_progress {
+                let publish =
+                    loaded == 1 || loaded % SESSION_LIST_PUBLISH_INTERVAL == 0 || loaded == total;
+                let snapshot = publish.then(|| sort_session_infos(partial.clone()));
+                callback(loaded, total, snapshot.as_deref());
+            }
+            info
+        })
         .collect()
 }
 
@@ -1253,6 +1294,18 @@ impl SessionManager {
     /// sessions of a directory, most recently active first. A custom session
     /// directory filters by the session's stored cwd.
     pub fn list(cwd: &Path, session_dir: Option<&Path>) -> Vec<SessionInfo> {
+        Self::list_with_progress(cwd, session_dir, None)
+    }
+
+    /// `SessionManager.list(cwd, sessionDir?, onProgress?)` with the optional
+    /// progress callback (`:1916-1931`). Callers of [`SessionManager::list`] are
+    /// unaffected. The callback sees partial sessions filtered by the same cwd
+    /// rule as the final result, matching upstream's `includeSession` wrapper.
+    pub fn list_with_progress(
+        cwd: &Path,
+        session_dir: Option<&Path>,
+        on_progress: Option<&SessionListProgress<'_>>,
+    ) -> Vec<SessionInfo> {
         let dir = match session_dir {
             Some(dir) => PathBuf::from(dir),
             None => match default_session_dir(cwd) {
@@ -1266,14 +1319,32 @@ impl SessionManager {
                 &default_session_dir_path(cwd, &crate::config::get_sessions_dir()),
             );
         let resolved_cwd = resolve_path(cwd);
-        let sessions = if filter_cwd {
-            list_sessions_in_dir(&dir)
+        let progress: Option<Box<SessionListProgress<'_>>> = on_progress.map(|callback| {
+            let filter = filter_cwd;
+            let resolved = resolved_cwd.clone();
+            let wrapped =
+                move |loaded: usize, total: usize, partial: Option<&[SessionInfo]>| match partial {
+                    Some(sessions) => {
+                        let filtered: Vec<SessionInfo> = sessions
+                            .iter()
+                            .filter(|session| {
+                                !filter || session_cwd_matches(Some(&session.cwd), &resolved)
+                            })
+                            .cloned()
+                            .collect();
+                        callback(loaded, total, Some(&filtered));
+                    }
+                    None => callback(loaded, total, None),
+                };
+            Box::new(wrapped) as Box<SessionListProgress<'_>>
+        });
+        let sessions: Vec<SessionInfo> =
+            list_sessions_in_dir_with_progress(&dir, progress.as_deref())
                 .into_iter()
-                .filter(|session| session_cwd_matches(Some(&session.cwd), &resolved_cwd))
-                .collect()
-        } else {
-            list_sessions_in_dir(&dir)
-        };
+                .filter(|session| {
+                    !filter_cwd || session_cwd_matches(Some(&session.cwd), &resolved_cwd)
+                })
+                .collect();
         sort_session_infos(sessions)
     }
 
@@ -1281,21 +1352,61 @@ impl SessionManager {
     /// across all project directories of the agent sessions root, or of one
     /// explicit directory.
     pub fn list_all(session_dir: Option<&Path>) -> Vec<SessionInfo> {
+        Self::list_all_with_progress(session_dir, None)
+    }
+
+    /// `SessionManager.listAll(sessionDir?, onProgress?)` with the optional
+    /// progress callback (`:1937-2028`). The port discovers files sequentially
+    /// rather than via upstream's bounded concurrency, but reports the same
+    /// `(loaded, total, partialSessions?)` sequence and publish cadence
+    /// (`ALL_SESSION_LIST_PUBLISH_INTERVAL`) on the all-directories path.
+    pub fn list_all_with_progress(
+        session_dir: Option<&Path>,
+        on_progress: Option<&SessionListProgress<'_>>,
+    ) -> Vec<SessionInfo> {
         if let Some(dir) = session_dir {
-            return sort_session_infos(list_sessions_in_dir(dir));
+            return sort_session_infos(list_sessions_in_dir_with_progress(dir, on_progress));
         }
         let sessions_root = crate::config::get_sessions_dir();
         let Ok(entries) = fs::read_dir(&sessions_root) else {
             return Vec::new();
         };
-        let mut sessions = Vec::new();
+        let mut files: Vec<PathBuf> = Vec::new();
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
             if !path.is_dir() {
                 continue;
             }
-            sessions.extend(list_sessions_in_dir(&path));
+            if let Ok(dir_entries) = fs::read_dir(&path) {
+                for candidate in dir_entries.filter_map(Result::ok) {
+                    let candidate = candidate.path();
+                    if candidate.extension().is_some_and(|ext| ext == "jsonl") {
+                        files.push(candidate);
+                    }
+                }
+            }
         }
+        let total = files.len();
+        let mut partial: Vec<SessionInfo> = Vec::new();
+        let mut loaded = 0usize;
+        let sessions: Vec<SessionInfo> = files
+            .iter()
+            .filter_map(|path| {
+                let info = build_session_info(path);
+                loaded += 1;
+                if let Some(info) = &info {
+                    partial.push(info.clone());
+                }
+                if let Some(callback) = on_progress {
+                    let publish = loaded == 1
+                        || loaded % ALL_SESSION_LIST_PUBLISH_INTERVAL == 0
+                        || loaded == total;
+                    let snapshot = publish.then(|| sort_session_infos(partial.clone()));
+                    callback(loaded, total, snapshot.as_deref());
+                }
+                info
+            })
+            .collect();
         sort_session_infos(sessions)
     }
 
@@ -2440,6 +2551,8 @@ fn new_header_object(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use pi_ai::types::{TextContent, UsageCost};
 
@@ -2636,5 +2749,100 @@ mod tests {
         assert_eq!(entry.summary, "Summary of abandoned work");
         assert_eq!(entry.usage.map(|u| u.total_tokens), Some(100));
         assert_eq!(entry.base.parent_id, Some(id1));
+    }
+
+    fn create_flushed_session(cwd: &Path, dir: &Path) {
+        let mut manager =
+            SessionManager::create(cwd, Some(dir), &NewSessionOptions::default()).unwrap();
+        manager.append_message(user_message("hello")).unwrap();
+    }
+
+    #[test]
+    fn list_sessions_in_dir_reports_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..12 {
+            create_flushed_session(&PathBuf::from(format!("/proj/{index}")), dir.path());
+        }
+
+        let events = RefCell::new(Vec::new());
+        let infos = list_sessions_in_dir_with_progress(
+            dir.path(),
+            Some(
+                &|loaded: usize, total: usize, partial: Option<&[SessionInfo]>| {
+                    events.borrow_mut().push((
+                        loaded,
+                        total,
+                        partial.map_or(0, |sessions| sessions.len()),
+                    ));
+                },
+            ),
+        );
+
+        assert_eq!(infos.len(), 12);
+        let events = events.into_inner();
+        let loaded: Vec<usize> = events.iter().map(|(loaded, _, _)| *loaded).collect();
+        assert_eq!(loaded, (1..=12).collect::<Vec<_>>());
+        assert!(events.iter().all(|(_, total, _)| *total == 12));
+        // Publish cadence: 1st, every 10th, and the final load.
+        let with_partial: Vec<(usize, usize)> = events
+            .iter()
+            .filter(|(_, _, len)| *len > 0)
+            .map(|(loaded, _, len)| (*loaded, *len))
+            .collect();
+        assert_eq!(with_partial, vec![(1, 1), (10, 10), (12, 12)]);
+    }
+
+    #[test]
+    fn manager_list_with_progress_filters_partial_sessions_by_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_a = PathBuf::from("/proj/a");
+        let project_b = PathBuf::from("/proj/b");
+        create_flushed_session(&project_a, dir.path());
+        create_flushed_session(&project_b, dir.path());
+        create_flushed_session(&project_a, dir.path());
+
+        let events = RefCell::new(Vec::new());
+        let infos = SessionManager::list_with_progress(
+            &project_a,
+            Some(dir.path()),
+            Some(
+                &|loaded: usize, total: usize, partial: Option<&[SessionInfo]>| {
+                    events.borrow_mut().push((
+                        loaded,
+                        total,
+                        partial.map_or(0, |sessions| sessions.len()),
+                    ));
+                },
+            ),
+        );
+
+        assert_eq!(infos.len(), 2);
+        let events = events.into_inner();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|(_, total, _)| *total == 3));
+        // Every published partial snapshot is filtered to project A (2 sessions),
+        // never the project B session that lives in the same directory.
+        assert!(events.iter().all(|(_, _, len)| *len <= 2));
+        assert_eq!(events.last().unwrap().2, 2);
+    }
+
+    #[test]
+    fn no_progress_callers_are_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = PathBuf::from("/proj/one");
+        create_flushed_session(&cwd, dir.path());
+
+        assert_eq!(
+            SessionManager::list(&cwd, Some(dir.path())),
+            SessionManager::list_with_progress(&cwd, Some(dir.path()), None)
+        );
+        assert_eq!(
+            list_sessions_in_dir(dir.path()),
+            list_sessions_in_dir_with_progress(dir.path(), None)
+        );
+        assert_eq!(
+            SessionManager::list_all(Some(dir.path())),
+            SessionManager::list_all_with_progress(Some(dir.path()), None)
+        );
     }
 }
