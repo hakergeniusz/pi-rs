@@ -163,20 +163,21 @@ login/refresh** (Anthropic, Codex, Copilot), the new **`pi-env`** crate, the
 **telemetry exporter/ping/conformance** surface, and the registered **image
 pipeline** module.
 
-A follow-up host-wiring wave (`16060d5`..`bc518ac`) made stored built-in OAuth
+A follow-up host-wiring wave (`16060d5`..`deb633e`) made stored built-in OAuth
 credentials refresh at wire time, attached images from `read`/`@file` and the
-interactive `convertToLlm` filter, fired the telemetry ping/exporter at
+`convertToLlm` filter in all four modes, fired the telemetry ping/exporter at
 startup/shutdown, drove MCP startup/list-changed ticks, and upgraded `url` to
-2.5.9 (RUSTSEC-2026-0592). Full gate green: 2560 passed, 0 failed, 3 ignored.
+2.5.9 (RUSTSEC-2026-0592). Full gate green: 2565 passed, 0 failed, 3 ignored.
 
 Still open (mechanism tails or deliberate scope decisions):
 
 1. `pi-env` is still library-only: ticks/PTY/SSH onboarding have no host consumer.
-2. Wiring tails: `blockImages` is installed only on the interactive `convertToLlm`
-   path (print/JSON/RPC unwired), there is no image pixel backend, telemetry
-   transports stay inert (no real HTTP), the MCP `StartupWait` is one-shot with
-   poll-based notifications and no tick in the interactive/RPC pump modes, and
-   OAuth refresh covers only the three built-in flows (Anthropic/Codex/Copilot).
+2. Wiring tails: `blockImages` is installed in all four modes but headless
+   modes snapshot it once at startup (upstream re-reads it per call); there is
+   no image pixel backend, telemetry transports stay inert (no real HTTP), the
+   MCP `StartupWait` is one-shot with poll-based notifications and no tick in
+   the interactive/RPC pump modes, and OAuth refresh covers only the three
+   built-in flows (Anthropic/Codex/Copilot).
 3. RPC dispatch is still serial and session rebind/host events remain stubbed.
    Codemode Node/Workers/wasm transports are typed stubs; dynamic `require`,
    `node_modules` resolution and `URL.canParse` remain unported.

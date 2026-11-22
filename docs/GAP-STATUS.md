@@ -1,6 +1,6 @@
 # Upstream ↔ pi-rs coverage (gap-wave snapshot)
 
-> Snapshot: 2026-11-22, after `bc518ac` (the host-wiring wave on `main`).
+> Snapshot: 2026-11-22, after `deb633e` (the host-wiring wave on `main`).
 > Ground truth is pi 1.5.2 (`/tmp/pi`; re-clone with
 > `gh repo clone earendil-works/pi /tmp/pi` if the tmpfs copy is gone). This is
 > a mechanism-level map, **not** a claim of 1:1 parity: each module's `//!` docs
@@ -28,7 +28,7 @@ Legend:
 | `pi-tui` | `pi-tui` + host package shim | Ported / data-shape | full Rust renderer; shims are data-shape only |
 | `pi-coding-agent` — CLI, modes, sessions, tools, extensions E0–E3 | `pi-coding-agent` | Ported | host-driven timers and other mechanism deviations documented in module docs |
 | `pi-coding-agent` — RPC remaining fidelity | `modes/rpc.rs` | Partial | preflight, input handlers, expansion, no-model gate and `model_select` callbacks have inert defaults; serial dispatch, no runtime rebind |
-| `pi-coding-agent` — image attachment pipeline | `images/{mod,sniff,resize}.rs` | Partial | wired into `read.rs`, `@file`/`file_processor.rs` and the interactive `convertToLlm` `blockImages` filter; print/JSON/RPC filters unwired, no pixel backend, 29 tests |
+| `pi-coding-agent` — image attachment pipeline | `images/{mod,sniff,resize}.rs` | Partial | wired into `read.rs`, `@file`/`file_processor.rs` and `blockImages` `convertToLlm` in all four modes; headless modes snapshot the setting at startup, no pixel backend, 34 tests |
 | `pi-coding-agent` — telemetry | `telemetry/{host,ping,exporters,conformance}.rs` | Partial | ping fires at upstream's interactive changelog point and the exporter flushes at shutdown, gated by `PI_OFFLINE`/`PI_TELEMETRY` + setting; 12 conformance cases; default transports stay inert (no real HTTP transport), OTLP endpoint additive |
 | `pi-mcp` — client, stdio/HTTP transports, OAuth, resources | `pi-mcp` | Ported | `pi mcp` CLI and `/mcp` selector wired |
 | `pi-mcp` — startup wait, `list_changed`, result `_meta` | `pi-ext-js::mcp_manager`, `pi-mcp::types`, `pi-coding-agent::extensions` | Partial | `mcp_tick` + `settle_mcp_startup` before first prompt, tool-exposure glob delegation and `list_changed` re-registration wired; interactive/RPC pump ticks unwired, `StartupWait` one-shot, notifications poll-based, stderr via temp-file sink |
@@ -42,9 +42,10 @@ Legend:
 - **`pi-env` host wiring (still library-only):** daemon keepalive/watch ticks,
   PTY/process input on a Tokio runtime, explicit SSH host-key onboarding; no
   host crate consumes it yet.
-- **Wiring tails:** the image `blockImages` filter is installed only on the
-  interactive `convertToLlm` path (print/JSON/RPC unwired); no pixel backend,
-  so oversized/BMP images stay on upstream's "unavailable" omission path;
+- **Wiring tails:** the image `blockImages` filter is installed in all four
+  modes, but headless modes snapshot it once at startup (upstream re-reads it
+  per call); no pixel backend, so oversized/BMP images stay on upstream's
+  "unavailable" omission path;
   telemetry ping/HTTP transports are inert by default (no real HTTP transport);
   MCP `StartupWait` is one-shot once its bound elapses, notifications are
   poll-based, and the interactive/RPC pump modes do not drive `mcp_tick`.

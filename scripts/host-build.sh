@@ -35,12 +35,12 @@ unset PI_CODING_AGENT_DIR PI_CODING_AGENT_SESSION_DIR
 mkdir -p "$CARGO_TARGET_DIR" "$XDG_CACHE_HOME"
 cd "$(dirname "$0")/.." || exit 1
 
-SNAPSHOT=.build-cache/host-target.tgz
+SNAPSHOT=.build-cache/host-target.tar.zst
 
 snapshot() {
   mkdir -p .build-cache
-  echo "[host-build] snapshotting $CARGO_TARGET_DIR -> $SNAPSHOT"
-  tar czf "${SNAPSHOT}.tmp" -C "$(dirname "$CARGO_TARGET_DIR")" "$(basename "$CARGO_TARGET_DIR")"
+  echo "[host-build] snapshotting $CARGO_TARGET_DIR -> $SNAPSHOT (zstd -5)"
+  tar -I 'zstd -5' -cf "${SNAPSHOT}.tmp" -C "$(dirname "$CARGO_TARGET_DIR")" "$(basename "$CARGO_TARGET_DIR")"
   mv -f "${SNAPSHOT}.tmp" "$SNAPSHOT"
 }
 

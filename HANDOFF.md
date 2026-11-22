@@ -3973,7 +3973,7 @@ call sites are listed in `crates/pi-coding-agent/src/images/WIRING.md`.
 
 ## 2026-11-22 — host-wiring wave
 
-Five commits closed the host-call-site gaps left by the gap-closing wave above;
+Six commits closed the host-call-site gaps left by the gap-closing wave above;
 this section supersedes that section's "Open" notes for OAuth, telemetry and
 images. Coverage statuses are reflected in
 [`docs/GAP-STATUS.md`](docs/GAP-STATUS.md).
@@ -4030,8 +4030,17 @@ images. Coverage statuses are reflected in
   manager worker), notifications are poll-based, and stderr is captured via a
   temp-file sink.
 
-**Gate:** workspace fmt + clippy (`-D warnings`) + tests green — **2560 passed,
-0 failed, 3 ignored**; CI all jobs green including the dependency audit.
+- **`deb633e` — headless `blockImages`:** `images::block_images_converter` is a
+  shared seam installed in print, JSON and RPC (interactive keeps its own
+  wrapper). `main.rs` snapshots `getBlockImages()` alongside retry/compaction
+  and threads it into all three run modes; 5 new tests, including a real RPC
+  end-to-end prompt with an image. Headless modes snapshot once at startup
+  rather than re-reading per `convertToLlm` call (single-run, no visible delta).
+
+**Gate:** workspace fmt + clippy (`-D warnings`) + tests green — **2565 passed,
+0 failed, 3 ignored**; CI all jobs green including the dependency audit. The
+host build cache is snapshotted to `.build-cache/host-target.tar.zst` with
+`zstd -5` (`scripts/host-build.sh snapshot`).
 
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
