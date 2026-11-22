@@ -21,6 +21,9 @@ pi-agent = { workspace = true }
 pi-ai = { workspace = true }
 pi-codemode = { workspace = true }
 pi-mcp = { workspace = true }
+# Direct path so the workspace root's dependency table stays untouched; the
+# crate is already a workspace member. `pi remote` is its host consumer.
+pi-env = { path = "../pi-env" }
 pi-schema = { workspace = true }
 pi-tui = { workspace = true }
 # The embedded JS extensions host; build without it via `--no-default-features`.

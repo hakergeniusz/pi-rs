@@ -70,6 +70,9 @@ pub mod package_manager;
 pub mod prompt;
 /// Command prompt templates (`core/prompt-templates.ts`).
 pub mod prompt_templates;
+/// `pi remote`: host consumer for the `pi-env` daemon connection, with
+/// host-driven ping/watch ticks (`packages/env/src/**`).
+pub mod remote_env;
 /// Process-wide tokio runtime driving async work from the sync CLI paths.
 pub mod runtime;
 /// The JSONL session tree: v3 records, store, migrations, compaction.

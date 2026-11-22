@@ -24,9 +24,12 @@ pi-env = { path = "crates/pi-env", version = "0.1.0" }
 external crate and no `Cargo.lock` change is required.** All lints are
 inherited via `[lints] workspace = true`.
 
-## 3. Host wiring needed for `pi-coding-agent` to consume it
+## 3. Host wiring in `pi-coding-agent` (`pi remote`)
 
-None is assumed or performed by this slice. When a follow-up slice wires it in:
+Wired by the follow-up `task/env-host` slice; see
+`crates/pi-coding-agent/src/remote_env.rs`. The crate is imported as a direct
+path dependency (`pi-env = { path = "../pi-env" }`) so the workspace root's
+`[workspace.dependencies]` stays untouched. Equivalent to step 1 below:
 
 1. Add `pi-env = { workspace = true }` to `crates/pi-coding-agent/Cargo.toml`.
 2. Build a daemon connection and hand it to the environment. The crate is
@@ -60,6 +63,10 @@ None is assumed or performed by this slice. When a follow-up slice wires it in:
 6. SSH host-key onboarding is explicit: `scan_host_key`, `accept_hostKey` →
    `apply_accept` + `write_known_hosts`, `forget` → `apply_forget` +
    `write_known_hosts`. No key is accepted automatically.
+7. `SshConnection` now implements `Daemon` by forwarding to its inner
+   `ProcessDaemon`, so the host keeps one `Arc<dyn Daemon>` for both the local
+   and SSH paths. `test_support` is public so host tests can inject
+   `FakeDaemon` without a real transport.
 
 ## 4. Surface covered (upstream `packages/env/src`)
 

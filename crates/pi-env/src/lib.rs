@@ -57,9 +57,10 @@ pub mod process;
 pub mod ssh;
 /// PTY remote terminals (`terminal.ts`).
 pub mod terminal;
-/// Scripted daemon used by the unit tests (test-only, no upstream file).
-#[cfg(test)]
-pub(crate) mod test_support;
+/// Scripted backends used by the unit tests and by downstream host-wiring
+/// tests (no upstream file). Public so the `pi remote` host arm can drive a
+/// fake daemon without opening a socket or starting `ssh`.
+pub mod test_support;
 /// Remote file watcher with host-driven reconnect (`watch.ts`).
 pub mod watch;
 

@@ -69,6 +69,7 @@ pub struct FakeDaemon {
     script: StdMutex<VecDeque<Scripted>>,
     calls: StdMutex<Vec<String>>,
     killed: StdMutex<Vec<(u64, u64)>>,
+    ticks: StdMutex<Vec<u64>>,
 }
 
 impl FakeDaemon {
@@ -80,6 +81,7 @@ impl FakeDaemon {
             script: StdMutex::new(VecDeque::new()),
             calls: StdMutex::new(Vec::new()),
             killed: StdMutex::new(Vec::new()),
+            ticks: StdMutex::new(Vec::new()),
         }
     }
 
@@ -126,6 +128,12 @@ impl FakeDaemon {
     #[must_use]
     pub fn killed(&self) -> Vec<(u64, u64)> {
         self.killed.lock().expect("killed lock").clone()
+    }
+
+    /// The monotonic timestamps passed to `tick`, in order.
+    #[must_use]
+    pub fn ticks(&self) -> Vec<u64> {
+        self.ticks.lock().expect("ticks lock").clone()
     }
 }
 
@@ -177,6 +185,11 @@ impl Daemon for FakeDaemon {
     }
 
     fn close(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+
+    fn tick(&self, now_ms: u64) -> BoxFuture<'_, ()> {
+        self.ticks.lock().expect("ticks lock").push(now_ms);
         Box::pin(async {})
     }
 }

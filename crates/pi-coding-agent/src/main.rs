@@ -49,6 +49,13 @@ fn main() {
         std::process::exit(code);
     }
 
+    // `pi remote` routes before mode startup like `pi mcp`. It is a new host
+    // arm for `pi-env` (upstream has no remote subcommand) and stays inert
+    // unless a daemon/host is explicitly configured.
+    if let Some(code) = pi_coding_agent::remote_env::handle_remote_command(&raw) {
+        std::process::exit(code);
+    }
+
     // `pi mcp` routes before mode startup like the package commands
     // (upstream `main.ts:665-667`): `runMcpCommand(args.slice(1), { cwd,
     // agentDir })`. The CLI's own `parse_args` must never see the `mcp` word.

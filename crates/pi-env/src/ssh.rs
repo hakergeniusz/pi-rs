@@ -1105,6 +1105,40 @@ impl SshConnection {
     }
 }
 
+/// Forward the [`Daemon`] surface so a host can keep one
+/// `Arc<dyn Daemon>` whether the daemon was spawned locally or reached over
+/// SSH. This is a pure delegation to [`SshConnection::daemon`]; no extra
+/// connection or state is introduced.
+impl Daemon for SshConnection {
+    fn info(
+        &self,
+        abort: Option<crate::errors::AbortSignal>,
+    ) -> BoxFuture<'_, Result<crate::connection::RemoteInfo, RemoteError>> {
+        self.daemon.info(abort)
+    }
+
+    fn request(
+        &self,
+        op: &str,
+        json: crate::JsonMap,
+        options: crate::connection::RequestOptions,
+    ) -> BoxFuture<'_, Result<crate::connection::Reply, RemoteError>> {
+        self.daemon.request(op, json, options)
+    }
+
+    fn kill(&self, id: u64, session: u64) -> BoxFuture<'_, ()> {
+        self.daemon.kill(id, session)
+    }
+
+    fn close(&self) -> BoxFuture<'_, ()> {
+        self.daemon.close()
+    }
+
+    fn tick(&self, now_ms: u64) -> BoxFuture<'_, ()> {
+        self.daemon.tick(now_ms)
+    }
+}
+
 fn command_builder(
     options: SshConnectOptions,
     runner: Arc<dyn SshRunner>,
