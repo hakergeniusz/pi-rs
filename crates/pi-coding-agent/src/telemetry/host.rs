@@ -28,6 +28,13 @@
 //! [`HostTelemetry::with_real_transports`], which install the reqwest-backed
 //! [`exporters::ReqwestHttpTransport`] and [`ping::HttpPingTransport`] behind
 //! exactly the same gates.
+//!
+//! The binary attaches this recorder to each mode through
+//! [`HostTelemetry::record_run`] (a single local `pi.run` span with a benign
+//! mode label — no prompts, credentials or session content) and drains it
+//! once with [`HostTelemetry::flush_and_shutdown`]. Upstream v1.5.2 has no
+//! span producer in the CLI host, so this one span is the minimal seam that
+//! keeps the recorder from being dead; redaction and gating are unchanged.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,7 +46,10 @@ use super::exporters::{
     ReqwestHttpTransport, TelemetryExporter, export_telemetry,
 };
 use super::ping::{ENV_OFFLINE, HttpPingTransport, NoopPingTransport, PingOutcome, PingTransport};
-use super::{ENV_TELEMETRY, Telemetry, construct_telemetry, is_install_telemetry_enabled};
+use super::{
+    AttributeValue, ENV_TELEMETRY, SpanAttributes, SpanOptions, Telemetry, construct_telemetry,
+    is_install_telemetry_enabled,
+};
 
 /// Additive OTLP endpoint override. `PI_RS_` keeps it distinct from any
 /// variable a real TypeScript pi install might read.
@@ -242,6 +252,25 @@ impl HostTelemetry {
         Arc::clone(&self.telemetry)
     }
 
+    /// Attach this host's recorder to a mode by recording one local `pi.run`
+    /// span. Upstream v1.5.2 has no span producer in the CLI host — its only
+    /// telemetry surface is the install ping — so without this seam the
+    /// recorder stays empty and [`Self::flush`] has nothing to export. The
+    /// span carries only a benign mode label (never prompts, credentials or
+    /// session data); gating and [`exporters::redact_attributes`] are
+    /// unchanged, so default wiring still opens no socket.
+    pub fn record_run(&self, mode: &str) {
+        let options = SpanOptions {
+            name: "pi.run".to_string(),
+            attributes: SpanAttributes::from([(
+                "mode".to_string(),
+                AttributeValue::String(mode.to_string()),
+            )]),
+            links: Vec::new(),
+        };
+        self.telemetry.start_span(options, &mut |_| {});
+    }
+
     /// The batched exporter, for diagnostics and tests.
     #[must_use]
     pub fn exporter(&self) -> &Arc<BatchExporter> {
@@ -279,6 +308,15 @@ impl HostTelemetry {
     /// recorder's snapshot. Never fails the CLI.
     pub fn shutdown(&self) {
         self.exporter.shutdown();
+    }
+
+    /// The single shutdown call for each mode: export the recorder's snapshot
+    /// exactly once, then drain the exporter. [`Self::flush`]'s `AtomicBool`
+    /// makes repeated passes idempotent, so no span or metric is sent twice.
+    pub fn flush_and_shutdown(&self) -> ExportReport {
+        let report = self.flush();
+        self.shutdown();
+        report
     }
 }
 
@@ -533,6 +571,57 @@ mod tests {
         assert_eq!(configured.flush(), ExportReport::default());
         configured.shutdown();
         assert_eq!(http.requests().len(), 2);
+    }
+
+    /// The recorder installed by [`HostTelemetry::record_run`] must reach the
+    /// injected transport at shutdown: the span is recorded locally, exported
+    /// once by `flush_and_shutdown`, and never duplicated by a second pass.
+    #[test]
+    fn recorded_run_reaches_transport_at_shutdown() {
+        let http = Arc::new(FakeHttpTransport::default());
+        let host = HostTelemetry::with_transport(
+            HostTelemetryConfig::resolve(true, Some("http://collector"), &WiringEnv::default()),
+            Arc::clone(&http) as Arc<dyn HttpTransport>,
+            Arc::new(NoopPingTransport),
+        );
+        host.record_run("print");
+        // Recording is local: nothing leaves until the mode shuts down.
+        assert_eq!(http.requests().len(), 0);
+        let report = host.flush_and_shutdown();
+        assert_eq!(report.spans, 1);
+        assert_eq!(report.metrics, 0);
+        assert_eq!(report.errors, Vec::new());
+
+        let requests = http.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].endpoint, "http://collector");
+        let spans = &requests[0].body["resourceSpans"][0]["scopeSpans"][0]["spans"];
+        assert_eq!(spans.as_array().map(Vec::len), Some(1));
+        assert_eq!(spans[0]["name"], serde_json::json!("pi.run"));
+        // The benign mode label survives the unchanged redaction pipeline.
+        let attributes = spans[0]["attributes"].as_array().expect("attributes array");
+        assert!(attributes.iter().any(|attribute| {
+            attribute["key"] == serde_json::json!("mode")
+                && attribute["value"]["stringValue"] == serde_json::json!("print")
+        }));
+        // A repeated shutdown pass must not send the snapshot twice.
+        assert_eq!(host.flush(), ExportReport::default());
+        host.shutdown();
+        assert_eq!(http.requests().len(), 1);
+    }
+
+    /// With default wiring there is no endpoint, so a recorded run stays in
+    /// memory: `flush_and_shutdown` opens no socket and sends nothing.
+    #[test]
+    fn recorded_run_stays_inert_without_an_endpoint() {
+        let host = HostTelemetry::new(HostTelemetryConfig::resolve(
+            true,
+            None,
+            &WiringEnv::default(),
+        ));
+        host.record_run("rpc");
+        assert_eq!(host.flush_and_shutdown(), ExportReport::default());
+        assert_eq!(host.exporter().exports(), 0);
     }
 
     /// Real transports are wired, but the resolved gate still blocks all I/O

@@ -770,6 +770,7 @@ fn run_print(
 ) -> Result<i32, String> {
     let (mut runtime, host_telemetry, block_images) =
         build_runtime(args, cwd, cwd_string, "print")?;
+    host_telemetry.record_run("print");
     let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd, stdin_content)?;
     let options = PrintModeOptions {
         mode: Mode::Text,
@@ -780,7 +781,7 @@ fn run_print(
     // `restoreStdout()` after the mode returns (`main.ts:1059`; no theme
     // watcher to stop first).
     let outcome = run_print_mode(&mut runtime, &options, block_images);
-    host_telemetry.shutdown();
+    host_telemetry.flush_and_shutdown();
     restore_stdout();
     outcome
 }
@@ -807,6 +808,7 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
     #[cfg(not(feature = "ext-js"))]
     let (mut runtime, host_telemetry, _block_images) =
         build_runtime(args, cwd, cwd_string, "interactive")?;
+    host_telemetry.record_run("interactive");
     // The trust ladder resolved once in build_runtime — extensions may have
     // decided through the `project_trust` hook.
     let project_trusted = runtime.project_trusted;
@@ -843,7 +845,7 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
         &mut runtime,
         &options,
     );
-    host_telemetry.shutdown();
+    host_telemetry.flush_and_shutdown();
     outcome
 }
 
@@ -857,6 +859,7 @@ fn run_json(
     stdin_content: Option<&str>,
 ) -> Result<i32, String> {
     let (mut runtime, host_telemetry, block_images) = build_runtime(args, cwd, cwd_string, "json")?;
+    host_telemetry.record_run("json");
     let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd, stdin_content)?;
     let options = PrintModeOptions {
         mode: Mode::Json,
@@ -866,7 +869,7 @@ fn run_json(
     };
     // `restoreStdout()` after the mode returns (`main.ts:1059`).
     let outcome = run_json_mode(&mut runtime, &options, block_images);
-    host_telemetry.shutdown();
+    host_telemetry.flush_and_shutdown();
     restore_stdout();
     outcome
 }
@@ -889,8 +892,9 @@ fn run_rpc(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, 
         build_runtime_with_ui(args, cwd, cwd_string, "rpc", Some(Arc::clone(&bridge.sink)))?;
     #[cfg(not(feature = "ext-js"))]
     let (mut runtime, host_telemetry, block_images) = build_runtime(args, cwd, cwd_string, "rpc")?;
+    host_telemetry.record_run("rpc");
     let outcome = run_rpc_mode(&mut runtime, &mut bridge, block_images);
-    host_telemetry.shutdown();
+    host_telemetry.flush_and_shutdown();
     outcome
 }
 
