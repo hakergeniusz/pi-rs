@@ -10,11 +10,11 @@
 //! upstream reads whatever the user points at.
 //!
 //! Images go through [`crate::images::process_image`] with
-//! `autoResizeImages: false` (the print path's setting) and the unavailable
-//! pixel transformer: supported formats pass through byte-for-byte, and bmp
-//! takes upstream's could-not-convert text because there is no PNG converter
-//! installed. Detection is shared with the read tool via
-//! [`crate::images::detect_supported_image_format`].
+//! `autoResizeImages: false` (the print path's setting) and the default
+//! [`crate::images::default_transformer`]: supported formats pass through
+//! byte-for-byte, while bmp is decoded and re-encoded as PNG so it attaches
+//! instead of taking upstream's could-not-convert text. Detection is shared
+//! with the read tool via [`crate::images::detect_supported_image_format`].
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use pi_ai::types::ImageContent;
 
 use crate::images::{
-    ImageProcessResult, ImageSettings, ResizeOptions, UnavailableTransformer,
+    ImageProcessResult, ImageSettings, ResizeOptions, default_transformer,
     detect_supported_image_format, to_image_content,
 };
 use crate::tools::path_utils::resolve_read_path;
@@ -73,7 +73,7 @@ pub fn process_file_arguments(file_args: &[String], cwd: &Path) -> Result<Proces
                 format.mime_type(),
                 &settings,
                 &ResizeOptions::default(),
-                &UnavailableTransformer,
+                default_transformer(),
             ) {
                 ImageProcessResult::Processed {
                     data,
@@ -210,10 +210,10 @@ mod tests {
     }
 
     #[test]
-    fn bmp_files_report_the_upstream_omission_text() {
+    fn malformed_bmp_reports_the_upstream_omission_text() {
         let dir = tempdir();
-        // Minimal valid BMP: BM, file size 30, pixel data at 26, DIB size 12,
-        // one color plane, 24 bits per pixel.
+        // Header-only BMP: the sniffer accepts it, but there is no pixel data,
+        // so even the real backend cannot decode it (Photon-unavailable path).
         let mut bmp = vec![b'B', b'M'];
         bmp.extend_from_slice(&30u32.to_le_bytes()); // declared file size
         bmp.extend_from_slice(&[0u8; 4]); // reserved
@@ -278,6 +278,43 @@ mod tests {
                 "<file name=\"{}\">\nA\n</file>\n<file name=\"{}\">\nB\n</file>\n",
                 a.display(),
                 b.display()
+            )
+        );
+    }
+
+    #[test]
+    fn valid_bmp_is_converted_to_a_png_attachment() {
+        use image::codecs::bmp::BmpEncoder;
+        use image::{ExtendedColorType, ImageEncoder, RgbImage};
+
+        let dir = tempdir();
+        let source = RgbImage::new(2, 2);
+        let mut bmp = Vec::new();
+        BmpEncoder::new(&mut bmp)
+            .write_image(
+                source.as_raw(),
+                source.width(),
+                source.height(),
+                ExtendedColorType::Rgb8,
+            )
+            .expect("encode synthetic bmp");
+        let path = write(&dir, "image.bmp", &bmp);
+
+        let processed = process_file_arguments(&["image.bmp".to_string()], dir.path()).expect("ok");
+        assert_eq!(processed.images.len(), 1);
+        assert_eq!(processed.images[0].mime_type, "image/png");
+        let decoded = image::load_from_memory(
+            &BASE64_STANDARD
+                .decode(&processed.images[0].data)
+                .expect("base64"),
+        )
+        .expect("decode converted png");
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(
+            processed.text,
+            format!(
+                "<file name=\"{}\">[Image converted from image/bmp to image/png.]</file>\n",
+                path.display()
             )
         );
     }

@@ -4,8 +4,10 @@
 //! (`DEFAULT_OPTIONS`, `resizeImageInProcess`, `base64Size`) and
 //! `utils/image-resize.ts:113-124` (`formatDimensionNote`). The quality steps,
 //! two-pass PNG/JPEG preference, and 0.75 dimension shrink loop are ported
-//! verbatim; only the actual decode/resize/encode is behind [`ImageTransformer`]
-//! (Photon/WASM in upstream). See `WIRING.md`.
+//! verbatim; the actual decode/resize/encode is behind [`ImageTransformer`]
+//! (Photon/WASM in upstream). The default host backend is
+//! [`super::transform::ImageCrateTransformer`]; [`UnavailableTransformer`] is
+//! kept as the explicit "no backend" override. See `WIRING.md`.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -88,8 +90,10 @@ pub fn base64_size(byte_len: usize) -> usize {
 }
 
 /// Seam for the real pixel work. Upstream loads Photon (Rust/WASM) in a worker
-/// thread; a host that wires the cached `image` crate implements these two
-/// methods. The default "unavailable" behaviour mirrors Photon being absent.
+/// thread; the host-side implementation is
+/// [`super::transform::ImageCrateTransformer`] (wired as the default by the
+/// read tool and `@file` processor). [`UnavailableTransformer`] mirrors Photon
+/// being absent and is used by tests that exercise the omission paths.
 pub trait ImageTransformer {
     /// Decode `input`, fit it within `target_width`×`target_height`, and encode
     /// it as `mime_type` at `jpeg_quality`. `None` means the backend cannot
@@ -119,7 +123,8 @@ pub struct EncodedImage {
     pub mime_type: String,
 }
 
-/// A backend that cannot decode or encode images — the current port state.
+/// A backend that cannot decode or encode images: the explicit "Photon is
+/// unavailable" override, not the default any more (see `WIRING.md`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnavailableTransformer;
 

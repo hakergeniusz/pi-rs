@@ -11,12 +11,14 @@
 //!   `convertToLlm` filter) and `core/settings-defaults.ts:35-44` (defaults).
 //!
 //! [`sniff`] detects supported formats from magic bytes and reads dimensions
-//! from headers; [`resize`] ports the resize policy behind a backend seam.
+//! from headers; [`resize`] ports the resize policy and [`transform`] supplies
+//! the real decode/Lanczos3-resize/encode backend (the default for hosts).
 //! Terminal drawing stays in pi-tui (`terminal_image.rs`, `components/image.rs`)
 //! — see `WIRING.md` for host call sites and deliberate deviations.
 
 pub mod resize;
 pub mod sniff;
+pub mod transform;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,6 +38,7 @@ pub use resize::{
     ImageTransformer, ResizeOptions, ResizedImage, UnavailableTransformer,
 };
 pub use sniff::{ImageFormat, detect_supported_image_format};
+pub use transform::{ImageCrateTransformer, default_transformer};
 
 /// `image-process.ts:82`: unsupported input could not be converted to PNG.
 pub const UNCONVERTIBLE_IMAGE: &str =
@@ -176,7 +179,9 @@ fn conversion_hint(from: Option<&str>, to: &str) -> Option<String> {
 
 /// Port of `processImage` (`image-process.ts:72-119`). `resize_options` is the
 /// model's profile (or the conservative defaults); `settings.auto_resize`
-/// toggles the resize path exactly like upstream's `autoResizeImages`.
+/// toggles the resize path exactly like upstream's `autoResizeImages`. Normal
+/// callers pass [`default_transformer`] (the host's Photon replacement); pass
+/// [`UnavailableTransformer`] only to exercise upstream's omission paths.
 pub fn process_image(
     bytes: &[u8],
     mime_type: &str,
@@ -767,6 +772,101 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .ends_with(".png")
+        );
+    }
+
+    // Tiny fixtures encoded by the `image` crate itself: no real user files.
+    use image::codecs::bmp::BmpEncoder;
+    use image::codecs::png::PngEncoder;
+    use image::{ExtendedColorType, ImageEncoder, RgbImage};
+
+    fn rgb(width: u32, height: u32) -> RgbImage {
+        let mut image = RgbImage::new(width, height);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                u8::try_from(x * 37 % 256).unwrap_or_default(),
+                u8::try_from(y * 91 % 256).unwrap_or_default(),
+                0x40,
+            ]);
+        }
+        image
+    }
+
+    fn encode_png(image: &RgbImage) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        PngEncoder::new(&mut bytes)
+            .write_image(
+                image.as_raw(),
+                image.width(),
+                image.height(),
+                ExtendedColorType::Rgb8,
+            )
+            .expect("encode synthetic png");
+        bytes
+    }
+
+    #[test]
+    fn bmp_with_default_backend_produces_a_real_png_attachment() {
+        let mut bmp = Vec::new();
+        let source = rgb(3, 2);
+        BmpEncoder::new(&mut bmp)
+            .write_image(
+                source.as_raw(),
+                source.width(),
+                source.height(),
+                ExtendedColorType::Rgb8,
+            )
+            .expect("encode synthetic bmp");
+        let result = process_image(
+            &bmp,
+            "image/bmp",
+            &ImageSettings::default(),
+            &ResizeOptions::default(),
+            default_transformer(),
+        );
+        let ImageProcessResult::Processed {
+            data,
+            mime_type,
+            hints,
+        } = result
+        else {
+            panic!("a valid BMP now converts instead of being omitted")
+        };
+        assert_eq!(mime_type, "image/png");
+        assert_eq!(
+            hints,
+            vec!["[Image converted from image/bmp to image/png.]".to_string()]
+        );
+        let decoded = image::load_from_memory(&BASE64_STANDARD.decode(&data).expect("base64"))
+            .expect("decode converted png");
+        assert_eq!(decoded.dimensions(), (3, 2));
+    }
+
+    #[test]
+    fn oversized_image_with_default_backend_is_resized() {
+        let options = ResizeOptions {
+            max_width: 10,
+            max_height: 10,
+            ..ResizeOptions::default()
+        };
+        let result = process_image(
+            &encode_png(&rgb(40, 30)),
+            "image/png",
+            &ImageSettings::default(),
+            &options,
+            default_transformer(),
+        );
+        let ImageProcessResult::Processed { data, hints, .. } = result else {
+            panic!("an oversized image now resizes instead of being omitted")
+        };
+        let decoded = image::load_from_memory(&BASE64_STANDARD.decode(&data).expect("base64"))
+            .expect("decode resized candidate");
+        assert_eq!(decoded.dimensions(), (10, 8));
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.contains("[Image: original 40x30, displayed at 10x8.")),
+            "{hints:?}"
         );
     }
 }

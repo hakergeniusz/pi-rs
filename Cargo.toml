@@ -54,6 +54,16 @@ regex = "1"
 base64 = "0.22"
 sha2 = "0.10"
 tempfile = "3"
+# Pixel backend for the image pipeline (port of Photon's decode/Lanczos3
+# resize/encode in utils/image-resize-core.ts). Only the codecs pi inlines
+# plus BMP-for-conversion are enabled; all other decoders are left out.
+image = { version = "0.25.10", default-features = false, features = [
+	"png",
+	"jpeg",
+	"gif",
+	"webp",
+	"bmp",
+] }
 
 # internal crates
 pi-schema = { path = "crates/pi-schema", version = "0.1.0" }

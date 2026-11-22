@@ -13,6 +13,7 @@ for current coverage.
 | `mod.rs` | `ImageSettings`, `process_image`, `ImageProcessResult`, read-note builders, `ImageContent` construction, `filter_blocked_images` (`blockImages`), `block_images_converter` (the shared `convertToLlm` seam), `normalize_tool_result_images`, temp-file spill helpers. |
 | `sniff.rs` | Magic-byte detection for jpeg/png/gif/webp/bmp (port of `utils/mime.ts:1-116`) plus header dimension readers. |
 | `resize.rs` | `ResizeOptions` (+ `From<ModelImageResizeOptions>`), the 2000×2000 / 4.5 MB resize policy ported from `utils/image-resize-core.ts`, `formatDimensionNote`, and the `ImageTransformer` seam. |
+| `transform.rs` | `ImageCrateTransformer` — the real decode / Lanczos3 resize / PNG+JPEG encode backend and PNG conversion (`convert_to_png`), plus `default_transformer()`. Backed by the offline-cached `image` crate; replaces Photon/WASM. |
 
 Add one line to `crates/pi-coding-agent/src/lib.rs` (the only host edit needed
 to compile the module):
@@ -24,40 +25,37 @@ pub mod images;
 ## Host call sites (edit these, not this directory)
 
 **Status:** `read.rs`, `file_processor.rs` and the interactive `convertToLlm`
-filter are **wired** (`e8308bb`); `lib.rs` registers `pub mod images`. Still
-open: the print/JSON/RPC `convertToLlm` paths, clipboard-image paste/temp files,
-live `ShowImagesChange` refresh, and `normalize_tool_result_images` on tool/MCP
-image blocks. The recipe below is retained for those tails.
+filter are **wired** (`e8308bb`); `lib.rs` registers `pub mod images`. Both
+image-producing call sites now pass `default_transformer()` instead of
+`UnavailableTransformer`, so oversized images are resized and BMP is converted
+to PNG. Still open: clipboard-image paste/temp files, live `ShowImagesChange`
+refresh, and `normalize_tool_result_images` on tool/MCP image blocks (that seam
+still takes an explicit transformer from its caller). The recipe below is
+retained for those tails.
 
-### `crates/pi-coding-agent/src/tools/read.rs`
+### `crates/pi-coding-agent/src/tools/read.rs` — done
 
-- `execute_image` at `:186-230` currently calls a reduced local `process_image`
-  (`:244-256`) and builds the note inline (`:194`, `:205-209`).
-- Replace the local `ProcessedImage` enum / `process_image` with
-  `pi_coding_agent::images::process_image(&bytes, mime_type, &ImageSettings::from_settings(...), &ResizeOptions::from(model_profile.unwrap_or_default()), &transformer)`.
-- Replace the inline notes with `images::read_image_note(...)` and
-  `images::read_failure_note(...)`; build the block with
-  `images::to_image_content(data, mime_type)` instead of the literal at `:215-218`.
-- Keep the `structuredContent` shape at `:220-225` unchanged.
-- Add `ctx.model.input` / `ctx.model.input_limits.images.resize` as the
-  `non_vision` and `ResizeOptions` inputs (TS `read.ts:274-281`). The current
-  signature of `execute_image` has no context, so thread the settings/model
-  snapshot through from `execute` at `:93-94`.
-- The duplicate MIME sniffer at `:562-694` can delegate to
-  `images::sniff::detect_supported_image_format` (same semantics, incl.
-  lossless-JPEG and animated-PNG rejection); leaving it is harmless.
+- `execute_image` calls `images::process_image(&bytes, mime_type,
+  &ImageSettings::default(), &ResizeOptions::default(),
+  images::default_transformer())` and builds the note/block with
+  `images::read_image_note` / `images::read_failure_note` /
+  `images::to_image_content`; the `structuredContent` shape is unchanged.
+- Still a deliberate deviation: the builtin `ToolContext` carries no model
+  metadata, so `getNonVisionImageNote(ctx.model)` (`read.ts:274`) takes its
+  no-model arm and the conservative fallback resize options apply. Threading a
+  model snapshot through `execute` would close that gap.
+- The MIME sniffer now delegates to `images::detect_supported_image_format`
+  (same semantics, incl. lossless-JPEG and animated-PNG rejection).
 
-### `crates/pi-coding-agent/src/cli/file_processor.rs`
+### `crates/pi-coding-agent/src/cli/file_processor.rs` — done
 
-- `process_file_arguments` at `:45-100`, image branch `:68-88`: it currently
-  inlines raw bytes for the four provider formats and emits the
-  could-not-convert text for BMP (`:69-79`). Route the branch through
-  `images::process_image` with `auto_resize: false` (the print arm passes
-  `autoResizeImages: false`, TS `main.ts:270`). BMP then correctly takes the
-  conversion-failure path when no transformer is installed.
-- The private `detect_supported_image_mime` at `:109-135` is byte-for-byte the
-  same rule as `images::sniff::detect_supported_image_format`; delegation is
-  optional.
+- The image branch of `process_file_arguments` calls `images::process_image`
+  with `auto_resize: false` (the print arm passes `autoResizeImages: false`,
+  TS `main.ts:270`) and `default_transformer()`. Supported formats attach
+  byte-for-byte; a valid BMP now attaches as PNG with the conversion hint.
+  Malformed BMPs still take the could-not-convert text path.
+- Detection is shared with the read tool via
+  `images::detect_supported_image_format`.
 
 ### `crates/pi-coding-agent/src/modes/interactive/interactive_mode.rs`
 
@@ -109,27 +107,33 @@ inlined.
 
 ## Dependencies
 
-**No new dependencies are required for this directory.** It uses only crates
-already in `crates/pi-coding-agent/Cargo.toml`: `base64`, `uuid`, `pi-ai`, and
-`tempfile` (dev). Do **not** edit `Cargo.toml` / `Cargo.lock` for this slice.
+The real pixel backend adds the offline-cached pure-Rust **`image` crate
+0.25.10** to the workspace (`default-features = false`, codecs `png`, `jpeg`,
+`gif`, `webp`, `bmp` only — decoders for every format pi inlines plus BMP for
+conversion, encoders only for png/jpeg). `pi-coding-agent` depends on it via
+the workspace table; the registry-resident transitive deps (`png`, `gif`,
+`image-webp`, `zune-jpeg`, `moxcms`, …) are already cached, so `cargo
+check --offline` resolves without network access. The rest of the directory
+still uses only `base64`, `uuid`, `pi-ai` and `tempfile` (dev).
 
-If the host wants a real pixel backend, implement `ImageTransformer`:
+Hosts that want to override the backend can still implement `ImageTransformer`
+and pass it to `process_image`; `UnavailableTransformer` remains the explicit
+"Photon is absent" override used by the omission-path tests:
 
 ```rust
-impl images::ImageTransformer for MyImageCrateBackend {
+impl images::ImageTransformer for MyBackend {
     fn transform(&self, input: &[u8], w: u32, h: u32, mime: &str, q: u8)
         -> Option<images::resize::EncodedImage> { /* decode -> resize -> encode */ }
     fn convert_to_png(&self, input: &[u8]) -> Option<Vec<u8>> { /* re-encode */ }
 }
 ```
 
-The cached pure-Rust `image` crate (`0.24.9` / `0.25.10` are in the offline
-registry) is sufficient for decode/resize/encode; adding it to the workspace
-is a **separate, host-owned** change because this slice may not touch
-`Cargo.toml`. With the default `UnavailableTransformer`, oversized images take
-upstream's "could not be resized / could not be converted" omission paths, and
-images already within limits pass through byte-for-byte — matching upstream
-when Photon is unavailable.
+The canonical default is `images::default_transformer()`, wired into the read
+tool and the `@file` processor. It decodes with `image::load_from_memory`,
+resizes with `FilterType::Lanczos3` (upstream's `SamplingFilter.Lanczos3`),
+encodes PNG (RGBA8) and JPEG (RGB, configured quality), and re-encodes BMP to
+PNG. Images already within limits still pass through byte-for-byte, exactly
+like upstream's early return (`image-resize-core.ts:92-103`).
 
 ## Deviations from upstream (deliberate, mechanism-level)
 
@@ -138,10 +142,17 @@ when Photon is unavailable.
    PNG `IHDR`, JPEG SOF, GIF logical screen, WebP `VP8 `/`VP8L`/`VP8X`, and BMP
    DIB headers. Header dimensions are trusted for the resize decision; a
    truncated/implausible header yields the "could not be resized" note.
-2. **Transform is a seam, not Photon.** The decode/Lanczos3-resize/re-encode
-   step is `ImageTransformer`; the default is a no-op that reports
-   "unavailable", exactly like upstream when Photon fails to load. Quality
-   steps, PNG-vs-JPEG preference, and the 0.75 shrink loop are ported verbatim.
+2. **Transform is `image`, not Photon.** The `ImageTransformer` seam is now
+   implemented by `ImageCrateTransformer` (the default via
+   `default_transformer()`): `image::load_from_memory` decodes,
+   `FilterType::Lanczos3` resizes (same filter as Photon), and png/jpeg encoders
+   produce the candidates. Quality steps, PNG-vs-JPEG preference, and the 0.75
+   shrink loop in `resize.rs` are ported verbatim. `UnavailableTransformer`
+   remains only as the explicit no-backend override. Minor mechanism deltas:
+   Photon applies EXIF orientation before decoding (`exif-orientation.ts`,
+   `image-resize-core.ts:85`) which `image` does not; Photon decodes once per
+   resize request while this backend decodes on each `transform` call; and the
+   upstream worker thread is unnecessary because this path is synchronous.
 3. **Header-only "sniff bytes".** Upstream reads 4100 bytes from disk; callers
    here already hold the full bytes. Detection logic is identical.
 4. **Temp-file spill for oversized images.** Upstream always omits an image it
@@ -153,31 +164,40 @@ when Photon is unavailable.
    `terminal_image.rs` (Kitty/iTerm2 encode + cell sizing) and
    `components/image.rs` remain the display path. `show_images` and
    `image_width_cells` only gate/label that path, as upstream.
-6. **BMP sniffing is kept but not inlined.** `image/bmp` is detected, then
-   takes the conversion-to-PNG route; without a transformer that is upstream's
-   "could not be converted" note (this is also what the existing print path
-   does at `file_processor.rs:69-79`).
+6. **BMP is converted, not omitted.** `image/bmp` is detected and the default
+   transformer's `convert_to_png` decodes it and emits a real PNG attachment,
+   with the same "[Image converted from image/bmp to image/png.]" hint
+   upstream produces when Photon is present. A malformed/header-only BMP still
+   fails conversion and takes the omission path. Animated PNG/JPEG-LS are still
+   rejected by the sniffer before any decode, as upstream does.
 
 ## Tests
 
-29 unit tests, all in `#[cfg(test)] mod tests` at the end of each file:
-`sniff.rs` 7 (jpeg/png/gif/webp/bmp sniffing, lossless JPEG and animated PNG
-rejection, header dimensions), `resize.rs` 10 (base64 sizing, target dims,
-byte/dimension gating, quality steps, shrink loop, model overlay, format note),
-`mod.rs` 12 (settings defaults, MIME normalization, pass-through, auto-resize
-off, conversion hints, omission notes, content shape, blocked filter, tool
-result normalization, temp paths).
+36 unit tests in this directory, all in `#[cfg(test)] mod tests` at the end of
+each file: `sniff.rs` 7 (jpeg/png/gif/webp/bmp sniffing, lossless JPEG and
+animated PNG rejection, header dimensions), `resize.rs` 10 (base64 sizing,
+target dims, byte/dimension gating, quality steps, shrink loop, model overlay,
+format note), `mod.rs` 14 (settings defaults, MIME normalization, pass-through,
+auto-resize off, conversion hints, omission notes, content shape, blocked
+filter, tool result normalization, temp paths, plus real-backend BMP conversion
+and oversize resize), `transform.rs` 5 (PNG/JPEG resize+encode, quality ordering,
+BMP→PNG, fail-closed on bad bytes, default seam). Three more end-to-end tests
+live in the wired call sites: `read.rs` 2 (valid BMP attachment, oversize resize
+attachment) and `file_processor.rs` 1 (valid BMP attachment). All fixtures are
+synthetic images produced by the `image` crate — no real user files.
 
-Verified with `rustfmt --edition 2024` and a standalone `rustc`/`clippy-driver`
-harness using the workspace's pedantic lint set (the coordinator runs the real
-cargo gate after wiring).
+Verified with `cargo fmt` and `cargo test -p pi-coding-agent images::` plus the
+wired call-site tests (the coordinator runs the full workspace gate).
 
 ## Ground-truth citations
 
 - `utils/mime.ts:1-116` — `sniff.rs` detection.
 - `utils/image-process.ts:1-119` — `mod.rs` normalization + omission messages.
 - `utils/image-resize-core.ts:1-176`, `utils/image-resize.ts:113-124` —
-  `resize.rs` policy and note.
+  `resize.rs` policy and note; `transform.rs` ports the decode/Lanczos3/encode
+  seam (`:82-130`), while EXIF orientation (`:85`, `utils/exif-orientation.ts`)
+  is a documented deviation.
+- `utils/image-convert.ts:7-30` — `transform.rs::convert_to_png`.
 - `core/tools/read.ts:27-38,95-107,275-294` — read notes / image block.
 - `utils/tool-result-images.ts:1-67` — history normalization.
 - `core/sdk.ts:296-331`, `core/settings-defaults.ts:35-44` — settings semantics.
