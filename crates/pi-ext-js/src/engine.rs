@@ -2472,7 +2472,10 @@ mod tests {
             .expect("begin");
         host.load_extension_module(index, &dir.join("main.ts").to_string_lossy(), None)
             .expect("node:path now resolves");
-        assert_eq!(host.eval_for_tests("globalThis.__used").expect("eval"), "a/b");
+        assert_eq!(
+            host.eval_for_tests("globalThis.__used").expect("eval"),
+            "a/b"
+        );
 
         std::fs::write(
             dir.join("unsupported.ts"),

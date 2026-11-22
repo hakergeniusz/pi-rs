@@ -6200,8 +6200,10 @@ impl InteractiveMode {
                     done = Some(result);
                     break;
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty
-                    | std::sync::mpsc::TryRecvError::Disconnected) => break,
+                Err(
+                    std::sync::mpsc::TryRecvError::Empty
+                    | std::sync::mpsc::TryRecvError::Disconnected,
+                ) => break,
             }
         }
         let Some(result) = done else {

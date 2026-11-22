@@ -33,6 +33,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -139,7 +140,7 @@ impl Exposure {
     #[must_use]
     pub fn parse(value: Option<&str>) -> Self {
         match value {
-            Some("deferred") | Some("codemode-deferred") => Self::Deferred,
+            Some("deferred" | "codemode-deferred") => Self::Deferred,
             Some("hidden") => Self::Hidden,
             // `codemode` and `direct` both reach scripts.
             _ => Self::Direct,
@@ -207,7 +208,7 @@ impl CallableTool {
         let bullets: Vec<String> = self
             .guidelines
             .iter()
-            .map(str::trim)
+            .map(|line| line.trim())
             .filter(|line| !line.is_empty())
             .map(|line| format!("- {line}"))
             .collect();
@@ -241,10 +242,10 @@ pub fn execute_via_executor(
     name: &str,
     args: Json,
     call_id: &str,
-    signal: &AbortFlag,
+    _signal: &AbortFlag,
 ) -> Result<AgentToolResult, String> {
-    use pi_agent::types::ToolCall;
     use pi_ai::types::JsonObject;
+    use pi_ai::types::ToolCall;
 
     let arguments: JsonObject = match args {
         Json::Object(map) => map,
@@ -418,7 +419,8 @@ impl CodemodeTool for AgentToolAdapter {
                 let value = to_script_value(&self.tool, &result);
                 let error_text = if failed {
                     Some(truncate_text(
-                        &text_of(&result).or_else(|| format!("Tool \"{}\" failed", self.tool.name)),
+                        &text_of(&result)
+                            .unwrap_or_else(|| format!("Tool \"{}\" failed", self.tool.name)),
                         ERROR_PREVIEW_CHARS,
                     ))
                 } else {
@@ -511,8 +513,9 @@ fn value_text(value: &Json) -> String {
 /// `renderToolSample` (`declarations.rs:87-97`).
 fn tool_sample(tool: &CallableTool) -> String {
     let text_schema = json!({ "type": "string" });
+    let description = tool.description_with_guidelines();
     let declaration = RenderTool::new(&tool.name)
-        .description(&tool.description_with_guidelines())
+        .description(&description)
         .input_schema(&tool.parameters)
         .output_schema(tool.output_schema.as_ref().unwrap_or(&text_schema));
     render_tool_sample(&declaration, &RenderToolOptions::default())
@@ -546,7 +549,7 @@ fn describe_globals(models: bool) -> String {
 }
 
 /// Options of [`create_codemode_description`] (`tool.ts:168-182`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DescriptionOptions<'a> {
     /// Declare the `models` namespace.
     pub models: bool,
@@ -623,7 +626,7 @@ pub fn create_codemode_description(
         namespace: None,
         entries: Vec::new(),
     }];
-    for tool in declarations {
+    for tool in &declarations {
         let section = render_tool_section(tool);
         let entry = CatalogEntry {
             name: tool.name.clone(),
@@ -790,11 +793,11 @@ fn join_adjacent_text(items: Vec<OutputItem>) -> Vec<OutputItem> {
                     last_part = "\n".to_string();
                 }
                 if !text.is_empty() {
-                    last_part = text.clone();
+                    last_part.clone_from(&text);
                 }
                 parts.push(text);
             }
-            other => {
+            other @ OutputItem::Image { .. } => {
                 if !parts.is_empty() {
                     joined.push(OutputItem::text(std::mem::take(&mut parts).join("")));
                 }
@@ -898,7 +901,7 @@ fn truncate_output(items: Vec<OutputItem>, max_tokens: u64) -> (Vec<OutputItem>,
         .iter()
         .filter_map(|item| match item {
             OutputItem::Text { text, .. } => Some(text.clone()),
-            _ => None,
+            OutputItem::Image { .. } => None,
         })
         .collect();
     let combined = texts.join("\n");
@@ -919,13 +922,11 @@ fn truncate_output(items: Vec<OutputItem>, max_tokens: u64) -> (Vec<OutputItem>,
     );
     let full = match write_output_file("pi-codemode", "txt", combined.as_bytes()) {
         Ok(path) => {
-            text.push_str(&format!(
-                "\n\n[Full output: {path} (read with offset/limit)]"
-            ));
+            let _ = write!(text, "\n\n[Full output: {path} (read with offset/limit)]");
             Some(path)
         }
         Err(error) => {
-            text.push_str(&format!("\n\n[Could not save the full output: {error}]"));
+            let _ = write!(text, "\n\n[Could not save the full output: {error}]");
             None
         }
     };
@@ -981,13 +982,16 @@ const CODEMODE_RENDERERS: ToolRenderers = ToolRenderers {
 
 /// The codemode tool host. Cloneable handles share tools/invoker/settings;
 /// execution state (nested calls) is per call.
+/// Callback the host supplies to persist an entry into the session.
+type AppendEntryFn = Arc<dyn Fn(&str, Json) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct CodemodeHost {
     tools: Vec<CallableTool>,
     invoker: Arc<dyn ToolInvoker>,
     options: CodemodeOptions,
     store_reader: Arc<dyn Fn() -> BTreeMap<String, Json> + Send + Sync>,
-    append_entry: Option<Arc<dyn Fn(&str, Json) + Send + Sync>>,
+    append_entry: Option<AppendEntryFn>,
 }
 
 impl std::fmt::Debug for CodemodeHost {
@@ -1338,17 +1342,18 @@ fn discovery_globals(tools: &[CallableTool]) -> Vec<Arc<dyn CodemodeTool>> {
                     let namespace = options
                         .and_then(|value| value.get("namespace"))
                         .and_then(Json::as_str);
-                    let tokens: Vec<String> = query
-                        .split_whitespace()
-                        .map(|token| token.to_lowercase())
-                        .collect();
+                    let tokens: Vec<String> =
+                        query.split_whitespace().map(str::to_lowercase).collect();
                     let mut matches: Vec<(u64, String)> = tools
                         .iter()
                         .filter(|tool| {
                             namespace.is_none()
                                 || tool.namespace.as_ref().is_some_and(|info| {
-                                    info.name == namespace
-                                        || info.aliases.iter().any(|alias| alias == namespace)
+                                    info.name.as_str() == namespace.unwrap_or("")
+                                        || info
+                                            .aliases
+                                            .iter()
+                                            .any(|alias| alias.as_str() == namespace.unwrap_or(""))
                                 })
                         })
                         .filter_map(|tool| {
@@ -1577,8 +1582,8 @@ mod tests {
         let mut hidden = echo_tool();
         hidden.name = "secret".to_string();
         hidden.exposure = Exposure::Hidden;
-        let host = host(vec![deferred, hidden], echo_invoker());
-        assert_eq!(host.tools().len(), 1);
+        let host = host(vec![echo_tool(), deferred, hidden], echo_invoker());
+        assert_eq!(host.tools().len(), 2); // echo + the deferred tool
         let description = host.description();
         assert!(description.contains("### `echo`"), "{description}");
         assert!(!description.contains("mcp__docs__search"), "{description}");
@@ -1697,7 +1702,7 @@ mod tests {
         );
         assert!(!result.is_error, "{}", text_of_result(&result));
         assert!(
-            text_of_result(&result).contains("6"),
+            text_of_result(&result).contains('6'),
             "{}",
             text_of_result(&result)
         );

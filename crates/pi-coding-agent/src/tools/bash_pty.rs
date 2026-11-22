@@ -263,7 +263,9 @@ fn worker(
         }
         // A blocking read is fine: `^C`/kill makes the child close the pty,
         // which ends the read. The watchdog bounds a stubborn job.
-        let Ok(read) = stdout.read(&mut buffer) else { break };
+        let Ok(read) = stdout.read(&mut buffer) else {
+            break;
+        };
         if read == 0 {
             break;
         }
