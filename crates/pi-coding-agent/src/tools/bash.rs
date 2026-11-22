@@ -24,6 +24,15 @@
 //! close. Here the process group kill ends the pipe holders too, so the
 //! timeout path never hangs and the shellExit detail pi adds for that case is
 //! unreachable.
+//!
+//! [`bash_pty`] is the PTY-backed sibling used only by the interactive `!`
+//! seam (`bash-executor.ts:20-148`); this module stays on upstream's pipe path
+//! for the agent tool. It is declared here with `#[path]` so the new file does
+//! not need an edit to `tools/mod.rs`.
+
+/// PTY execution for the interactive `!` command (`bash-executor.ts:20-148`).
+#[path = "bash_pty.rs"]
+pub mod bash_pty;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

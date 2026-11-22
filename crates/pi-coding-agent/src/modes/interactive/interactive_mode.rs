@@ -989,6 +989,22 @@ struct AgentRun {
     context: AgentContext,
 }
 
+/// One interactive `!` command on a worker thread. Upstream's
+/// `session.isBashRunning` (`agent-session.ts:4074-4076`) gates a second `!`
+/// and Esc aborts the run; the PTY output arrives as events on `events` and
+/// `control` carries the interrupt into the child's terminal.
+struct BashRun {
+    command: String,
+    excluded: bool,
+    started: Instant,
+    /// The chat row receiving live output (`BashExecutionComponent` upstream).
+    index: usize,
+    streamed: String,
+    events: std::sync::mpsc::Receiver<crate::tools::bash::bash_pty::BashPtyEvent>,
+    control: crate::tools::bash::bash_pty::BashPtyControl,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
 /// The retry backoff wait (`_prepareRetry`'s sleep, `agent-session.ts`
 /// :3965-3975): a thread sleeps abortably and reports the outcome.
 enum RetryWaitEvent {
@@ -1520,6 +1536,9 @@ pub struct InteractiveMode {
     streaming_index: Option<usize>,
     /// The run in flight, if any.
     agent_run: Option<AgentRun>,
+    /// The interactive `!` command in flight (`isBashRunning`,
+    /// `agent-session.ts:4074-4076`).
+    bash_run: Option<BashRun>,
     /// The compaction attempt in flight, if any (`session.isCompacting`).
     compaction_run: Option<CompactionRun>,
     /// The `agent_end` verdict, consumed by the post-run machine.
@@ -1917,6 +1936,7 @@ impl InteractiveMode {
             pending_tools: std::collections::HashMap::new(),
             streaming_index: None,
             agent_run: None,
+            bash_run: None,
             last_sigint_time: None,
             last_status_pair: None,
             last_spinner_tick: Instant::now(),
@@ -3823,6 +3843,16 @@ impl InteractiveMode {
             let excluded = rest.starts_with('!');
             let command = rest.trim_start_matches('!').trim().to_string();
             if !command.is_empty() {
+                // `session.isBashRunning` (`interactive-mode.ts:3476-3480`):
+                // a second `!` while a pty command is live is rejected and
+                // the draft is put back. Esc (wired below) cancels it first.
+                if self.bash_run.is_some() {
+                    self.editor_mut().editor.set_text(text);
+                    self.show_warning(
+                        "A bash command is already running. Press Esc to cancel it first.",
+                    );
+                    return;
+                }
                 self.run_bash(&command, excluded);
                 return;
             }
@@ -6060,10 +6090,14 @@ impl InteractiveMode {
         }
     }
 
-    /// `!command` (`handleBashCommand`): run synchronously, render as a shell
-    /// row, persist as a bash-execution message. Upstream streams the output
-    /// live through a PTY; the streaming pass lands with P7.
+    /// `!command` (`handleBashCommand`, `interactive-mode.ts:7178-7271`):
+    /// start a PTY-backed local run and stream its output into a shell row.
+    /// Upstream's `session.executeBash` takes an `onChunk` callback; the port
+    /// runs the pty on a worker thread so the UI keeps painting and Esc/\x03
+    /// can interrupt the command mid-flight.
     fn run_bash(&mut self, command: &str, excluded: bool) {
+        use crate::tools::bash::bash_pty::{self, BashPtyRequest, BashPtyRun};
+
         // Extensions intercept first (`handleBashCommand`,
         // `interactive-mode.ts:7172-7189`): a handler failure skips local
         // execution entirely (the runner already reported it); a decision
@@ -6088,26 +6122,134 @@ impl InteractiveMode {
             }
         }
         let started = Instant::now();
-        let output = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(command)
-            .current_dir(self.session.get_cwd())
-            .output();
-        let (text, exit_code) = match output {
-            Ok(output) => {
-                let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stderr.is_empty() {
-                    if !text.is_empty() && !text.ends_with('\n') {
-                        text.push('\n');
-                    }
-                    text.push_str(&stderr);
-                }
-                (text, Some(output.status.code().unwrap_or(-1) as i64))
-            }
-            Err(error) => (error.to_string(), None),
+        let request = BashPtyRequest {
+            command: command.to_string(),
+            cwd: self.session.get_cwd().to_path_buf(),
         };
-        self.record_bash_output(command, excluded, text, exit_code, false, None, started);
+        let pty = match bash_pty::run(request) {
+            Ok(pty) => pty,
+            Err(error) => {
+                self.record_bash_output(command, excluded, error, None, false, None, started);
+                return;
+            }
+        };
+        let component = ToolExecutionComponent::new(
+            "bash",
+            &format!("bash-{}", self.chat_len()),
+            serde_json::json!({ "command": command }),
+            self.output_pad,
+            &self.session.get_cwd().to_string_lossy(),
+            crate::tools::renderers::renderers_for("bash"),
+            None,
+        );
+        let index = self.add_to_chat(Box::new(component));
+        if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
+            component.mark_execution_started();
+        }
+        let BashPtyRun {
+            control,
+            events,
+            thread,
+        } = pty;
+        self.bash_run = Some(BashRun {
+            command: command.to_string(),
+            excluded,
+            started,
+            index,
+            streamed: String::new(),
+            events,
+            control,
+            thread,
+        });
+        self.editor_mut().is_bash_mode = false;
+        self.update_editor_border_color();
+        self.tui.request_render();
+    }
+
+    /// Drain PTY chunks into the live tool row, then persist the row and the
+    /// bash-execution message once the worker reports `Done`
+    /// (`handleBashCommand`'s `appendOutput`/`setComplete` +
+    /// `recordBashResult`, `interactive-mode.ts:7243-7261`).
+    fn pump_bash_run(&mut self) {
+        use crate::tools::bash::bash_pty::BashPtyEvent;
+
+        // Take the run out so `downcast_chat` can borrow `self` while events
+        // are applied; a still-running command is put back at the end.
+        let Some(mut run) = self.bash_run.take() else {
+            return;
+        };
+        let mut done = None;
+        loop {
+            match run.events.try_recv() {
+                Ok(BashPtyEvent::Chunk(text)) => {
+                    run.streamed.push_str(&text);
+                    if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(run.index)
+                    {
+                        component.update_result(
+                            ToolResultView {
+                                text: run.streamed.clone(),
+                                is_error: false,
+                                duration_ms: Some(run.started.elapsed().as_millis() as u64),
+                            },
+                            true,
+                        );
+                    }
+                    self.tui.request_render();
+                }
+                Ok(BashPtyEvent::Done(result)) => {
+                    done = Some(result);
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        let Some(result) = done else {
+            self.bash_run = Some(run);
+            return;
+        };
+        if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(run.index) {
+            component.update_result(
+                ToolResultView {
+                    text: result.output.clone(),
+                    is_error: result.exit_code.is_none_or(|code| code != 0),
+                    duration_ms: Some(run.started.elapsed().as_millis() as u64),
+                },
+                false,
+            );
+        }
+        let _ = self.session.append_message(AgentMessage::BashExecution(
+            pi_agent::agent_message::BashExecutionMessage {
+                command: run.command,
+                output: result.output,
+                exit_code: result.exit_code.map(i64::from),
+                cancelled: result.cancelled,
+                truncated: result.truncated,
+                full_output_path: result
+                    .full_output_path
+                    .map(|path| path.to_string_lossy().into_owned()),
+                exclude_from_context: Some(run.excluded),
+                timestamp: now_millis(),
+            },
+        ));
+        if let Some(thread) = run.thread {
+            let _ = thread.join();
+        }
+        self.tui.request_render();
+    }
+
+    /// Esc / Ctrl-C during a `!` run (`abortBash`, `agent-session.ts:4067-4071`).
+    /// The key is consumed so the editor never sees it, and the pty receives
+    /// a real `^C` (or a hard kill) through its control handle.
+    fn interrupt_bash(&mut self) {
+        // Clone the control so the borrow of `bash_run` ends before the
+        // warning row mutates `self`.
+        let Some(control) = self.bash_run.as_ref().map(|run| run.control.clone()) else {
+            return;
+        };
+        control.interrupt();
+        self.show_warning("Bash command interrupted");
+        self.tui.request_render();
     }
 
     /// The shared `!` tail — render the shell row and persist the
@@ -6654,6 +6796,18 @@ impl InteractiveMode {
         for event in events {
             match event {
                 StdinEvent::Data(sequence) => {
+                    // A live `!` command owns the terminal: forward raw bytes
+                    // into the pty, and let `^C`/Esc abort it (upstream's
+                    // `abortBash`, `agent-session.ts:4067-4071`) instead of
+                    // reaching the editor.
+                    if self.bash_run.is_some() {
+                        if sequence == "\x03" || sequence == "\x1b" {
+                            self.interrupt_bash();
+                        } else if let Some(run) = self.bash_run.as_ref() {
+                            run.control.write_stdin(sequence.as_bytes());
+                        }
+                        continue;
+                    }
                     #[cfg(feature = "ext-js")]
                     if self.terminal_input_listeners > 0 {
                         self.dispatch_extension_terminal_input(sequence);
@@ -11659,6 +11813,10 @@ impl InteractiveMode {
                 EditorEventOut::ExtensionShortcut(key) => self.run_extension_shortcut(&key),
             }
         }
+
+        // Interactive `!` output: streamed pty chunks and the final result
+        // (`handleBashCommand`'s onChunk/setComplete path).
+        self.pump_bash_run();
 
         // Selector events, drained through the Arcs the components publish
         // to (`showSelector`'s onSelect/onCancel callbacks).
