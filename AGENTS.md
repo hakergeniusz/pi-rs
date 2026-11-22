@@ -163,15 +163,22 @@ login/refresh** (Anthropic, Codex, Copilot), the new **`pi-env`** crate, the
 **telemetry exporter/ping/conformance** surface, and the registered **image
 pipeline** module.
 
-Still open (no longer "in flight" — landed modules need host wiring, or are
-deliberate scope/mechanism decisions):
+A follow-up host-wiring wave (`16060d5`..`bc518ac`) made stored built-in OAuth
+credentials refresh at wire time, attached images from `read`/`@file` and the
+interactive `convertToLlm` filter, fired the telemetry ping/exporter at
+startup/shutdown, drove MCP startup/list-changed ticks, and upgraded `url` to
+2.5.9 (RUSTSEC-2026-0592). Full gate green: 2560 passed, 0 failed, 3 ignored.
 
-1. Host wiring for library-only slices: `pi-env` (ticks/PTY/SSH onboarding),
-   images (`read.rs`/`file_processor.rs`, `convertToLlm` filter), telemetry
-   (ping gating, exporter injection), and MCP startup-wait/notification ticks.
-2. OAuth refresh is library-complete but not called from `resolve_wire_credential`;
-   RPC dispatch is still serial and session rebind/host events remain stubbed.
-3. Codemode Node/Workers/wasm transports are typed stubs; dynamic `require`,
+Still open (mechanism tails or deliberate scope decisions):
+
+1. `pi-env` is still library-only: ticks/PTY/SSH onboarding have no host consumer.
+2. Wiring tails: `blockImages` is installed only on the interactive `convertToLlm`
+   path (print/JSON/RPC unwired), there is no image pixel backend, telemetry
+   transports stay inert (no real HTTP), the MCP `StartupWait` is one-shot with
+   poll-based notifications and no tick in the interactive/RPC pump modes, and
+   OAuth refresh covers only the three built-in flows (Anthropic/Codex/Copilot).
+3. RPC dispatch is still serial and session rebind/host events remain stubbed.
+   Codemode Node/Workers/wasm transports are typed stubs; dynamic `require`,
    `node_modules` resolution and `URL.canParse` remain unported.
 4. Out of scope: `chord`, `pi-durable`, `evals`, `apps/p2`. `/share` and `/bug`
    stay omitted (Radius upload policy); macOS release assets await a runner.

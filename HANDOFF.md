@@ -3971,6 +3971,68 @@ call sites are listed in `crates/pi-coding-agent/src/images/WIRING.md`.
   behind the `pi-agent-core` host package; serial RPC dispatch (above). The
   integration commit notes verification was still in progress at commit time.
 
+## 2026-11-22 — host-wiring wave
+
+Five commits closed the host-call-site gaps left by the gap-closing wave above;
+this section supersedes that section's "Open" notes for OAuth, telemetry and
+images. Coverage statuses are reflected in
+[`docs/GAP-STATUS.md`](docs/GAP-STATUS.md).
+
+- **`16060d5` — `url` 2.5.9 (RUSTSEC-2026-0592):** patch upgrade (stack overflow
+  in `Url::origin()` on nested `blob:` URLs), `form_urlencoded` 1.2.3;
+  `Cargo.lock` only.
+- **`1b1b258` — telemetry host wiring:** new `telemetry/host.rs` with
+  `HostTelemetry`, built in `build_runtime` and shut down in all four mode
+  tails. The anonymous install/update ping fires at upstream's interactive
+  changelog point (`getChangelogForDisplay`: fresh session, fresh install or
+  newer entries; resumed sessions skip it), gated by `PI_OFFLINE`/
+  `PI_TELEMETRY` and the install-telemetry setting. The additive OTLP endpoint
+  (`PI_RS_OTLP_ENDPOINT` or `telemetryOtlpEndpoint`) builds an exporter flushed
+  at shutdown.
+  **Deviation:** ping and HTTP transports are inert by default
+  (`NoopPingTransport`/`NoopHttpTransport`) — no real HTTP transport is
+  injected, no socket opens, and the exporter surface is additive (upstream
+  1.5.2 ships only the ping).
+- **`64a6f8a` — OAuth refresh at wire time:**
+  `resolve_wire_credential_composed` now calls `oauth::refresh_stored_oauth`,
+  which refreshes a stored built-in credential expiring inside upstream's
+  inclusive five-minute window, then derives wire auth from the rotated token.
+  Persistence is double-checked under the credential-store lock; the wait runs
+  on a dedicated current-thread runtime with a 15 s timeout, and
+  `refresh_stored_oauth_with_flow` is an injectable seam with a loopback
+  end-to-end test. A failed refresh or logged-out credential resolves to
+  nothing (no stale token, no env fallback); extension OAuth keeps its
+  handler-derived key.
+  **Open:** only the three built-in flows (Anthropic/OpenAI Codex/GitHub
+  Copilot) refresh — the rest keep the honest error — Copilot's 429 back-off is
+  omitted, and a cancelled wait cannot roll back a refresh another process
+  already made.
+- **`e8308bb` — image wiring:** `tools/read.rs` and `cli/file_processor.rs`
+  route through `images::process_image` (MIME sniffing shared with
+  `images::sniff`), attaching `ImageContent` with upstream's notes, hints and
+  omission messages; `@file` images pass `auto_resize: false`. The interactive
+  agent installs the `blockImages` `convertToLlm` filter (placeholder text with
+  consecutive-placeholder dedupe).
+  **Open:** print/JSON/RPC do not install the `blockImages` filter, there is no
+  pixel backend (resize/conversion stay on upstream's "unavailable" path), and
+  the settings live-sweep / clipboard-paste call sites in `images/WIRING.md`
+  are still pending.
+- **`bc518ac` — MCP host ticks:** connections now start in the background and
+  register in a `StartupWait` advanced by `ExtensionRunner::mcp_tick`;
+  `ExtensionHost::mcp_tick` exposes it to the binary. `settle_mcp_startup`
+  drives a bounded wait before the first prompt on load and `/reload`, and
+  `list_changed` notifications re-register refreshed tools through the same
+  tick. Tool-exposure resolution delegates to the faithful glob matcher in
+  `pi-ext-js::mcp_manager`; host ticks come from the agent-loop context
+  transform and the extension tool-execution path.
+  **Open:** interactive/RPC pump modes do not drive the tick, the `StartupWait`
+  is one-shot once its bound elapses (late connections stay owned by the
+  manager worker), notifications are poll-based, and stderr is captured via a
+  temp-file sink.
+
+**Gate:** workspace fmt + clippy (`-D warnings`) + tests green — **2560 passed,
+0 failed, 3 ignored**; CI all jobs green including the dependency audit.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
