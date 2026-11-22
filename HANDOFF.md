@@ -4081,6 +4081,16 @@ pedantic lints across `pi-ai`, `pi-codemode`, `pi-ext-js` and `pi-coding-agent`
 that the parallel merge produced. Workspace check and `clippy --all-targets
 -D warnings` were green at that commit.
 
+### Terminal-exit noise fix (`3cb7659`)
+Reproduced in tmux: after Ctrl+D the scrollback showed a raw `ESC[?1;2;4c`
+(DA1 reply) and the resume hint overprinting the preserved footer. Root cause:
+the initial OSC/DA1 theme query was issued during mode construction, before
+`Tui::start` enabled raw mode, so the terminal echoed its reply. The query now
+fires immediately after raw mode starts; pending stdin is drained like
+upstream's `terminal.drainInput(1000, 50)` before restoring the terminal; and
+the resume hint starts on a fresh line. Verified live in regular and fullscreen
+modes; full gate and CI green.
+
 **Gate / CI status: GREEN.** A read-only audit of all ten slices found five
 dead/partial mechanisms, which a follow-up fix wave closed: telemetry recorder
 + flush at shutdown (`0203f94`), real RPC abort cancellation (`4e65bed`), typed
