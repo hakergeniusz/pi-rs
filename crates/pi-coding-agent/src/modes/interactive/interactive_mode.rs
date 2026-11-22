@@ -4984,10 +4984,9 @@ impl InteractiveMode {
             return;
         }
         let events = Arc::new(Mutex::new(Vec::new()));
-        let selector = McpSelectorComponent::new(Arc::clone(&events));
-        self.mcp_selector_events = Some(events);
-        self.suspend_editor_with(Box::new(selector));
-
+        // Build the menu BEFORE mounting: in fullscreen the viewport's slot
+        // ids still name the original editor, so a post-mount downcast via
+        // HostSlot::Editor cannot find the newly swapped-in component.
         let cwd = self.session.get_cwd().to_path_buf();
         let snapshot =
             crate::mcp_config::load_mcp_config(&crate::mcp_config::LoadMcpConfigOptions {
@@ -5035,10 +5034,10 @@ impl InteractiveMode {
         }
         menu.confirm_label = "manage".to_string();
         menu.cancel_label = "close".to_string();
-        if let Some(view) = self.downcast_tree::<McpSelectorComponent>(HostSlot::Editor) {
-            view.set_screen(McpSelectorScreen::Menu(menu));
-        }
-        self.tui.request_render();
+        let mut selector = McpSelectorComponent::new(Arc::clone(&events));
+        selector.set_screen(McpSelectorScreen::Menu(menu));
+        self.mcp_selector_events = Some(events);
+        self.suspend_editor_with(Box::new(selector));
     }
 
     /// Put the editor back after the `/mcp` manager closes.
