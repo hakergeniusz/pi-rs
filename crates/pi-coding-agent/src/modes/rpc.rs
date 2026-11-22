@@ -25,6 +25,14 @@
 //! [`LocalRpcHost`] uses the port's `SessionManager`, `export_html`, and
 //! extension seams; a host with a full runtime can override it. See
 //! `WIRING.md` for the exact contract.
+//!
+//! Prompt preflight (`rpc-mode.ts:409-435`, `agent-session.ts:2162-2263`):
+//! the authoritative `prompt` response is emitted only after slash-command
+//! resolution through the command registry and the model/auth gate succeed.
+//! A failure before that point is the single `success: false` frame with no
+//! disposition; a failure after it is swallowed (`:425-429`). The
+//! delivery-time `queue_update` mirrors `_handleAgentEvent`
+//! (`agent-session.ts:1181-1198`).
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -167,6 +175,42 @@ pub struct RpcForkResult {
     pub cancelled: bool,
 }
 
+/// `PromptDisposition` (`agent-session.ts:339`, emitted at `:2175,2195,2238`):
+/// what preflight decided about a submitted prompt. It rides in the `prompt`
+/// response's `data.disposition` (`rpc-mode.ts:420-423`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptDisposition {
+    /// An extension command or input handler consumed the prompt, so no run
+    /// starts (`:2171-2178,2213-2216`).
+    Handled,
+    /// The prompt was queued during a run (`:2226-2240`). The port handles one
+    /// command at a time, so this is reachable only through a host override.
+    Queued,
+    /// The prompt was accepted to start a run (`:2195`).
+    Started,
+}
+
+impl PromptDisposition {
+    /// The verbatim wire string (`rpc-commands.md`'s `disposition` values).
+    fn as_str(&self) -> &'static str {
+        match *self {
+            Self::Handled => "handled",
+            Self::Queued => "queued",
+            Self::Started => "started",
+        }
+    }
+}
+
+/// The auth facts `_preparePrompt` reads (`agent-session.ts:2242-2260`):
+/// `hasConfiguredAuth(provider) || (await checkAuth(provider)) !== undefined`
+/// and `isUsingOAuth(provider)`, the latter picking which verbatim refusal
+/// text a missing credential gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcAuthCheck {
+    pub configured: bool,
+    pub using_oauth: bool,
+}
+
 /// The host-owned operations `rpc-mode.ts` delegates to `runtimeHost` and
 /// `AgentSession` (`:328-345,456-463,501-507,582-650,701-732`). The port has
 /// no `AgentSessionRuntime` in RPC mode, so [`LocalRpcHost`] reconstructs the
@@ -214,8 +258,17 @@ pub trait RpcHost: Send {
 
     /// The three command sources of `get_commands` (`:701-732`), in upstream
     /// order: extension, prompt, skill. Each item is an already-shaped
-    /// `RpcSlashCommand` (`rpc-types.ts:81-90`).
+    /// `RpcSlashCommand` (`rpc-types.ts:81-90`). Reused by prompt preflight to
+    /// resolve a leading slash command (`:2171-2178`).
     fn get_commands(&self, runtime: &PrintRuntime) -> Result<Vec<Value>, String>;
+
+    /// The model/auth gate of `_preparePrompt` (`:2242-2260`). The default
+    /// resolves the port's credential ladder for `provider`; a host with a
+    /// live `ModelRuntime` can override both facts. `configured: false` is a
+    /// preflight failure: the caller emits upstream's verbatim refusal and no
+    /// disposition, and no run starts. [`RpcAuthCheck::using_oauth`] selects
+    /// the expired-credentials refusal over the missing-key one.
+    fn check_auth(&self, runtime: &PrintRuntime, provider: &str) -> Result<RpcAuthCheck, String>;
 }
 
 /// The default [`RpcHost`] — the same seams the interactive host uses, minus
@@ -427,6 +480,27 @@ impl RpcHost for LocalRpcHost {
     fn get_commands(&self, runtime: &PrintRuntime) -> Result<Vec<Value>, String> {
         Ok(extension_commands(runtime))
     }
+
+    fn check_auth(&self, runtime: &PrintRuntime, provider: &str) -> Result<RpcAuthCheck, String> {
+        // The ladder re-runs for the *selected* provider, so a `set_model`
+        // switch is reflected even though the runtime's flag credential was
+        // resolved for the startup model (`print_mode.rs:689-705`).
+        let credential = crate::modes::print_mode::resolve_wire_credential(
+            provider,
+            runtime.api_key.as_deref(),
+            &crate::config::get_auth_path(),
+        );
+        let config = crate::models_state::models_json_provider(provider);
+        let extension = crate::models_state::extension_provider_config(provider);
+        let using_oauth = runtime.access_token.is_some()
+            || crate::oauth::provider_auth_methods(provider, config.as_ref(), extension.as_ref())
+                .iter()
+                .any(|method| matches!(method, crate::oauth::AuthMethod::OAuth(_)));
+        Ok(RpcAuthCheck {
+            configured: credential.is_some() || runtime.access_token.is_some(),
+            using_oauth,
+        })
+    }
 }
 
 /// The session file as the string upstream puts on the wire (`:456-463`
@@ -627,6 +701,75 @@ fn synthetic_source_info(path: &str) -> Value {
         "scope": "temporary",
         "origin": "top-level",
     })
+}
+
+/// `_tryExecuteExtensionCommand`'s name parse (`:2268-2273`): the text after
+/// the leading `/`, stopping at the first space.
+fn slash_command_name(text: &str) -> &str {
+    match text.find(' ') {
+        Some(index) => &text[1..index],
+        None => &text[1..],
+    }
+}
+
+/// `formatNoApiKeyFoundMessage` (`auth-guidance.ts:22-25`). The `unknown`
+/// provider id is rendered as "the selected model" upstream.
+fn format_no_api_key_message(provider: &str) -> String {
+    let display = if provider == "unknown" {
+        "the selected model"
+    } else {
+        provider
+    };
+    let docs = crate::prompt::get_docs_path();
+    format!(
+        "No API key found for {display}.\n\nUse /login to log into a provider via OAuth or API key. See:\n  {docs}/providers.md\n  {docs}/models.md"
+    )
+}
+
+/// The prompt preflight upstream runs before calling `preflightResult`
+/// (`agent-session.ts:2162-2196,2202-2263`, `rpc-mode.ts:409-435`). Returns
+/// the disposition to put on the wire, or the verbatim refusal a failed
+/// preflight reports as the single `success: false` response.
+///
+/// A leading slash is resolved through the command registry: an `extension`
+/// command is upstream's immediately-executed command (`"handled"`); `prompt`
+/// and `skill` commands are input *expansions* (`:2219-2224`) and continue to
+/// the auth gate as a started run. The port has no command-handler or resource
+/// body on this seam, so expansion is a documented deviation (`WIRING.md`).
+fn prompt_preflight(
+    runtime: &PrintRuntime,
+    host: &dyn RpcHost,
+    message: &str,
+) -> Result<PromptDisposition, String> {
+    // `_tryExecuteExtensionCommand` (`:2171-2178`): only when template
+    // expansion is enabled (RPC does not disable it) and the text leads `/`.
+    if message.starts_with('/') {
+        let name = slash_command_name(message);
+        let commands = host.get_commands(runtime)?;
+        let handled = commands.iter().any(|command| {
+            command.get("name").and_then(Value::as_str) == Some(name)
+                && command.get("source").and_then(Value::as_str) == Some("extension")
+        });
+        if handled {
+            return Ok(PromptDisposition::Handled);
+        }
+    }
+
+    // `if (!this.model)` (`:2242-2245`) is unreachable: `PrintRuntime.model`
+    // is always present. The port's `set_model` also validates against the
+    // model snapshot (`rpc-mode.ts:491-499`).
+    let provider = runtime.model.provider.as_str();
+    let auth = host.check_auth(runtime, provider)?;
+    if !auth.configured {
+        return Err(if auth.using_oauth {
+            format!(
+                "Authentication failed for \"{provider}\". Credentials may have expired or network is unavailable. Run '/login {provider}' to re-authenticate."
+            )
+        } else {
+            format_no_api_key_message(provider)
+        });
+    }
+    Ok(PromptDisposition::Started)
 }
 
 /// `session.getSessionStats()` (`agent-session.ts:4350-4402`,
@@ -1076,10 +1219,30 @@ fn session_messages(runtime: &PrintRuntime) -> Vec<AgentMessage> {
 /// deadlocking.
 struct RpcEventSink {
     writer: RpcOut,
+    /// The delivery mirror (`agent-session.ts:1183-1198`).
+    queued_texts: Arc<Mutex<QueuedTexts>>,
 }
 
 impl AgentEventSink for RpcEventSink {
     fn emit(&mut self, event: AgentEvent) -> pi_agent::types::BoxFuture<'_, ()> {
+        // `_handleAgentEvent`'s delivery bookkeeping (`agent-session.ts:1181-1198`):
+        // when a queued user message starts, upstream removes its text from the
+        // queue mirrors and emits the reduced `queue_update` *before*
+        // forwarding `message_start`. The loop drained the real queues already,
+        // so the mirror is what still knows the text was queued.
+        if let AgentEvent::MessageStart { message } = &event
+            && let AgentMessage::User(user) = message
+        {
+            let text = user_content_text(&user.content);
+            let mut mirror = self.queued_texts.lock().expect("rpc queued texts");
+            if mirror.take_delivered(&text) {
+                let update =
+                    Value::Object(crate::modes::json_event::event_to_json(&mirror.as_event()))
+                        .to_string();
+                let mut writer = self.writer.lock().expect("rpc output");
+                let _ = writeln!(writer, "{update}");
+            }
+        }
         let line =
             serde_json::Value::Object(crate::modes::json_event::event_to_json(&event)).to_string();
         let mut writer = self.writer.lock().expect("rpc output");
@@ -1158,6 +1321,37 @@ impl Write for RpcStdout {
 /// agent events on the same stream — `rpc-mode.ts`'s single `output`).
 type RpcOut = Arc<Mutex<Box<dyn Write + Send>>>;
 
+/// Upstream's `_steeringMessages` / `_followUpMessages` mirrors
+/// (`agent-session.ts:1183-1198`): the agent loop drains the real queues
+/// before it emits `message_start`, so a delivery-time `queue_update` removes
+/// the delivered text from this mirror rather than from the drained queues.
+#[derive(Debug, Default)]
+pub struct QueuedTexts {
+    pub steering: Vec<String>,
+    pub follow_up: Vec<String>,
+}
+
+impl QueuedTexts {
+    /// Steering wins, like upstream's check order (`:1186-1197`); returns
+    /// whether a queued message matched and was removed.
+    fn take_delivered(&mut self, text: &str) -> bool {
+        for queue in [&mut self.steering, &mut self.follow_up] {
+            if let Some(index) = queue.iter().position(|queued| queued == text) {
+                queue.remove(index);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn as_event(&self) -> AgentEvent {
+        AgentEvent::QueueUpdate {
+            steering: self.steering.clone(),
+            follow_up: self.follow_up.clone(),
+        }
+    }
+}
+
 /// The RPC plumbing shared by the command loop and the dialog bridge.
 pub struct RpcBridge {
     /// Command lines the reader thread forwards — everything that is not
@@ -1175,10 +1369,14 @@ pub struct RpcBridge {
     /// (`bindExtensions`'s `uiContext`, before `session_start`).
     #[cfg(feature = "ext-js")]
     pub sink: Arc<dyn pi_ext_js::UiSink>,
-    /// Host-owned session replacement / fork / bash / command table
+    /// Host-owned session replacement / fork / bash / command table / auth
     /// ([`RpcHost`]). `create_bridge` installs [`LocalRpcHost`]; the
     /// coordinator can swap it before `run_rpc_mode` (see `WIRING.md`).
     pub host: Box<dyn RpcHost + Send>,
+    /// Delivery mirror for the `queue_update` re-emission
+    /// (`agent-session.ts:1181-1198`). Enqueues record text here; the event
+    /// sink removes it at `message_start`.
+    pub queued_texts: Arc<Mutex<QueuedTexts>>,
 }
 
 /// Wires the bridge: the reader thread owns the input and routes by
@@ -1239,6 +1437,7 @@ pub fn create_bridge(input: Box<dyn BufRead + Send>, output: Box<dyn Write + Sen
             timeouts: Mutex::new(HashMap::new()),
         }),
         host: Box::new(LocalRpcHost),
+        queued_texts: Arc::new(Mutex::new(QueuedTexts::default())),
     }
 }
 
@@ -1435,24 +1634,30 @@ fn handle_command(
             message, images, ..
         } => {
             // Upstream starts prompt handling immediately and emits the
-            // authoritative response after preflight succeeds
-            // (`rpc-mode.ts:409-435`); the port always starts a run, so the
-            // disposition is `"started"` and the response precedes the event
-            // stream. A missing `message` throws on `text.startsWith`
-            // before preflight, like the TS.
+            // authoritative response only after preflight succeeds
+            // (`rpc-mode.ts:409-435`): command resolution and the model/auth
+            // gate. A missing `message` throws on `text.startsWith` before
+            // preflight, like the TS.
             let Some(message) = message else {
                 return Err(
                     "Cannot read properties of undefined (reading 'startsWith')".to_string()
                 );
             };
+            let disposition = prompt_preflight(runtime, bridge.host.as_ref(), &message)?;
             write_line(
                 &out,
                 &RpcResponse::success(
                     id,
                     "prompt",
-                    Some(serde_json::json!({ "disposition": "started" })),
+                    Some(serde_json::json!({ "disposition": disposition.as_str() })),
                 ),
             )?;
+            if disposition != PromptDisposition::Started {
+                // `"handled"` (an extension command) and `"queued"` (a host
+                // override during a run) both return before `_startRun`
+                // (`agent-session.ts:2175-2176,2238-2239`).
+                return Ok(CommandOutcome::Replied);
+            }
             let now = now_millis();
             let prompt = if images.is_empty() {
                 pi_agent::transcript::user_message(&message, now)
@@ -1462,7 +1667,14 @@ fn handle_command(
             // Post-preflight failures are swallowed upstream (the `.catch`
             // checks `preflightSucceeded`, `rpc-mode.ts:425-429`): the run's
             // failure already surfaced as its `agent_end`.
-            if run_agent_turn(runtime, vec![prompt], &mut bridge.queues, Arc::clone(&out)).is_err()
+            if run_agent_turn(
+                runtime,
+                vec![prompt],
+                &mut bridge.queues,
+                Arc::clone(&out),
+                Arc::clone(&bridge.queued_texts),
+            )
+            .is_err()
             {
                 // Swallowed, like the TS.
             }
@@ -1480,6 +1692,12 @@ fn handle_command(
             };
             let now = now_millis();
             let queued = pi_agent::transcript::user_message_with_images(&message, &images, now);
+            bridge
+                .queued_texts
+                .lock()
+                .expect("rpc queued texts")
+                .steering
+                .push(message.clone());
             bridge.queues.steer([queued]);
             emit_queue_update(&out, &bridge.queues)?;
             Ok(CommandOutcome::Success(Some(
@@ -1496,6 +1714,12 @@ fn handle_command(
             };
             let now = now_millis();
             let queued = pi_agent::transcript::user_message_with_images(&message, &images, now);
+            bridge
+                .queued_texts
+                .lock()
+                .expect("rpc queued texts")
+                .follow_up
+                .push(message.clone());
             bridge.queues.follow_up([queued]);
             emit_queue_update(&out, &bridge.queues)?;
             Ok(CommandOutcome::Success(Some(
@@ -1515,6 +1739,7 @@ fn handle_command(
             let steering = bridge.queues.steering_all();
             let follow_up = bridge.queues.follow_up_all();
             bridge.queues.clear_all();
+            *bridge.queued_texts.lock().expect("rpc queued texts") = QueuedTexts::default();
             emit_queue_update(&out, &bridge.queues)?;
             Ok(CommandOutcome::Success(Some(serde_json::json!({
                 "steering": steering.iter().map(queued_message_text).collect::<Vec<String>>(),
@@ -1590,7 +1815,8 @@ fn handle_command(
             runtime.model = resolved.clone();
             // `session.setModel` appends the transcript record
             // (`agent-session.ts:2665`). The per-model thinking-level switch
-            // and the auth precheck land with the settings/auth slices.
+            // stays deferred; the auth check is re-run per provider by the
+            // prompt preflight (`prompt_preflight`, `:2247-2260`).
             runtime
                 .session
                 .append_model_change(&resolved.provider, &resolved.id)
@@ -1661,6 +1887,7 @@ fn handle_command(
                 crate::modes::compaction::AutoCompaction::new(runtime.compaction_settings);
             let mut sink = RpcEventSink {
                 writer: Arc::clone(&out),
+                queued_texts: Arc::clone(&bridge.queued_texts),
             };
             let result = compaction.run_manual(
                 custom_instructions.as_deref(),
@@ -1835,6 +2062,7 @@ fn handle_command(
                 .new_session(runtime, parent_session.as_deref())?;
             if !cancelled {
                 bridge.queues = Queues::new();
+                *bridge.queued_texts.lock().expect("rpc queued texts") = QueuedTexts::default();
             }
             Ok(CommandOutcome::Success(Some(
                 serde_json::json!({ "cancelled": cancelled }),
@@ -1941,6 +2169,7 @@ fn handle_command(
             let cancelled = bridge.host.switch_session(runtime, &session_path)?;
             if !cancelled {
                 bridge.queues = Queues::new();
+                *bridge.queued_texts.lock().expect("rpc queued texts") = QueuedTexts::default();
             }
             Ok(CommandOutcome::Success(Some(
                 serde_json::json!({ "cancelled": cancelled }),
@@ -1958,6 +2187,7 @@ fn handle_command(
                 .fork(runtime, &entry_id, RpcForkPosition::Before)?;
             if !result.cancelled {
                 bridge.queues = Queues::new();
+                *bridge.queued_texts.lock().expect("rpc queued texts") = QueuedTexts::default();
             }
             let mut data = serde_json::Map::new();
             if let Some(text) = result.selected_text {
@@ -1975,6 +2205,7 @@ fn handle_command(
             let result = bridge.host.fork(runtime, &leaf_id, RpcForkPosition::At)?;
             if !result.cancelled {
                 bridge.queues = Queues::new();
+                *bridge.queued_texts.lock().expect("rpc queued texts") = QueuedTexts::default();
             }
             Ok(CommandOutcome::Success(Some(
                 serde_json::json!({ "cancelled": result.cancelled }),
@@ -2048,6 +2279,7 @@ fn run_agent_turn(
     prompts: Vec<AgentMessage>,
     queues: &mut Queues,
     output: RpcOut,
+    queued_texts: Arc<Mutex<QueuedTexts>>,
 ) -> Result<(), String> {
     let executor = runtime.executor.clone();
     let specs: Vec<ToolSpec> = executor.tools();
@@ -2058,7 +2290,10 @@ fn run_agent_turn(
     };
 
     let user_prompts = prompts;
-    let mut sink = RpcEventSink { writer: output };
+    let mut sink = RpcEventSink {
+        writer: output,
+        queued_texts,
+    };
     let signal = Arc::new(AbortSignal::new());
     // Under a virtual selection every request routes first
     // (`_installAgentRequestProjection`).
@@ -3033,6 +3268,17 @@ mod tests {
                                "scope": "temporary", "origin": "top-level"},
             })])
         }
+
+        fn check_auth(
+            &self,
+            _runtime: &PrintRuntime,
+            _provider: &str,
+        ) -> Result<RpcAuthCheck, String> {
+            Ok(RpcAuthCheck {
+                configured: true,
+                using_oauth: false,
+            })
+        }
     }
 
     #[test]
@@ -3337,5 +3583,376 @@ mod tests {
         assert_eq!(parsed[2]["data"], json!({"cancelled": true}));
         assert_eq!(parsed[3]["data"]["commands"][0]["source"], "extension");
         assert_eq!(parsed[3]["data"]["commands"][0]["name"], "extension:deploy");
+    }
+
+    /// A host whose command table and auth facts are scripted; the unrelated
+    /// operations delegate to the local host.
+    struct PreflightHost {
+        commands: Vec<Value>,
+        auth: RpcAuthCheck,
+    }
+
+    impl PreflightHost {
+        fn configured(commands: Vec<Value>) -> Self {
+            Self {
+                commands,
+                auth: RpcAuthCheck {
+                    configured: true,
+                    using_oauth: false,
+                },
+            }
+        }
+    }
+
+    impl RpcHost for PreflightHost {
+        fn new_session(
+            &self,
+            runtime: &mut PrintRuntime,
+            parent: Option<&str>,
+        ) -> Result<bool, String> {
+            LocalRpcHost.new_session(runtime, parent)
+        }
+
+        fn switch_session(&self, runtime: &mut PrintRuntime, path: &str) -> Result<bool, String> {
+            LocalRpcHost.switch_session(runtime, path)
+        }
+
+        fn fork(
+            &self,
+            runtime: &mut PrintRuntime,
+            entry_id: &str,
+            position: RpcForkPosition,
+        ) -> Result<RpcForkResult, String> {
+            LocalRpcHost.fork(runtime, entry_id, position)
+        }
+
+        fn bash(
+            &self,
+            runtime: &mut PrintRuntime,
+            command: &str,
+            exclude: bool,
+            id: Option<&str>,
+        ) -> Result<Value, String> {
+            LocalRpcHost.bash(runtime, command, exclude, id)
+        }
+
+        fn get_commands(&self, _runtime: &PrintRuntime) -> Result<Vec<Value>, String> {
+            Ok(self.commands.clone())
+        }
+
+        fn check_auth(
+            &self,
+            _runtime: &PrintRuntime,
+            _provider: &str,
+        ) -> Result<RpcAuthCheck, String> {
+            Ok(self.auth)
+        }
+    }
+
+    /// Waits for the run tail in tests that must observe the event stream.
+    fn wait_for_settle(fixture: &BridgeFixture) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let lines = fixture.output_lines();
+            if lines.iter().any(|line| line.contains("agent_settled")) {
+                return lines;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run did not settle: {lines:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A provider error after acceptance: it surfaces in the event stream,
+    /// never as a second `prompt` response (`rpc-mode.ts:425-429`).
+    struct FailingStream;
+
+    impl pi_agent::types::StreamFn for FailingStream {
+        fn stream(
+            &self,
+            _request: pi_agent::types::StreamRequest,
+        ) -> futures::stream::BoxStream<'static, pi_ai::types::AssistantMessageEvent> {
+            use pi_ai::types::AssistantMessageEvent;
+            let partial = serde_json::from_value::<pi_ai::types::AssistantMessage>(json!({
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "provider failed" }],
+                "api": "test",
+                "provider": "test",
+                "model": "test-model",
+                "usage": {
+                    "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                    "totalTokens": 0,
+                    "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0,
+                              "cacheWrite": 0.0, "total": 0.0 }
+                },
+                "stopReason": "error",
+                "errorMessage": "provider failed",
+                "timestamp": 0
+            }))
+            .expect("assistant message");
+            Box::pin(futures::stream::iter(vec![
+                AssistantMessageEvent::Start {
+                    partial: partial.clone(),
+                },
+                AssistantMessageEvent::Done {
+                    reason: pi_ai::types::StopReason::Error,
+                    message: partial,
+                },
+            ]))
+        }
+    }
+
+    #[test]
+    fn prompt_preflight_handles_a_known_extension_command_without_a_run() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A run would panic in `NeverStream`, so this also proves no run starts.
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        fixture.set_host(Box::new(PreflightHost::configured(vec![json!({
+            "name": "deploy",
+            "description": "Deploy",
+            "source": "extension",
+        })])));
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        fixture.write_line(r#"{"type":"prompt","id":"p1","message":"/deploy now"}"#);
+        let lines = fixture.wait_for_output(1);
+        drop(fixture.writer);
+        mode.join();
+
+        assert_eq!(lines.len(), 1, "no run for a handled command: {lines:?}");
+        let value: Value = serde_json::from_str(&lines[0]).expect("frame");
+        assert_eq!(value["type"], "response");
+        assert_eq!(value["id"], "p1");
+        assert_eq!(value["command"], "prompt");
+        assert_eq!(value["success"], true);
+        assert_eq!(value["data"]["disposition"], "handled");
+    }
+
+    #[test]
+    fn prompt_preflight_starts_template_skill_and_unknown_slash_commands() {
+        for (name, source) in [
+            ("review", "prompt"),
+            ("skill:review", "skill"),
+            ("missing", "unknown"),
+            ("deploy", "extension"),
+        ] {
+            let mut fixture = BridgeFixture::new();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let runtime = test_runtime(
+                dir.path(),
+                Arc::new(TextScript {
+                    calls: AtomicUsize::new(0),
+                }),
+            );
+            // The registry holds "deploy"; only an exact extension-command
+            // match is handled. The other slash forms fall through to a run.
+            fixture.set_host(Box::new(PreflightHost::configured(vec![json!({
+                "name": "deploy",
+                "description": "Deploy",
+                "source": "extension",
+            })])));
+            let bridge = fixture.take_bridge();
+            let mode = ModeThread::start(runtime, bridge);
+            let command = format!("/{name} file.rs");
+
+            let expected = if source == "extension" {
+                "handled"
+            } else {
+                "started"
+            };
+            fixture.write_line(&format!(
+                r#"{{"type":"prompt","id":"p1","message":"{command}"}}"#
+            ));
+            // A handled command starts no run, so there is no `agent_settled`
+            // to wait for in that arm.
+            let lines = if expected == "handled" {
+                fixture.wait_for_output(1)
+            } else {
+                wait_for_settle(&fixture)
+            };
+            drop(fixture.writer);
+            mode.join();
+
+            let parsed: Vec<Value> = lines
+                .iter()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            let response = parsed
+                .iter()
+                .find(|value| value["command"] == "prompt")
+                .unwrap_or_else(|| panic!("prompt response for {command}: {parsed:?}"));
+            assert_eq!(
+                response["data"]["disposition"], expected,
+                "{command} / {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_preflight_refuses_an_unconfigured_provider_before_acceptance() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        fixture.set_host(Box::new(PreflightHost {
+            commands: Vec::new(),
+            auth: RpcAuthCheck {
+                configured: false,
+                using_oauth: false,
+            },
+        }));
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        fixture.write_line(r#"{"type":"prompt","id":"u1","message":"hello"}"#);
+        let lines = fixture.wait_for_output(1);
+        drop(fixture.writer);
+        mode.join();
+
+        assert_eq!(lines.len(), 1, "only the refusal crossed: {lines:?}");
+        let value: Value = serde_json::from_str(&lines[0]).expect("frame");
+        assert_eq!(value["id"], "u1");
+        assert_eq!(value["command"], "prompt");
+        assert_eq!(value["success"], false);
+        assert_eq!(value["error"], format_no_api_key_message("test"));
+        assert!(
+            value.get("data").is_none(),
+            "a refusal carries no disposition: {value}"
+        );
+    }
+
+    #[test]
+    fn prompt_preflight_uses_the_oauth_refusal_for_a_missing_oauth_credential() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        fixture.set_host(Box::new(PreflightHost {
+            commands: Vec::new(),
+            auth: RpcAuthCheck {
+                configured: false,
+                using_oauth: true,
+            },
+        }));
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        fixture.write_line(r#"{"type":"prompt","id":"o1","message":"hello"}"#);
+        let lines = fixture.wait_for_output(1);
+        drop(fixture.writer);
+        mode.join();
+
+        let value: Value = serde_json::from_str(&lines[0]).expect("frame");
+        assert_eq!(value["success"], false);
+        assert_eq!(
+            value["error"],
+            "Authentication failed for \"test\". Credentials may have expired or network is unavailable. Run '/login test' to re-authenticate."
+        );
+        assert!(value.get("data").is_none());
+    }
+
+    #[test]
+    fn prompt_response_precedes_the_run_and_a_failed_run_adds_no_second_response() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut runtime = test_runtime(dir.path(), Arc::new(FailingStream));
+        runtime.retry_settings.enabled = false;
+        fixture.set_host(Box::new(PreflightHost::configured(Vec::new())));
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        fixture.write_line(r#"{"type":"prompt","id":"f1","message":"will fail"}"#);
+        let lines = wait_for_settle(&fixture);
+        drop(fixture.writer);
+        mode.join();
+
+        let parsed: Vec<Value> = lines
+            .iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let response_index = parsed
+            .iter()
+            .position(|value| value["command"] == "prompt")
+            .expect("prompt response");
+        let agent_start = parsed
+            .iter()
+            .position(|value| value["type"] == "agent_start")
+            .expect("agent_start");
+        assert_eq!(response_index, 0, "preflight response is first: {parsed:?}");
+        assert!(
+            response_index < agent_start,
+            "the response precedes the run"
+        );
+        assert_eq!(parsed[response_index]["data"]["disposition"], "started");
+        assert_eq!(
+            parsed
+                .iter()
+                .filter(|value| value["command"] == "prompt")
+                .count(),
+            1,
+            "the post-preflight failure is swallowed, not a second response"
+        );
+        assert!(
+            parsed.iter().any(|value| value["type"] == "agent_end"),
+            "the provider failure surfaced as an event"
+        );
+    }
+
+    #[test]
+    fn prompt_reemits_queue_update_when_a_queued_message_is_delivered() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime(
+            dir.path(),
+            Arc::new(TextScript {
+                calls: AtomicUsize::new(0),
+            }),
+        );
+        fixture.set_host(Box::new(PreflightHost::configured(Vec::new())));
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        fixture.write_line(r#"{"type":"steer","id":"s1","message":"queued steer"}"#);
+        let lines = fixture.wait_for_output(2);
+        assert_eq!(
+            lines[0],
+            r#"{"type":"queue_update","steering":["queued steer"],"followUp":[]}"#
+        );
+        fixture.write_line(r#"{"type":"prompt","id":"p1","message":"go"}"#);
+        let lines = wait_for_settle(&fixture);
+        drop(fixture.writer);
+        mode.join();
+
+        let parsed: Vec<Value> = lines
+            .iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let update_indices: Vec<usize> = parsed
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value["type"] == "queue_update")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            update_indices.len(),
+            2,
+            "one at enqueue, one at delivery: {parsed:?}"
+        );
+        assert_eq!(parsed[update_indices[1]]["steering"], json!([]));
+        assert_eq!(parsed[update_indices[1]]["followUp"], json!([]));
+        let delivery = parsed
+            .iter()
+            .position(|value| {
+                value["type"] == "message_start"
+                    && value["message"]["role"] == "user"
+                    && value["message"]["content"][0]["text"] == "queued steer"
+            })
+            .expect("the queued message is delivered inside the run");
+        assert!(
+            update_indices[1] < delivery,
+            "the reduced queue crosses before its message_start"
+        );
     }
 }
