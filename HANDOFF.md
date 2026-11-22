@@ -3741,13 +3741,25 @@ bash via PTY (`87f53ee`, 6 tests), serde_json `float_roundtrip`
 bugs found by gates: an inverted hex-encoding assumption in a test and a
 `file://` URL authority normalization bug in the node shim.
 
+**Second parity wave (all landed, full host gate + CI green):** CJS interop
+(`d661f32`, 7 tests), per-path `/reload` unload via fresh-runtime rebuild
+(`8215fd8`, 4 tests + pi-coding-agent call-site), `pi-ai`/`pi-tui`/
+`pi-agent-core`/`pi-codemode/source` host packages (`2441b91` + `d661f32`),
+fuller WHATWG URL / `Stats` / HMAC / `process` shims (`83c4e7a`, 5 new tests),
+typed-session tolerant-decode/unknown-key byte preservation (`88ad16a`), and
+RPC prompt preflight with command/auth checks and queue mirror (`6603d47`,
+6 new tests). Real bugs found by gates: deterministic `Math.random()` in
+fresh QuickJS runtimes caused duplicate temp paths, and a 1-byte enum ref
+tripped a pedantic lint.
+
 **Honest 1:1 status:** still not exact parity. Deliberate deviations remain
 (no `/share` or `/bug` — Radius upload policy; Node/Workers-only codemode
-transports; partial WHATWG URL/`Stats`/crypto shims; timer ownership in the
-cache warmer; no CJS interop or per-path `/reload` unload; macOS release
-assets pending runner availability). The upstream feature surface is
-otherwise covered; remaining differences are mechanism-level and documented
-in module docs and `docs/upstream/` notes.
+transports; host-driven timers; a few unserved `pi-ai` subpaths and type-only
+exports; pi-tui shims are data-shape only; no live Agent loop in
+`pi-agent-core`; no `node_modules` resolution, dynamic `require`, or
+`URL.canParse`; macOS release assets pending runner availability). The
+upstream feature surface is otherwise covered; remaining differences are
+mechanism-level and documented in module docs and `docs/upstream/` notes.
 
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
