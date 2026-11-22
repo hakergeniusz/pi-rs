@@ -1,7 +1,9 @@
-// `node:process` — the ambient object Node extensions expect. cwd and mode
-// come from the host's HostCore, not the OS process, so a session's
-// configured cwd is what `process.cwd()` reports. Credential-shaped
-// environment keys are filtered by the host op (see `WIRING.md`).
+// `node:process` — the ambient object Node extensions expect. cwd comes from
+// the host's HostCore, not the OS process, so a session's configured cwd is
+// what `process.cwd()` reports. `platform`, `arch`, `version` and `cwd()` are
+// always strings. `process.env` is a snapshot: the host op drops empty,
+// non-shell-shaped and credential-shaped keys so a fixture can never leak a
+// live token (see `WIRING.md`).
 
 const ops = globalThis.__piOps;
 
@@ -66,8 +68,17 @@ if (globalThis.process === undefined) {
     platform,
     arch,
     version,
+    versions,
+    title,
+    argv,
+    execArgv,
+    pid,
+    ppid,
     cwd,
+    chdir,
     nextTick,
+    uptime,
+    memoryUsage,
     stdout,
     stderr,
     exit,

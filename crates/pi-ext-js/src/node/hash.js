@@ -46,10 +46,44 @@ export function createHash(algorithm) {
   };
 }
 
+// HMAC (RFC 2104) uses the same chainable object as `createHash`; the key
+// never leaves the engine except as a byte array passed to the host op.
+// SHA-256 and SHA-512 are supported (their block sizes differ), matching
+// `getHashes()`.
 export function createHmac(algorithm, key) {
-  void algorithm;
-  void key;
-  throw new Error("crypto.createHmac is not available in the extensions host");
+  const keyBytes =
+    typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
+  const chunks = [];
+  return {
+    update(data, encoding = "utf8") {
+      const bytes = typeof data === "string" ? Buffer.from(data, encoding) : Buffer.from(data);
+      chunks.push(bytes);
+      return this;
+    },
+    digest(encoding = "buffer") {
+      const bytes = Buffer.concat(chunks);
+      const raw = JSON.parse(
+        ops.nodeCryptoHmac(
+          String(algorithm),
+          JSON.stringify(Array.from(keyBytes)),
+          JSON.stringify(Array.from(bytes)),
+          String(encoding),
+        ),
+      );
+      if (raw.error) {
+        const error = new Error(raw.error);
+        error.code = raw.code;
+        throw error;
+      }
+      if (encoding === "buffer") return Buffer.from(raw.ok);
+      return raw.ok;
+    },
+    copy() {
+      const clone = createHmac(algorithm, keyBytes);
+      for (const chunk of chunks) clone.update(chunk);
+      return clone;
+    },
+  };
 }
 
 export function randomUUID() {

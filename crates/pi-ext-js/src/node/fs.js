@@ -29,6 +29,10 @@ export class Stats {
     this.isFileValue = !!value.isFile;
     this.isDirectoryValue = !!value.isDirectory;
     this.isSymbolicLinkValue = !!value.isSymbolicLink;
+    this.isBlockDeviceValue = !!value.isBlockDevice;
+    this.isCharacterDeviceValue = !!value.isCharacterDevice;
+    this.isFIFOValue = !!value.isFIFO;
+    this.isSocketValue = !!value.isSocket;
     this.size = value.size;
     this.mtimeMs = value.mtimeMs;
     this.mode = value.mode;
@@ -42,6 +46,18 @@ export class Stats {
   }
   isSymbolicLink() {
     return this.isSymbolicLinkValue;
+  }
+  isBlockDevice() {
+    return this.isBlockDeviceValue;
+  }
+  isCharacterDevice() {
+    return this.isCharacterDeviceValue;
+  }
+  isFIFO() {
+    return this.isFIFOValue;
+  }
+  isSocket() {
+    return this.isSocketValue;
   }
 }
 
@@ -93,7 +109,9 @@ export function readdirSync(path, options) {
       let isFile = false;
       let isSymbolicLink = false;
       try {
-        const stat = unwrap(ops.nodeFsStatSync(`${String(path)}/${name}`), "stat", String(path));
+        // Dirents describe the entry itself, so a symlink must not be
+        // followed (the same rule Node uses for `withFileTypes`).
+        const stat = unwrap(ops.nodeFsLstatSync(`${String(path)}/${name}`), "lstat", String(path));
         isDirectory = !!stat.isDirectory;
         isFile = !!stat.isFile;
         isSymbolicLink = !!stat.isSymbolicLink;
@@ -110,7 +128,11 @@ export function statSync(path) {
   return new Stats(unwrap(ops.nodeFsStatSync(String(path)), "stat", String(path)));
 }
 
-export const lstatSync = statSync;
+// Unlike `statSync`, lstat reports the link itself (including
+// `isSymbolicLink()`), matching Node's `fs.lstatSync`.
+export function lstatSync(path) {
+  return new Stats(unwrap(ops.nodeFsLstatSync(String(path)), "lstat", String(path)));
+}
 
 export function mkdirSync(path, options) {
   const recursive = !!(options && options.recursive);
@@ -156,6 +178,10 @@ export function readlinkSync(path) {
   return unwrap(ops.nodeFsReadlinkSync(String(path)), "readlink", String(path));
 }
 
+export function symlinkSync(target, path) {
+  unwrap(ops.nodeFsSymlinkSync(String(target), String(path)), "symlink", String(path));
+}
+
 // Promise forms settle from the same host ops. Upstream is async here; the
 // embedded host has a synchronous filesystem, so the observable result is
 // the same once the engine's job queue drains.
@@ -179,7 +205,9 @@ export function stat(path) {
   return Promise.resolve().then(() => statSync(path));
 }
 
-export const lstat = stat;
+export function lstat(path) {
+  return Promise.resolve().then(() => lstatSync(path));
+}
 
 export function readdir(path, options) {
   return Promise.resolve().then(() => readdirSync(path, options));
@@ -216,6 +244,7 @@ export default {
   rmdirSync,
   realpathSync,
   readlinkSync,
+  symlinkSync,
   readFile,
   writeFile,
   appendFile,

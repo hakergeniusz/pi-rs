@@ -6,7 +6,9 @@
 //! fs/promises, os, path, process, url, util) plus the state-backed
 //! `@earendil-works/pi-coding-agent` and `@earendil-works/pi-mcp` packages.
 //! A second test pins the E1 rejection string for packages the port does
-//! not bundle.
+//! not bundle. A third pins the raised-fidelity shim semantics: WHATWG URL
+//! getters/relative resolution/searchParams sync, real `fs.Stats` plus
+//! `lstat`, HMAC-SHA256 and string-valued `process` properties.
 
 use pi_ext_js::resolver::{is_unavailable_host_module, node, virtual_module_source};
 use pi_ext_js::{HostCore, JsHost};
@@ -81,6 +83,63 @@ fn fixture_extension_imports_and_calls_every_served_module() {
             .starts_with("pi-ext-js-node-fixture-")
     );
     assert_eq!(result["fsExt"], ".txt");
+}
+
+#[test]
+fn fixture_exposes_the_raised_fidelity_shim_semantics() {
+    let host = host();
+    let result = load_fixture(&host);
+
+    // crypto.createHmac: RFC-style vectors, multi-update chaining and copy().
+    assert_eq!(
+        result["hmac"],
+        "9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab"
+    );
+    assert_eq!(
+        result["hmacChunked"],
+        "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+    );
+    assert_eq!(result["hmacBufferCopy"], result["hmac"]);
+    assert_eq!(result["hmacAlgorithms"], true);
+
+    // fs.Stats comes from real metadata; lstat does not follow the symlink.
+    assert_eq!(result["fsStatIsFile"], true);
+    assert_eq!(result["fsStatIsDirectory"], true);
+    assert_eq!(result["fsStatSize"], 7);
+    assert_eq!(result["fsStatModeType"], "number");
+    assert_eq!(result["fsStatMtimeType"], "number");
+    assert_eq!(result["fsLstatLinkIsLink"], true);
+    assert_eq!(result["fsStatLinkIsLink"], false);
+
+    // WHATWG URL components, default ports, origin and pathname encoding.
+    assert_eq!(
+        result["urlHref"],
+        "https://User:pass@example.com:8080/a/b?x=1#f"
+    );
+    assert_eq!(result["urlProtocol"], "https:");
+    assert_eq!(result["urlHost"], "example.com:8080");
+    assert_eq!(result["urlHostname"], "example.com");
+    assert_eq!(result["urlPort"], "8080");
+    assert_eq!(result["urlOrigin"], "https://example.com:8080");
+    assert_eq!(result["urlPathname"], "/a%20b/c%C3%A9");
+    assert_eq!(result["urlDefaultPort"], "");
+    assert_eq!(result["urlFileOrigin"], "null");
+    assert_eq!(result["urlRelative"], "https://example.com/a/img.png");
+
+    // URLSearchParams mutations flow back into search/href, and form
+    // encoding uses `+` for spaces.
+    assert_eq!(result["urlSearchParams"][0], "9");
+    assert_eq!(result["urlSearchParams"][1], "?a=9&b=2");
+    assert_eq!(result["urlSearchParams"][2], "http://x/?a=9&b=2");
+    assert_eq!(result["urlSearchParamsEncode"], "a=hello+world");
+
+    // process properties are strings and env keys obey the host filter.
+    assert_eq!(result["processCwdType"], "string");
+    assert_eq!(result["processPlatformType"], "string");
+    assert_eq!(result["processArchType"], "string");
+    assert_eq!(result["processVersionType"], "string");
+    assert_eq!(result["processEnvIsObject"], true);
+    assert_eq!(result["processEnvKeysValid"], true);
 }
 
 #[test]

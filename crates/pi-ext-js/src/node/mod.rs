@@ -30,6 +30,20 @@
 //! directly: each one goes through the `__piOps` entries installed by
 //! [`install_ops`], so the host remains the single owner of cwd, settings,
 //! environment and process lifecycle.
+//!
+//! ## Fidelity ground truth
+//!
+//! Unlike the rest of the port, these shims mirror **Node's** documented
+//! semantics rather than a TypeScript file (upstream only *imports* these as
+//! real Node built-ins):
+//!
+//! - `node:url` → WHATWG URL Standard + `node:url` (`fileURLToPath`,
+//!   `pathToFileURL`, `URL`, `URLSearchParams`),
+//! - `node:fs` → `fs.Stats` / `fs.lstatSync` (symlinks are *not* followed),
+//! - `node:crypto` → `crypto.createHmac` (RFC 2104 / FIPS 198-1, SHA-256 and
+//!   SHA-512 block sizes),
+//! - `node:process` → `process.env` key rules and the string-valued
+//!   `cwd`/`platform`/`arch`/`version` properties.
 
 use std::fmt::Write as _;
 use std::io::Read as _;
@@ -111,6 +125,48 @@ fn io_error(error: &std::io::Error) -> Json {
         },
     };
     serde_json::json!({ "error": error.to_string(), "code": code })
+}
+
+/// The `fs.Stats` payload shared by `statSync` (follows symlinks) and
+/// `lstatSync` (uses `symlink_metadata`, so a symlink reports itself).
+///
+/// `mode` is the raw Unix permission/type bits, matching Node's
+/// `stats.mode`; `mtimeMs` is the modification time as fractional
+/// milliseconds since the Unix epoch.
+fn fs_stats(metadata: &std::fs::Metadata) -> Json {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+    #[cfg(unix)]
+    let mode = metadata.permissions().mode();
+    #[cfg(not(unix))]
+    let mode = 0;
+    #[cfg(unix)]
+    let (is_block_device, is_character_device, is_fifo, is_socket) = {
+        use std::os::unix::fs::FileTypeExt as _;
+        let file_type = metadata.file_type();
+        (
+            file_type.is_block_device(),
+            file_type.is_char_device(),
+            file_type.is_fifo(),
+            file_type.is_socket(),
+        )
+    };
+    #[cfg(not(unix))]
+    let (is_block_device, is_character_device, is_fifo, is_socket) = (false, false, false, false);
+    serde_json::json!({
+        "isFile": metadata.is_file(),
+        "isDirectory": metadata.is_dir(),
+        "isSymbolicLink": metadata.file_type().is_symlink(),
+        "isBlockDevice": is_block_device,
+        "isCharacterDevice": is_character_device,
+        "isFIFO": is_fifo,
+        "isSocket": is_socket,
+        "size": metadata.len(),
+        "mtimeMs": modified.map_or(0.0, |duration| duration.as_secs_f64() * 1000.0),
+        "mode": mode,
+    })
 }
 
 /// Decodes bytes with one of the encodings Node's `Buffer` accepts.
@@ -349,23 +405,52 @@ fn os_value(op: &str) -> Json {
     }
 }
 
-/// `process.env` with credential-shaped names removed. Upstream extensions
-/// can read the whole environment; the port deliberately filters keys that
-/// look like secrets (see `WIRING.md`) so a fixture can never leak a live
-/// token into a transcript.
-fn process_env() -> Json {
+/// A name Node will actually surface in `process.env`. Empty names, names
+/// containing `=` or NUL, and names that cannot be written in a shell are
+/// dropped. Valid names start with a letter or `_` and continue with ASCII
+/// letters, digits or `_` (the portable environment-variable grammar).
+fn is_valid_env_key(key: &str) -> bool {
+    let mut characters = key.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Credential-shaped names are filtered deliberately so an extension can
+/// never copy a live token into a transcript or a tool call (see
+/// `WIRING.md`). This is a port-specific deviation from Node, not a spec
+/// behaviour.
+fn is_secret_env_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    ["key", "token", "secret", "password", "credential", "auth"]
+        .into_iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// Pure `process.env` builder so the filtering rules can be unit-tested with
+/// synthetic entries without touching the real process environment.
+fn filter_env(entries: impl IntoIterator<Item = (String, String)>) -> Json {
     let mut env = serde_json::Map::new();
-    for (key, value) in std::env::vars() {
-        let lower = key.to_ascii_lowercase();
-        if ["key", "token", "secret", "password", "credential", "auth"]
-            .into_iter()
-            .any(|needle| lower.contains(needle))
-        {
-            continue;
+    for (key, value) in entries {
+        if is_valid_env_key(&key) && !is_secret_env_key(&key) {
+            env.insert(key, Json::String(value));
         }
-        env.insert(key, Json::String(value));
     }
     Json::Object(env)
+}
+
+/// `process.env` from the ambient process. `vars_os` is used instead of
+/// `vars` so a single non-UTF-8 entry cannot panic the whole engine; such
+/// entries are simply dropped as invalid names.
+fn process_env() -> Json {
+    filter_env(
+        std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?))),
+    )
 }
 
 /// `node:process` values backed by host state rather than the ambient
@@ -398,14 +483,67 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Node accepts the OpenSSL spelling of a digest (`SHA256`, `SHA-256`,
+/// `sha256`); normalise to the canonical lowercase name so all three work.
+fn normalize_digest_name(algorithm: &str) -> String {
+    algorithm
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| *character != '-')
+        .collect()
+}
+
 /// The hash algorithms the bundled MCP OAuth flow needs. Algorithms outside
 /// this set reject with a Node-shaped message.
 fn crypto_digest(algorithm: &str, bytes: &[u8]) -> Result<String, String> {
-    match algorithm {
+    match normalize_digest_name(algorithm).as_str() {
         "sha256" => Ok(to_hex(&Sha256::digest(bytes))),
         "sha512" => Ok(to_hex(&Sha512::digest(bytes))),
-        other => Err(format!("Digest method not supported: {other}")),
+        _ => Err(format!("Digest method not supported: {algorithm}")),
     }
+}
+
+/// HMAC (RFC 2104) implemented directly over `sha2` because the host does
+/// not depend on the `hmac` crate. `key` is hashed when longer than the
+/// digest's block size and zero-padded otherwise, then combined with the
+/// inner (`0x36`) and outer (`0x5c`) pads.
+///
+/// The algorithm name is normalised like [`crypto_digest`]; the returned
+/// string is lowercase hex, matching `digest("hex")`.
+fn crypto_hmac(algorithm: &str, key: &[u8], bytes: &[u8]) -> Result<String, String> {
+    let (block_size, digest): (usize, fn(&[u8]) -> Vec<u8>) =
+        match normalize_digest_name(algorithm).as_str() {
+            "sha256" => (64, |data| Sha256::digest(data).to_vec()),
+            "sha512" => (128, |data| Sha512::digest(data).to_vec()),
+            _ => return Err(format!("Digest method not supported: {algorithm}")),
+        };
+
+    let shortened;
+    let normalized_key = if key.len() > block_size {
+        shortened = digest(key);
+        shortened.as_slice()
+    } else {
+        key
+    };
+
+    let mut inner_pad = vec![0x36_u8; block_size];
+    let mut outer_pad = vec![0x5c_u8; block_size];
+    for (pad, key_byte) in inner_pad.iter_mut().zip(normalized_key) {
+        *pad ^= key_byte;
+    }
+    for (pad, key_byte) in outer_pad.iter_mut().zip(normalized_key) {
+        *pad ^= key_byte;
+    }
+
+    let mut inner = Vec::with_capacity(block_size + bytes.len());
+    inner.extend_from_slice(&inner_pad);
+    inner.extend_from_slice(bytes);
+    let inner_digest = digest(&inner);
+
+    let mut outer = Vec::with_capacity(block_size + inner_digest.len());
+    outer.extend_from_slice(&outer_pad);
+    outer.extend_from_slice(&inner_digest);
+    Ok(to_hex(&digest(&outer)))
 }
 
 /// RFC 4122 v4 UUID from `/dev/urandom`, with a time-derived fallback on
@@ -509,6 +647,19 @@ pub(crate) fn install_ops(ctx: &Ctx<'_>, core: &Arc<Mutex<HostCore>>) -> Result<
             Err(error) => fail(&error, "ERR_CRYPTO_INVALID_DIGEST"),
         }
     });
+    op!("nodeCryptoHmac", _core, |algorithm: String,
+                                  key: String,
+                                  bytes: String,
+                                  encoding: String|
+     -> String {
+        let key_bytes: Vec<u8> = serde_json::from_str(&key).unwrap_or_default();
+        let values: Vec<u8> = serde_json::from_str(&bytes).unwrap_or_default();
+        match crypto_hmac(&algorithm, &key_bytes, &values) {
+            Ok(digest) if encoding == "buffer" => ok(serde_json::json!(digest.as_bytes())),
+            Ok(digest) => ok(Json::String(digest)),
+            Err(error) => fail(&error, "ERR_CRYPTO_INVALID_DIGEST"),
+        }
+    });
     op!("nodeCryptoRandomUuid", _core, || -> String {
         ok(Json::String(random_uuid()))
     });
@@ -582,24 +733,17 @@ pub(crate) fn install_ops(ctx: &Ctx<'_>, core: &Arc<Mutex<HostCore>>) -> Result<
     });
     op!("nodeFsStatSync", _core, |path: String| -> String {
         match std::fs::metadata(&path) {
-            Ok(metadata) => {
-                let modified = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
-                #[cfg(unix)]
-                let mode = metadata.permissions().mode();
-                #[cfg(not(unix))]
-                let mode = 0;
-                ok(serde_json::json!({
-                    "isFile": metadata.is_file(),
-                    "isDirectory": metadata.is_dir(),
-                    "isSymbolicLink": metadata.file_type().is_symlink(),
-                    "size": metadata.len(),
-                    "mtimeMs": modified.map_or(0.0, |duration| duration.as_secs_f64() * 1000.0),
-                    "mode": mode,
-                }))
+            Ok(metadata) => ok(fs_stats(&metadata)),
+            Err(error) => {
+                serde_json::to_string(&io_error(&error)).unwrap_or_else(|_| fail("io error", "EIO"))
             }
+        }
+    });
+    // `lstat` does NOT follow the final symlink, so `isSymbolicLink()` is
+    // observable here while `statSync` reports the link's target.
+    op!("nodeFsLstatSync", _core, |path: String| -> String {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => ok(fs_stats(&metadata)),
             Err(error) => {
                 serde_json::to_string(&io_error(&error)).unwrap_or_else(|_| fail("io error", "EIO"))
             }
@@ -661,6 +805,29 @@ pub(crate) fn install_ops(ctx: &Ctx<'_>, core: &Arc<Mutex<HostCore>>) -> Result<
     op!("nodeFsRealpathSync", _core, |path: String| -> String {
         match std::fs::canonicalize(&path) {
             Ok(resolved) => ok(Json::String(resolved.to_string_lossy().into_owned())),
+            Err(error) => {
+                serde_json::to_string(&io_error(&error)).unwrap_or_else(|_| fail("io error", "EIO"))
+            }
+        }
+    });
+    op!("nodeFsSymlinkSync", _core, |target: String,
+                                     path: String|
+     -> String {
+        #[cfg(unix)]
+        let outcome = std::os::unix::fs::symlink(&target, &path);
+        #[cfg(windows)]
+        let outcome = if std::path::Path::new(&target).is_dir() {
+            std::os::windows::fs::symlink_dir(&target, &path)
+        } else {
+            std::os::windows::fs::symlink_file(&target, &path)
+        };
+        #[cfg(not(any(unix, windows)))]
+        let outcome: std::io::Result<()> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlinks are not supported on this platform",
+        ));
+        match outcome {
+            Ok(()) => ok(Json::Null),
             Err(error) => {
                 serde_json::to_string(&io_error(&error)).unwrap_or_else(|_| fail("io error", "EIO"))
             }
@@ -831,5 +998,98 @@ mod tests {
             assert!(source(specifier).is_some(), "missing shim for {specifier}");
         }
         assert!(source("node:sqlite").is_none());
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_vectors() {
+        // RFC 4231 cases 1 and 2, plus a key longer than the 64-byte block
+        // size to exercise the key-hashing branch.
+        let repeated_key = vec![0x0b_u8; 20];
+        assert_eq!(
+            crypto_hmac("sha256", &repeated_key, b"Hi There").expect("hmac"),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            crypto_hmac("SHA-256", b"Jefe", b"what do ya want for nothing?").expect("hmac"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        let long_key: Vec<u8> = (0_u8..80).collect();
+        assert_eq!(
+            crypto_hmac("sha256", &long_key, b"long key path").expect("hmac"),
+            "12ca2c961396e2355fd356109a525431ff41e6d9db96b68952362b0cdd2dc0d5"
+        );
+    }
+
+    #[test]
+    fn hmac_sha512_matches_rfc4231_and_rejects_unknown_digests() {
+        // SHA-512 uses a 128-byte block; case 1 still uses a short key.
+        let repeated_key = vec![0x0b_u8; 20];
+        assert_eq!(
+            crypto_hmac("sha512", &repeated_key, b"Hi There").expect("hmac"),
+            concat!(
+                "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cde",
+                "daa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854"
+            )
+        );
+        assert!(crypto_hmac("md5", b"key", b"data").is_err());
+        assert_eq!(
+            crypto_digest("SHA-256", b"abc").expect("digest"),
+            crypto_digest("sha256", b"abc").expect("digest")
+        );
+    }
+
+    #[test]
+    fn filter_env_drops_empty_invalid_and_credential_keys() {
+        let entries = [
+            ("GOOD_NAME".to_string(), "one".to_string()),
+            (String::new(), "two".to_string()),
+            ("BAD=NAME".to_string(), "three".to_string()),
+            ("9BAD".to_string(), "four".to_string()),
+            ("bad-name".to_string(), "five".to_string()),
+            ("API_KEY".to_string(), "six".to_string()),
+            ("SESSION_TOKEN".to_string(), "seven".to_string()),
+            ("DB_PASSWORD".to_string(), "eight".to_string()),
+            ("lower_ok".to_string(), "nine".to_string()),
+            ("A1_B2".to_string(), "ten".to_string()),
+        ];
+        let filtered = filter_env(entries);
+        let object = filtered.as_object().expect("env object");
+        assert_eq!(object.len(), 3);
+        assert_eq!(object["GOOD_NAME"], Json::String("one".to_string()));
+        assert_eq!(object["lower_ok"], Json::String("nine".to_string()));
+        assert_eq!(object["A1_B2"], Json::String("ten".to_string()));
+        for rejected in ["API_KEY", "SESSION_TOKEN", "DB_PASSWORD"] {
+            assert!(
+                !object.contains_key(rejected),
+                "{rejected} must be filtered"
+            );
+        }
+    }
+
+    #[test]
+    fn fs_stats_reports_real_metadata_and_distinguishes_lstat() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("stats.txt");
+        std::fs::write(&path, b"stats").expect("write");
+        let stats = fs_stats(&std::fs::metadata(&path).expect("metadata"));
+        assert_eq!(stats["isFile"], Json::Bool(true));
+        assert_eq!(stats["isDirectory"], Json::Bool(false));
+        assert_eq!(stats["isSymbolicLink"], Json::Bool(false));
+        assert_eq!(stats["size"], 5);
+        assert!(stats["mtimeMs"].as_f64().is_some_and(|millis| millis > 0.0));
+        #[cfg(unix)]
+        assert!(stats["mode"].as_u64().is_some_and(|mode| mode > 0));
+
+        #[cfg(unix)]
+        {
+            let link = directory.path().join("link");
+            std::os::unix::fs::symlink(&path, &link).expect("symlink");
+            let followed = fs_stats(&std::fs::metadata(&link).expect("follow"));
+            assert_eq!(followed["isSymbolicLink"], Json::Bool(false));
+            assert_eq!(followed["isFile"], Json::Bool(true));
+            let unfollowed = fs_stats(&std::fs::symlink_metadata(&link).expect("lstat"));
+            assert_eq!(unfollowed["isSymbolicLink"], Json::Bool(true));
+            assert_eq!(unfollowed["isFile"], Json::Bool(false));
+        }
     }
 }
