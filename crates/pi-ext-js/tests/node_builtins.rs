@@ -2,7 +2,7 @@
 //! packages loads in the embedded host and observes the upstream API shape.
 //!
 //! The fixture under `tests/fixtures/node-builtins/` exercises one
-//! representative call per module (buffer, child_process, crypto, fs,
+//! representative call per module (buffer, `child_process`, crypto, fs,
 //! fs/promises, os, path, process, url, util) plus the state-backed
 //! `@earendil-works/pi-coding-agent` and `@earendil-works/pi-mcp` packages.
 //! A second test pins the E1 rejection string for packages the port does

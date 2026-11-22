@@ -142,11 +142,11 @@ fn encode_text(text: &str, encoding: &str) -> Result<Vec<u8>, String> {
             .collect()),
         "hex" => {
             let bytes = text.as_bytes();
-            if bytes.len() % 2 != 0 {
+            if !bytes.len().is_multiple_of(2) {
                 return Err("Invalid hex string".to_string());
             }
             let mut out = Vec::with_capacity(bytes.len() / 2);
-            for pair in bytes.chunks_exact(2) {
+            for pair in bytes.as_chunks::<2>().0 {
                 let hi = (pair[0] as char).to_digit(16);
                 let lo = (pair[1] as char).to_digit(16);
                 match (hi, lo) {
@@ -203,7 +203,7 @@ fn normalize_posix(input: &str) -> String {
 fn path_resolve(cwd: &str, args: &[String]) -> String {
     let mut current = String::new();
     if args.first().is_none_or(|first| !first.starts_with('/')) {
-        current.clone_from(cwd);
+        current.push_str(cwd);
     }
     for arg in args {
         if arg.starts_with('/') {
@@ -342,7 +342,7 @@ fn os_value(op: &str) -> Json {
         }
         "availableParallelism" => Json::String(
             std::thread::available_parallelism()
-                .map_or(1, |count| count.get())
+                .map_or(1, std::num::NonZero::get)
                 .to_string(),
         ),
         _ => Json::Null,
@@ -452,6 +452,7 @@ fn session_metadata(core: &HostCore) -> Json {
 }
 
 /// Wraps a host value in the `{ok, error}` envelope every shim parses.
+#[allow(clippy::needless_pass_by_value)] // by-value keeps the shim call sites terse
 fn ok(value: Json) -> String {
     serde_json::json!({ "ok": value }).to_string()
 }
@@ -773,7 +774,7 @@ mod tests {
 
     #[test]
     fn path_helpers_match_node_lexical_semantics() {
-        assert_eq!(normalize_posix("/a/b/../c/./d"), "/a/b/c/d");
+        assert_eq!(normalize_posix("/a/b/../c/./d"), "/a/c/d");
         assert_eq!(normalize_posix("a/../../b"), "../b");
         assert_eq!(
             path_resolve("/work", &["x".into(), "..".into(), "y".into()]),
@@ -795,9 +796,16 @@ mod tests {
 
     #[test]
     fn buffer_encodings_round_trip() {
-        for encoding in ["utf8", "hex", "base64", "latin1"] {
-            let bytes = encode_text("pi-rs", encoding).expect("encode");
-            assert_eq!(decode_bytes(&bytes, encoding).expect("decode"), "pi-rs");
+        // hex/base64 encode_text DECODE a textual representation, so the
+        // source must itself be valid in that encoding for the round trip.
+        for (text, encoding) in [
+            ("pi-rs", "utf8"),
+            ("pi-rs", "latin1"),
+            ("6869", "hex"),
+            ("cGktcnM=", "base64"),
+        ] {
+            let bytes = encode_text(text, encoding).expect("encode");
+            assert_eq!(decode_bytes(&bytes, encoding).expect("decode"), text);
         }
         assert_eq!(
             encode_text("6869", "hex").expect("hex decode"),
