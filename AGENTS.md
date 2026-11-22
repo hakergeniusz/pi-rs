@@ -167,19 +167,39 @@ A follow-up host-wiring wave (`16060d5`..`deb633e`) made stored built-in OAuth
 credentials refresh at wire time, attached images from `read`/`@file` and the
 `convertToLlm` filter in all four modes, fired the telemetry ping/exporter at
 startup/shutdown, drove MCP startup/list-changed ticks, and upgraded `url` to
-2.5.9 (RUSTSEC-2026-0592). Full gate green: 2565 passed, 0 failed, 3 ignored.
+2.5.9 (RUSTSEC-2026-0592). That wave's full gate was green: 2565 passed, 0
+failed, 3 ignored.
 
-Still open (mechanism tails or deliberate scope decisions):
+The **ten-agent gap wave** (integration `1279ad7`, seven slices recovered from
+worktrees before a restart) then closed the remaining mechanism gaps: `pi-env`
+got a real host consumer (`pi remote` via `remote_env.rs`); the image pipeline
+got a real pixel backend (`image` 0.25.10 — Lanczos3 resize, BMP→PNG) with
+per-call `blockImages` re-read in interactive/RPC; telemetry got opt-in reqwest
+ping/OTLP transports; MCP got per-server readiness surviving the one-shot
+`StartupWait` plus non-blocking `list_changed` drains and host ticks in the
+interactive pump and per RPC command; RPC got a bounded FIFO dispatcher with
+`activeCommands`, session rebind, per-call `blockImages` and an MCP tick; OAuth
+gained Copilot's 429 back-off and enterprise base URL; codemode got real local
+thread/client transports; and E4 gained `URL.canParse`, ancestor `node_modules`
+resolution and statically-foldable `require(expr)`. Gate/CI for this wave:
+**VERIFYING** — final numbers to be supplied.
 
-1. `pi-env` is still library-only: ticks/PTY/SSH onboarding have no host consumer.
-2. Wiring tails: `blockImages` is installed in all four modes but headless
-   modes snapshot it once at startup (upstream re-reads it per call); there is
-   no image pixel backend, telemetry transports stay inert (no real HTTP), the
-   MCP `StartupWait` is one-shot with poll-based notifications and no tick in
-   the interactive/RPC pump modes, and OAuth refresh covers only the three
-   built-in flows (Anthropic/Codex/Copilot).
-3. RPC dispatch is still serial and session rebind/host events remain stubbed.
-   Codemode Node/Workers/wasm transports are typed stubs; dynamic `require`,
-   `node_modules` resolution and `URL.canParse` remain unported.
-4. Out of scope: `chord`, `pi-durable`, `evals`, `apps/p2`. `/share` and `/bug`
+Still open (genuine mechanism tails or deliberate scope decisions):
+
+1. RPC execution is still serialized on the shared runtime behind the FIFO
+   turnstile (receives are concurrent); signal handling/graceful shutdown are
+   open. Dynamic/computed `require` specifiers (only statically-foldable ones
+   resolve), a few unserved `pi-ai` subpaths and type-only exports remain.
+2. True Node `worker_threads`/Cloudflare/wasm transports are typed stubs; the
+   wasm `Stats`/`HMAC`/URL shims are unported and codemode tools stay
+   synchronous. `blockImages` is still snapshotted once at startup in print/JSON
+   (interactive/RPC re-read per call); clipboard-image paste needs a host hook.
+   Telemetry's real transports are opt-in library capabilities — the binary
+   still builds the inert default at this base. MCP stderr uses a temp-file
+   sink; `StartupWait` is one-shot (late connects survive via a per-server
+   queue). Session-delta types are library surfaces with no host emission call
+   site yet. `pi-env` ticks/PTY/SSH onboarding are host-driven by design.
+3. Out of scope: `chord`, `pi-durable`, `evals`, `apps/p2`. `/share` and `/bug`
    stay omitted (Radius upload policy); macOS release assets await a runner.
+   No full 1:1 parity is claimed — remaining differences are mechanism-level
+   and documented in module docs and [`docs/GAP-STATUS.md`](docs/GAP-STATUS.md).

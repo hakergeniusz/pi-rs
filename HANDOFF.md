@@ -4042,6 +4042,50 @@ images. Coverage statuses are reflected in
 host build cache is snapshotted to `.build-cache/host-target.tar.zst` with
 `zstd -5` (`scripts/host-build.sh snapshot`).
 
+## 2026-11-22 — ten-agent gap wave
+
+A parallel fleet of ten gap-closing slices landed on `main` and was integrated
+in `1279ad7`. Each slice was authored as a disjoint module layer (no shared
+files) by a subagent; three slices plus one test fix landed first, then seven
+in-flight slices were **recovered from their worktrees and committed before a
+process restart** (the `feat: recover … gap work before restart` commits), and
+the integration commit resolved the compile errors and pedantic lints that the
+parallel merge surfaced. This section supersedes the "Open" notes in the two
+preceding 2026-11-22 sections (OAuth refresh, telemetry, images, MCP, RPC,
+codemode, `pi-env`, E4 tail). The compact coverage matrix is
+[`docs/GAP-STATUS.md`](docs/GAP-STATUS.md); **no parity is claimed where a
+mechanism remains a typed stub, a library surface or a host-driven tail**.
+
+| Slice | Commit(s) | What landed / honest remainder |
+|---|---|---|
+| telemetry real transports | `eb7bc00` | reqwest-backed `HttpPingTransport` (GET, version-only URL, 5 s timeout) + `ReqwestHttpTransport` for the OTLP exporter (POST of redacted JSON), exposed as an opt-in via `HostTelemetry::with_real_transports` / `install_from_env[_with_settings]`; loopback-TCP tests only. At this integration base `main.rs` still builds the inert `HostTelemetry::new`, so no socket opens by default. |
+| extensions E4 resolver | `6aa11f0` | `URL.canParse` on the `node:url` shim; ancestor `node_modules` resolution (scoped packages, `exports` string targets, `main`/index) with upstream's exact missing-module error; `require(expr)` folding into the static-import path. **Only statically resolvable specifiers fold** — computed/dynamic ones keep the unresolved-module error. |
+| RPC fidelity | `262ecff` | full preflight order behind narrow host seams; bounded FIFO command dispatcher with an `activeCommands` mirror; session rebind after swap; per-call `blockImages` re-read; MCP tick per command. **Execution is still serialized** on the shared runtime behind the FIFO turnstile; signal handling/graceful shutdown open. |
+| MCP tick test | `4b8c3db` | the synthetic server's `list_changed` notification can land just after `StartupWait` settles — the test now drives the tick until the refreshed tool appears (12/12 repeats green). |
+| mcp-core recovery | `e276229` | background connects publish outcomes to a per-server readiness queue, so a server settling *after* the one-shot `StartupWait` bound still registers on a later tick; non-blocking `try_drain_notifications` re-registers `list_changed` tools; a tokio request channel keeps transport reader tasks alive between ticks. Remaining: stderr tail still uses a temp-file sink; blocking `poll_notifications` kept for barrier hosts. |
+| interactive-tails recovery | `4a1799c` | a live `ImageSettings` cell refreshed on every image-setting change and `/reload`; `blockImages` re-read on **every** `convertToLlm` call (mid-session toggle honoured mid-stream); `afterToolCall` tool/MCP image normalizer; the interactive pump drives `ExtensionRunner::mcp_tick` once per frame. Clipboard-image paste still needs a host clipboard-read hook. |
+| session-deltas recovery | `e93a888` | `session/bash_execution.rs` — the `{type, id?, delta}` `bash_execution_update` event + `BashExecutionDeltaCollector`; `session/readonly.rs` — the `ReadonlySessionManager` capability view; `store.rs` — `SessionListProgress` callback + `list_sessions_in_dir_with_progress`. These are registered/tested **library surfaces**: live bash-delta emission and readonly-view consumption have no host call site yet. |
+| codemode-transports recovery | `077cbb8` | `transport.rs` — real local equivalents: `ThreadWorkerTransport` (VM on a thread, host tools on the caller), `RemoteCodemodeTransport` + `serve_remote` + `InProcessRemote`, worker admission with exit reporting. **True Node `worker_threads`, Cloudflare Worker isolates and wasm compilation remain typed stubs** (API compatibility, upstream's exact error strings); the wasm `Stats`/`HMAC`/URL shims are unported and tools/`ModelRuntime` stay synchronous. |
+| oauth-fidelity recovery | `2e4190b` | Copilot's bounded 429 back-off (`fetchWithRateLimitRetry`, `maxRetries: 2`/`maxElapsedMs: 5000`) and the `toAuth` proxy-base/enterprise-domain fallback, with upstream-exact retry strings; loopback fixtures only. Wire-time refresh still covers only the three built-in flows (Anthropic/Codex/Copilot); other providers keep the honest "not implemented" error. |
+| images-backend recovery | `5deaf59` | `images/transform.rs` — the real pixel backend on the offline-cached pure-Rust `image` 0.25.10 crate (decode → Lanczos3 resize → PNG/JPEG encode; BMP→PNG). Replaces Photon/WASM; dimensions still read from headers, EXIF orientation not applied, and the worker thread is unnecessary on the synchronous path. `read.rs`/`@file` already route through `process_image` from `e8308bb`; the clipboard-paste and non-interactive `afterToolCall` tails stay open. |
+| env-host recovery | `02c1575` | the `pi-env` host consumer `pi-coding-agent::remote_env` (`pi remote`): daemon transport, `ExecutionEnv`, SSH target/host-key onboarding, and `SshConnection: Daemon` forwarding. Keepalive/watch ticks, PTY input on the process Tokio runtime and explicit host-key acceptance are **host-driven** (no internal timers), per `crates/pi-env/WIRING.md`. |
+
+**Restart recovery:** the seven `recover … before restart` commits (`e276229`,
+`4a1799c`, `e93a888`, `077cbb8`, `2e4190b`, `5deaf59`, `02c1575`) preserved
+subagent work that was mid-flight when the process restarted; each was committed
+from its worktree layer and then gated during the integration pass.
+
+**Integration fixes:** `4b8c3db` stabilised the MCP `list_changed` tick test;
+`1279ad7` ("integrate the ten-agent gap fleet") resolved the compile errors and
+pedantic lints across `pi-ai`, `pi-codemode`, `pi-ext-js` and `pi-coding-agent`
+that the parallel merge produced. Workspace check and `clippy --all-targets
+-D warnings` were green at that commit.
+
+**Gate / CI status: VERIFYING.** Final workspace test counts and CI job results
+for this integration are not yet recorded — the coordinator will supply them.
+No parity claim is made on the basis of the per-slice notes alone; the full
+suite and CI remain the authority.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
