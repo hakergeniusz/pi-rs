@@ -18,11 +18,13 @@
 //! responses can arrive while the loop is inside a command — upstream routes
 //! both through the same stdin handler on its event loop.
 //!
-//! Commands whose session/runtime machinery has not landed yet
-//! (`new_session`, `switch_session`, `fork`, `clone`, `bash`, `abort_bash`,
-//! `get_session_stats`, `export_html`, `get_commands`) parse as unknown —
-//! the `Unknown command:` frame — until their host work lands (P5/P6
-//! remainder).
+//! The session/runtime commands (`rpc-mode.ts:456-463,501-507,582-650,
+//! 614-622,701-732`) are served through [`RpcHost`]: a narrow seam for the
+//! host-owned session replacement/fork/bash/command-table operations that
+//! upstream routes through `runtimeHost` and `AgentSession`. The default
+//! [`LocalRpcHost`] uses the port's `SessionManager`, `export_html`, and
+//! extension seams; a host with a full runtime can override it. See
+//! `WIRING.md` for the exact contract.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -33,7 +35,7 @@ use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
 use pi_agent::agent_loop::{AgentLoopConfig, DefaultConvertToLlm};
-use pi_agent::agent_message::AgentMessage;
+use pi_agent::agent_message::{AgentMessage, BashExecutionMessage};
 use pi_agent::events::{AgentEvent, AgentEventSink};
 use pi_agent::queues::Queues;
 use pi_agent::transcript::tool_declaration;
@@ -42,11 +44,18 @@ use pi_ai::types::StopReason;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::modes::interactive::components::footer::UsageTotals;
 use crate::modes::print_mode::ModelPattern;
 use crate::modes::print_mode::{PrintRuntime, now_millis};
 use crate::modes::print_mode::{resolve_model, thinking_level_from_str};
+use crate::session::compaction::{
+    ContextUsageEstimate, calculate_context_tokens, estimate_projected_context_tokens,
+};
+use crate::session::export_html::{ExportOptions, ExportState, export_session_to_html};
+use crate::session::records::SessionEntry;
 use crate::session::store::SessionTreeNode;
 use crate::session::store::build_session_context_from;
+use crate::session::store::get_latest_compaction_entry;
 
 /// The RPC commands the port serves (`rpc-types.ts:20-74`); every variant
 /// mirrors its `handleCommand` case in `rpc-mode.ts:401-739`. Optional
@@ -116,6 +125,656 @@ pub enum RpcCommand {
     GetMessages,
     /// `type: "get_fork_messages"` (`rpc-mode.ts:652-655`).
     GetForkMessages,
+    /// `type: "new_session"` (`rpc-mode.ts:456-463`, `rpc-types.ts:27`).
+    NewSession { parent_session: Option<String> },
+    /// `type: "cycle_model"` (`rpc-mode.ts:501-507`, `rpc-types.ts:34`).
+    CycleModel,
+    /// `type: "bash"` (`rpc-mode.ts:582-603`, `rpc-types.ts:55`).
+    Bash {
+        command: Option<String>,
+        exclude_from_context: bool,
+    },
+    /// `type: "abort_bash"` (`rpc-mode.ts:605-608`, `rpc-types.ts:56`).
+    AbortBash,
+    /// `type: "get_session_stats"` (`rpc-mode.ts:614-617`, `rpc-types.ts:59`).
+    GetSessionStats,
+    /// `type: "export_html"` (`rpc-mode.ts:619-622`, `rpc-types.ts:60`).
+    ExportHtml { output_path: Option<String> },
+    /// `type: "switch_session"` (`rpc-mode.ts:624-630`, `rpc-types.ts:61`).
+    SwitchSession { session_path: Option<String> },
+    /// `type: "fork"` (`rpc-mode.ts:632-638`, `rpc-types.ts:62`).
+    Fork { entry_id: Option<String> },
+    /// `type: "clone"` (`rpc-mode.ts:640-650`, `rpc-types.ts:63`).
+    Clone,
+    /// `type: "get_commands"` (`rpc-mode.ts:701-732`, `rpc-types.ts:74`).
+    GetCommands,
+}
+
+/// `AgentSessionRuntime.fork`'s `position` option
+/// (`agent-session-runtime.ts:264`): `"before"` forks from the selected user
+/// message's parent and returns its text; `"at"` keeps the entry as the leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcForkPosition {
+    Before,
+    At,
+}
+
+/// `AgentSessionRuntime.fork`'s result (`:265`): the selected text for the
+/// `"before"` position and whether an extension vetoed the operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcForkResult {
+    pub selected_text: Option<String>,
+    pub cancelled: bool,
+}
+
+/// The host-owned operations `rpc-mode.ts` delegates to `runtimeHost` and
+/// `AgentSession` (`:328-345,456-463,501-507,582-650,701-732`). The port has
+/// no `AgentSessionRuntime` in RPC mode, so [`LocalRpcHost`] reconstructs the
+/// observable part with `SessionManager`'s fork/new/open primitives and the
+/// extension seams. A coordinator with a full runtime can install its own
+/// host on [`RpcBridge::host`] to restore runtime rebind, cwd rebuild, and
+/// prompt-template/skill command sources; see `WIRING.md`.
+pub trait RpcHost: Send {
+    /// `runtimeHost.newSession(options)` (`:456-463`).
+    fn new_session(
+        &self,
+        runtime: &mut PrintRuntime,
+        parent_session: Option<&str>,
+    ) -> Result<bool, String>;
+
+    /// `runtimeHost.switchSession(sessionPath)` (`:624-630`).
+    fn switch_session(
+        &self,
+        runtime: &mut PrintRuntime,
+        session_path: &str,
+    ) -> Result<bool, String>;
+
+    /// `runtimeHost.fork(entryId, options)` (`:632-638,640-650`).
+    fn fork(
+        &self,
+        runtime: &mut PrintRuntime,
+        entry_id: &str,
+        position: RpcForkPosition,
+    ) -> Result<RpcForkResult, String>;
+
+    /// `session.executeBash` plus the `user_bash` interception (`:582-603`).
+    /// Returns the verbatim `BashResult` object and records it in the session.
+    fn bash(
+        &self,
+        runtime: &mut PrintRuntime,
+        command: &str,
+        exclude_from_context: bool,
+        id: Option<&str>,
+    ) -> Result<Value, String>;
+
+    /// `session.abortBash()` (`:605-608`). The default is the idle no-op —
+    /// the port's local execution is synchronous, so no shell is in flight.
+    #[allow(clippy::unused_self)] // a PTY host needs the receiver
+    fn abort_bash(&self) {}
+
+    /// The three command sources of `get_commands` (`:701-732`), in upstream
+    /// order: extension, prompt, skill. Each item is an already-shaped
+    /// `RpcSlashCommand` (`rpc-types.ts:81-90`).
+    fn get_commands(&self, runtime: &PrintRuntime) -> Result<Vec<Value>, String>;
+}
+
+/// The default [`RpcHost`] — the same seams the interactive host uses, minus
+/// its TUI/runtime rebind. Every error is upstream's verbatim text
+/// (`agent-session-runtime.ts:275,293,313,318`).
+pub struct LocalRpcHost;
+
+impl RpcHost for LocalRpcHost {
+    fn new_session(
+        &self,
+        runtime: &mut PrintRuntime,
+        parent_session: Option<&str>,
+    ) -> Result<bool, String> {
+        if emit_gate(
+            runtime,
+            &serde_json::json!({"type": "session_before_switch", "reason": "new"}),
+        )? {
+            return Ok(true);
+        }
+        let cwd = runtime.session.get_cwd().to_path_buf();
+        let session_dir = runtime.session.get_session_dir().to_path_buf();
+        let previous = session_file_string(&runtime.session);
+        let mut session = if runtime.session.is_persisted() {
+            crate::session::store::SessionManager::create(
+                &cwd,
+                Some(&session_dir),
+                &crate::session::store::NewSessionOptions::default(),
+            )
+        } else {
+            crate::session::store::SessionManager::in_memory(
+                &cwd,
+                &crate::session::store::NewSessionOptions::default(),
+                Vec::new(),
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        if let Some(parent) = parent_session {
+            session
+                .new_session(&crate::session::store::NewSessionOptions {
+                    parent_session: Some(parent.to_string()),
+                    ..crate::session::store::NewSessionOptions::default()
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        emit_shutdown(runtime, "new", None);
+        runtime.session = session;
+        emit_start(runtime, "new", previous.as_deref());
+        Ok(false)
+    }
+
+    fn switch_session(
+        &self,
+        runtime: &mut PrintRuntime,
+        session_path: &str,
+    ) -> Result<bool, String> {
+        let event = serde_json::json!({
+            "type": "session_before_switch",
+            "reason": "resume",
+            "targetSessionFile": session_path,
+        });
+        if emit_gate(runtime, &event)? {
+            return Ok(true);
+        }
+        let session_dir = runtime.session.get_session_dir().to_path_buf();
+        let previous = session_file_string(&runtime.session);
+        let session = crate::session::store::SessionManager::open(
+            std::path::Path::new(session_path),
+            Some(&session_dir),
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let destination = session_file_string(&session);
+        emit_shutdown(runtime, "resume", destination.as_deref());
+        runtime.session = session;
+        emit_start(runtime, "resume", previous.as_deref());
+        Ok(false)
+    }
+
+    #[allow(clippy::too_many_lines)] // mirrors the TS AgentSessionRuntime.fork; split when extending
+    fn fork(
+        &self,
+        runtime: &mut PrintRuntime,
+        entry_id: &str,
+        position: RpcForkPosition,
+    ) -> Result<RpcForkResult, String> {
+        let position_str = match position {
+            RpcForkPosition::Before => "before",
+            RpcForkPosition::At => "at",
+        };
+        let event = serde_json::json!({
+            "type": "session_before_fork",
+            "entryId": entry_id,
+            "position": position_str,
+        });
+        if emit_gate(runtime, &event)? {
+            return Ok(RpcForkResult {
+                selected_text: None,
+                cancelled: true,
+            });
+        }
+        let Some(selected) = runtime.session.get_entry(entry_id) else {
+            return Err("Invalid entry ID for forking".to_string());
+        };
+        let (selected_text, target_leaf_id) = match position {
+            RpcForkPosition::At => (None, Some(entry_id.to_string())),
+            RpcForkPosition::Before => {
+                let SessionEntry::Message(message) = &selected else {
+                    return Err("Invalid entry ID for forking".to_string());
+                };
+                let AgentMessage::User(user) = &message.message else {
+                    return Err("Invalid entry ID for forking".to_string());
+                };
+                (
+                    Some(user_content_text(&user.content)),
+                    selected.parent_id().map(str::to_string),
+                )
+            }
+        };
+        let previous = session_file_string(&runtime.session);
+        let session_dir = runtime.session.get_session_dir().to_path_buf();
+        if runtime.session.is_persisted() {
+            let Some(current) = session_file_string(&runtime.session) else {
+                return Err("Persisted session is missing a session file".to_string());
+            };
+            if target_leaf_id.is_none() {
+                let options = crate::session::store::NewSessionOptions {
+                    parent_session: Some(current),
+                    ..crate::session::store::NewSessionOptions::default()
+                };
+                let session = crate::session::store::SessionManager::create(
+                    runtime.session.get_cwd(),
+                    Some(&session_dir),
+                    &options,
+                )
+                .map_err(|error| error.to_string())?;
+                let destination = session_file_string(&session);
+                emit_shutdown(runtime, "fork", destination.as_deref());
+                runtime.session = session;
+                emit_start(runtime, "fork", previous.as_deref());
+            } else if !std::path::Path::new(&current).exists() {
+                return Err(
+                    "This session has not been saved yet. Send a message before cloning or forking it."
+                        .to_string(),
+                );
+            } else {
+                let mut session = crate::session::store::SessionManager::open(
+                    std::path::Path::new(&current),
+                    Some(&session_dir),
+                    None,
+                )
+                .map_err(|error| error.to_string())?;
+                session
+                    .create_branched_session(target_leaf_id.as_deref().unwrap_or_default())
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "Failed to create forked session".to_string())?;
+                let destination = session_file_string(&session);
+                emit_shutdown(runtime, "fork", destination.as_deref());
+                runtime.session = session;
+                emit_start(runtime, "fork", previous.as_deref());
+            }
+        } else {
+            emit_shutdown(runtime, "fork", None);
+            if let Some(leaf) = target_leaf_id {
+                runtime
+                    .session
+                    .create_branched_session(&leaf)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                let options = crate::session::store::NewSessionOptions {
+                    parent_session: previous.clone(),
+                    ..crate::session::store::NewSessionOptions::default()
+                };
+                runtime
+                    .session
+                    .new_session(&options)
+                    .map_err(|error| error.to_string())?;
+            }
+            emit_start(runtime, "fork", previous.as_deref());
+        }
+        Ok(RpcForkResult {
+            selected_text,
+            cancelled: false,
+        })
+    }
+
+    fn bash(
+        &self,
+        runtime: &mut PrintRuntime,
+        command: &str,
+        exclude_from_context: bool,
+        id: Option<&str>,
+    ) -> Result<Value, String> {
+        let cwd = runtime.session.get_cwd().to_string_lossy().into_owned();
+        let intercepted = extension_user_bash(runtime, command, exclude_from_context, &cwd);
+        let result = match intercepted {
+            Some(Ok(
+                crate::extensions::UserBashOutcome::Executed(result)
+                | crate::extensions::UserBashOutcome::Result(result),
+            )) => result,
+            Some(Err(message)) => return Err(message),
+            Some(Ok(crate::extensions::UserBashOutcome::Local)) | None => {
+                local_bash(command, &runtime.session)?
+            }
+        };
+        record_bash_result(runtime, command, &result, exclude_from_context, id);
+        Ok(result)
+    }
+
+    fn get_commands(&self, runtime: &PrintRuntime) -> Result<Vec<Value>, String> {
+        Ok(extension_commands(runtime))
+    }
+}
+
+/// The session file as the string upstream puts on the wire (`:456-463`
+/// carries no file, but `session_shutdown`/`session_start` do).
+fn session_file_string(session: &crate::session::store::SessionManager) -> Option<String> {
+    session
+        .session_file()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// `session_before_*` gate vote (`extensions/mod.rs::emit_gate`).
+#[allow(clippy::unnecessary_wraps)] // headless builds have no runner that can fail
+fn emit_gate(runtime: &PrintRuntime, event: &Value) -> Result<bool, String> {
+    #[cfg(feature = "ext-js")]
+    {
+        if let Some(runner) = &runtime.extension_runner {
+            return crate::extensions::emit_gate(runner, event);
+        }
+    }
+    #[cfg(not(feature = "ext-js"))]
+    let _ = runtime;
+    let _ = event;
+    Ok(false)
+}
+
+/// `teardownCurrent`'s `session_shutdown` emission
+/// (`agent-session-runtime.ts:167-175`).
+fn emit_shutdown(runtime: &PrintRuntime, reason: &str, target: Option<&str>) {
+    let mut event = serde_json::json!({"type": "session_shutdown", "reason": reason});
+    if let Some(target) = target {
+        event["targetSessionFile"] = serde_json::json!(target);
+    }
+    if let Err(error) = emit_gate(runtime, &event) {
+        eprintln!("Warning: Extension error: session_shutdown: {error}");
+    }
+    #[cfg(feature = "ext-js")]
+    if let Some(runner) = &runtime.extension_runner {
+        if let Ok(mut runner) = runner.lock() {
+            runner.shutdown_mcp();
+        }
+    }
+}
+
+/// The `session_start(reason, previousSessionFile)` emission of
+/// `createRuntime` (`agent-session-runtime.ts:217-220,250-251,322-326`).
+fn emit_start(runtime: &PrintRuntime, reason: &str, previous: Option<&str>) {
+    let mut event = serde_json::json!({"type": "session_start", "reason": reason});
+    if let Some(previous) = previous {
+        event["previousSessionFile"] = serde_json::json!(previous);
+    }
+    if let Err(error) = emit_gate(runtime, &event) {
+        eprintln!("Warning: Extension error: session_start: {error}");
+    }
+}
+
+/// The `user_bash` interception (`interactive-mode.rs::extension_user_bash`);
+/// headless builds answer `None` — execute locally.
+#[cfg(feature = "ext-js")]
+fn extension_user_bash(
+    runtime: &PrintRuntime,
+    command: &str,
+    exclude: bool,
+    cwd: &str,
+) -> Option<Result<crate::extensions::UserBashOutcome, String>> {
+    let runner = runtime.extension_runner.as_ref()?;
+    crate::extensions::user_bash(runner, command, exclude, cwd)
+}
+
+/// Headless twin: no runner, no interception.
+#[cfg(not(feature = "ext-js"))]
+fn extension_user_bash(
+    runtime: &PrintRuntime,
+    command: &str,
+    exclude: bool,
+    cwd: &str,
+) -> Option<Result<crate::extensions::UserBashOutcome, String>> {
+    let _ = (runtime, command, exclude, cwd);
+    None
+}
+
+/// The local `bash -c` operation (`createLocalBashOperations`,
+/// `bash-executor.ts:137-180`), reduced to the synchronous shape the port
+/// uses everywhere outside the PTY slice (P7). The result is the verbatim
+/// `BashResult` object (`rpc-types.ts:193`).
+fn local_bash(
+    command: &str,
+    session: &crate::session::store::SessionManager,
+) -> Result<Value, String> {
+    let output = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .current_dir(session.get_cwd())
+        .output()
+        .map_err(|error| error.to_string())?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&stderr);
+    }
+    Ok(serde_json::json!({
+        "output": text,
+        "exitCode": output.status.code().unwrap_or(-1),
+        "cancelled": false,
+        "truncated": false,
+    }))
+}
+
+/// `session.recordBashResult` (`agent-session.ts:4041-4062`): append the
+/// `bashExecution` entry so it rides in the model context exactly like
+/// upstream. `id` only feeds `bash_execution_update` events; the port's event
+/// enum has no such variant (documented in `WIRING.md`).
+fn record_bash_result(
+    runtime: &mut PrintRuntime,
+    command: &str,
+    result: &Value,
+    exclude_from_context: bool,
+    _id: Option<&str>,
+) {
+    let message = BashExecutionMessage {
+        command: command.to_string(),
+        output: result
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        exit_code: result.get("exitCode").and_then(Value::as_i64),
+        cancelled: result
+            .get("cancelled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        truncated: result
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        full_output_path: result
+            .get("fullOutputPath")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        exclude_from_context: Some(exclude_from_context),
+        timestamp: now_millis(),
+    };
+    let _ = runtime
+        .session
+        .append_message(AgentMessage::BashExecution(message));
+}
+
+/// Extension commands for `get_commands` (`:704-711`). The port's
+/// `ResolvedCommand` carries only `extension_path`, so `sourceInfo` is the
+/// upstream synthetic shape derived from it; a host with the real extension
+/// `SourceInfo` can override through [`RpcHost::get_commands`].
+#[cfg(feature = "ext-js")]
+fn extension_commands(runtime: &PrintRuntime) -> Vec<Value> {
+    let Some(runner) = &runtime.extension_runner else {
+        return Vec::new();
+    };
+    let runner = runner.lock().expect("extension runner mutex poisoned");
+    runner
+        .resolved_commands()
+        .into_iter()
+        .map(|command| {
+            serde_json::json!({
+                "name": command.invocation_name,
+                "description": command.description,
+                "source": "extension",
+                "sourceInfo": synthetic_source_info(&command.extension_path),
+            })
+        })
+        .collect()
+}
+
+/// Headless twin: no extension commands.
+#[cfg(not(feature = "ext-js"))]
+fn extension_commands(runtime: &PrintRuntime) -> Vec<Value> {
+    let _ = runtime;
+    Vec::new()
+}
+
+/// The synthetic `SourceInfo` (`source-info.ts:61-79`) for a path with no
+/// metadata attached. `WIRING.md` records the host override for the real
+/// per-extension metadata and for the prompt/skill command sources.
+fn synthetic_source_info(path: &str) -> Value {
+    let source = if let Some(rest) = path.strip_prefix("builtin:") {
+        rest.split(':').next().unwrap_or("builtin")
+    } else if let Some(inner) = path
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        inner.split(':').next().unwrap_or("temporary")
+    } else {
+        "temporary"
+    };
+    serde_json::json!({
+        "path": path,
+        "source": source,
+        "scope": "temporary",
+        "origin": "top-level",
+    })
+}
+
+/// `session.getSessionStats()` (`agent-session.ts:4350-4402`,
+/// `SessionStats` at `:357-374`). Aggregates over *all* entries, including
+/// compacted-away history; `sessionFile`/`contextUsage` are `undefined` and
+/// therefore absent from the wire when unavailable.
+fn session_stats_json(runtime: &PrintRuntime) -> Value {
+    let mut totals = UsageTotals::default();
+    let mut total_messages = 0u64;
+    let mut user_messages = 0u64;
+    let mut assistant_messages = 0u64;
+    let mut tool_results = 0u64;
+    let mut tool_calls = 0u64;
+
+    for entry in runtime.session.get_entries() {
+        match &entry {
+            SessionEntry::Usage(usage) => totals.add(&usage.usage),
+            SessionEntry::BranchSummary(summary) => {
+                if let Some(usage) = &summary.usage {
+                    totals.add(usage);
+                }
+            }
+            SessionEntry::Compaction(compaction) => {
+                if let Some(usage) = &compaction.usage {
+                    totals.add(usage);
+                }
+            }
+            SessionEntry::Message(message) => {
+                total_messages += 1;
+                match &message.message {
+                    AgentMessage::User(_) => user_messages += 1,
+                    AgentMessage::ToolResult(result) => {
+                        tool_results += 1;
+                        if let Some(usage) = &result.usage {
+                            totals.add(usage);
+                        }
+                    }
+                    AgentMessage::Assistant(assistant) => {
+                        assistant_messages += 1;
+                        tool_calls += assistant
+                            .content
+                            .iter()
+                            .filter(|block| {
+                                matches!(block, pi_ai::types::AssistantContent::ToolCall(_))
+                            })
+                            .count() as u64;
+                        totals.add(&assistant.usage);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut stats = serde_json::Map::new();
+    if let Some(session_file) = runtime.session.session_file() {
+        stats.insert(
+            "sessionFile".to_string(),
+            serde_json::json!(session_file.display().to_string()),
+        );
+    }
+    stats.insert(
+        "sessionId".to_string(),
+        serde_json::json!(runtime.session.get_session_id()),
+    );
+    stats.insert("userMessages".to_string(), serde_json::json!(user_messages));
+    stats.insert(
+        "assistantMessages".to_string(),
+        serde_json::json!(assistant_messages),
+    );
+    stats.insert("toolCalls".to_string(), serde_json::json!(tool_calls));
+    stats.insert("toolResults".to_string(), serde_json::json!(tool_results));
+    stats.insert(
+        "totalMessages".to_string(),
+        serde_json::json!(total_messages),
+    );
+    stats.insert(
+        "tokens".to_string(),
+        serde_json::json!({
+            "input": totals.input,
+            "output": totals.output,
+            "cacheRead": totals.cache_read,
+            "cacheWrite": totals.cache_write,
+            "total": totals.tokens(),
+        }),
+    );
+    stats.insert("cost".to_string(), serde_json::json!(totals.cost));
+    let context_usage = context_usage_json(runtime);
+    if context_usage != Value::Null {
+        stats.insert("contextUsage".to_string(), context_usage);
+    }
+    Value::Object(stats)
+}
+
+/// `session.getContextUsage()` (`agent-session.ts:4404-4447`), including the
+/// post-compaction `tokens: null` answer. A model without a positive context
+/// window answers `undefined` (the caller drops the key).
+fn context_usage_json(runtime: &PrintRuntime) -> Value {
+    let context_window = runtime.model.context_window;
+    if context_window == 0 {
+        return Value::Null;
+    }
+    let Ok(branch) = runtime.session.get_branch(None) else {
+        return Value::Null;
+    };
+    let Ok(projection) = runtime.session.build_session_projection() else {
+        return Value::Null;
+    };
+    if let Some(compaction) = get_latest_compaction_entry(&branch) {
+        let mut projected = std::collections::HashSet::new();
+        for entry in &projection.entries {
+            let has_usage = entry.messages.iter().any(|message| {
+                let AgentMessage::Assistant(assistant) = message else {
+                    return false;
+                };
+                assistant.stop_reason != StopReason::Aborted
+                    && assistant.stop_reason != StopReason::Error
+                    && calculate_context_tokens(&assistant.usage) > 0
+            });
+            if has_usage {
+                projected.insert(entry.source_entry.id().to_string());
+            }
+        }
+        if let Some(index) = branch
+            .iter()
+            .position(|entry| entry.id() == compaction.base.id.as_str())
+        {
+            let has_post_compaction = branch[index + 1..]
+                .iter()
+                .any(|entry| projected.contains(entry.id()));
+            if !has_post_compaction {
+                return serde_json::json!({
+                    "tokens": null,
+                    "contextWindow": context_window,
+                    "percent": null,
+                });
+            }
+        }
+    }
+    let estimate: ContextUsageEstimate = estimate_projected_context_tokens(&projection, &branch);
+    #[allow(clippy::cast_precision_loss)] // upstream divides JS numbers directly
+    let percent = (estimate.tokens as f64 / context_window as f64) * 100.0;
+    serde_json::json!({
+        "tokens": estimate.tokens,
+        "contextWindow": context_window,
+        "percent": percent,
+    })
 }
 
 /// One stdin line classified for dispatch (`handleInputLine`,
@@ -259,9 +918,30 @@ fn parse_request(line: &str) -> Result<(Incoming, Option<String>, Option<String>
         },
         "get_messages" => RpcCommand::GetMessages,
         "get_fork_messages" => RpcCommand::GetForkMessages,
-        // Unimplemented upstream commands (`rpc-types.ts:22-74`) land here
-        // until their runtime work lands; the frame is the same
-        // `Unknown command:` error upstream answers with for junk types.
+        "new_session" => RpcCommand::NewSession {
+            parent_session: field_str(&value, "parentSession"),
+        },
+        "cycle_model" => RpcCommand::CycleModel,
+        "bash" => RpcCommand::Bash {
+            command: field_str(&value, "command"),
+            // `command.excludeFromContext ?? false` (`rpc-mode.ts:586`).
+            exclude_from_context: field_bool(&value, "excludeFromContext"),
+        },
+        "abort_bash" => RpcCommand::AbortBash,
+        "get_session_stats" => RpcCommand::GetSessionStats,
+        "export_html" => RpcCommand::ExportHtml {
+            output_path: field_str(&value, "outputPath"),
+        },
+        "switch_session" => RpcCommand::SwitchSession {
+            session_path: field_str(&value, "sessionPath"),
+        },
+        "fork" => RpcCommand::Fork {
+            entry_id: field_str(&value, "entryId"),
+        },
+        "clone" => RpcCommand::Clone,
+        "get_commands" => RpcCommand::GetCommands,
+        // Junk `type` values keep upstream's `Unknown command:` frame
+        // (`rpc-mode.ts:734-737`).
         _ => {
             return Ok((
                 Incoming::Unknown(Some(type_name.clone())),
@@ -495,6 +1175,10 @@ pub struct RpcBridge {
     /// (`bindExtensions`'s `uiContext`, before `session_start`).
     #[cfg(feature = "ext-js")]
     pub sink: Arc<dyn pi_ext_js::UiSink>,
+    /// Host-owned session replacement / fork / bash / command table
+    /// ([`RpcHost`]). `create_bridge` installs [`LocalRpcHost`]; the
+    /// coordinator can swap it before `run_rpc_mode` (see `WIRING.md`).
+    pub host: Box<dyn RpcHost + Send>,
 }
 
 /// Wires the bridge: the reader thread owns the input and routes by
@@ -554,6 +1238,7 @@ pub fn create_bridge(input: Box<dyn BufRead + Send>, output: Box<dyn Write + Sen
             receivers: Mutex::new(HashMap::new()),
             timeouts: Mutex::new(HashMap::new()),
         }),
+        host: Box::new(LocalRpcHost),
     }
 }
 
@@ -1140,6 +1825,170 @@ fn handle_command(
                 serde_json::json!({ "messages": messages }),
             )))
         }
+
+        RpcCommand::NewSession { parent_session } => {
+            // `new_session` (`rpc-mode.ts:456-463`): the response data is the
+            // whole `{ cancelled }` result; a live replacement rebinds the
+            // session — the port's fresh agent clears its queues.
+            let cancelled = bridge
+                .host
+                .new_session(runtime, parent_session.as_deref())?;
+            if !cancelled {
+                bridge.queues = Queues::new();
+            }
+            Ok(CommandOutcome::Success(Some(
+                serde_json::json!({ "cancelled": cancelled }),
+            )))
+        }
+        RpcCommand::CycleModel => {
+            // `session.cycleModel` (`agent-session.ts:2686-2759`): the port
+            // has no scoped-model list, so this is `_cycleAvailableModel`.
+            // A one-entry (or empty) snapshot answers `null`.
+            let models = crate::models_state::all();
+            let current = models.iter().position(|model| {
+                model.provider == runtime.model.provider && model.id == runtime.model.id
+            });
+            let next_index = match (current, models.len()) {
+                (_, 0) => None,
+                (None, _) => Some(0),
+                (Some(_), 1) => None,
+                (Some(index), len) => Some((index + 1) % len),
+            };
+            let Some(next) = next_index.and_then(|index| models.get(index)) else {
+                return Ok(CommandOutcome::Success(Some(Value::Null)));
+            };
+            let next = (*next).clone();
+            runtime.model = next.clone();
+            runtime
+                .session
+                .append_model_change(&next.provider, &next.id)
+                .map_err(|error| error.to_string())?;
+            // Clone before the mutable borrow: upstream switches to the
+            // settings level, which the port does not carry in `PrintRuntime`.
+            let current_level = runtime.thinking_level.as_str().to_string();
+            apply_thinking_level(runtime, &current_level, &out)?;
+            Ok(CommandOutcome::Success(Some(serde_json::json!({
+                "model": next,
+                "thinkingLevel": runtime.thinking_level.as_str(),
+                "isScoped": false,
+            }))))
+        }
+        RpcCommand::Bash {
+            command,
+            exclude_from_context,
+        } => {
+            // `bash` (`rpc-mode.ts:582-603`): `user_bash` first, then the
+            // local operation; the extension result is recorded verbatim.
+            let Some(command) = command else {
+                // Port-side guard for a malformed request: upstream throws a
+                // Node TypeError deep in `spawn` (WIRING.md).
+                return Err(
+                    "The \"command\" argument must be of type string. Received undefined"
+                        .to_string(),
+                );
+            };
+            let result = bridge
+                .host
+                .bash(runtime, &command, exclude_from_context, id)?;
+            Ok(CommandOutcome::Success(Some(result)))
+        }
+        RpcCommand::AbortBash => {
+            // `session.abortBash()` (`rpc-mode.ts:605-608`): cancels every
+            // live shell. The port's local run is synchronous, so the default
+            // host has nothing in flight; a host with a PTY can override.
+            bridge.host.abort_bash();
+            Ok(CommandOutcome::Success(None))
+        }
+        RpcCommand::GetSessionStats => {
+            // `get_session_stats` (`rpc-mode.ts:614-617`).
+            Ok(CommandOutcome::Success(Some(session_stats_json(runtime))))
+        }
+        RpcCommand::ExportHtml { output_path } => {
+            // `session.exportToHtml(outputPath)` (`rpc-mode.ts:619-622`).
+            // The port embeds upstream's templates byte-for-byte and reuses
+            // its in-memory/unsaved error strings.
+            let specs: Vec<ToolSpec> = runtime.executor.tools();
+            let state = ExportState {
+                system_prompt: Some(runtime.system_prompt.clone()),
+                tools: Some(
+                    specs
+                        .iter()
+                        .map(|spec| crate::session::export_html::ExportTool {
+                            name: spec.name.clone(),
+                            description: spec.description.clone(),
+                            parameters: spec.parameters.clone(),
+                        })
+                        .collect(),
+                ),
+            };
+            let options = ExportOptions {
+                output_path: output_path.as_deref(),
+                theme_name: None,
+                tool_renderer: None,
+            };
+            let path = export_session_to_html(&runtime.session, Some(&state), &options)?;
+            Ok(CommandOutcome::Success(Some(
+                serde_json::json!({ "path": path.display().to_string() }),
+            )))
+        }
+        RpcCommand::SwitchSession { session_path } => {
+            // `switch_session` (`rpc-mode.ts:624-630`): the verbatim error for
+            // a missing path is upstream's `normalizePath` deref.
+            let Some(session_path) = session_path else {
+                return Err(
+                    "Cannot read properties of undefined (reading 'startsWith')".to_string()
+                );
+            };
+            let cancelled = bridge.host.switch_session(runtime, &session_path)?;
+            if !cancelled {
+                bridge.queues = Queues::new();
+            }
+            Ok(CommandOutcome::Success(Some(
+                serde_json::json!({ "cancelled": cancelled }),
+            )))
+        }
+        RpcCommand::Fork { entry_id } => {
+            // `fork` (`rpc-mode.ts:632-638`): no `position` on the wire, so
+            // upstream's default `"before"` applies. `text` is dropped when
+            // the result carries no `selectedText` (JS `undefined`).
+            let Some(entry_id) = entry_id else {
+                return Err("Invalid entry ID for forking".to_string());
+            };
+            let result = bridge
+                .host
+                .fork(runtime, &entry_id, RpcForkPosition::Before)?;
+            if !result.cancelled {
+                bridge.queues = Queues::new();
+            }
+            let mut data = serde_json::Map::new();
+            if let Some(text) = result.selected_text {
+                data.insert("text".to_string(), serde_json::json!(text));
+            }
+            data.insert("cancelled".to_string(), serde_json::json!(result.cancelled));
+            Ok(CommandOutcome::Success(Some(Value::Object(data))))
+        }
+        RpcCommand::Clone => {
+            // `clone` (`rpc-mode.ts:640-650`): fork the leaf `"at"`, with the
+            // verbatim refusal when no entry is selected.
+            let Some(leaf_id) = runtime.session.get_leaf_id().map(str::to_string) else {
+                return Err("Cannot clone session: no current entry selected".to_string());
+            };
+            let result = bridge.host.fork(runtime, &leaf_id, RpcForkPosition::At)?;
+            if !result.cancelled {
+                bridge.queues = Queues::new();
+            }
+            Ok(CommandOutcome::Success(Some(
+                serde_json::json!({ "cancelled": result.cancelled }),
+            )))
+        }
+        RpcCommand::GetCommands => {
+            // `get_commands` (`rpc-mode.ts:701-732`): extension, prompt,
+            // skill order is owned by the host callback.
+            let commands = bridge.host.get_commands(runtime)?;
+            Ok(CommandOutcome::Success(Some(
+                serde_json::json!({ "commands": commands }),
+            )))
+        }
     }
 }
 
@@ -1469,6 +2318,14 @@ mod tests {
         /// pipe writer and the shared output.
         fn take_bridge(&mut self) -> RpcBridge {
             self.bridge.take().expect("bridge still in the fixture")
+        }
+
+        /// Installs a host double before the bridge moves to the mode thread.
+        fn set_host(&mut self, host: Box<dyn RpcHost + Send>) {
+            self.bridge
+                .as_mut()
+                .expect("bridge still in the fixture")
+                .host = host;
         }
 
         fn write_line(&self, line: &str) {
@@ -2119,5 +2976,364 @@ mod tests {
         // No waiter was registered: the wait returns the default at once.
         let response = fixture.bridge().sink.wait_response("ui-3", "notify");
         assert_eq!(response, Value::Null);
+    }
+
+    /// A host double for the cancel paths and the command table: no session
+    /// files, no shells, no extensions.
+    struct CancellingHost;
+
+    impl RpcHost for CancellingHost {
+        fn new_session(
+            &self,
+            _runtime: &mut PrintRuntime,
+            _parent: Option<&str>,
+        ) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn switch_session(&self, _runtime: &mut PrintRuntime, _path: &str) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn fork(
+            &self,
+            _runtime: &mut PrintRuntime,
+            _entry_id: &str,
+            _position: RpcForkPosition,
+        ) -> Result<RpcForkResult, String> {
+            Ok(RpcForkResult {
+                selected_text: None,
+                cancelled: true,
+            })
+        }
+
+        fn bash(
+            &self,
+            _runtime: &mut PrintRuntime,
+            _command: &str,
+            _exclude: bool,
+            _id: Option<&str>,
+        ) -> Result<Value, String> {
+            Ok(json!({
+                "output": "hosted",
+                "exitCode": 7,
+                "cancelled": false,
+                "truncated": false,
+            }))
+        }
+
+        fn get_commands(&self, _runtime: &PrintRuntime) -> Result<Vec<Value>, String> {
+            Ok(vec![json!({
+                "name": "extension:deploy",
+                "description": "Deploy",
+                "source": "extension",
+                "sourceInfo": {"path": "<inline:deploy>", "source": "inline",
+                               "scope": "temporary", "origin": "top-level"},
+            })])
+        }
+    }
+
+    #[test]
+    fn parse_request_recognizes_the_remaining_ten_commands() {
+        let cases = [
+            (
+                r#"{"type":"new_session","id":"1","parentSession":"p"}"#,
+                "new_session",
+            ),
+            (r#"{"type":"cycle_model","id":"2"}"#, "cycle_model"),
+            (
+                r#"{"type":"bash","id":"3","command":"ls","excludeFromContext":true}"#,
+                "bash",
+            ),
+            (r#"{"type":"abort_bash","id":"4"}"#, "abort_bash"),
+            (
+                r#"{"type":"get_session_stats","id":"5"}"#,
+                "get_session_stats",
+            ),
+            (
+                r#"{"type":"export_html","id":"6","outputPath":"out.html"}"#,
+                "export_html",
+            ),
+            (
+                r#"{"type":"switch_session","id":"7","sessionPath":"s.jsonl"}"#,
+                "switch_session",
+            ),
+            (r#"{"type":"fork","id":"8","entryId":"e1"}"#, "fork"),
+            (r#"{"type":"clone","id":"9"}"#, "clone"),
+            (r#"{"type":"get_commands","id":"10"}"#, "get_commands"),
+        ];
+        for (line, kind) in cases {
+            let (incoming, id, type_name) = parse_request(line).expect("parse");
+            assert_eq!(type_name.as_deref(), Some(kind), "{line}");
+            assert!(id.is_some(), "{line}");
+            match incoming {
+                Incoming::Command(command) => {
+                    // Round-trip through the success frame: every command echo
+                    // is verbatim (`rpc-mode.ts:64-77`).
+                    let frame = RpcResponse::success(id.as_deref(), kind, None);
+                    assert_eq!(frame.command.as_deref(), Some(kind));
+                }
+                Incoming::Unknown(other) => panic!("{kind} parsed as unknown: {other:?}"),
+            }
+        }
+
+        // Field values ride on the variants (`rpc-types.ts:27-74`).
+        let (incoming, _, _) =
+            parse_request(r#"{"type":"bash","command":"echo hi"}"#).expect("parse");
+        assert_eq!(
+            incoming,
+            Incoming::Command(RpcCommand::Bash {
+                command: Some("echo hi".to_string()),
+                exclude_from_context: false,
+            })
+        );
+        let (incoming, _, _) = parse_request(r#"{"type":"new_session"}"#).expect("parse");
+        assert_eq!(
+            incoming,
+            Incoming::Command(RpcCommand::NewSession {
+                parent_session: None
+            })
+        );
+        let (incoming, _, _) = parse_request(r#"{"type":"clone"}"#).expect("parse");
+        assert_eq!(incoming, Incoming::Command(RpcCommand::Clone));
+    }
+
+    #[test]
+    fn rpc_mode_new_session_and_cycle_model_carry_their_data() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        let old_id = runtime.session.get_session_id().to_string();
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        fixture.write_line(r#"{"type":"new_session","id":"n1"}"#);
+        fixture.write_line(r#"{"type":"get_state","id":"s1"}"#);
+        fixture.write_line(r#"{"type":"cycle_model","id":"c1"}"#);
+        // Clamping the level to the new model may emit a
+        // `thinking_level_changed` event before the response, so wait for the
+        // response itself instead of a fixed line count.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let lines = loop {
+            let lines = fixture.output_lines();
+            if lines
+                .iter()
+                .any(|line| line.contains(r#""command":"cycle_model""#))
+            {
+                break lines;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cycle_model: {lines:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        drop(fixture.writer);
+        mode.join();
+
+        let parsed: Vec<Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("line"))
+            .collect();
+        let find = |name: &str| {
+            parsed
+                .iter()
+                .find(|value| value["command"] == name)
+                .unwrap_or_else(|| panic!("{name} response: {parsed:?}"))
+        };
+        assert_eq!(find("new_session")["success"], true);
+        assert_eq!(find("new_session")["data"]["cancelled"], false);
+        assert_ne!(
+            find("get_state")["data"]["sessionId"].as_str(),
+            Some(old_id.as_str()),
+            "a new session replaces the store"
+        );
+        let cycled = find("cycle_model");
+        assert_eq!(cycled["success"], true);
+        // The static catalog is non-empty unless another test composed a
+        // subset; both upstream answers are valid frames.
+        if !cycled["data"].is_null() {
+            assert_eq!(cycled["data"]["isScoped"], false);
+            assert!(cycled["data"].get("model").is_some());
+            assert!(cycled["data"].get("thinkingLevel").is_some());
+        }
+    }
+
+    #[test]
+    fn rpc_mode_runs_bash_and_reports_session_stats() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        fixture.write_line(r#"{"type":"bash","id":"b1","command":"printf 'hello\\n'"}"#);
+        fixture.write_line(r#"{"type":"get_session_stats","id":"st1"}"#);
+        let lines = fixture.wait_for_output(2);
+        drop(fixture.writer);
+        mode.join();
+
+        let parsed: Vec<Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("line"))
+            .collect();
+        let bash = &parsed[0];
+        assert_eq!(bash["id"], "b1");
+        assert_eq!(bash["command"], "bash");
+        assert_eq!(bash["success"], true);
+        assert_eq!(bash["data"]["output"], "hello\n");
+        assert_eq!(bash["data"]["exitCode"], 0);
+        assert_eq!(bash["data"]["cancelled"], false);
+        assert_eq!(bash["data"]["truncated"], false);
+
+        let stats = &parsed[1]["data"];
+        assert_eq!(parsed[1]["command"], "get_session_stats");
+        assert_eq!(stats["totalMessages"], 1, "the bashExecution was recorded");
+        assert_eq!(stats["userMessages"], 0);
+        assert_eq!(stats["toolCalls"], 0);
+        assert!(stats["tokens"].is_object());
+        assert!(stats["tokens"]["total"].is_number());
+        assert!(stats["cost"].is_number());
+        assert!(stats.get("sessionFile").is_none(), "in-memory session");
+        assert!(stats["contextUsage"].is_object(), "the model has a window");
+    }
+
+    #[test]
+    fn rpc_mode_reports_the_hosted_bash_result_and_abort() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        fixture.set_host(Box::new(CancellingHost));
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        fixture.write_line(r#"{"type":"bash","id":"b2","command":"ignored"}"#);
+        fixture.write_line(r#"{"type":"abort_bash","id":"a1"}"#);
+        let lines = fixture.wait_for_output(2);
+        drop(fixture.writer);
+        mode.join();
+
+        let parsed: Vec<Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("line"))
+            .collect();
+        assert_eq!(parsed[0]["data"]["output"], "hosted");
+        assert_eq!(parsed[0]["data"]["exitCode"], 7);
+        assert_eq!(parsed[1]["command"], "abort_bash");
+        assert_eq!(parsed[1]["success"], true);
+        assert!(parsed[1].get("data").is_none());
+    }
+
+    #[test]
+    fn rpc_mode_refuses_export_and_missing_required_fields_verbatim() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        fixture.write_line(r#"{"type":"export_html","id":"e1"}"#);
+        fixture.write_line(r#"{"type":"bash","id":"b1"}"#);
+        fixture.write_line(r#"{"type":"switch_session","id":"s1"}"#);
+        fixture.write_line(r#"{"type":"clone","id":"c1"}"#);
+        let lines = fixture.wait_for_output(4);
+        drop(fixture.writer);
+        mode.join();
+
+        let parsed: Vec<Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("line"))
+            .collect();
+        assert_eq!(parsed[0]["success"], false);
+        assert_eq!(
+            parsed[0]["error"],
+            "Cannot export in-memory session to HTML"
+        );
+        assert_eq!(parsed[0]["command"], "export_html");
+        assert_eq!(
+            parsed[1]["error"],
+            "The \"command\" argument must be of type string. Received undefined"
+        );
+        assert_eq!(
+            parsed[2]["error"],
+            "Cannot read properties of undefined (reading 'startsWith')"
+        );
+        assert_eq!(
+            parsed[3]["error"],
+            "Cannot clone session: no current entry selected"
+        );
+        assert_eq!(parsed[3]["command"], "clone");
+    }
+
+    #[test]
+    fn rpc_mode_forks_clones_switches_and_lists_commands() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        runtime
+            .session
+            .append_message(pi_agent::transcript::user_message("fork me", now_millis()))
+            .expect("append user message");
+        let entry_id = runtime.session.get_entries()[0].id().to_string();
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        // Clone first: forking from the first user message resets an
+        // in-memory session, so the leaf would be gone afterwards.
+        fixture.write_line(r#"{"type":"clone","id":"c1"}"#);
+        fixture.write_line(&format!(
+            r#"{{"type":"fork","id":"f1","entryId":"{entry_id}"}}"#
+        ));
+        fixture.write_line(r#"{"type":"fork","id":"f2","entryId":"missing"}"#);
+        fixture.write_line(r#"{"type":"get_commands","id":"g1"}"#);
+        let lines = fixture.wait_for_output(4);
+        drop(fixture.writer);
+        mode.join();
+
+        let parsed: Vec<Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("line"))
+            .collect();
+        assert_eq!(parsed[0]["command"], "clone");
+        assert_eq!(parsed[0]["success"], true);
+        assert_eq!(parsed[0]["data"]["cancelled"], false);
+        assert_eq!(parsed[1]["command"], "fork");
+        assert_eq!(parsed[1]["success"], true);
+        assert_eq!(parsed[1]["data"]["text"], "fork me");
+        assert_eq!(parsed[1]["data"]["cancelled"], false);
+        assert_eq!(parsed[2]["success"], false);
+        assert_eq!(parsed[2]["error"], "Invalid entry ID for forking");
+        assert_eq!(parsed[3]["command"], "get_commands");
+        assert_eq!(parsed[3]["success"], true);
+        assert!(parsed[3]["data"]["commands"].is_array());
+    }
+
+    #[test]
+    fn rpc_mode_honors_host_cancellations_and_the_host_command_table() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        fixture.set_host(Box::new(CancellingHost));
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        fixture.write_line(r#"{"type":"new_session","id":"n1"}"#);
+        fixture.write_line(r#"{"type":"switch_session","id":"s1","sessionPath":"x"}"#);
+        fixture.write_line(r#"{"type":"fork","id":"f1","entryId":"e1"}"#);
+        fixture.write_line(r#"{"type":"get_commands","id":"g1"}"#);
+        let lines = fixture.wait_for_output(4);
+        drop(fixture.writer);
+        mode.join();
+
+        let parsed: Vec<Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("line"))
+            .collect();
+        assert_eq!(parsed[0]["data"], json!({"cancelled": true}));
+        assert_eq!(parsed[1]["data"], json!({"cancelled": true}));
+        // A cancelled fork drops the `text` key like JS drops `undefined`.
+        assert_eq!(parsed[2]["data"], json!({"cancelled": true}));
+        assert_eq!(parsed[3]["data"]["commands"][0]["source"], "extension");
+        assert_eq!(parsed[3]["data"]["commands"][0]["name"], "extension:deploy");
     }
 }
