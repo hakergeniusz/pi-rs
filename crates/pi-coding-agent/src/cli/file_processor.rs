@@ -118,9 +118,10 @@ fn strip_bom(content: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use image::GenericImageView;
     // `assert!(v.is_empty())` stays: the `assert_eq!(v, [])` alternative is
     // noisier for these fixture assertions.
-    #![allow(clippy::assert_is_empty)]
     use super::*;
 
     use base64::Engine as _;
@@ -145,7 +146,7 @@ mod tests {
             processed.text,
             format!("<file name=\"{}\">\nalpha\n</file>\n", path.display())
         );
-        assert!(processed.images.is_empty());
+        assert_eq!(processed.images, [] as [pi_ai::types::ImageContent; 0]);
     }
 
     #[test]
@@ -154,7 +155,7 @@ mod tests {
         write(&dir, "empty.txt", b"");
         let processed = process_file_arguments(&["empty.txt".to_string()], dir.path()).expect("ok");
         assert_eq!(processed.text, "");
-        assert!(processed.images.is_empty());
+        assert_eq!(processed.images, [] as [pi_ai::types::ImageContent; 0]);
     }
 
     #[test]
@@ -205,7 +206,7 @@ mod tests {
         write(&dir, "lossless.jpg", &[0xff, 0xd8, 0xff, 0xf7, 0x00]);
         let processed =
             process_file_arguments(&["lossless.jpg".to_string()], dir.path()).expect("ok");
-        assert!(processed.images.is_empty());
+        assert_eq!(processed.images, [] as [pi_ai::types::ImageContent; 0]);
         assert!(processed.text.contains("</file>"));
     }
 
@@ -225,7 +226,7 @@ mod tests {
         bmp.extend_from_slice(&[0u8; 4]);
         write(&dir, "image.bmp", &bmp);
         let processed = process_file_arguments(&["image.bmp".to_string()], dir.path()).expect("ok");
-        assert!(processed.images.is_empty());
+        assert_eq!(processed.images, [] as [pi_ai::types::ImageContent; 0]);
         assert!(
             processed.text.contains(crate::images::UNCONVERTIBLE_IMAGE),
             "{processed:?}"

@@ -572,6 +572,8 @@ fn detect_supported_image_mime_type_from_file(path: &std::path::Path) -> Option<
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use image::GenericImageView;
     use super::*;
 
     use base64::Engine as _;

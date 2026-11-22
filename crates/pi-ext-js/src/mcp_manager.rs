@@ -880,7 +880,7 @@ fn spawn_worker(
 /// down (their transports kill the children).
 #[allow(clippy::too_many_lines)] // mirrors upstream's single worker loop; split when extending
 fn worker_loop(
-    receiver: &std::sync::mpsc::Receiver<Request>,
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Request>,
     timeouts: &Arc<Mutex<HashMap<String, Duration>>>,
     tool_changes: &Arc<Mutex<Vec<ToolChange>>>,
     settled_connects: &Arc<Mutex<SettledConnects>>,
@@ -891,7 +891,7 @@ fn worker_loop(
         .build()
         .expect("build MCP manager runtime");
     let mut servers: HashMap<String, ServerEntry> = HashMap::new();
-    while let Ok(request) = receiver.recv() {
+    while let Some(request) = runtime.block_on(receiver.recv()) {
         // Notifications are an explicit host-tick event now
         // (`Request::DrainNotifications`), not a side effect of an unrelated
         // wake-up; the drain runs the non-blocking try_recv loop there.

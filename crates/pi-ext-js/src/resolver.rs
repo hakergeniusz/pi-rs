@@ -377,12 +377,11 @@ fn initializer_end(chars: &[char], start: usize) -> usize {
                 depth += 1;
                 index += 1;
             }
-            ')' | ']' | '}' if depth == 0 => return index,
+            ')' | ']' | '}' | ';' | ',' | '\n' if depth == 0 => return index,
             ')' | ']' | '}' => {
                 depth -= 1;
                 index += 1;
             }
-            ';' | ',' | '\n' if depth == 0 => return index,
             _ => index += 1,
         }
     }
@@ -541,7 +540,6 @@ pub fn fold_require_expressions(js: &str) -> String {
                     let quoted = serde_json::to_string(&literal).unwrap_or_else(|_| "\"\"".into());
                     replacements.push((open + 1, argument_end, quoted));
                     index = close;
-                    continue;
                 }
             }
         }
@@ -629,10 +627,10 @@ impl rquickjs::loader::Resolver for ExtensionResolver {
         // Bare specifiers walk ancestor `node_modules`, like upstream's
         // `createRequire`. Host packages we cannot serve keep their E1 error
         // instead of being shadowed by an installed copy (jiti aliases win).
-        if !name.starts_with("node:") && !is_unavailable_host_module(name) {
-            if let Some(resolved) = resolve_bare(&base_dir, name) {
-                return Ok(resolved.to_string_lossy().into_owned());
-            }
+        if !name.starts_with("node:") && !is_unavailable_host_module(name)
+            && let Some(resolved) = resolve_bare(&base_dir, name)
+        {
+            return Ok(resolved.to_string_lossy().into_owned());
         }
         Err(throw_unavailable_module(ctx, name))
     }

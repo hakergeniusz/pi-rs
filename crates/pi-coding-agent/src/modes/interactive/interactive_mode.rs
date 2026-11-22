@@ -6702,6 +6702,7 @@ impl InteractiveMode {
         })
     }
 
+    #[allow(clippy::too_many_lines)] // mirrors upstream's spawnRun; split when extending
     fn spawn_run(&mut self, prompts: Vec<AgentMessage>, context: AgentContext) {
         #[cfg(feature = "ext-js")]
         let routing = crate::virtual_models::TurnRouting::install(
@@ -12286,11 +12287,10 @@ impl InteractiveMode {
             // re-registration can change the visible tool list; redraw so the
             // footer/autocomplete see the new state on this frame.
             Ok(outcome) if !outcome.is_idle() => self.tui.request_render(),
-            Ok(_) => {}
+            Ok(_) | Err(_) => {}
             // Server-state failures are reported by the runner itself; the
             // tick's result is deliberately dropped (extensions/mod.rs's
             // transform/tool tick points do the same).
-            Err(_) => {}
         }
     }
 

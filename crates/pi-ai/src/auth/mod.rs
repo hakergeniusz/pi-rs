@@ -365,19 +365,10 @@ impl Interaction {
 /// `500 * 2 ** retry` ms unless `Retry-After` says otherwise) and an optional
 /// `maxElapsedMs` overall budget. `{0, 0}` disables retrying, as in the
 /// refresh path upstream (`github-copilot.ts:352-354`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RetryPolicy {
     pub max_retries: usize,
     pub max_elapsed_ms: u64,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_retries: 0,
-            max_elapsed_ms: 0,
-        }
-    }
 }
 
 /// Per-provider URLs and callback binding. `Default` is the verbatim

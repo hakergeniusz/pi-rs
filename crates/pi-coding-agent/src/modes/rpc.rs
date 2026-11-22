@@ -1988,7 +1988,7 @@ pub fn run_rpc_mode(
                 gate.run_ordered(my_seq, || {
                     let mut rt = runtime.lock().expect("rpc runtime");
                     let mut br = bridge.lock().expect("rpc bridge");
-                    if let Err(error) = dispatch_line(&mut **rt, &mut **br, &line, &flag) {
+                    if let Err(error) = dispatch_line(&mut rt, &mut br, &line, &flag) {
                         let mut slot = first_error.lock().expect("rpc first error");
                         if slot.is_none() {
                             *slot = Some(error);
@@ -2004,7 +2004,7 @@ pub fn run_rpc_mode(
     // once (`setUIContext(undefined)` at shutdown).
     {
         let rt = runtime.lock().expect("rpc runtime");
-        clear_extension_ui(&**rt);
+        clear_extension_ui(&rt);
     }
     if let Some(error) = first_error.lock().expect("rpc first error").take() {
         return Err(error);
@@ -5317,11 +5317,11 @@ mod tests {
             .iter()
             .position(|line| line.contains(r#""id":"p1""#))
             .expect("prompt response");
-        let state = lines
+        let seen = lines
             .iter()
             .position(|line| line.contains(r#""id":"s1""#))
             .expect("state response");
-        assert!(prompt < state, "responses follow input order: {lines:?}");
+        assert!(prompt < seen, "responses follow input order: {lines:?}");
         assert_eq!(stats.started(), 2);
         assert_eq!(stats.active(), 0, "both commands retired");
     }

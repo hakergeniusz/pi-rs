@@ -64,8 +64,10 @@ fn is_truthy_env_flag(value: Option<&str>) -> bool {
 /// Where the daemon lives. [`RemoteTarget::Disabled`] is the default and never
 /// constructs a connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum RemoteTarget {
     /// No remote environment configured (the inert default).
+    #[default]
     Disabled,
     /// A daemon started as a local child process.
     Local {
@@ -81,11 +83,7 @@ pub enum RemoteTarget {
     },
 }
 
-impl Default for RemoteTarget {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
+
 
 /// The settings view consumed by [`HostRemoteEnv::from_settings`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,10 +135,10 @@ impl RemoteSettings {
         settings.known_hosts_file = std::env::var(PI_REMOTE_KNOWN_HOSTS).ok();
         // An explicit host wins: the user asked for a remote machine. Local
         // daemons are inert children, so they are the fallback.
-        settings.target = if let Some(spec) = std::env::var(PI_REMOTE_HOST).ok() {
+        settings.target = if let Ok(spec) = std::env::var(PI_REMOTE_HOST) {
             let (user, host) = split_host_spec(&spec);
             RemoteTarget::Ssh { host, user }
-        } else if let Some(daemon) = std::env::var(PI_REMOTE_DAEMON).ok() {
+        } else if let Ok(daemon) = std::env::var(PI_REMOTE_DAEMON) {
             RemoteTarget::Local { daemon }
         } else {
             RemoteTarget::Disabled
@@ -182,6 +180,7 @@ impl std::fmt::Debug for HostRemoteEnv {
 impl HostRemoteEnv {
     /// Build a host environment from settings. Returns `Ok(None)` when the
     /// target is disabled or offline — no process or socket is touched.
+    #[allow(clippy::result_large_err)] // mirrors pi_env's by-value RemoteError
     pub fn from_settings(settings: &RemoteSettings) -> Result<Option<Self>, RemoteError> {
         if settings.offline {
             return Ok(None);
@@ -195,7 +194,7 @@ impl HostRemoteEnv {
                 let known_hosts_file = settings
                     .known_hosts_file
                     .clone()
-                    .map_or_else(|| default_known_hosts().display().to_string(), |path| path);
+                    .unwrap_or_else(|| default_known_hosts().display().to_string());
                 let target = SshTarget {
                     host: host.clone(),
                     user: user.clone(),
@@ -412,8 +411,8 @@ fn parse_remote_args(args: &[String]) -> Result<ParsedCommand, String> {
                         let (user, host) = split_host_spec(value);
                         settings.target = RemoteTarget::Ssh { host, user };
                     }
-                    "--cwd" => settings.cwd = value.clone(),
-                    "--id" => settings.id = value.clone(),
+                    "--cwd" => settings.cwd.clone_from(value),
+                    "--id" => settings.id.clone_from(value),
                     _ => unreachable!("value-taking options are matched above"),
                 }
             }
@@ -665,7 +664,7 @@ mod tests {
             vec![output_event("output", "stdout", b"hello\n")],
             Some((42, 1)),
         );
-        let shared: Arc<dyn Daemon> = Arc::clone(&daemon);
+        let shared: Arc<dyn Daemon> = daemon.clone();
         let host = HostRemoteEnv::with_daemon(shared, "pi-env:test", "/work");
         runtime::block_on(host.tick(7));
 
@@ -710,7 +709,7 @@ mod tests {
             }],
             None,
         );
-        let shared: Arc<dyn Daemon> = Arc::clone(&daemon);
+        let shared: Arc<dyn Daemon> = daemon.clone();
         let mut host = HostRemoteEnv::with_daemon(shared, "pi-env:test", "/work");
         runtime::block_on(async {
             host.watch(&["/work".to_owned()]).await.expect("watch");

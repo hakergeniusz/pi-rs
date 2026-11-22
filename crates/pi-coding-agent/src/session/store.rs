@@ -670,7 +670,7 @@ pub fn list_sessions_in_dir_with_progress(
             }
             if let Some(callback) = on_progress {
                 let publish =
-                    loaded == 1 || loaded % SESSION_LIST_PUBLISH_INTERVAL == 0 || loaded == total;
+                    loaded == 1 || loaded.is_multiple_of(SESSION_LIST_PUBLISH_INTERVAL) || loaded == total;
                 let snapshot = publish.then(|| sort_session_infos(partial.clone()));
                 callback(loaded, total, snapshot.as_deref());
             }
@@ -1399,7 +1399,7 @@ impl SessionManager {
                 }
                 if let Some(callback) = on_progress {
                     let publish = loaded == 1
-                        || loaded % ALL_SESSION_LIST_PUBLISH_INTERVAL == 0
+                        || loaded.is_multiple_of(ALL_SESSION_LIST_PUBLISH_INTERVAL)
                         || loaded == total;
                     let snapshot = publish.then(|| sort_session_infos(partial.clone()));
                     callback(loaded, total, snapshot.as_deref());
@@ -2772,7 +2772,7 @@ mod tests {
                     events.borrow_mut().push((
                         loaded,
                         total,
-                        partial.map_or(0, |sessions| sessions.len()),
+                        partial.map_or(0, <[SessionInfo]>::len),
                     ));
                 },
             ),
@@ -2810,7 +2810,7 @@ mod tests {
                     events.borrow_mut().push((
                         loaded,
                         total,
-                        partial.map_or(0, |sessions| sessions.len()),
+                        partial.map_or(0, <[SessionInfo]>::len),
                     ));
                 },
             ),

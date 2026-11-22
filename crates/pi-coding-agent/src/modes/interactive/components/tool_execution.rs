@@ -241,6 +241,7 @@ impl ToolExecutionComponent {
     /// cell (`ImageSettings::from_settings` refreshed on every image setting
     /// change) so the `showImages` flag is live for this row's render context.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // builder mirrors upstream's option struct
     pub fn with_image_settings(
         tool_name: &str,
         tool_call_id: &str,

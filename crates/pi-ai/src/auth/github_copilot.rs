@@ -86,20 +86,6 @@ fn http_error(status: reqwest::StatusCode, text: &str) -> AuthError {
     AuthError::Message(format!("{} {reason}: {text}", status.as_u16()))
 }
 
-async fn get_json(
-    client: &reqwest::Client,
-    url: &str,
-    headers: &[(&str, &str)],
-    cancel: &CancelToken,
-) -> Result<Value, AuthError> {
-    let mut request = client.get(url).header("Accept", "application/json");
-    for (name, value) in headers {
-        request = request.header(*name, *value);
-    }
-    let response = send(request, cancel).await?;
-    json_from_response(response).await
-}
-
 async fn json_from_response(response: reqwest::Response) -> Result<Value, AuthError> {
     let status = response.status();
     let text = response
@@ -121,7 +107,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// are treated as unparseable, which has the same observable effect as
 /// upstream's `!Number.isFinite(delayMs)` branch: give up and return the 429.
 fn parse_http_date(text: &str) -> Option<i64> {
-    let parts: Vec<&str> = text.trim().split_whitespace().collect();
+    let parts: Vec<&str> = text.split_whitespace().collect();
     let [weekday, day, month, year, time, zone] = parts.as_slice() else {
         return None;
     };
@@ -153,7 +139,11 @@ fn parse_http_date(text: &str) -> Option<i64> {
     let [hours, minutes, seconds] = clock.as_slice() else {
         return None;
     };
-    if !(1..=31).contains(day) || !(0..=23).contains(hours) || !(0..=59).contains(minutes) || !(0..=59).contains(seconds) {
+    if !(1..=31).contains(&day)
+        || !(0..=23).contains(hours)
+        || !(0..=59).contains(minutes)
+        || !(0..=59).contains(seconds)
+    {
         return None;
     }
     // Days from the Unix epoch (Howard Hinnant's civil calendar algorithm).
@@ -209,7 +199,7 @@ async fn fetch_with_rate_limit_retry(
         if let Some(value) = response.headers().get(reqwest::header::RETRY_AFTER)
             && let Ok(text) = value.to_str()
         {
-            if let Some(seconds) = text.trim().parse::<f64>().ok() {
+            if let Ok(seconds) = text.trim().parse::<f64>() {
                 if !seconds.is_finite() || seconds < 0.0 {
                     return Ok(response);
                 }

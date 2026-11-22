@@ -247,7 +247,7 @@ impl ToolExecutor for RelayExecutor {
                     }
                     return Err(error);
                 }
-                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(ToolError::new("Execution aborted"));
                 }
@@ -585,7 +585,7 @@ impl ToolExecutor for RemoteExecutor {
                     Err(error)
                 }
             }
-            Ok(RemoteReply::Stop) | Ok(RemoteReply::None) | Err(_) => {
+            Ok(RemoteReply::Stop | RemoteReply::None) | Err(_) => {
                 self.stop.abort();
                 Err(ToolError::new("Execution aborted"))
             }
@@ -603,7 +603,7 @@ impl ToolExecutor for RemoteExecutor {
 /// Returns `Err` only when no usable VM can be created at all (the launcher
 /// failure upstream reports as a `failure` message). Script errors and
 /// transport stops are delivered through `exchange`.
-#[allow(clippy::too_many_lines)] // mirrors serveCodemodeRemote; split when extending
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)] // mirrors serveCodemodeRemote; split when extending
 pub fn serve_remote(
     request: RemoteRequest,
     exchange: &RemoteExchange,
@@ -649,7 +649,7 @@ pub fn serve_remote(
             drop(guard);
             if !matches!(
                 sink_exchange(&batch),
-                Ok(RemoteReply::Result(_)) | Ok(RemoteReply::None)
+                Ok(RemoteReply::Result(_) | RemoteReply::None)
             ) {
                 sink_stop.abort();
             }
@@ -767,7 +767,11 @@ impl RemoteCodemodeTransport {
 
     /// Run one execution with no external stop signal.
     #[must_use]
-    pub fn execute(&self, request: RemoteRequest, executor: &dyn ToolExecutor) -> CodemodeResult {
+    pub fn execute(
+        &self,
+        request: RemoteRequest,
+        executor: Arc<dyn ToolExecutor + Send + Sync>,
+    ) -> CodemodeResult {
         self.execute_with_stop(request, executor, AbortFlag::new())
     }
 
@@ -778,14 +782,18 @@ impl RemoteCodemodeTransport {
     pub fn execute_with_stop(
         &self,
         request: RemoteRequest,
-        executor: &dyn ToolExecutor,
+        executor: Arc<dyn ToolExecutor + Send + Sync>,
         stop: AbortFlag,
     ) -> CodemodeResult {
-        let output = Mutex::new(Vec::<OutputItem>::new());
-        let calls = Mutex::new(Vec::<Call>::new());
-        let terminal = Mutex::new(Option::<CodemodeResult>::None);
+        let output = Arc::new(Mutex::new(Vec::<OutputItem>::new()));
+        let calls = Arc::new(Mutex::new(Vec::<Call>::new()));
+        let terminal = Arc::new(Mutex::new(Option::<CodemodeResult>::None));
 
-        let exchange: RemoteExchange = Arc::new(move |messages| {
+        let exchange: RemoteExchange = Arc::new({
+            let terminal = Arc::clone(&terminal);
+            let output = Arc::clone(&output);
+            let calls = Arc::clone(&calls);
+            move |messages| {
             if stop.is_aborted()
                 || terminal
                     .lock()
@@ -954,11 +962,13 @@ impl RemoteCodemodeTransport {
                                 during: None,
                             });
                     }
-                    RemoteMessage::Vm(WorkerToHostMessage::Started { .. })
-                    | RemoteMessage::Vm(WorkerToHostMessage::Idle { .. }) => {}
+                    RemoteMessage::Vm(
+                        WorkerToHostMessage::Started { .. } | WorkerToHostMessage::Idle { .. },
+                    ) => {}
                 }
             }
             Ok(answer.unwrap_or(RemoteReply::None))
+            }
         });
 
         // remote.ts:229-234 — reaching the remote can fail before any RPC.
@@ -986,6 +996,27 @@ impl RemoteCodemodeTransport {
 }
 
 #[cfg(test)]
+struct Adapter(Arc<dyn crate::sandbox::Tool>);
+#[cfg(test)]
+impl ToolExecutor for Adapter {
+    fn call(
+        &self,
+        _id: u32,
+        target: CallTargetKind,
+        name: &str,
+        args: Json,
+        context: &ToolContext,
+    ) -> Result<Json, ToolError> {
+        if target != CallTargetKind::Tool {
+            return Err(ToolError::new("unexpected global"));
+        }
+        if name != "double" {
+            return Err(ToolError::new(format!("Unknown tool \"{name}\"")));
+        }
+        crate::sandbox::Tool::execute(self.0.as_ref(), args, context)
+    }
+}
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::ToolStartData;
@@ -999,32 +1030,13 @@ mod tests {
         load_quickjs_wasm(Some(WASM)).expect("valid wasm header")
     }
 
-    fn double_tool() -> Arc<dyn ToolExecutor> {
+    fn double_tool() -> Arc<dyn ToolExecutor + Send + Sync> {
         let tool = tool("double", |args, _| {
             let number = args.get("n").and_then(Json::as_i64).unwrap_or(0);
             Ok(json!({ "value": number * 2 }))
         });
         // `tool()` is a host `Tool`; wrap it so the transports' executor seam
         // is exercised with the same call signature as `Sandbox`.
-        struct Adapter(Arc<dyn crate::sandbox::Tool>);
-        impl ToolExecutor for Adapter {
-            fn call(
-                &self,
-                _id: u32,
-                target: CallTargetKind,
-                name: &str,
-                args: Json,
-                context: &ToolContext,
-            ) -> Result<Json, ToolError> {
-                if target != CallTargetKind::Tool {
-                    return Err(ToolError::new("unexpected global"));
-                }
-                if name != "double" {
-                    return Err(ToolError::new(format!("Unknown tool \"{name}\"")));
-                }
-                crate::sandbox::Tool::execute(self.0.as_ref(), args, context)
-            }
-        }
         Arc::new(Adapter(tool))
     }
 
@@ -1186,7 +1198,7 @@ mod tests {
 
     #[test]
     fn remote_transport_runs_a_script_through_an_in_process_remote() {
-        let result = in_process_client().execute(remote_request(), double_tool().as_ref());
+        let result = in_process_client().execute(remote_request(), double_tool());
         assert!(result.is_ok(), "{result:?}");
         match result {
             CodemodeResult::Ok {
@@ -1208,7 +1220,7 @@ mod tests {
     #[test]
     fn remote_transport_reports_reach_failure_with_upstream_string() {
         let client = RemoteCodemodeTransport::new(Arc::new(|| Err("MISSING_BINDING".to_string())));
-        let result = client.execute(remote_request(), double_tool().as_ref());
+        let result = client.execute(remote_request(), double_tool());
         assert_eq!(
             result.error().map_or("", |error| error.message.as_str()),
             "Failed to reach the remote sandbox: MISSING_BINDING"
@@ -1228,7 +1240,7 @@ mod tests {
             }
         }
         let client = RemoteCodemodeTransport::new(Arc::new(|| Ok(Arc::new(Broken))));
-        let result = client.execute(remote_request(), double_tool().as_ref());
+        let result = client.execute(remote_request(), double_tool());
         assert_eq!(
             result.error().map_or("", |error| error.message.as_str()),
             "Remote sandbox failed: OOM"
@@ -1248,7 +1260,7 @@ mod tests {
             }
         }
         let client = RemoteCodemodeTransport::new(Arc::new(|| Ok(Arc::new(Silent))));
-        let result = client.execute(remote_request(), double_tool().as_ref());
+        let result = client.execute(remote_request(), double_tool());
         assert_eq!(
             result.error().map_or("", |error| error.message.as_str()),
             "Remote sandbox returned before the script settled"
@@ -1286,7 +1298,7 @@ mod tests {
         }));
         let stop = AbortFlag::new();
         stop.abort();
-        let result = client.execute_with_stop(remote_request(), double_tool().as_ref(), stop);
+        let result = client.execute_with_stop(remote_request(), double_tool(), stop);
         let replies = replies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

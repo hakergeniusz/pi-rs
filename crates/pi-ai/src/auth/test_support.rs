@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-type Handler = dyn Fn(&str) -> (u16, String) + Send + Sync;
 type HeaderHandler = dyn Fn(&str) -> (u16, Vec<(String, String)>, String) + Send + Sync;
 
 /// The handler receives the full request text (request line, headers and,
@@ -80,10 +79,11 @@ impl FakeServer {
                             429 => "Too Many Requests",
                             _ => "Bad Request",
                         };
-                        let extra = headers
-                            .iter()
-                            .map(|(name, value)| format!("{name}: {value}\r\n"))
-                            .collect::<String>();
+                        let mut extra = String::new();
+                        for (name, value) in headers {
+                            use std::fmt::Write as _;
+                            let _ = write!(extra, "{name}: {value}\r\n");
+                        }
                         let head = format!(
                             "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
                             body.len()
