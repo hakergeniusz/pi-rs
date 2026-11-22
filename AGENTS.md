@@ -22,9 +22,9 @@ real TypeScript pi install.
 ### Ground truth and the privacy rule
 
 - **TypeScript source (canonical, cited by line in module docs):**
-  `/tmp/pi` on the operator's machine — a read-only clone of
-  `earendil-works/pi`; `packages/coding-agent` is at 1.5.2. `/tmp` is
-  ephemeral; re-clone the public repo if it is gone:
+  `/home/hakergeniusz/tmp-11-18/pi-152` on the operator's machine — the pinned
+  1.5.2 copy of `earendil-works/pi`; `packages/coding-agent` is at 1.5.2. If it
+  is gone, re-clone the public repo (e.g. under `/tmp/pi`):
   `gh repo clone earendil-works/pi /tmp/pi`.
 - **Privacy rule (hard):** never open, `cat`, or Read anything under a
   live pi data root — the XDG `pi` directories (`~/.config/pi`,
@@ -73,51 +73,34 @@ cargo fmt --all -- --check
 The operator's machine has OOM-killed cargo builds before; when building
 there (and only there), these limits apply:
 
-- Run heavy cargo commands inside the podman container `pi-rs-build`
-  (workspace mounted at `/work`), never on the host.
-- Always: `nice -n 19`, `CARGO_BUILD_JOBS=8`, `CARGO_INCREMENTAL=0`,
-  `CARGO_PROFILE_DEV_DEBUGINFO=0` (and the release equivalent). Use the
-  shared target dir `/build-target` so artifacts are reused.
-- Never run memory-stress probes, `ulimit` experiments, or parallel heavy
-  builds. If a command might OOM, reduce parallelism first and say so.
-- The container runs with 8 CPUs / 7 GB RAM (user-ordered 2026-11-15; was
-  4/4 earlier that day, 5/7 before that) — `-j 8` matches the 8 threads;
-  if a container OOM ever reappears, drop `-j` first and report it.
+- **Build host-side.** The old podman containers (`pi-rs-build`,
+  `pi-rs-build-ram`) and `scripts/ram-build.sh` were retired — do not use or
+  look for them. `scripts/host-build.sh` is now the single source of truth for
+  the env (`CARGO_NET_OFFLINE=true`, `CARGO_INCREMENTAL=0`, debug info off)
+  and the gate steps (fmt, clippy, test, fmt --check, plus a
+  `pi-coding-agent` no-default-features check). It applies `nice -n 19` to
+  every cargo step.
+- **Low parallelism:** keep `JOBS=2`. The host has little spare RAM (heavy
+  swap use); if a command might OOM, reduce parallelism first and say so.
+  Never run memory-stress probes or `ulimit` experiments, and never run two
+  heavy gates in parallel.
+- **Keep writes off `/tmp`.** `/tmp` is user-quota-blocked (writes fail), so
+  logs, worktrees, test fixtures and `TMPDIR` go under `/var/tmp` or the
+  disk-backed `.build-cache` in the workspace. Only `snapshot` batches the
+  target dir into one compressed archive.
+- **Offline builds:** the script exports `CARGO_NET_OFFLINE=true` and already
+  passes `--offline` to clippy/test/check — do not pass `--offline` again.
 - Do not block-wait on background tasks; poll. Do not pipe clippy through
-  `tail`/`head` — the pipe masks its exit status. Log files written inside
-  the container stay inside it (`podman exec pi-rs-build cat …`).
+  `tail`/`head` — the pipe masks its exit status.
 
 The full gate as run on that machine:
 
 ```sh
-podman exec pi-rs-build sh -c 'export CARGO_TARGET_DIR=/build-target CARGO_BUILD_JOBS=8 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUGINFO=0; cd /work; nice -n 19 sh -c "cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace -- --test-threads=4 && cargo fmt --all -- --check"'
+cd /home/hakergeniusz/Projects/pi-rs && TMPDIR=/var/tmp PI_CACHE_DIR=/var/tmp/opencode/pi-rs-cache PI_TARGET_DIR=/var/tmp/opencode/pt/ca JOBS=2 sh scripts/host-build.sh gate
 ```
 
-#### RAM-first build / low-TBW workflow (2026-11-21)
-
-The old gate wrote a 16 GB cargo target dir directly to the NVMe SSD, one
-small file at a time. Use the RAM-first variant instead: a second container
-`pi-rs-build-ram` (built from `pi-rs-build-base`, the committed toolchain
-layer) mounts a 1.8 GB tmpfs at `/ramdisk`, bind-mounts `/work` and the cargo
-registry **read-only**, and sets `CARGO_NET_OFFLINE=true`. All cargo artifacts
-and test caches live in `/ramdisk`; the SSD volume is touched just once per
-gate by a single compressed snapshot (`scripts/ram-build.sh snapshot`).
-
-```sh
-podman exec pi-rs-build-ram sh /work/scripts/ram-build.sh check -p pi-mcp
-podman exec pi-rs-build-ram sh /work/scripts/ram-build.sh test -p pi-mcp
-podman exec pi-rs-build-ram sh /work/scripts/ram-build.sh gate
-podman exec pi-rs-build-ram sh /work/scripts/ram-build.sh snapshot
-```
-
-`scripts/ram-build.sh` is the single source of truth for the env and the
-gate steps (it also runs `cargo check --no-default-features`, which CI skips).
-Targeted crate checks need only ~150 MB of tmpfs and ~15 s; a full workspace
-build fits the 1.8 GB tmpfs only with `DEBUGINFO=0` + `CARGO_INCREMENTAL=0`
-(and does not touch disk until `snapshot`). Keep scratch files, subagent
-worktrees and test fixtures under `/tmp/...` (host tmpfs). The host has little
-spare RAM (~2.4 GB free, heavy swap use) — never enlarge the tmpfs or run two
-heavy gates in parallel; one RAM gate at a time.
+`PI_TARGET_DIR`, `JOBS` and `PI_CACHE_DIR` are the knobs the script reads
+(defaults: `.build-cache/target`, `4`, and `/tmp/opencode/pi-rs-cache`).
 
 ## Git workflow
 
