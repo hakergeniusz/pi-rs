@@ -16,7 +16,7 @@
 //!   [`super::ping`]); v1.5.2 has no span/metric exporter trait and no OTLP
 //!   client. The traits, batching and OTLP JSON encoder below are additive
 //!   port surface, shaped around the ported `StoredSpan`/`StoredMetric`
-//!   records. `WIRING.md` records the deviation and the host wiring.
+//!   records. [`super::host`] records the deviation and the host wiring.
 
 use std::collections::BTreeMap;
 use std::fmt;

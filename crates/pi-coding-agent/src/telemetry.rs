@@ -43,7 +43,7 @@
 //! span/measurement storage and queries, carrier injection/extraction, the
 //! exact render output, the anonymous install/update ping with its exact
 //! env gates, and the conformance case shapes. Deliberately omitted (see
-//! `WIRING.md`):
+//! [`host`] for the wiring deviation):
 //!
 //! * TS type-level machinery (`defineTelemetrySchema`, `createTypedMetrics`,
 //!   `createTypedSpanStarter`, the `Infer*`/`Exact*` conditional types —
@@ -88,6 +88,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub mod conformance;
 /// Span/metric exporter traits, batching and the inert `OTLP/HTTP` encoder.
 pub mod exporters;
+/// Startup/shutdown wiring for the ping and exporter, with inert defaults.
+pub mod host;
 /// The anonymous install/update ping and provider attribution.
 pub mod ping;
 
@@ -1478,8 +1480,8 @@ pub fn is_install_telemetry_enabled_from_env(settings_enabled: bool) -> bool {
 }
 
 /// Host-facing constructor: a noop recorder when telemetry is disabled and
-/// the in-memory recorder when it is enabled. The ping gating and host wiring
-/// are documented in `WIRING.md` and implemented in [`ping`].
+/// the in-memory recorder when it is enabled. The ping gating lives in
+/// [`ping`]; startup/shutdown wiring lives in [`host`].
 pub fn construct_telemetry(enabled: bool) -> Arc<dyn Telemetry> {
     if enabled {
         Arc::new(InMemoryTelemetry::new())

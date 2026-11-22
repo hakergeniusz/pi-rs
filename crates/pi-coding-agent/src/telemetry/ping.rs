@@ -23,7 +23,7 @@
 //! Upstream calls `fetch` unconditionally when the gates pass. This port
 //! keeps the exact gates and payload but routes the request through
 //! [`PingTransport`]; the default transport is inert, so no network call is
-//! made unless the host injects one. `WIRING.md` records the wiring.
+//! made unless the host injects one. [`super::host`] records the wiring.
 
 use std::fmt::Write;
 use std::sync::{Arc, Mutex, PoisonError};

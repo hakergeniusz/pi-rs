@@ -14,6 +14,7 @@ use std::sync::Arc;
 use pi_ai::providers;
 
 use pi_ai::types::ImageContent;
+use pi_coding_agent::changelog::ChangelogEntry;
 use pi_coding_agent::cli::args::{Args, DiagnosticKind, Mode, parse_args, print_help};
 use pi_coding_agent::cli::file_processor::process_file_arguments;
 use pi_coding_agent::cli::project_trust::{DefaultProjectTrust, ProjectTrustStore};
@@ -29,6 +30,10 @@ use pi_coding_agent::modes::print_mode::{
 use pi_coding_agent::modes::rpc::run_rpc_mode;
 use pi_coding_agent::output_guard::{restore_stdout, take_over_stdout};
 use pi_coding_agent::session::store::{NewSessionOptions, SessionManager};
+use pi_coding_agent::telemetry::host::{
+    ChangelogPingDecision, HostTelemetry, HostTelemetryConfig, LAST_CHANGELOG_VERSION_SETTING,
+    SETTING_OTLP_ENDPOINT, WiringEnv, changelog_ping_decision,
+};
 use pi_coding_agent::tools::index::ToolRegistry;
 
 /// CLI entry (`runAgentMain`, `main.ts:630-1065`): subcommands, parsing,
@@ -316,14 +321,28 @@ fn initial_thinking_level(
     pi_agent::types::clamp_thinking_level(model, level)
 }
 
+/// Upstream's install/update ping lives in interactive mode's
+/// `getChangelogForDisplay` (`interactive-mode.ts:1373-1403`), so headless
+/// modes never run the changelog half of the wiring (`None` here).
+fn interactive_changelog_decision(
+    mode: &str,
+    has_messages: bool,
+    last_version: Option<&str>,
+    entries: &[ChangelogEntry],
+) -> Option<ChangelogPingDecision> {
+    (mode == "interactive").then(|| changelog_ping_decision(has_messages, last_version, entries))
+}
+
 /// Every non-RPC mode: headless extension host, like upstream's
-/// non-interactive paths that pass no `uiContext`.
+/// non-interactive paths that pass no `uiContext`. The returned
+/// [`HostTelemetry`] owns the startup ping and the shutdown exporter; both
+/// are inert unless settings/env opt in.
 fn build_runtime(
     args: &Args,
     cwd: &std::path::Path,
     cwd_string: &str,
     mode: &str,
-) -> Result<PrintRuntime, String> {
+) -> Result<(PrintRuntime, HostTelemetry), String> {
     build_runtime_with_ui(args, cwd, cwd_string, mode, ModeUi::default())
 }
 
@@ -338,7 +357,7 @@ fn build_runtime_with_ui(
     cwd_string: &str,
     mode: &str,
     ui: ModeUi,
-) -> Result<PrintRuntime, String> {
+) -> Result<(PrintRuntime, HostTelemetry), String> {
     let agent_dir = config::get_agent_dir();
     let trust_store = ProjectTrustStore::new(&agent_dir);
     let startup_settings = SettingsManager::create(
@@ -423,13 +442,25 @@ fn build_runtime_with_ui(
     // ("ask" without a UI resolves to not-trusted, like upstream's
     // non-interactive paths) — with the extension hook consulted when the
     // bootstrap pass ran.
-    let settings = SettingsManager::create(
+    let mut settings = SettingsManager::create(
         cwd,
         &agent_dir,
         SettingsManagerCreateOptions {
             project_trusted: Some(project_trusted),
         },
     );
+
+    // Telemetry startup wiring (`core/telemetry.ts:8-13`): the trusted
+    // settings manager supplies the install-telemetry setting, the additive
+    // OTLP endpoint comes from the setting or `PI_RS_OTLP_ENDPOINT`, and the
+    // default wiring stays inert (no ping, no HTTP transport).
+    let host_telemetry = HostTelemetry::new(HostTelemetryConfig::resolve(
+        settings.get_enable_install_telemetry(),
+        settings
+            .get(SETTING_OTLP_ENDPOINT)
+            .and_then(serde_json::Value::as_str),
+        &WiringEnv::from_process(),
+    ));
 
     // Model: --model pattern, else the settings default. The surface also
     // carries extension-registered virtual models (`withVirtualModels`).
@@ -564,6 +595,39 @@ fn build_runtime_with_ui(
     let has_existing_session = projection
         .as_ref()
         .is_some_and(|projection| !projection.messages.is_empty());
+
+    // Upstream's install/update ping fires from `getChangelogForDisplay`
+    // (`interactive-mode.ts:1373-1403`): interactive mode, fresh session,
+    // fresh install or a newer changelog entry. The saved version is recorded
+    // first, exactly like upstream (`:1379`, `:1393`, `:1397`).
+    if let Some(decision) = interactive_changelog_decision(
+        mode,
+        has_existing_session,
+        settings
+            .get(LAST_CHANGELOG_VERSION_SETTING)
+            .and_then(serde_json::Value::as_str),
+        &pi_coding_agent::changelog::parse_changelog(
+            &pi_coding_agent::changelog::get_changelog_path(),
+        ),
+    ) {
+        match decision {
+            ChangelogPingDecision::Skip => {}
+            ChangelogPingDecision::RecordVersionOnly => {
+                settings.set(
+                    LAST_CHANGELOG_VERSION_SETTING,
+                    serde_json::json!(env!("CARGO_PKG_VERSION")),
+                );
+            }
+            ChangelogPingDecision::PingAndRecord => {
+                settings.set(
+                    LAST_CHANGELOG_VERSION_SETTING,
+                    serde_json::json!(env!("CARGO_PKG_VERSION")),
+                );
+                host_telemetry.report_install_ping(env!("CARGO_PKG_VERSION"));
+            }
+        }
+    }
+
     let branch_has_thinking_entry =
         session
             .get_branch(None)
@@ -623,21 +687,24 @@ fn build_runtime_with_ui(
     let compaction_settings = settings
         .get_compaction_settings(Some((model.provider.as_str(), model.id.as_str())))
         .unwrap_or(pi_coding_agent::session::compaction::DEFAULT_COMPACTION_SETTINGS);
-    Ok(PrintRuntime {
-        model,
-        thinking_level,
-        api_key,
-        access_token,
-        stream_fn,
-        executor,
-        system_prompt,
-        session,
-        project_trusted,
-        retry_settings: settings.get_retry_settings(),
-        compaction_settings,
-        #[cfg(feature = "ext-js")]
-        extension_runner: extensions.host.runner(),
-    })
+    Ok((
+        PrintRuntime {
+            model,
+            thinking_level,
+            api_key,
+            access_token,
+            stream_fn,
+            executor,
+            system_prompt,
+            session,
+            project_trusted,
+            retry_settings: settings.get_retry_settings(),
+            compaction_settings,
+            #[cfg(feature = "ext-js")]
+            extension_runner: extensions.host.runner(),
+        },
+        host_telemetry,
+    ))
 }
 
 /// The initial prompt pieces: `(initialMessage, initialImages, followUps)`.
@@ -690,7 +757,7 @@ fn run_print(
     cwd_string: &str,
     stdin_content: Option<&str>,
 ) -> Result<i32, String> {
-    let mut runtime = build_runtime(args, cwd, cwd_string, "print")?;
+    let (mut runtime, host_telemetry) = build_runtime(args, cwd, cwd_string, "print")?;
     let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd, stdin_content)?;
     let options = PrintModeOptions {
         mode: Mode::Text,
@@ -701,6 +768,7 @@ fn run_print(
     // `restoreStdout()` after the mode returns (`main.ts:1059`; no theme
     // watcher to stop first).
     let outcome = run_print_mode(&mut runtime, &options);
+    host_telemetry.shutdown();
     restore_stdout();
     outcome
 }
@@ -717,7 +785,7 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
         pi_coding_agent::modes::interactive::extension_ui::ExtensionUiBridge::new(),
     );
     #[cfg(feature = "ext-js")]
-    let mut runtime = build_runtime_with_ui(
+    let (mut runtime, host_telemetry) = build_runtime_with_ui(
         args,
         cwd,
         cwd_string,
@@ -725,7 +793,7 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
         Some(Arc::clone(&extension_ui) as Arc<dyn pi_ext_js::UiSink>),
     )?;
     #[cfg(not(feature = "ext-js"))]
-    let mut runtime = build_runtime(args, cwd, cwd_string, "interactive")?;
+    let (mut runtime, host_telemetry) = build_runtime(args, cwd, cwd_string, "interactive")?;
     // The trust ladder resolved once in build_runtime — extensions may have
     // decided through the `project_trust` hook.
     let project_trusted = runtime.project_trusted;
@@ -758,10 +826,12 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
         #[cfg(feature = "ext-js")]
         extension_ui: Some(extension_ui),
     };
-    pi_coding_agent::modes::interactive::interactive_mode::run_interactive_mode(
+    let outcome = pi_coding_agent::modes::interactive::interactive_mode::run_interactive_mode(
         &mut runtime,
         &options,
-    )
+    );
+    host_telemetry.shutdown();
+    outcome
 }
 
 /// The JSON dispatch arm (`main.ts:1050-1059` with `toPrintOutputMode`'s
@@ -773,7 +843,7 @@ fn run_json(
     cwd_string: &str,
     stdin_content: Option<&str>,
 ) -> Result<i32, String> {
-    let mut runtime = build_runtime(args, cwd, cwd_string, "json")?;
+    let (mut runtime, host_telemetry) = build_runtime(args, cwd, cwd_string, "json")?;
     let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd, stdin_content)?;
     let options = PrintModeOptions {
         mode: Mode::Json,
@@ -783,6 +853,7 @@ fn run_json(
     };
     // `restoreStdout()` after the mode returns (`main.ts:1059`).
     let outcome = run_json_mode(&mut runtime, &options);
+    host_telemetry.shutdown();
     restore_stdout();
     outcome
 }
@@ -801,11 +872,13 @@ fn run_rpc(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, 
         Box::new(pi_coding_agent::modes::rpc::RpcStdout::new()),
     );
     #[cfg(feature = "ext-js")]
-    let mut runtime =
+    let (mut runtime, host_telemetry) =
         build_runtime_with_ui(args, cwd, cwd_string, "rpc", Some(Arc::clone(&bridge.sink)))?;
     #[cfg(not(feature = "ext-js"))]
-    let mut runtime = build_runtime(args, cwd, cwd_string, "rpc")?;
-    run_rpc_mode(&mut runtime, &mut bridge)
+    let (mut runtime, host_telemetry) = build_runtime(args, cwd, cwd_string, "rpc")?;
+    let outcome = run_rpc_mode(&mut runtime, &mut bridge);
+    host_telemetry.shutdown();
+    outcome
 }
 
 #[cfg(test)]
@@ -820,6 +893,43 @@ mod tests {
             reasoning,
             ..pi_ai::types::Model::default()
         }
+    }
+
+    /// The install/update ping is an interactive-only startup action
+    /// (`interactive-mode.ts:1373-1403`). Headless modes never reach it, and
+    /// a resumed session suppresses it in interactive mode too.
+    #[test]
+    fn changelog_ping_wiring_is_interactive_and_fresh_only() {
+        let entries = [ChangelogEntry {
+            major: 1,
+            minor: 2,
+            patch: 3,
+            content: String::new(),
+        }];
+        assert_eq!(
+            interactive_changelog_decision("print", false, None, &entries),
+            None
+        );
+        assert_eq!(
+            interactive_changelog_decision("json", false, None, &entries),
+            None
+        );
+        assert_eq!(
+            interactive_changelog_decision("rpc", false, None, &entries),
+            None
+        );
+        assert_eq!(
+            interactive_changelog_decision("interactive", false, None, &entries),
+            Some(ChangelogPingDecision::PingAndRecord)
+        );
+        assert_eq!(
+            interactive_changelog_decision("interactive", true, None, &entries),
+            Some(ChangelogPingDecision::Skip)
+        );
+        assert_eq!(
+            interactive_changelog_decision("interactive", false, Some("1.2.3"), &entries),
+            Some(ChangelogPingDecision::Skip)
+        );
     }
 
     /// Nothing configured: upstream starts a reasoning model at
