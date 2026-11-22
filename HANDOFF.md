@@ -3785,6 +3785,37 @@ this model (it exposes no thinking-level map).
 because the post-mount downcast via `HostSlot::Editor` resolves the original
 editor id; the menu is now set on the component before mounting (`6d94910`).
 
+## 2026-11-22 — exhaustive live TUI sweep
+
+Drove every slash command and the key/dialog surfaces in tmux with the
+Nemotron nvidia model (test logs under `/tmp/opencode/tui-command-tests/`,
+tmpfs — copy out if needed):
+
+- **All 23 commands** responded with upstream-style output: `/hotkeys`,
+  `/session`, `/changelog`, `/model`, `/thinking` (valid + invalid level),
+  `/scoped-models`, `/login` (method dialog), `/logout` (provider dialog),
+  `/copy`, `/name`, `/session`, `/export`, `/import`, `/fork`, `/clone`,
+  `/tree`, `/reload`, `/mcp`, `/trust`, `/resume`, `/settings`, `/compact`,
+  `/new`, `/quit`. `/share` and `/bug` stay absent from autocomplete by policy.
+- **Dialogs/submenus**: settings search + theme submenu (system/automatic/
+  dark/light — selected dark, verified persisted, restored to system),
+  per-model thinking submenu, TUI-mode row + overlay guard, model selector
+  search, scoped-model Tab scope toggle + catalog refresh hints, resume
+  search (scope/regex/phrase), tree search, fork-from-message, import confirm.
+- **Keys**: Ctrl+P / Ctrl+Shift+P cycling, Ctrl+L selector, Ctrl+O tool-output
+  expansion, Ctrl+T, Shift+Tab, Ctrl+C editor clear, Escape, `/` and `@`
+  completion. Alt+Enter queued a steering message ("Steering: …" row + hint),
+  Alt+Up dequeued it into the editor, Escape interrupted a long run.
+- **Model round-trips**: PONG, a read-tool round-trip (tool row → streamed
+  markdown answer, footer usage), long-response streaming, compaction refusal,
+  and `/quit` clean exit. `!` bash via PTY and Ctrl+C interrupt worked.
+- **Resize**: 100×32 → 120×40 repainted the footer correctly.
+
+Two fidelity bugs found by the sweep, both fixed: `/mcp` stuck on "Loading…"
+in fullscreen (`6d94910`) and the interrupt error missing the provider prefix
+upstream puts there (`273cc7f`). Theme was restored to `system`; the tmux
+session was restarted with the final release binary and left running.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
