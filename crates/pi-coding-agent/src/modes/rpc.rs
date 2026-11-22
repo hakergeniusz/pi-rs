@@ -192,6 +192,7 @@ pub enum PromptDisposition {
 
 impl PromptDisposition {
     /// The verbatim wire string (`rpc-commands.md`'s `disposition` values).
+    #[allow(clippy::trivially_copy_pass_by_ref)] // trait-shaped method; callers use &self uniformly
     fn as_str(&self) -> &'static str {
         match *self {
             Self::Handled => "handled",
