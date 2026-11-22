@@ -4081,10 +4081,20 @@ pedantic lints across `pi-ai`, `pi-codemode`, `pi-ext-js` and `pi-coding-agent`
 that the parallel merge produced. Workspace check and `clippy --all-targets
 -D warnings` were green at that commit.
 
-**Gate / CI status: VERIFYING.** Final workspace test counts and CI job results
-for this integration are not yet recorded — the coordinator will supply them.
-No parity claim is made on the basis of the per-slice notes alone; the full
-suite and CI remain the authority.
+**Gate / CI status: GREEN.** A read-only audit of all ten slices found five
+dead/partial mechanisms, which a follow-up fix wave closed: telemetry recorder
++ flush at shutdown (`0203f94`), real RPC abort cancellation (`4e65bed`), typed
+OAuth errors + Copilot base URL on the wire (`943ac16`), real tool-result image
+transformer and session-delta call sites (`5739c3d`), and an opt-in codemode
+thread-worker transport (`38a5edc`). Integration also made the sync tokio
+runtime thread-local (`ca2c249`) — the process-wide current-thread runtime made
+parallel tests flake — and repaired the E4 `require` fold, whose `+` arm never
+advanced its cursor (`81bfe8f`).
+Final workspace gate: **2646 passed, 0 failed, 3 ignored**; fmt, clippy
+`--all-targets -D warnings` and `--no-default-features` all green. CI all jobs
+green (fmt, clippy, test, msrv, audit, release, no-default-features). No full
+1:1 parity is claimed; remaining differences are mechanism-level and recorded
+in module docs and `docs/GAP-STATUS.md`.
 
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).

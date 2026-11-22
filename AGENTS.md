@@ -181,8 +181,13 @@ interactive pump and per RPC command; RPC got a bounded FIFO dispatcher with
 `activeCommands`, session rebind, per-call `blockImages` and an MCP tick; OAuth
 gained Copilot's 429 back-off and enterprise base URL; codemode got real local
 thread/client transports; and E4 gained `URL.canParse`, ancestor `node_modules`
-resolution and statically-foldable `require(expr)`. Gate/CI for this wave:
-**VERIFYING** — final numbers to be supplied.
+resolution and statically-foldable `require(expr)`. A post-audit fix wave made
+telemetry end-to-end live, real RPC abort cancellation, the typed OAuth error
+and Copilot base URL reachable, real tool-result image conversion, session
+delta host call sites, and an opt-in codemode thread-worker transport. The
+sync tokio runtime is thread-local (removes parallel-test flakes) and the
+E4 `require` fold was repaired. Final gate: 2646 passed, 0 failed, 3 ignored;
+CI all jobs green.
 
 Still open (genuine mechanism tails or deliberate scope decisions):
 
