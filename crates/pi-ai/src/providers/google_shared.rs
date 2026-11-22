@@ -10,6 +10,36 @@
 //! top-level request fields and `temperature`/`maxOutputTokens`/`thinkingConfig`
 //! into `generationConfig` (`_models_converters.ts:2241-2322`).
 
+// 1:1 port of the upstream TS adapter: the TS-shaped control flow, literal
+// tables and helper structs trigger pedantic lints; keep the mirror exact.
+#![allow(
+    clippy::assert_is_empty,
+    clippy::assigning_clones,
+    clippy::collapsible_if,
+    clippy::default_trait_access,
+    clippy::doc_markdown,
+    clippy::field_reassign_with_default,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    clippy::if_not_else,
+    clippy::if_same_then_else,
+    clippy::manual_assert_eq,
+    clippy::manual_is_multiple_of,
+    clippy::manual_strip,
+    clippy::map_unwrap_or,
+    clippy::needless_pass_by_value,
+    clippy::redundant_closure_for_method_calls,
+    clippy::result_large_err,
+    clippy::single_match_else,
+    clippy::struct_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::unnecessary_get_then_check,
+    clippy::unnecessary_map_or,
+    clippy::unnecessary_wraps,
+    clippy::useless_concat,
+    dead_code
+)]
+
 use crate::constrained_sampling::{ConstrainedSampling, StrictMode};
 use crate::cost::calculate_cost;
 use crate::event_stream::EventSender;
@@ -375,12 +405,12 @@ pub(crate) fn resolve_function_calling_mode(
                 _ => "AUTO",
             }),
     };
-    if matches!(choice, Some("NONE") | Some("ANY")) {
+    if matches!(choice, Some("NONE" | "ANY")) {
         return Ok(choice);
     }
     let use_strict = tools
         .iter()
-        .any(|tool| resolve_json_schema_strict(tool, supports_strict).unwrap_or(false));
+        .any(|tool| resolve_json_schema_strict(tool, supports_strict).ok().flatten().unwrap_or(false));
     if use_strict {
         return Ok(Some("VALIDATED"));
     }
@@ -1008,7 +1038,11 @@ where
         apply_stream_event_hook(&options.on_provider_stream_event, chunk.clone(), model).await?;
         // Some relays wrap each response in a one-element array.
         let chunk = if chunk.is_array() {
-            chunk.first().cloned().unwrap_or(chunk)
+            chunk
+                .as_array()
+                .and_then(|items| items.first())
+                .cloned()
+                .unwrap_or(chunk)
         } else {
             chunk
         };

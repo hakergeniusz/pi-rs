@@ -18,6 +18,36 @@
 //!
 //! Deliberate deviations are listed in `WIRING.md` at the worktree root.
 
+// 1:1 port of the upstream TS adapter: the TS-shaped control flow, literal
+// tables and helper structs trigger pedantic lints; keep the mirror exact.
+#![allow(
+    clippy::assert_is_empty,
+    clippy::assigning_clones,
+    clippy::collapsible_if,
+    clippy::default_trait_access,
+    clippy::doc_markdown,
+    clippy::field_reassign_with_default,
+    clippy::float_cmp,
+    clippy::format_push_string,
+    clippy::if_not_else,
+    clippy::if_same_then_else,
+    clippy::manual_assert_eq,
+    clippy::manual_is_multiple_of,
+    clippy::manual_strip,
+    clippy::map_unwrap_or,
+    clippy::needless_pass_by_value,
+    clippy::redundant_closure_for_method_calls,
+    clippy::result_large_err,
+    clippy::single_match_else,
+    clippy::struct_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::unnecessary_get_then_check,
+    clippy::unnecessary_map_or,
+    clippy::unnecessary_wraps,
+    clippy::useless_concat,
+    dead_code
+)]
+
 use crate::event_stream::{AssistantMessageEventStream, EventSender};
 use crate::providers::common::{
     apply_payload_hook, apply_response_hook, apply_stream_event_hook, initial_output,
@@ -611,9 +641,11 @@ fn build_request_body(
     if let Some(choice) = tool_choice(options) {
         request_options.insert("toolChoice".to_string(), choice);
     }
+    // `TranscriptContext` is not `Serialize`; the wire shape is just its
+    // messages (TS sends `{ messages, tools? }`).
     Ok(json!({
         "model": model.id,
-        "context": context,
+        "context": { "messages": context.messages },
         "options": request_options,
     }))
 }
@@ -667,10 +699,10 @@ where
         apply_stream_event_hook(&options.on_provider_stream_event, raw.clone(), model).await?;
         let event: PiMessagesEvent =
             serde_json::from_value(raw).map_err(|e| format!("invalid pi-messages event: {e}"))?;
-        let converted = converter.apply(event)?;
+        let outcome = converter.apply(event)?;
         *output = converter.partial.clone();
-        let is_terminal = AssistantMessageEventStream::is_terminal(&converted);
-        if sender.send(converted).await.is_err() {
+        let is_terminal = AssistantMessageEventStream::is_terminal(&outcome);
+        if sender.send(outcome).await.is_err() {
             break;
         }
         if is_terminal {
@@ -905,10 +937,7 @@ mod tests {
             b"data: {\"type\":\"text_start\",\"contentIndex\":0}\n\n",
             b"data: {\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"Hel\"}\n\ndata: {\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"lo\"}\n\n",
             b"data: {\"type\":\"text_end\",\"contentIndex\":0,\"content\":\"Hello\",\"contentSignature\":\"sig\"}\n\n",
-            format!(
-                "data: {{\"type\":\"done\",\"reason\":\"stop\",\"usage\":{},\"responseId\":\"r1\",\"responseModel\":\"local-model\"}}\n\n"
-            )
-            .as_bytes(),
+            b"data: {\"type\":\"done\",\"reason\":\"stop\",\"usage\":{\"input\":11,\"output\":8,\"totalTokens\":19},\"responseId\":\"r1\",\"responseModel\":\"local-model\"}\n\n",
         ])
         .await;
         let kinds: Vec<&str> = events
@@ -958,10 +987,7 @@ mod tests {
             b"data: {\"type\":\"toolcall_delta\",\"contentIndex\":1,\"delta\":\"{\\\"cmd\\\":\"}\n\n",
             b"data: {\"type\":\"toolcall_delta\",\"contentIndex\":1,\"delta\":\"\\\"ls\\\"}\"}\n\n",
             b"data: {\"type\":\"toolcall_end\",\"contentIndex\":1,\"toolCall\":{\"id\":\"tc_1\",\"name\":\"bash\",\"arguments\":{\"cmd\":\"ls\"}}}\n\n",
-            format!(
-                "data: {{\"type\":\"done\",\"reason\":\"toolUse\",\"usage\":{}}}\n\n"
-            )
-            .as_bytes(),
+            b"data: {\"type\":\"done\",\"reason\":\"toolUse\",\"usage\":{}}\n\n",
         ])
         .await;
         let AssistantMessageEvent::Done { reason, message } = events.last().unwrap() else {
