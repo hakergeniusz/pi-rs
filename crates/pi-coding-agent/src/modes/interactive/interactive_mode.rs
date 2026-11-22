@@ -18,10 +18,27 @@
 //! `blockImages` is read from that cell on **every** `convertToLlm` call —
 //! upstream's `settingsManager.getBlockImages()` — and the same cell feeds
 //! the tool rows' `showImages` render flag and the `afterToolCall` image
-//! normalizer. The host pump drives `ExtensionRunner::mcp_tick` once per
-//! frame (no timers), matching the MCP runtime's host-supplied tick.
+//! normalizer. That normalizer runs on [`crate::images::default_transformer`]
+//! (via [`DefaultImageTransformer`]), so MCP/extension tool-result images take
+//! the same BMP-convert / oversize-resize path as the read tool. The host pump
+//! drives `ExtensionRunner::mcp_tick` once per frame (no timers), matching the
+//! MCP runtime's host-supplied tick.
 //! Clipboard-image paste (`interactive-mode.ts:3296-3305`) still needs a
 //! clipboard read hook in the host; there is none in `crate::clipboard` yet.
+//!
+//! Session-delta wiring (`agent-session.ts:251,4003-4035`,
+//! `session-manager.ts:245-262,885-890,1916-2035`): the `!` bash path feeds
+//! each streamed PTY chunk through [`BashExecutionDeltaCollector`] and emits
+//! the byte-identical `bash_execution_update` event on the extension/session
+//! event stream before the row repaints; the accumulated output is the one
+//! persisted on the final `BashExecutionMessage`. Extension-facing payloads
+//! read the leaf through [`ReadonlySessionManager`], and the `/resume` cwd
+//! gate consumes the same view. The selector passes a `SessionListProgress`
+//! callback into both list loaders. Remaining delta: the embedded JS host
+//! (outside this module's ownership) does not yet accept a readonly session
+//! object on its API surface, and `emit_extension_event` is a no-op in
+//! `--no-default-features` builds, so the emitted updates are only observable
+//! where an extension runner is installed.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -60,9 +77,10 @@ use crate::config::settings::{
     FullscreenExitOutput, FullscreenScrollbar, SettingsManager, SettingsManagerCreateOptions,
     format_http_idle_timeout_ms,
 };
-use crate::images::{ImageSettings, ImageTransformer, ResizeOptions, UnavailableTransformer};
+use crate::images::{ImageSettings, ImageTransformer, ResizeOptions};
 use crate::modes::print_mode::PrintRuntime;
 use crate::session::store::{NewSessionOptions, SessionManager};
+use crate::session::{BashExecutionDeltaCollector, BashExecutionEvent, ReadonlySessionManager};
 
 use super::autocomplete;
 use super::chat_viewport::{self, ChatViewport, HostSlot};
@@ -1014,9 +1032,28 @@ struct BashRun {
     /// The chat row receiving live output (`BashExecutionComponent` upstream).
     index: usize,
     streamed: String,
+    /// Accumulates the streamed `onChunk` deltas into the output the final
+    /// `BashExecutionMessage` carries (`agent-session.ts:4022-4025`).
+    deltas: BashExecutionDeltaCollector,
     events: std::sync::mpsc::Receiver<crate::tools::bash::bash_pty::BashPtyEvent>,
     control: crate::tools::bash::bash_pty::BashPtyControl,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Feed one streamed PTY chunk into a bash execution's delta collector and
+/// hand the exact `bash_execution_update` event pi emits to `emit`
+/// (`agent-session.ts:4003-4035`). The collector's accumulated output is what
+/// the final `BashExecutionMessage` persists, so the event order and the
+/// stored output stay in lockstep with upstream.
+fn emit_bash_execution_delta(
+    collector: &mut BashExecutionDeltaCollector,
+    chunk: &str,
+    mut emit: impl FnMut(serde_json::Value),
+) {
+    let event: BashExecutionEvent = collector.push(chunk);
+    if let Ok(value) = serde_json::to_value(&event) {
+        emit(value);
+    }
 }
 
 /// The retry backoff wait (`_prepareRetry`'s sleep, `agent-session.ts`
@@ -1564,12 +1601,47 @@ struct ImageNormalizingAfterHook {
     transformer: Arc<dyn ImageTransformer + Send + Sync>,
 }
 
+/// A `Send + Sync` handle for [`crate::images::default_transformer`], the
+/// host-side replacement for Photon that converts BMP and resizes oversized
+/// images (`images/WIRING.md`). The canonical seam hands out a bare
+/// `&'static dyn ImageTransformer` (no auto-trait bounds), while the tool hook
+/// is stored behind `Arc<dyn ImageTransformer + Send + Sync>`; this zero-sized
+/// forwarder bridges the two without touching the `images` module.
+#[derive(Debug, Clone, Copy, Default)]
+struct DefaultImageTransformer;
+
+impl ImageTransformer for DefaultImageTransformer {
+    fn transform(
+        &self,
+        input: &[u8],
+        target_width: u32,
+        target_height: u32,
+        mime_type: &str,
+        jpeg_quality: u8,
+    ) -> Option<crate::images::resize::EncodedImage> {
+        crate::images::default_transformer().transform(
+            input,
+            target_width,
+            target_height,
+            mime_type,
+            jpeg_quality,
+        )
+    }
+
+    fn convert_to_png(&self, input: &[u8]) -> Option<Vec<u8>> {
+        crate::images::default_transformer().convert_to_png(input)
+    }
+}
+
 impl ImageNormalizingAfterHook {
     fn new(live_images: Arc<Mutex<ImageSettings>>, resize_options: ResizeOptions) -> Self {
         Self {
             live_images,
             resize_options,
-            transformer: Arc::new(UnavailableTransformer),
+            // Upstream loads Photon here (`tool-result-images.ts:24-67`); the
+            // port's real backend is `images::default_transformer`, so tool
+            // results get the same resize/convert path as the read tool.
+            transformer: Arc::new(DefaultImageTransformer),
         }
     }
 }
@@ -6357,6 +6429,9 @@ impl InteractiveMode {
             started,
             index,
             streamed: String::new(),
+            // `executeBash`'s `options.id` is absent for the interactive `!`
+            // path, so pi emits idless `bash_execution_update` events.
+            deltas: BashExecutionDeltaCollector::new(None),
             events,
             control,
             thread,
@@ -6383,6 +6458,12 @@ impl InteractiveMode {
             match run.events.try_recv() {
                 Ok(BashPtyEvent::Chunk(text)) => {
                     run.streamed.push_str(&text);
+                    // Upstream's `executeBash` emits one
+                    // `bash_execution_update` per `onChunk` delivery before
+                    // the row paints the new text (`agent-session.ts:4003-4035`).
+                    emit_bash_execution_delta(&mut run.deltas, &text, |value| {
+                        self.emit_extension_event(&value);
+                    });
                     if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(run.index)
                     {
                         component.update_result(
@@ -6469,6 +6550,13 @@ impl InteractiveMode {
         full_output_path: Option<String>,
         started: Instant,
     ) {
+        // Extension-decided and early-error paths have no PTY stream, but
+        // upstream still emits one `bash_execution_update` with the whole
+        // output (`agent-session.ts:4003-4035`).
+        let mut deltas = BashExecutionDeltaCollector::new(None);
+        emit_bash_execution_delta(&mut deltas, &text, |value| {
+            self.emit_extension_event(&value);
+        });
         let component = ToolExecutionComponent::with_image_settings(
             "bash",
             &format!("bash-{}", self.chat_len()),
@@ -9811,15 +9899,25 @@ impl InteractiveMode {
         self.pending_tools.clear();
         self.streaming_index = None;
 
-        // `session_tree` (`:4319-4325`).
+        // `session_tree` (`:4319-4325`). The extension-facing payload reads
+        // the leaf through the capability-limited view, not the mutable store.
+        let view = self.readonly_session();
         self.emit_extension_event(&serde_json::json!({
             "type": "session_tree",
-            "newLeafId": self.session.get_leaf_id(),
+            "newLeafId": view.get_leaf_id(),
             "oldLeafId": old_leaf_id,
             "summaryEntry": summary_entry_id,
         }));
 
         Ok(editor_text)
+    }
+
+    /// The capability-limited session view extension hooks read
+    /// (`session-manager.ts:245-262`, `ReadonlySessionManager`). Exposing the
+    /// trait object at the interactive seam keeps extension-facing payloads
+    /// from reaching for the mutable store.
+    fn readonly_session(&self) -> &dyn ReadonlySessionManager {
+        &self.session
     }
 
     /// A notification-only extension emit (`runner.emit`): errors surface as
@@ -13605,6 +13703,31 @@ mod tests {
         );
     }
 
+    /// The interactive `!` path feeds each PTY chunk through the library
+    /// accumulator and emits the byte-identical `bash_execution_update`
+    /// event, in arrival order (`agent-session.ts:4003-4035`).
+    #[test]
+    fn bash_chunks_emit_ordered_execution_update_events() {
+        let mut collector = BashExecutionDeltaCollector::new(None);
+        let mut emitted = Vec::new();
+        for chunk in ["first\n", "sec", "ond\n"] {
+            super::emit_bash_execution_delta(&mut collector, chunk, |value| {
+                emitted.push(value);
+            });
+        }
+        assert_eq!(
+            emitted,
+            vec![
+                serde_json::json!({"type": "bash_execution_update", "delta": "first\n"}),
+                serde_json::json!({"type": "bash_execution_update", "delta": "sec"}),
+                serde_json::json!({"type": "bash_execution_update", "delta": "ond\n"}),
+            ]
+        );
+        // The final `BashExecutionMessage` persists the same accumulated
+        // output, in arrival order.
+        assert_eq!(collector.output(), "first\nsecond\n");
+    }
+
     /// The border stylers map the upstream theme tokens
     /// (`theme.ts:348-372`): thinking levels and bash mode carry distinct
     /// colors. (The fallback test theme renders `thinkingHigh` and
@@ -13616,6 +13739,18 @@ mod tests {
         let bash = theme::bash_mode_border_styler();
         assert_ne!(off("-"), high("-"), "levels map to distinct tokens");
         assert_ne!(off("-"), bash("-"), "bash mode is its own token");
+    }
+
+    /// Extension-facing payloads read a capability-limited readonly view, not
+    /// the mutable store (`session-manager.ts:245-262`).
+    #[test]
+    fn readonly_session_exposes_the_modes_session() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mode, _capture) = fixture(dir.path(), "unused.txt");
+        let view = mode.readonly_session();
+        assert_eq!(view.get_session_id(), mode.session.get_session_id());
+        assert_eq!(view.get_cwd(), mode.session.get_cwd());
+        assert_eq!(view.get_leaf_id(), mode.session.get_leaf_id());
     }
 
     /// A capture-terminal mode over a read-only executor in `dir`, driven by a
@@ -18406,6 +18541,132 @@ export default function (pi) {
             crate::runtime::block_on(hook.call(&assistant, &tool_call, &text_only, false))
                 .is_none(),
             "text-only results are left alone"
+        );
+    }
+
+    /// Encode a small synthetic image for the real pixel backend. `bmp`
+    /// selects BMP-for-conversion; otherwise a PNG is produced.
+    fn synthetic_image_bytes(width: u32, height: u32, bmp: bool) -> Vec<u8> {
+        use image::{ExtendedColorType, ImageEncoder, RgbImage};
+        let pixels = RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([
+                u8::try_from(x % 251).unwrap_or_default(),
+                u8::try_from(y % 239).unwrap_or_default(),
+                0x40,
+            ])
+        });
+        let mut bytes = Vec::new();
+        if bmp {
+            image::codecs::bmp::BmpEncoder::new(&mut bytes)
+                .write_image(
+                    pixels.as_raw(),
+                    pixels.width(),
+                    pixels.height(),
+                    ExtendedColorType::Rgb8,
+                )
+                .expect("encode synthetic bmp");
+        } else {
+            image::codecs::png::PngEncoder::new(&mut bytes)
+                .write_image(
+                    pixels.as_raw(),
+                    pixels.width(),
+                    pixels.height(),
+                    ExtendedColorType::Rgb8,
+                )
+                .expect("encode synthetic png");
+        }
+        bytes
+    }
+
+    fn image_tool_call() -> AgentToolCall {
+        serde_json::from_value(serde_json::json!({
+            "id": "call-image",
+            "name": "mcp__image",
+            "arguments": {}
+        }))
+        .expect("tool call")
+    }
+
+    /// The hook the interactive host actually installs (no transformer
+    /// override) runs `images::default_transformer`'s `convert_to_png` on a
+    /// synthetic BMP tool result (`tool-result-images.ts:24-67`).
+    #[test]
+    fn after_hook_converts_bmp_with_the_real_transformer() {
+        use image::GenericImageView;
+        let live = Arc::new(Mutex::new(ImageSettings {
+            auto_resize: false,
+            ..ImageSettings::default()
+        }));
+        let hook = super::ImageNormalizingAfterHook::new(live, ResizeOptions::default());
+        let assistant = scripted_assistant(&[], StopReason::Stop);
+        let result = AgentToolResult {
+            content: vec![pi_ai::types::ContentBlock::Image(
+                pi_ai::types::ImageContent {
+                    data: base64::engine::general_purpose::STANDARD
+                        .encode(synthetic_image_bytes(3, 2, true)),
+                    mime_type: "image/bmp".to_string(),
+                },
+            )],
+            ..AgentToolResult::default()
+        };
+        let override_ =
+            crate::runtime::block_on(hook.call(&assistant, &image_tool_call(), &result, false))
+                .expect("bmp result is rewritten");
+        let content = override_.content.expect("content override");
+        let pi_ai::types::ContentBlock::Image(image) = &content[0] else {
+            panic!("first block is the converted image");
+        };
+        assert_eq!(image.mime_type, "image/png");
+        let decoded = image::load_from_memory(
+            &base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .expect("base64 png"),
+        )
+        .expect("decode png");
+        assert_eq!(decoded.dimensions(), (3, 2));
+        assert!(content.iter().any(|block| matches!(block,
+            pi_ai::types::ContentBlock::Text(text)
+                if text.text.contains("Image converted from image/bmp to image/png."))));
+    }
+
+    /// The same production hook runs the real Lanczos3 resize on an oversized
+    /// tool-result image (`images/WIRING.md`).
+    #[test]
+    fn after_hook_resizes_oversized_results_with_the_real_transformer() {
+        use image::GenericImageView;
+        let live = Arc::new(Mutex::new(ImageSettings {
+            auto_resize: true,
+            ..ImageSettings::default()
+        }));
+        let hook = super::ImageNormalizingAfterHook::new(live, ResizeOptions::default());
+        let assistant = scripted_assistant(&[], StopReason::Stop);
+        let result = AgentToolResult {
+            content: vec![pi_ai::types::ContentBlock::Image(
+                pi_ai::types::ImageContent {
+                    data: base64::engine::general_purpose::STANDARD
+                        .encode(synthetic_image_bytes(2200, 1800, false)),
+                    mime_type: "image/png".to_string(),
+                },
+            )],
+            ..AgentToolResult::default()
+        };
+        let override_ =
+            crate::runtime::block_on(hook.call(&assistant, &image_tool_call(), &result, false))
+                .expect("oversized result is rewritten");
+        let content = override_.content.expect("content override");
+        let pi_ai::types::ContentBlock::Image(image) = &content[0] else {
+            panic!("first block is the resized image");
+        };
+        let decoded = image::load_from_memory(
+            &base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .expect("base64 image"),
+        )
+        .expect("decode resized image");
+        let (width, height) = decoded.dimensions();
+        assert!(
+            width <= 2000 && height <= 2000 && (width < 2200 || height < 1800),
+            "the real transformer shrank {width}x{height} within the inline limits"
         );
     }
 

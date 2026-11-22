@@ -15,7 +15,10 @@
 //! just in the final `BashExecutionMessage`. The types here let a tool host
 //! feed those deltas into the session layer with a JSON shape byte-identical
 //! to the event pi emits, and accumulate them in arrival order into the output
-//! the final message carries.
+//! the final message carries. The interactive `!` host is that tool host:
+//! `modes::interactive::interactive_mode::emit_bash_execution_delta` pushes
+//! each PTY chunk and emits the returned event on the extension/session event
+//! stream before the chat row repaints.
 
 use serde::{Deserialize, Serialize};
 

@@ -31,11 +31,13 @@
 //!   (`core/export-html/`, templates embedded byte-identically).
 //! * [`bash_execution`] — incremental `bash_execution_update` output deltas
 //!   (`core/agent-session.ts:251,4003-4035`, `core/tools/bash.ts:289-364`) and
-//!   the tool-host feed/accumulator.
+//!   the tool-host feed/accumulator, driven by the interactive `!` path.
 //! * [`readonly`] — the `ReadonlySessionManager` read-only view
-//!   (`core/session-manager.ts:245-262`).
+//!   (`core/session-manager.ts:245-262`), consumed by the cwd gate and exposed
+//!   by the interactive host for extension-facing payloads.
 //! * [`store::SessionListProgress`] — the optional session-listing progress
-//!   callback (`core/session-manager.ts:885-890,942-975,1916-2035`).
+//!   callback (`core/session-manager.ts:885-890,942-975,1916-2035`), passed by
+//!   the interactive `/resume` selector.
 
 #![forbid(unsafe_code)]
 

@@ -5,11 +5,14 @@
 //! file, `:1-73`). Consumers: the `/import` flow
 //! (`agent-session-runtime.ts:359-407` re-opens the copied file and asserts
 //! the cwd, `interactive-mode.ts:6755-6803` prompts on the error) and the
-//! `/resume` flow (`interactive-mode.ts:5955-5980`).
+//! `/resume` flow (`interactive-mode.ts:5955-5980`). The gate only reads the
+//! stored cwd and session file, so it takes the [`ReadonlySessionManager`]
+//! capability-limited view (`session-manager.ts:245-262`); this is the first
+//! production consumer of that trait.
 
 use std::path::{Path, PathBuf};
 
-use super::SessionManager;
+use super::ReadonlySessionManager;
 
 /// `SessionCwdIssue` (`session-cwd.ts:3-7`): the stored cwd that is gone, the
 /// cwd to fall back to, and the session file that carries the stale cwd.
@@ -25,7 +28,7 @@ pub struct SessionCwdIssue {
 /// `getMissingSessionCwdIssue` (`session-cwd.ts:14-33`): `None` when the
 /// session is in-memory, its cwd is recorded, or the recorded cwd exists.
 pub fn get_missing_session_cwd_issue(
-    session_manager: &SessionManager,
+    session_manager: &dyn ReadonlySessionManager,
     fallback_cwd: &Path,
 ) -> Option<SessionCwdIssue> {
     let session_file = session_manager.get_session_file()?;
@@ -124,7 +127,7 @@ impl std::error::Error for MissingSessionCwdError {}
 /// call this after opening the (copied) session file and abort when the
 /// stored cwd is stale.
 pub fn assert_session_cwd_exists(
-    session_manager: &SessionManager,
+    session_manager: &dyn ReadonlySessionManager,
     fallback_cwd: &Path,
 ) -> Result<(), MissingSessionCwdError> {
     match get_missing_session_cwd_issue(session_manager, fallback_cwd) {
@@ -136,6 +139,7 @@ pub fn assert_session_cwd_exists(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SessionManager;
     use crate::session::store::NewSessionOptions;
     use std::fs;
 
@@ -227,6 +231,23 @@ mod tests {
                 .expect("in-memory");
         assert!(in_memory.get_session_file().is_none());
         assert_eq!(get_missing_session_cwd_issue(&in_memory, dir.path()), None);
+    }
+
+    /// The gate consumes the capability-limited readonly view
+    /// (`session-manager.ts:245-262`) — the same shape an extension hook gets.
+    #[test]
+    fn cwd_gate_accepts_a_readonly_session_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fallback_cwd = dir.path().join("fallback");
+        fs::create_dir_all(&fallback_cwd).expect("mkdir");
+        let missing_cwd = fallback_cwd.join("does-not-exist");
+        let session_file = dir.path().join("session.jsonl");
+        write_session_file(&session_file, &missing_cwd);
+
+        let session_manager = SessionManager::open(&session_file, None, None).expect("open");
+        let view: &dyn ReadonlySessionManager = &session_manager;
+        assert!(assert_session_cwd_exists(view, &fallback_cwd).is_err());
+        assert!(get_missing_session_cwd_issue(view, dir.path()).is_some());
     }
 
     /// `getMissingSessionCwdOptions` labels name the fallback cwd, and the

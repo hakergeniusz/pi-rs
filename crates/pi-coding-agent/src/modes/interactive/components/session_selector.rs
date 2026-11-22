@@ -2,11 +2,13 @@
 //!
 //! Ground truth: `modes/interactive/components/session-selector.ts` (884
 //! lines) with the search from [`super::session_selector_search`]. Deviations:
-//! the loaders are synchronous (`SessionManager::list`/`list_all` — no
-//! progress/abort plumbing), status messages persist until the next state
-//! change instead of auto-hiding on a timer, and the upstream loader
-//! callbacks collapse into direct calls because this component owns its
-//! header and list.
+//! the loaders are synchronous, so the `SessionManager.list`/`listAll`
+//! `onProgress` callbacks (`session-manager.ts:885-890,1916-2035`) fire within
+//! one call and their last `(loaded, total)` is retained on the component as
+//! the loading-status seam rather than driving mid-load repaints; status
+//! messages persist until the next state change instead of auto-hiding on a
+//! timer, and the upstream loader callbacks collapse into direct calls because
+//! this component owns its header and list.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,7 +25,7 @@ use pi_tui::theme::{ThemeBg, ThemeColor};
 use super::session_selector_search::{
     NameFilter, SortMode, filter_and_sort_sessions, has_session_name,
 };
-use crate::session::store::{SessionInfo, SessionManager};
+use crate::session::store::{SessionInfo, SessionListProgress, SessionManager};
 
 use super::header::DynamicBorder;
 use crate::modes::interactive::theme;
@@ -775,6 +777,11 @@ pub struct SessionSelectorComponent {
     rename_input: Input,
     rename_target_path: Option<PathBuf>,
     events: Arc<Mutex<Vec<SessionSelectorEvent>>>,
+    /// Last `(loaded, total)` reported by the session-list loader
+    /// (`session-manager.ts:885-890`): upstream uses these counts for the
+    /// transient "Loading sessions" status; the sync port keeps them as the
+    /// progress seam (and to assert the callback actually ran).
+    last_load_progress: Option<(usize, usize)>,
 }
 
 enum ViewMode {
@@ -792,7 +799,16 @@ impl SessionSelectorComponent {
         current_session_file: Option<&Path>,
         events: Arc<Mutex<Vec<SessionSelectorEvent>>>,
     ) -> Self {
-        let current_sessions = SessionManager::list(cwd, session_dir);
+        // `SessionManager.list(cwd, sessionDir, onProgress)`
+        // (`session-manager.ts:1916-1931`): the callback records the counts
+        // that drive upstream's loading status while files are scanned.
+        let load_counts = std::cell::Cell::new(None);
+        let on_progress: &SessionListProgress<'_> = &|loaded, total, _| {
+            load_counts.set(Some((loaded, total)));
+        };
+        let current_sessions =
+            SessionManager::list_with_progress(cwd, session_dir, Some(on_progress));
+        let last_load_progress = load_counts.get();
         let sort_mode = SortMode::Threaded;
         let name_filter = NameFilter::All;
         let header = SessionSelectorHeader {
@@ -826,15 +842,24 @@ impl SessionSelectorComponent {
             rename_input: Input::new(InputOptions::default()),
             rename_target_path: None,
             events,
+            last_load_progress,
         }
     }
 
-    fn load_all(&self) -> Vec<SessionInfo> {
-        if self.uses_default_session_dir {
-            SessionManager::list_all(None)
+    /// `SessionManager.listAll(sessionDir, onProgress)`
+    /// (`session-manager.ts:1937-2028`) with the same count recording as the
+    /// constructor's current-folder load.
+    fn load_all(&self) -> (Vec<SessionInfo>, Option<(usize, usize)>) {
+        let load_counts = std::cell::Cell::new(None);
+        let on_progress: &SessionListProgress<'_> = &|loaded, total, _| {
+            load_counts.set(Some((loaded, total)));
+        };
+        let sessions = if self.uses_default_session_dir {
+            SessionManager::list_all_with_progress(None, Some(on_progress))
         } else {
-            SessionManager::list_all(self.session_dir.as_deref())
-        }
+            SessionManager::list_all_with_progress(self.session_dir.as_deref(), Some(on_progress))
+        };
+        (sessions, load_counts.get())
     }
 
     fn set_status(&mut self, kind: StatusKind, message: impl Into<String>) {
@@ -861,10 +886,21 @@ impl SessionSelectorComponent {
     fn load_scope(&mut self, scope_all: bool) {
         if scope_all {
             if self.all_sessions.is_none() {
-                self.all_sessions = Some(self.load_all());
+                let (sessions, progress) = self.load_all();
+                self.all_sessions = Some(sessions);
+                self.last_load_progress = progress;
             }
         } else {
-            self.current_sessions = SessionManager::list(&self.cwd, self.session_dir.as_deref());
+            let load_counts = std::cell::Cell::new(None);
+            let on_progress: &SessionListProgress<'_> = &|loaded, total, _| {
+                load_counts.set(Some((loaded, total)));
+            };
+            self.current_sessions = SessionManager::list_with_progress(
+                &self.cwd,
+                self.session_dir.as_deref(),
+                Some(on_progress),
+            );
+            self.last_load_progress = load_counts.get();
         }
         let sessions = self.sessions_for_scope(scope_all);
         self.session_list.set_sessions(sessions, scope_all);
@@ -1138,6 +1174,25 @@ mod tests {
             "{plain}"
         );
         assert!(plain.contains("Resume Session (Current Folder)"), "{plain}");
+    }
+
+    /// The selector now passes a `SessionListProgress` callback into the
+    /// loader (`session-manager.ts:885-890,1916-2035`); the final counts equal
+    /// the number of discoverable session files on both scopes.
+    #[test]
+    fn session_load_progress_is_reported() {
+        let (dir, sessions) = fixture_dir();
+        make_session(dir.path(), &sessions, "first");
+        make_session(dir.path(), &sessions, "second");
+
+        let (component, _events) = fixture_component(dir.path(), &sessions, None);
+        assert_eq!(component.last_load_progress, Some((2, 2)));
+
+        let (mut component, _events) = fixture_component(dir.path(), &sessions, None);
+        component.load_scope(true);
+        assert_eq!(component.last_load_progress, Some((2, 2)));
+        component.load_scope(false);
+        assert_eq!(component.last_load_progress, Some((2, 2)));
     }
 
     #[test]

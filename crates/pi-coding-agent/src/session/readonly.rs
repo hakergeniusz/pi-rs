@@ -11,6 +11,10 @@
 //! blanket impl) for references to any implementor. Callers hold an
 //! `&dyn ReadonlySessionManager` to get the same capability-limited view. The
 //! trait is purely additive: `SessionManager`'s inherent methods are unchanged.
+//! Production consumers: [`super::cwd::assert_session_cwd_exists`] (the
+//! `/import` / `/resume` gate) and the interactive host's `readonly_session()`
+//! seam, which extension-facing payloads use to read session state without
+//! touching the mutable store.
 
 use std::path::Path;
 
