@@ -45,17 +45,34 @@
 //! deliveries split into [`ExtensionRunner::begin_ui_dialog`] +
 //! [`ExtensionRunner::complete_ui_dialog`] so a dialog's wait never holds
 //! the runner mutex.
+//!
+//! `/reload` (`ExtensionRunner::reload`) ports upstream's
+//! `clearExtensionCache()` + fresh-runner sequence
+//! (`core/resource-loader.ts:541-545`, `core/agent-session.ts:3826-3849`,
+//! `core/extensions/loader.ts:145-151`): the module cache is dropped and every
+//! extension file is re-evaluated, so no handler, tool, flag, command,
+//! shortcut, renderer, or MCP registration from the previous evaluation
+//! survives. Because the port reuses one engine, this is reproduced by
+//! rebuilding the JS runtime over the carried-over host core — a fresh runtime
+//! has empty `__piExtensions` and module caches — and re-loading every
+//! discovered path. The stale-ctx protocol
+//! (`core/extensions/loader.ts:200-205`, `runner.ts:729-737`) is applied to the
+//! outgoing runtime so captured `pi`/ctx objects from the previous evaluation
+//! throw afterwards.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
 
+use crate::loader::LoadExtensionsResult;
+
 use crate::engine::{
     ContextKind, HostCore, JsHost, ThemeByNameFn, ThemeHandleStyler, ThemeSetNameFn,
 };
-use crate::error::{ExtensionError, JsHostError};
+use crate::error::{ExtensionError, JsHostError, LoadError};
 use crate::events::{
     self, BeforeAgentStartCombined, BeforeAgentStartResult, BeforeAgentStartTrigger,
     BoundaryDispatchResult, InputResult, ProjectTrustResult, SessionBeforeResult, SessionOutcome,
@@ -646,6 +663,107 @@ impl ExtensionRunner {
         }
         self.refresh_snapshots()?;
         Ok(())
+    }
+
+    /// `/reload`'s per-path unload + re-evaluation (upstream
+    /// `clearExtensionCache()` + a fresh runner, `resource-loader.ts:541-545`
+    /// and `agent-session.ts:3826-3849`).
+    ///
+    /// Upstream drops the extension factory cache and builds a brand-new
+    /// runner, so every extension file is re-evaluated and none of the prior
+    /// evaluation's handlers, tools, commands, flags, shortcuts, renderers,
+    /// or MCP registrations survive. The port reuses one engine; this method
+    /// reproduces that by rebuilding the JS runtime over the carried-over
+    /// host core — a fresh runtime has empty `__piExtensions` and module
+    /// caches — and then re-evaluating each `path` in order. Host-facing state
+    /// (settings, cwd, UI mode, flag values, error listeners, UI sink) carries
+    /// over; extension-owned state does not. The caller keeps its existing
+    /// `bind()` / `session_start` / MCP-reconnect sequence after this returns.
+    ///
+    /// The stale-ctx protocol is applied to the outgoing runtime first
+    /// (`agent-session.ts:3829`): captured `pi`/ctx objects from the old
+    /// evaluation throw afterwards, while the freshly evaluated extensions
+    /// get untarnished contexts.
+    #[must_use]
+    pub fn reload(&mut self, paths: &[PathBuf]) -> LoadExtensionsResult {
+        self.reload_with_sources(paths, &[])
+    }
+
+    /// [`Self::reload`] with per-path inline source overrides. `sources`
+    /// parallels `paths`; a missing or `None` entry reads the file from disk
+    /// exactly like [`Self::load_extension`]. Tests use this to simulate an
+    /// edited extension file without touching the filesystem.
+    #[must_use]
+    fn reload_with_sources(
+        &mut self,
+        paths: &[PathBuf],
+        sources: &[Option<&str>],
+    ) -> LoadExtensionsResult {
+        // The outgoing runtime's captured contexts must go stale even though
+        // its registries are about to be discarded (`runner.ts:729-737`).
+        let _ = self.host.invalidate(None);
+
+        // Close MCP connections and clear extension-owned registry state so
+        // the caller's post-reload `connect_mcp_servers()` starts from an
+        // empty registry (`session_shutdown`, `index.ts:1250-1256`). The
+        // host-owned manager (with its auth dir) is kept in the carried core.
+        self.shutdown_mcp();
+        {
+            let mut core = self.core.lock().expect("host core mutex poisoned");
+            core.mcp_changes.clear();
+            core.provider_bind_errors.clear();
+            // Upstream's fresh runner has no providers or MCP servers; both
+            // registries are rebuilt by the re-evaluated extensions.
+            let _ = std::mem::take(&mut core.mcp);
+            let _ = std::mem::take(&mut core.providers);
+        }
+
+        // Move the host core out of the shared mutex. `mem::take` leaves a
+        // default core behind for the outgoing runtime, which is dropped when
+        // `*self` is replaced below. The taken core seeds the fresh runtime.
+        let core = {
+            let mut guard = self.core.lock().expect("host core mutex poisoned");
+            std::mem::take(&mut *guard)
+        };
+        let mut fresh = match ExtensionRunner::new(core) {
+            Ok(runner) => runner,
+            Err(error) => {
+                // Runtime creation failure is OOM-class; the shared mutex
+                // still holds the default core left by `mem::take`, so the
+                // runner stays usable (headless) instead of panicking.
+                return LoadExtensionsResult {
+                    extensions: Vec::new(),
+                    errors: paths
+                        .iter()
+                        .map(|path| LoadError {
+                            path: path.to_string_lossy().into_owned(),
+                            error: error.to_string(),
+                        })
+                        .collect(),
+                };
+            }
+        };
+        // Carry the host-facing bindings over; every extension-owned field
+        // (snapshots, MCP state, shortcuts, prompt depth) stays fresh.
+        fresh.error_listeners = std::mem::take(&mut self.error_listeners);
+        fresh.ui_sink = self.ui_sink.take();
+        *self = fresh;
+
+        // Re-evaluate every path in discovery order. A failing file produces
+        // an error value and never stops the others.
+        let mut outcome = LoadExtensionsResult::default();
+        for (index, path) in paths.iter().enumerate() {
+            let display = path.to_string_lossy().into_owned();
+            let source = sources.get(index).copied().flatten();
+            match self.load_extension(&display, source) {
+                Ok(()) => outcome.extensions.push(display),
+                Err(error) => outcome.errors.push(LoadError {
+                    path: display,
+                    error: error.to_string(),
+                }),
+            }
+        }
+        outcome
     }
 
     /// Binds the runtime and syncs the aggregated tool state the ops
@@ -7550,5 +7668,174 @@ export default function (pi) {
             ],
             "{headless_notifies:?}"
         );
+    }
+
+    // ---- /reload: per-path unload + re-evaluation (E4 deviation) ----
+
+    /// v1 registers a `session_start` handler plus tool/command/flag
+    /// metadata; v2 drops the handler and replaces the metadata.
+    const RELOAD_V1: &str = r#"
+export default function (pi) {
+  pi.on("session_start", () => pi.appendEntry("start", "v1"));
+  pi.on("tool_result", () => pi.appendEntry("result", "v1"));
+  pi.registerTool({
+    name: "old_tool", label: "old", description: "one",
+    parameters: { type: "object", properties: {} },
+    execute: async () => ({ content: [{ type: "text", text: "old" }] }),
+  });
+  pi.registerCommand("old_cmd", { description: "one", handler: async () => {} });
+  pi.registerFlag("mode", { type: "string", default: "first" });
+}
+"#;
+
+    const RELOAD_V2: &str = r#"
+export default function (pi) {
+  pi.registerTool({
+    name: "new_tool", label: "new", description: "two",
+    parameters: { type: "object", properties: {} },
+    execute: async () => ({ content: [{ type: "text", text: "new" }] }),
+  });
+  pi.registerCommand("new_cmd", { description: "two", handler: async () => {} });
+  pi.registerFlag("mode", { type: "string", default: "second" });
+}
+"#;
+
+    #[test]
+    fn reload_drops_handlers_removed_from_source() {
+        let mut runner = runner_with(&[RELOAD_V1]);
+        assert!(runner.has_handlers("session_start"));
+        assert!(runner.has_handlers("tool_result"));
+        runner
+            .emit(&events::session_start("startup"))
+            .expect("emit-before");
+        assert_eq!(
+            entries_of(&runner),
+            vec![json!({ "type": "start", "data": "v1" })]
+        );
+
+        let paths = [PathBuf::from("<test-0>")];
+        let outcome = runner.reload_with_sources(&paths, &[Some(RELOAD_V2)]);
+        assert_eq!(outcome.errors, Vec::<LoadError>::new());
+        assert_eq!(outcome.extensions, vec!["<test-0>"]);
+        runner.bind().expect("bind");
+
+        // The old evaluation's handlers are gone; the fresh source registers
+        // neither event, so re-emitting adds nothing.
+        assert!(!runner.has_handlers("session_start"));
+        assert!(!runner.has_handlers("tool_result"));
+        runner
+            .emit(&events::session_start("reload"))
+            .expect("emit-after");
+        assert_eq!(
+            entries_of(&runner),
+            vec![json!({ "type": "start", "data": "v1" })]
+        );
+        // No stale empty records survived the runtime rebuild.
+        assert_eq!(runner.extension_paths(), vec!["<test-0>"]);
+    }
+
+    #[test]
+    fn reload_re_registers_changed_metadata() {
+        let mut runner = runner_with(&[RELOAD_V1]);
+        assert!(runner.tool("old_tool").is_some());
+        assert!(runner.command("old_cmd").is_some());
+        assert_eq!(runner.flags()[0].name, "mode");
+
+        let paths = [PathBuf::from("<test-0>")];
+        runner.reload_with_sources(&paths, &[Some(RELOAD_V2)]);
+        runner.bind().expect("bind");
+
+        assert!(runner.tool("old_tool").is_none());
+        assert!(runner.command("old_cmd").is_none());
+        let tool = runner.tool("new_tool").expect("new tool");
+        assert_eq!(tool.description, "two");
+        assert!(runner.command("new_cmd").is_some());
+        assert_eq!(
+            runner.command("new_cmd").expect("new cmd").description,
+            "two"
+        );
+        let flags = runner.flags();
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].name, "mode");
+        // The re-evaluated registration refreshed the aggregated tool state.
+        assert!(runner.active_tools().contains(&"new_tool".to_string()));
+        assert!(!runner.active_tools().contains(&"old_tool".to_string()));
+    }
+
+    #[test]
+    fn reload_preserves_stale_ctx_protocol_and_fresh_contexts() {
+        const CAPTURE: &str = r#"
+export default function (pi) {
+  let saved;
+  pi.on("save", () => { saved = pi; });
+  pi.on("use", () => { saved.appendEntry("used", 1); });
+}
+"#;
+        let mut runner = runner_with(&[CAPTURE]);
+        let errors = errors_of(&mut runner);
+        runner.emit(&json!({ "type": "save" })).expect("save");
+        runner.invalidate(None).expect("invalidate");
+        runner.emit(&json!({ "type": "use" })).expect("use");
+        {
+            let errors = errors.lock().expect("errors");
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].error.contains("stale"), "{}", errors[0].error);
+        }
+
+        // The reload rebuilds the runtime with an untarnished staleMessage,
+        // so the newly evaluated handler runs normally.
+        const FRESH: &str = r#"
+export default function (pi) {
+  pi.on("use", () => pi.appendEntry("fresh", 1));
+}
+"#;
+        let paths = [PathBuf::from("<test-0>")];
+        runner.reload_with_sources(&paths, &[Some(FRESH)]);
+        runner.bind().expect("bind");
+        runner
+            .emit(&json!({ "type": "use" }))
+            .expect("use-after-reload");
+        assert!(
+            entries_of(&runner)
+                .iter()
+                .any(|entry| entry["type"] == "fresh")
+        );
+    }
+
+    #[test]
+    fn reload_drops_mcp_registrations_and_connections() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let server = crate::mcp_manager::write_fixture_server(directory.path()).expect("fixture");
+        let v1 = mcp_extension_source(&server, "");
+        let mut runner = runner_with(&[v1.as_str()]);
+        runner.connect_mcp_servers().expect("connect-before");
+        assert_eq!(runner.mcp_server_reports().len(), 1);
+        assert!(
+            runner
+                .all_registered_tools()
+                .iter()
+                .any(|tool| tool.name == "mcp__synth__echo")
+        );
+
+        // Reload with a source that registers no MCP server at all.
+        const EMPTY: &str = "export default function (pi) {}";
+        let paths = [PathBuf::from("<test-0>")];
+        runner.reload_with_sources(&paths, &[Some(EMPTY)]);
+        runner.bind().expect("bind");
+        assert!(
+            runner
+                .connect_mcp_servers()
+                .expect("connect-after")
+                .is_empty()
+        );
+        assert!(runner.mcp_server_reports().is_empty());
+        assert!(runner.core().lock().expect("core").mcp.list().is_empty());
+        assert!(
+            runner
+                .all_registered_tools()
+                .iter()
+                .all(|tool| !tool.name.starts_with("mcp__"))
+        );
+        assert!(runner.tool("mcp__synth__echo").is_none());
     }
 }
