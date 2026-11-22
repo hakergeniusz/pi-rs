@@ -430,11 +430,20 @@ fn fold_expression(expression: &str, consts: &[(String, String)]) -> Option<Stri
         return fold_expression(&text[1..text.len() - 1], consts);
     }
     let first = text.chars().next()?;
-    if matches!(first, '\'' | '"') && text.len() >= 2 && text.ends_with(first) {
+    let literal_chars: Vec<char> = text.chars().collect();
+    // `"a" + "b"` starts and ends with a quote but is not one literal: only
+    // treat the text as a literal when the leading quote closes at the end.
+    if matches!(first, '\'' | '"')
+        && text.len() >= 2
+        && skip_quoted(&literal_chars, 0) == Some(literal_chars.len())
+    {
         let inner = &text[1..text.len() - 1];
         return (!inner.contains('\\')).then(|| inner.to_string());
     }
-    if first == '`' && text.len() >= 2 && text.ends_with('`') {
+    if first == '`'
+        && text.len() >= 2
+        && skip_quoted(&literal_chars, 0) == Some(literal_chars.len())
+    {
         let inner = &text[1..text.len() - 1];
         return (!inner.contains("${") && !inner.contains('\\')).then(|| inner.to_string());
     }
@@ -460,7 +469,10 @@ fn fold_expression(expression: &str, consts: &[(String, String)]) -> Option<Stri
                 depth -= 1;
                 index += 1;
             }
-            '+' if depth == 0 => plus = Some(index),
+            '+' if depth == 0 => {
+                plus = Some(index);
+                index += 1;
+            }
             _ => index += 1,
         }
     }
@@ -831,17 +843,17 @@ const note = "require('not-a-real-import')";
     fn dynamic_require_and_node_modules_share_the_static_import_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(
-            &dir.path().join("node_modules/pi-test-dep/index.js"),
+            &dir.path().join("node_modules/test-dep-local/index.js"),
             "exports.tag = \"from-node-modules\";\n",
         );
         let entry = dir.path().join("entry.js");
         write(
             &entry,
-            "const name = \"pi-\" + \"test-dep\";\nconst dep = require(name);\nmodule.exports = function () { globalThis.__dyn = dep.tag; };\n",
+            "const name = \"test-\" + \"dep-local\";\nconst dep = require(name);\nmodule.exports = function () { globalThis.__dyn = dep.tag; };\n",
         );
         let prepared = crate::cjs::entry_source(&entry).expect("prepared");
         assert!(
-            prepared.contains("import * as __piCjsDep0 from \"pi-test-dep\""),
+            prepared.contains("import * as __piCjsDep0 from \"test-dep-local\""),
             "{prepared}"
         );
         let host = test_host();
