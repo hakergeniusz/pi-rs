@@ -463,10 +463,10 @@ fn emit_shutdown(runtime: &PrintRuntime, reason: &str, target: Option<&str>) {
         eprintln!("Warning: Extension error: session_shutdown: {error}");
     }
     #[cfg(feature = "ext-js")]
-    if let Some(runner) = &runtime.extension_runner {
-        if let Ok(mut runner) = runner.lock() {
-            runner.shutdown_mcp();
-        }
+    if let Some(runner) = &runtime.extension_runner
+        && let Ok(mut runner) = runner.lock()
+    {
+        runner.shutdown_mcp();
     }
 }
 
@@ -1849,9 +1849,8 @@ fn handle_command(
                 model.provider == runtime.model.provider && model.id == runtime.model.id
             });
             let next_index = match (current, models.len()) {
-                (_, 0) => None,
+                (_, 0) | (Some(_), 1) => None,
                 (None, _) => Some(0),
-                (Some(_), 1) => None,
                 (Some(index), len) => Some((index + 1) % len),
             };
             let Some(next) = next_index.and_then(|index| models.get(index)) else {
@@ -2592,9 +2591,12 @@ mod tests {
 
         // A junk `type` is the unknown frame; a missing one is `undefined`.
         let (incoming, _, type_name) =
-            parse_request(r#"{"type":"bash","command":"ls","id":"x"}"#).expect("parse");
-        assert_eq!(incoming, Incoming::Unknown(Some("bash".to_string())));
-        assert_eq!(type_name.as_deref(), Some("bash"));
+            parse_request(r#"{"type":"not_a_command","id":"x"}"#).expect("parse");
+        assert_eq!(
+            incoming,
+            Incoming::Unknown(Some("not_a_command".to_string()))
+        );
+        assert_eq!(type_name.as_deref(), Some("not_a_command"));
         let (incoming, id, type_name) = parse_request(r#"{"payload":true}"#).expect("parse");
         assert_eq!(incoming, Incoming::Unknown(None));
         assert_eq!(id, None);
@@ -3067,7 +3069,7 @@ mod tests {
             assert_eq!(type_name.as_deref(), Some(kind), "{line}");
             assert!(id.is_some(), "{line}");
             match incoming {
-                Incoming::Command(command) => {
+                Incoming::Command(_command) => {
                     // Round-trip through the success frame: every command echo
                     // is verbatim (`rpc-mode.ts:64-77`).
                     let frame = RpcResponse::success(id.as_deref(), kind, None);
