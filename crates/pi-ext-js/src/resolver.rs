@@ -7,34 +7,41 @@
 //! directory (jiti), and the entry rules (`loader.ts:748-750`: `.ts`/`.js`
 //! only; `loader.ts:761-791`: `index.ts` before `index.js`).
 //!
-//! E1 deliberately resolves *no* `node_modules`: the table covers the
-//! specifiers the bundled extensions import, host packages and `node:*`
-//! built-ins error with the E1 explanation (built-ins land in E4,
-//! `docs/EXTENSIONS.md` §6.3).
+//! E1 deliberately resolved *no* `node_modules`; E4 adds the `node:*` and
+//! host-package virtual modules served by [`node`] while keeping that same
+//! no-`node_modules` rule. Unknown specifiers still error with the E1
+//! explanation (`docs/EXTENSIONS.md` §6.3).
 
 use std::path::{Path, PathBuf};
 
 use rquickjs::{Ctx, Module, Result as JsResult};
 
-/// Sources of the virtual modules the E1 host serves.
+#[path = "node/mod.rs"]
+pub mod node;
+
+/// Sources of the virtual modules the host serves.
 ///
 /// `typebox` and `@earendil-works/pi-codemode/declarations` are the
-/// specifiers the bundled `tool-search` extension imports; host packages
-/// error like upstream's would without their bundle, with the E1 message.
+/// specifiers the bundled `tool-search` extension imports (E1); E4 adds the
+/// `node:*` built-ins and the host packages in [`node`]. Every other
+/// specifier is rejected with the documented E1 explanation.
 pub fn virtual_module_source(specifier: &str) -> Option<&'static str> {
     match specifier {
         "typebox" | "@sinclair/typebox" => Some(crate::glue::TYPEBOX_SHIM),
         "@earendil-works/pi-codemode/declarations" => Some(crate::glue::DECLARATIONS_SHIM),
-        _ => None,
+        _ => node::source(specifier),
     }
 }
 
-/// Whether a specifier is a host package the E1 core does not bundle.
+/// Whether a specifier is a host package the core does not serve. E4 serves
+/// the state-backed packages in [`node::HOST_PACKAGES`]; the rest keep the
+/// upstream (E1) rejection string.
 pub fn is_unavailable_host_module(specifier: &str) -> bool {
-    specifier.starts_with("@earendil-works/")
-        || specifier.starts_with("@mariozechner/")
-        || specifier.starts_with("pi-")
-        || specifier == "pi-coding-agent"
+    !node::HOST_PACKAGES.contains(&specifier)
+        && (specifier.starts_with("@earendil-works/")
+            || specifier.starts_with("@mariozechner/")
+            || specifier.starts_with("pi-")
+            || specifier == "pi-coding-agent")
 }
 
 /// Reads a `pi.extensions` manifest from a `package.json` body
@@ -144,11 +151,13 @@ fn throw_js_error(ctx: &Ctx<'_>, message: &str) -> rquickjs::Error {
     }
 }
 
-/// The resolution error for specifiers E1 does not support.
+/// The resolution error for specifiers this host does not serve. The
+/// host-package branch keeps the documented E1 string verbatim — bundled
+/// packages we cannot provide must keep failing the same way.
 fn throw_unavailable_module(ctx: &Ctx<'_>, name: &str) -> rquickjs::Error {
     let message = if name.starts_with("node:") {
         format!(
-            "Module \"{name}\" is not available in the E1 headless extensions core; node built-in modules land in E4"
+            "Module \"{name}\" is not polyfilled by the extensions host; see crates/pi-ext-js/src/node for the supported set"
         )
     } else {
         format!(

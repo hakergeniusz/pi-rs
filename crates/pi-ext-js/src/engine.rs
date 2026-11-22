@@ -18,7 +18,9 @@
 //! `pi.exec` exactly where upstream awaits them. The provider-stream op
 //! extends the same pattern to a stashed `streamSimple` handler's event
 //! stream (`core/provider-composer.ts:588-613`, `packages/ai`
-//! `StreamFunction` + `AssistantMessageEventStream`).
+//! `StreamFunction` + `AssistantMessageEventStream`). E4 adds the
+//! `crate::resolver::node` op group: the `node:*` built-ins and host packages share
+//! this same HostCore-backed boundary rather than reaching the host process.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1030,6 +1032,10 @@ impl JsHost {
                 .push((entry_id, label));
             String::new()
         });
+        // E4: the `node:*` and host-package shims install their own ops on
+        // the same private object; they read the same HostCore state the pi
+        // API does (see `resolver::node`).
+        crate::resolver::node::install_ops(ctx, core)?;
         Ok(())
     }
 
@@ -2452,22 +2458,34 @@ mod tests {
     }
 
     #[test]
-    fn node_imports_error_with_the_e4_message() {
+    fn supported_node_imports_resolve_and_unsupported_ones_reject() {
         let dir = std::env::temp_dir().join(format!("pi-ext-js-node-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("main.ts"),
-            "import { readFileSync } from \"node:fs\";\nexport default function (): void {\n  globalThis.__used = typeof readFileSync;\n}\n",
+            "import { join } from \"node:path\";\nexport default function (): void {\n  globalThis.__used = join(\"a\", \"b\");\n}\n",
         )
         .expect("write");
         let host = host();
         let index = host
             .begin_extension(&dir.join("main.ts").to_string_lossy())
             .expect("begin");
+        host.load_extension_module(index, &dir.join("main.ts").to_string_lossy(), None)
+            .expect("node:path now resolves");
+        assert_eq!(host.eval_for_tests("globalThis.__used").expect("eval"), "a/b");
+
+        std::fs::write(
+            dir.join("unsupported.ts"),
+            "import { x } from \"node:sqlite\";\nexport default function (): void { void x; }\n",
+        )
+        .expect("write");
+        let index = host
+            .begin_extension(&dir.join("unsupported.ts").to_string_lossy())
+            .expect("begin");
         let err = host
-            .load_extension_module(index, &dir.join("main.ts").to_string_lossy(), None)
-            .expect_err("node import must fail");
-        assert!(err.to_string().contains("land in E4"), "{err}");
+            .load_extension_module(index, &dir.join("unsupported.ts").to_string_lossy(), None)
+            .expect_err("unsupported node built-in must fail");
+        assert!(err.to_string().contains("not polyfilled"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
