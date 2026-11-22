@@ -25,21 +25,36 @@
 //! * `packages/telemetry/src/render.ts:1-72` — control-character escaping
 //!   (`:3-10`), microsecond rounding (`:12-15`), attribute formatting
 //!   (`:17-21`), `renderTrace` (`:23-72`).
+//! * `packages/coding-agent/src/modes/interactive/interactive-mode.ts:1373-1403`,
+//!   `:1472-1489` — changelog-triggered install/update ping
+//!   (`reportInstallTelemetry`), its `PI_OFFLINE`/telemetry gates and its
+//!   version-only `pi.dev` URL (ported in [`ping`]).
+//! * `packages/coding-agent/src/core/client-identity.ts:1-16` and
+//!   `packages/ai/src/utils/identity.ts:24`, `:75-82` — `getClientIdentity`,
+//!   `PI_ATTRIBUTION` and the detailed `User-Agent` (ported in [`ping`]).
+//! * `packages/telemetry/src/testing/types.ts:4-21` and
+//!   `packages/telemetry/src/testing/conformance.ts:10-386` — adapter fixture,
+//!   case shapes and conformance cases (ported in [`conformance`]).
 //!
 //! # Scope of the subset
 //!
 //! Ported: every *runtime* behaviour in the files above — metric kinds and
 //! recording, the noop implementation, the thread-safe in-memory recorder,
-//! span/measurement storage and queries, carrier injection/extraction, and
-//! the exact render output. Deliberately omitted (see `WIRING.md`):
+//! span/measurement storage and queries, carrier injection/extraction, the
+//! exact render output, the anonymous install/update ping with its exact
+//! env gates, and the conformance case shapes. Deliberately omitted (see
+//! `WIRING.md`):
 //!
 //! * TS type-level machinery (`defineTelemetrySchema`, `createTypedMetrics`,
 //!   `createTypedSpanStarter`, the `Infer*`/`Exact*` conditional types —
 //!   `index.ts:132-461`, `metrics.ts:43-145`): compile-time sugar with no
 //!   runtime counterpart to port.
-//! * The external backend surfaces (`reportInstallTelemetry`'s fetch to
-//!   `pi.dev`, `PI_ATTRIBUTION` in `client-identity.ts`, HTTP/OTel/SQLite
-//!   exporters): these require a network endpoint, which the task excludes.
+//! * Exporters and tracing backends: upstream v1.5.2 has no exporter trait or
+//!   OTLP client. [`exporters`] adds a trait-shaped, locally inert
+//!   `OTLP/HTTP` surface around the ported stored records; no dependency or
+//!   default network call is introduced.
+//!
+//! The `//!` doc of each submodule cites its own upstream ground truth.
 //!
 //! # Deviations (mechanism only)
 //!
@@ -66,6 +81,15 @@ use std::fmt::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+// -- submodules --------------------------------------------------------------
+
+/// Runner-independent adapter conformance shapes and cases.
+pub mod conformance;
+/// Span/metric exporter traits, batching and the inert `OTLP/HTTP` encoder.
+pub mod exporters;
+/// The anonymous install/update ping and provider attribution.
+pub mod ping;
 
 // -- carrier keys (memory.ts:93-95, :179-183) ------------------------------
 
@@ -1454,8 +1478,8 @@ pub fn is_install_telemetry_enabled_from_env(settings_enabled: bool) -> bool {
 }
 
 /// Host-facing constructor: a noop recorder when telemetry is disabled and
-/// the in-memory recorder when it is enabled. The omitted install ping and
-/// attribution are documented in `WIRING.md`.
+/// the in-memory recorder when it is enabled. The ping gating and host wiring
+/// are documented in `WIRING.md` and implemented in [`ping`].
 pub fn construct_telemetry(enabled: bool) -> Arc<dyn Telemetry> {
     if enabled {
         Arc::new(InMemoryTelemetry::new())
