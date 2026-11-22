@@ -1716,6 +1716,19 @@ pub struct InteractiveMode {
     login_prompt_provider: Option<(String, String)>,
     /// Where a cancelled login returns to (`onBack`).
     login_back: Option<LoginBackStep>,
+    /// The running built-in per-provider OAuth flow (`loginProvider`'s
+    /// built-in arm, `interactive-mode.ts:6077-6085`).
+    builtin_login_flow: Option<crate::oauth::BuiltinLoginFlow>,
+    /// Events from the built-in flow's text/manual-code prompt.
+    builtin_login_prompt: Option<Arc<Mutex<Vec<LoginPromptEvent>>>>,
+    /// Events from the built-in flow's method selector.
+    builtin_login_select: Option<Arc<Mutex<Vec<AuthSelectorEvent>>>>,
+    /// The prompt currently mounted for the built-in flow, by interaction id.
+    builtin_login_prompt_id: Option<u64>,
+    /// Option ids behind the mounted method selector, by label.
+    builtin_select_options: Option<Vec<pi_ai::auth::AuthPromptOption>>,
+    /// Where a cancelled built-in login returns to (`onBack`).
+    builtin_login_back: Option<LoginBackStep>,
     /// The running extension-oauth login flow (slice 6j).
     #[cfg(feature = "ext-js")]
     extension_login_flow: Option<ExtensionLoginFlow>,
@@ -2004,6 +2017,12 @@ impl InteractiveMode {
             login_prompt_events: None,
             login_prompt_provider: None,
             login_back: None,
+            builtin_login_flow: None,
+            builtin_login_prompt: None,
+            builtin_login_select: None,
+            builtin_login_prompt_id: None,
+            builtin_select_options: None,
+            builtin_login_back: None,
             #[cfg(feature = "ext-js")]
             extension_login_flow: None,
             #[cfg(feature = "ext-js")]
@@ -8030,6 +8049,12 @@ impl InteractiveMode {
         self.auth_selector_events = None;
         self.login_prompt_events = None;
         self.login_prompt_provider = None;
+        self.builtin_login_flow = None;
+        self.builtin_login_prompt = None;
+        self.builtin_login_select = None;
+        self.builtin_login_prompt_id = None;
+        self.builtin_select_options = None;
+        self.builtin_login_back = None;
         self.tui.set_focus(Some(FocusTarget::Id(self.editor_id)));
     }
 
@@ -8193,6 +8218,7 @@ impl InteractiveMode {
         // editor owns input while `/reload` is typed, and a mounted
         // dialog parks the editor — but the port runs it anyway, exactly
         // like upstream, so the invariant never depends on that reach.
+        self.cancel_builtin_login_flow();
         #[cfg(feature = "ext-js")]
         self.cancel_extension_login_flow();
         #[cfg(feature = "ext-js")]
@@ -9819,9 +9845,18 @@ impl InteractiveMode {
             if self.start_extension_oauth_login(provider, back) {
                 return;
             }
-            // The per-provider OAuth flows (PKCE/device-code/callback
-            // servers, `packages/ai/src/auth/oauth/*.ts`) are not ported
-            // yet; the upstream error shape reports the honest reason.
+            // Built-in flows (Anthropic, OpenAI Codex, GitHub Copilot) run
+            // in pi-ai and are pumped through the same dialog surface as the
+            // extension flows. Other OAuth providers keep the honest error.
+            if let Some(flow) = crate::oauth::BuiltinLoginFlow::start(provider) {
+                if let Some(old) = self.builtin_login_flow.take() {
+                    old.cancel();
+                }
+                self.builtin_login_flow = Some(flow);
+                self.builtin_login_back = back;
+                self.pump_builtin_login_flow();
+                return;
+            }
             self.show_error(&format!(
                 "Failed to login to {}: OAuth login flows are not implemented in pi-rs yet",
                 provider.name
@@ -9847,6 +9882,252 @@ impl InteractiveMode {
                 .to_string();
             self.open_login_prompt(&provider.id, &provider.name, &auth_name, back);
         }
+    }
+
+    // ---- Built-in per-provider OAuth login (pi-ai auth/oauth/*.ts) ----
+
+    /// The built-in flow's step drain (`loginProvider`'s notify/ask loop,
+    /// `interactive-mode.ts:6539-6583`).
+    fn pump_builtin_login_flow(&mut self) {
+        use crate::oauth::BuiltinFlowPoll;
+        let poll = self
+            .builtin_login_flow
+            .as_ref()
+            .map_or(BuiltinFlowPoll::Idle, crate::oauth::BuiltinLoginFlow::poll);
+        match poll {
+            BuiltinFlowPoll::Idle => {}
+            BuiltinFlowPoll::Notify(event) => self.show_builtin_login_notification(&event),
+            BuiltinFlowPoll::Prompt { id, prompt } => {
+                self.mount_builtin_login_prompt(id, &prompt);
+            }
+            BuiltinFlowPoll::PromptClosed { id } => {
+                if self.builtin_login_prompt_id == Some(id) {
+                    self.builtin_login_prompt = None;
+                    self.builtin_login_select = None;
+                    self.builtin_login_prompt_id = None;
+                    self.builtin_select_options = None;
+                    self.restore_editor();
+                }
+            }
+            BuiltinFlowPoll::Settled(result) => {
+                let Some(flow) = self.builtin_login_flow.take() else {
+                    return;
+                };
+                self.finish_builtin_login(&flow, result);
+            }
+        }
+    }
+
+    /// `notifyAuthDialog` (`interactive-mode.ts:6507-6518`) for the built-in
+    /// flows: sign-in URLs, device codes, and progress lines.
+    fn show_builtin_login_notification(&mut self, event: &pi_ai::auth::AuthEvent) {
+        match event {
+            pi_ai::auth::AuthEvent::AuthUrl {
+                url, instructions, ..
+            } => {
+                if let Some(instructions) = instructions {
+                    self.show_status(instructions);
+                }
+                self.show_status(&format!("Sign in: {url}"));
+            }
+            pi_ai::auth::AuthEvent::DeviceCode {
+                user_code,
+                verification_uri,
+                ..
+            } => {
+                self.show_status(&format!("Enter code {user_code} at {verification_uri}"));
+                self.show_status(&format!(
+                    "Waiting for authentication... ({})",
+                    self.builtin_login_flow
+                        .as_ref()
+                        .map_or("provider", crate::oauth::BuiltinLoginFlow::provider_name)
+                ));
+            }
+            pi_ai::auth::AuthEvent::Progress { message }
+            | pi_ai::auth::AuthEvent::Info { message, .. } => self.show_status(message),
+        }
+    }
+
+    /// `showAuthPrompt` (`interactive-mode.ts:6483-6505`): a select opens the
+    /// option selector; text/secret/manual-code opens the entry dialog.
+    fn mount_builtin_login_prompt(&mut self, id: u64, prompt: &pi_ai::auth::AuthPrompt) {
+        if self.suspended_editor.is_some() {
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        self.builtin_login_prompt_id = Some(id);
+        match prompt {
+            pi_ai::auth::AuthPrompt::Select { message, options } => {
+                let labels = options
+                    .iter()
+                    .map(|option| option.label.clone())
+                    .collect::<Vec<_>>();
+                let selector = AuthSelectorComponent::options(message, labels, Arc::clone(&events));
+                self.builtin_select_options = Some(options.clone());
+                self.builtin_login_select = Some(events);
+                self.builtin_login_prompt = None;
+                self.suspend_editor_with(Box::new(selector));
+            }
+            pi_ai::auth::AuthPrompt::Text {
+                message,
+                placeholder,
+            }
+            | pi_ai::auth::AuthPrompt::Secret {
+                message,
+                placeholder,
+            }
+            | pi_ai::auth::AuthPrompt::ManualCode {
+                message,
+                placeholder,
+            } => {
+                let dialog =
+                    LoginPromptComponent::new(message, placeholder.as_deref(), Arc::clone(&events));
+                self.builtin_login_prompt = Some(events);
+                self.builtin_login_select = None;
+                self.builtin_select_options = None;
+                self.suspend_editor_with(Box::new(dialog));
+            }
+        }
+    }
+
+    /// `showPrompt`'s resolver for the built-in text/manual-code asks.
+    fn pump_builtin_login_prompt(&mut self) {
+        if self.builtin_login_prompt.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .builtin_login_prompt
+                .as_ref()
+                .expect("built-in login prompt")
+                .lock()
+                .expect("built-in login prompt events"),
+        );
+        for event in events {
+            match event {
+                LoginPromptEvent::Submit(value) => {
+                    let Some(id) = self.builtin_login_prompt_id.take() else {
+                        continue;
+                    };
+                    self.builtin_login_prompt = None;
+                    self.restore_editor();
+                    if let Some(flow) = self.builtin_login_flow.as_ref() {
+                        flow.answer(id, value);
+                    }
+                }
+                LoginPromptEvent::Cancel => {
+                    self.builtin_login_prompt = None;
+                    self.restore_editor();
+                    self.cancel_builtin_login_flow();
+                }
+            }
+        }
+    }
+
+    /// `showAuthSelect`'s resolver (`interactive-mode.ts:6450-6481`): the
+    /// picked label maps back to the option id the flow expects.
+    fn pump_builtin_login_select(&mut self) {
+        if self.builtin_login_select.is_none() {
+            return;
+        }
+        let events = std::mem::take(
+            &mut *self
+                .builtin_login_select
+                .as_ref()
+                .expect("built-in login select")
+                .lock()
+                .expect("built-in login select events"),
+        );
+        for event in events {
+            match event {
+                AuthSelectorEvent::SelectOption(label) => {
+                    let id = self.builtin_login_prompt_id.take();
+                    let option_id = self.builtin_select_options.as_ref().and_then(|options| {
+                        options
+                            .iter()
+                            .find(|option| option.label == label)
+                            .map(|option| option.id.clone())
+                    });
+                    self.builtin_login_select = None;
+                    self.builtin_select_options = None;
+                    self.restore_editor();
+                    match (id, option_id) {
+                        (Some(id), Some(option)) => {
+                            if let Some(flow) = self.builtin_login_flow.as_ref() {
+                                flow.answer(id, option);
+                            }
+                        }
+                        _ => self.cancel_builtin_login_flow(),
+                    }
+                }
+                AuthSelectorEvent::Cancel => {
+                    self.builtin_login_select = None;
+                    self.builtin_select_options = None;
+                    self.restore_editor();
+                    self.cancel_builtin_login_flow();
+                }
+                AuthSelectorEvent::Select { .. } => {}
+            }
+        }
+    }
+
+    /// Abort a running built-in flow (`showLoginDialog`'s cancel branch):
+    /// drop the flow, close any mounted ask, and follow its `onBack`.
+    fn cancel_builtin_login_flow(&mut self) {
+        let Some(flow) = self.builtin_login_flow.take() else {
+            self.tui.request_render();
+            return;
+        };
+        flow.cancel();
+        self.builtin_login_prompt = None;
+        self.builtin_login_select = None;
+        self.builtin_login_prompt_id = None;
+        self.builtin_select_options = None;
+        self.restore_editor();
+        let back = self.builtin_login_back.take();
+        self.run_login_back(back);
+    }
+
+    /// Persist a settled built-in credential (`completeProviderAuthentication`,
+    /// `interactive-mode.ts:6303-6359`), or report the upstream error.
+    fn finish_builtin_login(
+        &mut self,
+        flow: &crate::oauth::BuiltinLoginFlow,
+        result: Result<crate::auth::Credential, String>,
+    ) {
+        self.builtin_login_prompt = None;
+        self.builtin_login_select = None;
+        self.builtin_login_prompt_id = None;
+        self.builtin_select_options = None;
+        self.restore_editor();
+        match result {
+            Err(message) if message == pi_ai::auth::CANCEL_MESSAGE => {
+                let back = self.builtin_login_back.take();
+                self.run_login_back(back);
+                return;
+            }
+            Err(message) => {
+                self.show_error(&format!(
+                    "Failed to login to {}: {message}",
+                    flow.provider_name()
+                ));
+            }
+            Ok(credential) => {
+                let storage = crate::auth::AuthStorage::create(&self.auth_path);
+                match storage.modify(flow.provider_id(), |_current| Ok(Some(credential))) {
+                    Ok(()) => self.show_status(&format!(
+                        "Logged in to {}. Credentials saved to {}",
+                        flow.provider_name(),
+                        self.auth_path.display()
+                    )),
+                    Err(error) => self.show_error(&format!(
+                        "Failed to save credentials for {}: {error}",
+                        flow.provider_name()
+                    )),
+                }
+            }
+        }
+        self.builtin_login_back = None;
     }
 
     /// `showApiKeyLoginDialog` + `loginProvider`'s prompt wiring
@@ -11835,6 +12116,9 @@ impl InteractiveMode {
         self.pump_branch_summary();
         self.pump_auth_selector();
         self.pump_login_prompt();
+        self.pump_builtin_login_prompt();
+        self.pump_builtin_login_select();
+        self.pump_builtin_login_flow();
         #[cfg(feature = "ext-js")]
         {
             self.pump_extension_login_prompt();
@@ -17046,20 +17330,71 @@ export default function (pi) {
         mode.shutdown().expect("shutdown");
     }
 
-    /// `/login` for an OAuth provider reports the unimplemented flow through
-    /// the upstream error shape (the slice 6c deviation: the per-provider
-    /// OAuth protocol machines in `packages/ai/src/auth/oauth/` are not
-    /// ported).
+    /// `/login <built-in oauth provider>` starts the ported flow and mounts
+    /// its login-method selector (`loginProvider`'s `onSelect` ask) instead
+    /// of the old unimplemented-flow error.
     #[test]
-    fn login_oauth_reports_the_unimplemented_flow() {
+    fn login_builtin_oauth_starts_the_flow() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
         mode.tui.start().expect("tui start");
 
         mode.submit("/login openai-codex");
+        // The flow runs on its own thread; give its first ask a few pump
+        // ticks to cross into the UI.
+        for _ in 0..50 {
+            mode.pump();
+            if mode.builtin_login_select.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         mode.tui.render_now(false);
         let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
-        assert!(frame.contains("Failed to login to"), "{frame}");
+        assert!(
+            frame.contains("Select OpenAI Codex login method:"),
+            "{frame}"
+        );
+        assert!(frame.contains("Device code login (headless)"), "{frame}");
+        assert!(mode.builtin_login_flow.is_some(), "flow started");
+        assert!(mode.builtin_login_select.is_some(), "method prompt mounted");
+
+        // Escape cancels the flow and restores the editor (upstream's
+        // `Login cancelled` -> `onBack`).
+        mode.builtin_login_select
+            .as_ref()
+            .expect("select")
+            .lock()
+            .expect("select events")
+            .push(AuthSelectorEvent::Cancel);
+        mode.pump();
+        assert!(mode.builtin_login_flow.is_none(), "flow cancelled");
+        assert!(mode.suspended_editor.is_none(), "editor restored");
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// Providers without a ported flow keep the honest upstream-shaped error
+    /// (Radius' branded flow stays outside this slice).
+    #[test]
+    fn login_unported_oauth_still_reports_the_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        let provider = AuthSelectorProvider {
+            id: "radius".to_string(),
+            name: "Radius".to_string(),
+            auth_type: "oauth",
+            subscription: false,
+            method_name: None,
+            login_label: None,
+            status: None,
+        };
+        mode.start_provider_login(&provider, None);
+        mode.tui.render_now(false);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Failed to login to Radius"), "{frame}");
         assert!(
             frame.contains("OAuth login flows are not implemented"),
             "{frame}"

@@ -36,12 +36,12 @@
 //!   `AuthSelectorProvider` (`:10-20`), `formatAuthSelectorProviderType`
 //!   (`:23-27`), `formatAuthSelectorProviderStatus` (`:30-49`).
 //!
-//! The per-provider OAuth *flows* (`packages/ai/src/auth/oauth/*.ts` —
-//! PKCE/device-code/callback-server implementations for anthropic, openai,
-//! openai-codex, github-copilot, kimi-coding, meta, xai, openrouter, radius)
-//! are network protocol machines that live in pi-ai upstream; this port does
-//! not have them yet, so an OAuth login attempt reports the upstream error
-//! shape with an honest reason. What this module ports is the composition
+//! The per-provider OAuth *flows* for Anthropic, OpenAI Codex and GitHub
+//! Copilot (PKCE/device-code/callback-server implementations in
+//! `packages/ai/src/auth/oauth/{anthropic,openai-codex,github-copilot}.ts`)
+//! live in `pi_ai::auth` and are driven by [`BuiltinLoginFlow`] here. The
+//! remaining flows (kimi-coding, meta, xai, openrouter, radius) still report
+//! the honest upstream-shaped error. This module also ports the composition
 //! surface: which auth methods a provider exposes, their display metadata,
 //! the login/logout option lists, and the request-time resolution rules the
 //! wire ladder applies
@@ -70,7 +70,8 @@ use crate::auth::read_stored_credential;
 use crate::models_config::{ExtensionProviderConfig, ModelsJsonProvider};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::mpsc;
+use std::sync::{Arc, RwLock};
 
 /// `RADIUS_PROVIDER_ID` (`core/radius.ts:3`).
 pub const RADIUS_PROVIDER_ID: &str = "radius";
@@ -128,8 +129,8 @@ pub const AMBIENT_LOGIN_PROVIDERS: [&str; 4] = [
 
 /// `OAuthAuth` metadata (`auth/types.ts:225-249`): the display name, whether
 /// access is subscription-backed, and the optional selector label. The
-/// `login`/`refresh`/`toAuth` functions are the per-provider flows in pi-ai
-/// (`auth/oauth/*.ts`) and are not part of this port yet.
+/// `login`/`refresh`/`toAuth` functions are the per-provider flows in
+/// `pi_ai::auth` for the three built-in providers (see [`BuiltinLoginFlow`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OAuthAuthInfo {
     /// Display name, e.g. "Anthropic (Claude Pro/Max)".
@@ -845,6 +846,173 @@ pub fn login_provider_completion_description(option: &LoginProviderCompletionOpt
     }
 }
 
+// ---- Built-in per-provider OAuth flows (packages/ai/src/auth/oauth/*.ts) ----
+
+/// One observable step of a running built-in flow. The host drains this with
+/// [`BuiltinLoginFlow::poll`] from its synchronous event loop, like the
+/// extension-oauth pump (`interactive-mode.ts:6539-6583`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BuiltinFlowPoll {
+    /// Nothing new this tick.
+    Idle,
+    /// `notifyAuthDialog` (`interactive-mode.ts:6507-6518`).
+    Notify(pi_ai::auth::AuthEvent),
+    /// An `AuthPrompt` to mount (`showAuthPrompt`, `:6483-6505`).
+    Prompt {
+        id: u64,
+        prompt: pi_ai::auth::AuthPrompt,
+    },
+    /// The flow abandoned this prompt (a browser callback won the race);
+    /// the host should unmount it.
+    PromptClosed { id: u64 },
+    /// The flow settled with a credential or the upstream error string.
+    Settled(Result<crate::auth::Credential, String>),
+}
+
+/// A running built-in login: the pi-ai flow executes on a dedicated thread
+/// with its own current-thread tokio runtime so the interactive loop stays
+/// free while it waits for browser callbacks or device-code polling.
+pub struct BuiltinLoginFlow {
+    provider_id: String,
+    provider_name: String,
+    interaction: Arc<pi_ai::auth::Interaction>,
+    messages: mpsc::Receiver<pi_ai::auth::InteractionMessage>,
+    outcome: mpsc::Receiver<Result<pi_ai::auth::OAuthCredential, pi_ai::auth::AuthError>>,
+}
+
+impl BuiltinLoginFlow {
+    /// Start a built-in flow for a provider row. `None` means the provider
+    /// has no ported flow (extension oauth and Radius still use their own
+    /// paths upstream).
+    #[must_use]
+    pub fn start(provider: &AuthSelectorProvider) -> Option<Self> {
+        if provider.auth_type != "oauth" || !pi_ai::auth::is_builtin_oauth_provider(&provider.id) {
+            return None;
+        }
+        let (raw_interaction, messages) = pi_ai::auth::Interaction::new();
+        let interaction = Arc::new(raw_interaction);
+        let (sender, outcome) = mpsc::channel();
+        let provider_id = provider.id.clone();
+        let flow_interaction = Arc::clone(&interaction);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("built-in oauth runtime");
+            let result = runtime.block_on(pi_ai::auth::login(
+                &provider_id,
+                &flow_interaction,
+                &pi_ai::auth::FlowConfig::default(),
+            ));
+            let _ = sender.send(result);
+        });
+        Some(Self {
+            provider_id: provider.id.clone(),
+            provider_name: provider.name.clone(),
+            interaction,
+            messages,
+            outcome,
+        })
+    }
+
+    /// The provider being configured (the `onProgress`/status label).
+    #[must_use]
+    pub fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
+    /// The `auth.json` key the flow's credential is stored under.
+    #[must_use]
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    /// Drain one observable step. Notifications and prompts are delivered
+    /// before the settlement so the last progress line is visible.
+    #[must_use]
+    pub fn poll(&self) -> BuiltinFlowPoll {
+        match self.messages.try_recv() {
+            Ok(pi_ai::auth::InteractionMessage::Notify(event)) => BuiltinFlowPoll::Notify(event),
+            Ok(pi_ai::auth::InteractionMessage::Prompt { id, prompt }) => {
+                BuiltinFlowPoll::Prompt { id, prompt }
+            }
+            Ok(pi_ai::auth::InteractionMessage::PromptClosed { id }) => {
+                BuiltinFlowPoll::PromptClosed { id }
+            }
+            Err(mpsc::TryRecvError::Empty) => match self.outcome.try_recv() {
+                Ok(result) => BuiltinFlowPoll::Settled(
+                    result
+                        .map(credential_from_pi)
+                        .map_err(|error| error.to_string()),
+                ),
+                Err(mpsc::TryRecvError::Empty) => BuiltinFlowPoll::Idle,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    BuiltinFlowPoll::Settled(Err("OAuth login flow ended unexpectedly".to_string()))
+                }
+            },
+            Err(mpsc::TryRecvError::Disconnected) => match self.outcome.try_recv() {
+                Ok(result) => BuiltinFlowPoll::Settled(
+                    result
+                        .map(credential_from_pi)
+                        .map_err(|error| error.to_string()),
+                ),
+                Err(_) => BuiltinFlowPoll::Idle,
+            },
+        }
+    }
+
+    /// Resolve a mounted prompt (`showPrompt`'s resolver).
+    pub fn answer(&self, id: u64, value: String) {
+        let _ = self.interaction.answer(id, Ok(value));
+    }
+
+    /// Reject a mounted prompt with `Login cancelled` (`showPrompt`'s
+    /// rejecter / the dialog's abort signal).
+    pub fn cancel_prompt(&self, id: u64) {
+        let _ = self
+            .interaction
+            .answer(id, Err(pi_ai::auth::AuthError::Cancelled));
+    }
+
+    /// Abort the flow-wide signal, including a pending callback server.
+    pub fn cancel(&self) {
+        self.interaction.cancel();
+    }
+}
+
+impl Drop for BuiltinLoginFlow {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// Map the pi-ai credential onto the on-disk `auth.json` shape, preserving the
+/// provider-specific fields in the tolerant `unknown` bag.
+fn credential_from_pi(credential: pi_ai::auth::OAuthCredential) -> crate::auth::Credential {
+    let mut unknown = serde_json::Map::new();
+    if let Some(account_id) = credential.account_id {
+        unknown.insert("accountId".to_string(), serde_json::json!(account_id));
+    }
+    if let Some(enterprise_url) = credential.enterprise_url {
+        unknown.insert(
+            "enterpriseUrl".to_string(),
+            serde_json::json!(enterprise_url),
+        );
+    }
+    if !credential.available_model_ids.is_empty() {
+        unknown.insert(
+            "availableModelIds".to_string(),
+            serde_json::json!(credential.available_model_ids),
+        );
+    }
+    crate::auth::Credential::Oauth {
+        access: credential.access,
+        refresh: credential.refresh,
+        expires: credential.expires,
+        unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1439,5 +1607,50 @@ mod tests {
         assert_eq!(runtime_api_key("getterother"), None);
         remove_runtime_api_key("getterprov");
         assert_eq!(runtime_api_key("getterprov"), None);
+    }
+
+    /// The built-in flow credential keeps `accountId`/`availableModelIds` in
+    /// the `unknown` bag so a later rewrite of auth.json does not drop them.
+    #[test]
+    fn builtin_credential_keeps_provider_fields() {
+        let credential = credential_from_pi(pi_ai::auth::OAuthCredential {
+            access: "a".to_string(),
+            refresh: "r".to_string(),
+            expires: 42,
+            account_id: Some("acct".to_string()),
+            enterprise_url: Some("ghe.company.com".to_string()),
+            available_model_ids: vec!["gpt-5".to_string()],
+        });
+        let value = serde_json::to_value(&credential).expect("credential json");
+        assert_eq!(
+            value,
+            json!({
+                "type": "oauth",
+                "access": "a",
+                "refresh": "r",
+                "expires": 42,
+                "accountId": "acct",
+                "enterpriseUrl": "ghe.company.com",
+                "availableModelIds": ["gpt-5"]
+            })
+        );
+    }
+
+    #[test]
+    fn builtin_flow_starts_only_for_ported_oauth_providers() {
+        let row = |id: &str, auth_type: &'static str| AuthSelectorProvider {
+            id: id.to_string(),
+            name: id.to_string(),
+            auth_type,
+            subscription: false,
+            method_name: None,
+            login_label: None,
+            status: None,
+        };
+        assert!(BuiltinLoginFlow::start(&row("openai-codex", "oauth")).is_some());
+        assert!(BuiltinLoginFlow::start(&row("anthropic", "oauth")).is_some());
+        assert!(BuiltinLoginFlow::start(&row("github-copilot", "oauth")).is_some());
+        assert!(BuiltinLoginFlow::start(&row("radius", "oauth")).is_none());
+        assert!(BuiltinLoginFlow::start(&row("anthropic", "api_key")).is_none());
     }
 }
