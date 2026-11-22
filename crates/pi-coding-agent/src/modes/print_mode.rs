@@ -698,8 +698,12 @@ pub enum WireCredential {
 /// `auth.json` — which owns the provider: a stored credential whose type the
 /// provider does not support resolves to nothing with no env fallback — then
 /// the configured models.json/extension `apiKey`, then provider environment
-/// variables. Returns the credential and its source, keeping bearer tokens
-/// distinct from API keys so the adapters can pick the right header.
+/// variables. A stored OAuth credential is refreshed through pi-ai's built-in
+/// flows when it expires within `resolveStoredOAuth`'s five-minute window
+/// (`auth/resolve.ts:157-191`); a failed refresh resolves to nothing rather
+/// than using the stale token. Returns the credential and its source, keeping
+/// bearer tokens distinct from API keys so the adapters can pick the right
+/// header.
 pub fn resolve_wire_credential(
     provider: &str,
     flag_key: Option<&str>,
@@ -726,6 +730,28 @@ pub fn resolve_wire_credential_composed(
     auth_path: &Path,
     config: Option<&crate::models_config::ModelsJsonProvider>,
     extension: Option<&crate::models_config::ExtensionProviderConfig>,
+) -> Option<(WireCredential, &'static str)> {
+    resolve_wire_credential_composed_with(
+        provider,
+        flag_key,
+        auth_path,
+        config,
+        extension,
+        &crate::oauth::refresh_stored_oauth,
+    )
+}
+
+/// [`resolve_wire_credential_composed`] with the OAuth refresh hook injected.
+/// Production passes [`crate::oauth::refresh_stored_oauth`] (pi-ai's built-in
+/// flows); tests pass a synthetic hook so the expiry/failure ladder can be
+/// exercised without a network round-trip.
+fn resolve_wire_credential_composed_with(
+    provider: &str,
+    flag_key: Option<&str>,
+    auth_path: &Path,
+    config: Option<&crate::models_config::ModelsJsonProvider>,
+    extension: Option<&crate::models_config::ExtensionProviderConfig>,
+    refresh: &dyn Fn(&str, &Credential, &Path) -> Option<Credential>,
 ) -> Option<(WireCredential, &'static str)> {
     let methods = crate::oauth::provider_auth_methods(provider, config, extension);
     let has_api_key = methods
@@ -760,7 +786,7 @@ pub fn resolve_wire_credential_composed(
                 // An unresolvable stored template falls through to the env
                 // loop inside `envApiKeyAuth.resolve` (`helpers.ts:21-29`).
             }
-            Credential::Oauth { access, .. } => {
+            Credential::Oauth { .. } => {
                 // A stored OAuth credential for a provider without OAuth
                 // auth resolves to nothing (`resolve.ts:72-86`).
                 if !has_oauth {
@@ -785,6 +811,17 @@ pub fn resolve_wire_credential_composed(
                     // back to the raw token.
                     return None;
                 }
+                // Upstream's `resolveStoredOAuth` (`auth/resolve.ts:157-191`)
+                // refreshes a token inside the five-minute window before
+                // deriving `toAuth`. The hook refreshes built-in credentials
+                // through pi-ai and persists the rotated token; a failed
+                // refresh (or a logged-out credential) resolves to nothing —
+                // no stale token and no env fallback. Extension oauth (above)
+                // keeps its own handler-derived key.
+                let effective = refresh(provider, &credential, auth_path)?;
+                let Credential::Oauth { access, .. } = &effective else {
+                    return None;
+                };
                 // The built-in OAuth flows hand the access token to the
                 // request through `toAuth`: most providers yield
                 // `auth.apiKey` (the provider's standard key header —
@@ -1159,6 +1196,150 @@ mod tests {
             resolve_wire_credential("openai-codex", None, &auth_path),
             None
         );
+    }
+
+    /// A synthetic auth.json holding one stored OAuth credential for the
+    /// refresh-ladder tests (`auth/resolve.ts:157-191`).
+    fn oauth_auth_path(
+        provider: &str,
+        access: &str,
+        expires: i64,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            serde_json::to_string(&serde_json::json!({
+                provider: {
+                    "type": "oauth",
+                    "access": access,
+                    "refresh": "r",
+                    "expires": expires,
+                },
+            }))
+            .expect("json"),
+        )
+        .expect("write auth.json");
+        (dir, auth_path)
+    }
+
+    /// An expiring stored OAuth credential is refreshed before its access
+    /// token reaches the request, with the rotated token riding the wire.
+    #[test]
+    fn expired_oauth_refreshes_before_the_wire_ladder() {
+        let (dir, auth_path) = oauth_auth_path("anthropic", "stale", 0);
+        let calls = std::cell::Cell::new(0);
+        let refresh = |provider: &str, credential: &Credential, _: &Path| {
+            assert_eq!(provider, "anthropic");
+            assert!(matches!(credential, Credential::Oauth { access, .. } if access == "stale"));
+            calls.set(calls.get() + 1);
+            Some(Credential::Oauth {
+                access: "refreshed".to_string(),
+                refresh: "r2".to_string(),
+                expires: pi_ai::auth::now_ms() + 60 * 60 * 1000,
+                unknown: serde_json::Map::new(),
+            })
+        };
+        assert_eq!(
+            resolve_wire_credential_composed_with(
+                "anthropic",
+                None,
+                &auth_path,
+                None,
+                None,
+                &refresh,
+            ),
+            Some((
+                WireCredential::ApiKey("refreshed".to_string()),
+                "stored credential"
+            ))
+        );
+        assert_eq!(calls.get(), 1);
+        drop(dir);
+    }
+
+    /// Upstream's failure semantics (`auth/resolve.ts:175-177`): a failed
+    /// refresh resolves to nothing — no stale token and no env fallback.
+    #[test]
+    fn failed_oauth_refresh_falls_back_to_nothing() {
+        let (dir, auth_path) = oauth_auth_path("anthropic", "stale", 0);
+        let refresh = |_: &str, _: &Credential, _: &Path| -> Option<Credential> { None };
+        assert_eq!(
+            resolve_wire_credential_composed_with(
+                "anthropic",
+                None,
+                &auth_path,
+                None,
+                None,
+                &refresh,
+            ),
+            None
+        );
+        drop(dir);
+    }
+
+    /// A token outside the five-minute window passes through the hook
+    /// unchanged (`auth/resolve.ts:169-174`): the hook owns the freshness gate
+    /// and returns a still-valid credential untouched.
+    #[test]
+    fn unexpired_oauth_uses_the_stored_token() {
+        let (dir, auth_path) =
+            oauth_auth_path("kimi-coding", "tok", pi_ai::auth::now_ms() + 60 * 60 * 1000);
+        let refresh = |_: &str, credential: &Credential, _: &Path| -> Option<Credential> {
+            let Credential::Oauth { expires, .. } = credential else {
+                panic!("expected an oauth credential");
+            };
+            assert!(!crate::oauth::oauth_expires_soon(
+                *expires,
+                pi_ai::auth::now_ms()
+            ));
+            Some(credential.clone())
+        };
+        assert_eq!(
+            resolve_wire_credential_composed_with(
+                "kimi-coding",
+                None,
+                &auth_path,
+                None,
+                None,
+                &refresh,
+            ),
+            Some((
+                WireCredential::AccessToken("tok".to_string()),
+                "stored credential"
+            ))
+        );
+        drop(dir);
+    }
+
+    /// A refreshed credential keeps the provider's wire header kind — the
+    /// Bearer header kimi-coding derives from `toAuth`.
+    #[test]
+    fn refreshed_oauth_keeps_the_bearer_wire_kind() {
+        let (dir, auth_path) = oauth_auth_path("kimi-coding", "stale", 0);
+        let refresh = |_: &str, _: &Credential, _: &Path| {
+            Some(Credential::Oauth {
+                access: "refreshed".to_string(),
+                refresh: "r2".to_string(),
+                expires: pi_ai::auth::now_ms() + 60 * 60 * 1000,
+                unknown: serde_json::Map::new(),
+            })
+        };
+        assert_eq!(
+            resolve_wire_credential_composed_with(
+                "kimi-coding",
+                None,
+                &auth_path,
+                None,
+                None,
+                &refresh,
+            ),
+            Some((
+                WireCredential::AccessToken("refreshed".to_string()),
+                "stored credential"
+            ))
+        );
+        drop(dir);
     }
 
     /// The composed config layers (`composeApiKeyAuth.resolve`,

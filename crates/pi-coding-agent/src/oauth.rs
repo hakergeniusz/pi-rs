@@ -22,7 +22,14 @@
 //! - `auth/resolve.ts` — `resolveProviderAuth` (`:33-93`): a stored
 //!   credential owns the provider; a credential whose type the provider does
 //!   not support resolves to nothing with **no** env fallback, and ambient
-//!   env vars are consulted only when nothing is stored.
+//!   env vars are consulted only when nothing is stored. `resolveStoredOAuth`
+//!   (`:157-191`) refreshes a token expiring within `DEFAULT_OAUTH_MINIMUM_VALIDITY_MS`
+//!   (`:102`, five minutes) through `refreshStoredOAuthCredential`
+//!   (`:119-155`, double-checked under the store lock, returning nothing when
+//!   logged out / throwing `ModelsError("oauth", "OAuth refresh failed for
+//!   <provider>")` on failure), then derives the wire auth with `toAuth`
+//!   (`:186-190`). The refresh wait is bounded by
+//!   `DEFAULT_OAUTH_REFRESH_TIMEOUT_MS` (`:103`, fifteen seconds).
 //! - `auth/helpers.ts` — `envApiKeyAuth` (`:8-33`) is the standard
 //!   stored-key-then-env-var API-key auth with a secret-prompt login;
 //!   `lazyOAuth` (`:36-56`) is the OAuthAuth metadata carrier.
@@ -66,12 +73,13 @@
 //! ([`is_radius_oauth`]/[`provider_auth_methods`]) rather than as a real
 //! provider object. Upstream's RPC mode has no auth dialogs (see above).
 
-use crate::auth::read_stored_credential;
+use crate::auth::{Credential, read_stored_credential};
 use crate::models_config::{ExtensionProviderConfig, ModelsJsonProvider};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// `RADIUS_PROVIDER_ID` (`core/radius.ts:3`).
 pub const RADIUS_PROVIDER_ID: &str = "radius";
@@ -1013,11 +1021,214 @@ fn credential_from_pi(credential: pi_ai::auth::OAuthCredential) -> crate::auth::
     }
 }
 
+// ---- Wire-time refresh of stored built-in OAuth credentials ----------------
+//
+// Upstream's `resolveStoredOAuth` (`auth/resolve.ts:157-191`) refreshes a
+// stored OAuth credential before deriving the request auth. This is the host
+// half: it drives pi-ai's async refresh flows from the synchronous wire
+// ladder, re-checking under the credential-store lock and persisting the
+// rotated token before returning it (`refreshStoredOAuthCredential`,
+// `auth/resolve.ts:119-155`).
+
+/// `DEFAULT_OAUTH_MINIMUM_VALIDITY_MS` (`auth/resolve.ts:102`).
+const OAUTH_MIN_VALIDITY_MS: i64 = 5 * 60 * 1000;
+
+/// `DEFAULT_OAUTH_REFRESH_TIMEOUT_MS` (`auth/resolve.ts:103`).
+const OAUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Upstream's `expiresSoon` (`auth/resolve.ts:169-170`):
+/// `Date.now() + minimumValidityMs >= credential.expires`.
+#[must_use]
+pub(crate) fn oauth_expires_soon(expires: i64, now_ms: i64) -> bool {
+    now_ms.saturating_add(OAUTH_MIN_VALIDITY_MS) >= expires
+}
+
+/// Decode a stored OAuth credential into pi-ai's flow credential, preserving
+/// the provider-specific fields the built-in flows attach (`accountId`,
+/// `enterpriseUrl`, `availableModelIds`; `credential_from_pi` writes them back
+/// after a refresh).
+fn stored_oauth_to_pi(
+    access: &str,
+    refresh: &str,
+    expires: i64,
+    unknown: &crate::auth::JsonObject,
+) -> pi_ai::auth::OAuthCredential {
+    let string = |field: &str| {
+        unknown
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    pi_ai::auth::OAuthCredential {
+        access: access.to_string(),
+        refresh: refresh.to_string(),
+        expires,
+        account_id: string("accountId"),
+        enterprise_url: string("enterpriseUrl"),
+        available_model_ids: unknown
+            .get("availableModelIds")
+            .and_then(serde_json::Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// The `extra` bag `pi_ai::auth::refresh` reads (`mod.rs:467-488`): Copilot
+/// needs the normalized `enterpriseUrl` from the stored credential.
+fn pi_credential_extra(
+    credential: &pi_ai::auth::OAuthCredential,
+) -> BTreeMap<String, serde_json::Value> {
+    let mut extra = BTreeMap::new();
+    if let Some(enterprise_url) = &credential.enterprise_url {
+        extra.insert(
+            "enterpriseUrl".to_string(),
+            serde_json::json!(enterprise_url),
+        );
+    }
+    extra
+}
+
+/// Drive pi-ai's async refresh on a dedicated current-thread runtime, like
+/// [`BuiltinLoginFlow`] does for login. The 15-second wait is the port of
+/// `AbortSignal.timeout(DEFAULT_OAUTH_REFRESH_TIMEOUT_MS)`
+/// (`auth/resolve.ts:140`); cancelling the wait cannot roll back a refresh the
+/// provider already started, so the flow token is cancelled rather than
+/// joined.
+fn run_builtin_refresh(
+    provider: &str,
+    credential: &pi_ai::auth::OAuthCredential,
+    config: &pi_ai::auth::FlowConfig,
+) -> Result<pi_ai::auth::OAuthCredential, String> {
+    let (sender, receiver) = mpsc::channel();
+    let flow_provider = provider.to_string();
+    let credential = credential.clone();
+    let config = config.clone();
+    let cancel = pi_ai::auth::CancelToken::new();
+    let flow_cancel = cancel.clone();
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = sender.send(Err(format!("OAuth refresh runtime failed: {error}")));
+                return;
+            }
+        };
+        let extra = pi_credential_extra(&credential);
+        let result = runtime.block_on(pi_ai::auth::refresh(
+            &flow_provider,
+            &credential.refresh,
+            &extra,
+            &flow_cancel,
+            &config,
+        ));
+        let _ = sender.send(result.map_err(|error| error.to_string()));
+    });
+    match receiver.recv_timeout(OAUTH_REFRESH_TIMEOUT) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            cancel.cancel();
+            Err(format!("OAuth refresh failed for {provider}: timed out"))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+            "OAuth refresh failed for {provider}: flow ended unexpectedly"
+        )),
+    }
+}
+
+/// The wire-ladder refresh hook (`resolve_wire_credential_composed`'s seam —
+/// [`crate::modes::print_mode::resolve_wire_credential_composed`]): refresh a
+/// stored OAuth credential when it is about to expire, persisting the rotated
+/// token under the store lock, and return the credential the request should
+/// use.
+///
+/// Failure semantics mirror upstream: a credential that logged out meanwhile
+/// or a failed refresh resolves to `None` (no raw/stale token is used, and no
+/// env fallback follows). Providers without a ported built-in flow cannot be
+/// renewed — an expired token for one resolves to nothing rather than going
+/// out stale. A still-valid credential is returned unchanged without I/O.
+#[must_use]
+pub fn refresh_stored_oauth(
+    provider: &str,
+    credential: &Credential,
+    auth_path: &Path,
+) -> Option<Credential> {
+    refresh_stored_oauth_with_flow(
+        provider,
+        credential,
+        auth_path,
+        &pi_ai::auth::FlowConfig::default(),
+    )
+}
+
+/// [`refresh_stored_oauth`] with pi-ai's flow endpoints injected, so tests can
+/// drive the real refresh against a synthetic loopback server.
+fn refresh_stored_oauth_with_flow(
+    provider: &str,
+    credential: &Credential,
+    auth_path: &Path,
+    config: &pi_ai::auth::FlowConfig,
+) -> Option<Credential> {
+    let is_fresh = || match credential {
+        Credential::Oauth { expires, .. } => !oauth_expires_soon(*expires, pi_ai::auth::now_ms()),
+        Credential::ApiKey { .. } => true,
+    };
+    // Upstream only refreshes through a provider's `oauth.refresh`; the port
+    // has flows for the three built-in providers (pi-ai's
+    // `is_builtin_oauth_provider`). The remaining OAuth providers report the
+    // honest upstream-shaped error and cannot renew an expired token.
+    if !pi_ai::auth::is_builtin_oauth_provider(provider) {
+        return if is_fresh() {
+            Some(credential.clone())
+        } else {
+            None
+        };
+    }
+    // The optimistic check (upstream's first `expiresSoon` at
+    // `auth/resolve.ts:173`); the authoritative one runs under the lock.
+    if is_fresh() {
+        return Some(credential.clone());
+    }
+    let storage = crate::auth::AuthStorage::create(auth_path);
+    let post = storage
+        .modify(provider, |current| {
+            let Some(Credential::Oauth {
+                access,
+                refresh,
+                expires,
+                unknown,
+            }) = current
+            else {
+                return Ok(None); // logged out meanwhile
+            };
+            if oauth_expires_soon(expires, pi_ai::auth::now_ms()) {
+                let pi = stored_oauth_to_pi(&access, &refresh, expires, &unknown);
+                let refreshed = run_builtin_refresh(provider, &pi, config)?;
+                Ok(Some(credential_from_pi(refreshed)))
+            } else {
+                Ok(None) // another process/request refreshed already
+            }
+        })
+        .ok()?;
+    match post {
+        Some(credential @ Credential::Oauth { .. }) => Some(credential),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models_config::{ExtensionOAuthMetadata, ModelsJsonProvider};
     use serde_json::json;
+    use std::io::{Read, Write};
     use std::path::PathBuf;
 
     fn models_json_provider(fields: serde_json::Value) -> ModelsJsonProvider {
@@ -1652,5 +1863,158 @@ mod tests {
         assert!(BuiltinLoginFlow::start(&row("github-copilot", "oauth")).is_some());
         assert!(BuiltinLoginFlow::start(&row("radius", "oauth")).is_none());
         assert!(BuiltinLoginFlow::start(&row("anthropic", "api_key")).is_none());
+    }
+
+    /// Upstream's `expiresSoon` boundary (`auth/resolve.ts:169-170`): the
+    /// five-minute validity window is inclusive, and saturating arithmetic
+    /// keeps an already-expired token from wrapping.
+    #[test]
+    fn oauth_expiry_window_is_five_minutes_and_inclusive() {
+        let now = 1_700_000_000_000i64;
+        assert!(oauth_expires_soon(now + OAUTH_MIN_VALIDITY_MS - 1, now));
+        assert!(oauth_expires_soon(now + OAUTH_MIN_VALIDITY_MS, now));
+        assert!(!oauth_expires_soon(now + OAUTH_MIN_VALIDITY_MS + 1, now));
+        assert!(oauth_expires_soon(0, now));
+    }
+
+    /// A still-valid credential is returned untouched, and an expired token
+    /// for a provider without a ported refresh flow resolves to nothing —
+    /// neither case touches the network or the store.
+    #[test]
+    fn refresh_hook_only_acts_on_expired_builtin_credentials() {
+        let fresh = Credential::Oauth {
+            access: "tok".to_string(),
+            refresh: "r".to_string(),
+            expires: pi_ai::auth::now_ms() + 60 * 60 * 1000,
+            unknown: serde_json::Map::new(),
+        };
+        assert_eq!(
+            refresh_stored_oauth("anthropic", &fresh, Path::new("/nonexistent/auth.json")),
+            Some(fresh.clone())
+        );
+
+        let expired = Credential::Oauth {
+            access: "tok".to_string(),
+            refresh: "r".to_string(),
+            expires: 0,
+            unknown: serde_json::Map::new(),
+        };
+        // kimi-coding has OAuth metadata but no ported flow.
+        assert_eq!(
+            refresh_stored_oauth("kimi-coding", &expired, Path::new("/nonexistent/auth.json")),
+            None
+        );
+        // A non-OAuth credential is never a refresh candidate.
+        let api_key = Credential::ApiKey {
+            key: Some("sk-test".to_string()),
+            env: None,
+            unknown: serde_json::Map::new(),
+        };
+        assert_eq!(
+            refresh_stored_oauth("anthropic", &api_key, Path::new("/nonexistent/auth.json")),
+            Some(api_key)
+        );
+    }
+
+    /// The round-trip a refresh persistence uses: provider-specific fields in
+    /// the stored `unknown` bag reach pi-ai's `refresh` (`enterpriseUrl` for
+    /// Copilot) and a returned pi credential writes them back unchanged.
+    #[test]
+    fn stored_oauth_round_trips_provider_fields() {
+        let mut unknown = serde_json::Map::new();
+        unknown.insert("accountId".to_string(), serde_json::json!("acct"));
+        unknown.insert(
+            "enterpriseUrl".to_string(),
+            serde_json::json!("ghe.company.com"),
+        );
+        unknown.insert(
+            "availableModelIds".to_string(),
+            serde_json::json!(["gpt-5"]),
+        );
+        let pi = stored_oauth_to_pi("a", "r", 42, &unknown);
+        assert_eq!(pi.account_id.as_deref(), Some("acct"));
+        assert_eq!(pi.enterprise_url.as_deref(), Some("ghe.company.com"));
+        assert_eq!(pi.available_model_ids, vec!["gpt-5"]);
+        let extra = pi_credential_extra(&pi);
+        assert_eq!(
+            extra
+                .get("enterpriseUrl")
+                .and_then(serde_json::Value::as_str),
+            Some("ghe.company.com")
+        );
+        assert_eq!(
+            serde_json::to_value(credential_from_pi(pi)).expect("credential json"),
+            json!({
+                "type": "oauth",
+                "access": "a",
+                "refresh": "r",
+                "expires": 42,
+                "accountId": "acct",
+                "enterpriseUrl": "ghe.company.com",
+                "availableModelIds": ["gpt-5"]
+            })
+        );
+    }
+
+    /// A one-shot loopback token endpoint for the full-flow refresh test
+    /// (no external network; every token is canned here).
+    fn fake_token_server(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let address = listener.local_addr().expect("loopback address");
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("token request");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        });
+        (format!("http://{address}"), thread)
+    }
+
+    /// The real refresh path: an expired built-in credential runs pi-ai's
+    /// Anthropic refresh flow against a synthetic endpoint, and the rotated
+    /// token is persisted back to auth.json under the store lock.
+    #[test]
+    fn builtin_refresh_runs_the_flow_and_persists_the_token() {
+        let (dir, path) = auth_path(&json!({
+            "anthropic": {"type": "oauth", "access": "stale", "refresh": "old-refresh", "expires": 0i64},
+        }));
+        let (base, server) = fake_token_server(
+            r#"{"access_token":"fresh","refresh_token":"new-refresh","expires_in":3600}"#,
+        );
+        let config = pi_ai::auth::FlowConfig {
+            anthropic: pi_ai::auth::EndpointConfig {
+                token_url: format!("{base}/token"),
+                ..pi_ai::auth::EndpointConfig::default()
+            },
+            ..pi_ai::auth::FlowConfig::default()
+        };
+        let stored = read_stored_credential("anthropic", &path).expect("stored credential");
+        let refreshed = refresh_stored_oauth_with_flow("anthropic", &stored, &path, &config)
+            .expect("refreshed credential");
+        let Credential::Oauth {
+            access,
+            refresh,
+            expires,
+            ..
+        } = &refreshed
+        else {
+            panic!("expected an oauth credential");
+        };
+        assert_eq!(access, "fresh");
+        assert_eq!(refresh, "new-refresh");
+        assert!(!oauth_expires_soon(*expires, pi_ai::auth::now_ms()));
+        // The store was rewritten with the rotated token, not just the local
+        // return value.
+        assert_eq!(
+            read_stored_credential("anthropic", &path).expect("persisted credential"),
+            refreshed
+        );
+        server.join().expect("token server thread");
+        drop(dir);
     }
 }
