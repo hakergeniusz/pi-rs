@@ -510,7 +510,9 @@ fn crypto_digest(algorithm: &str, bytes: &[u8]) -> Result<String, String> {
 ///
 /// The algorithm name is normalised like [`crypto_digest`]; the returned
 /// string is lowercase hex, matching `digest("hex")`.
+#[allow(clippy::type_complexity)] // (block size, digest fn) is clearer inline than a one-use alias
 fn crypto_hmac(algorithm: &str, key: &[u8], bytes: &[u8]) -> Result<String, String> {
+    // (block size for HMAC padding, digest function)
     let (block_size, digest): (usize, fn(&[u8]) -> Vec<u8>) =
         match normalize_digest_name(algorithm).as_str() {
             "sha256" => (64, |data| Sha256::digest(data).to_vec()),

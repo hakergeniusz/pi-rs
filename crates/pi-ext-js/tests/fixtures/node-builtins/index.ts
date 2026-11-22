@@ -34,8 +34,15 @@ import {
 import { createMcpToolName, mcpNamespace } from "@earendil-works/pi-mcp";
 
 export default function (): void {
-  const file = join(tmpdir(), `pi-ext-js-node-fixture-${Date.now()}-${Math.random()}.txt`);
-  const link = `${file}.link`;
+  // QuickJS seeds Math.random() identically in each fresh runtime, so two
+  // tests can otherwise pick the same temp path and collide on symlink().
+  let file = "";
+  let link = "";
+  let attempt = 0;
+  do {
+    file = join(tmpdir(), `pi-ext-js-node-fixture-${Date.now()}-${Math.random()}-${attempt++}.txt`);
+    link = `${file}.link`;
+  } while (existsSync(file) || existsSync(link));
   writeFileSync(file, "fixture", "utf8");
   symlinkSync(file, link);
 
