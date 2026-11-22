@@ -12,7 +12,10 @@
 //! * `packages/coding-agent/src/extensions/codemode/index.ts:14-47` — the
 //!   extension registration and its `codemode.mode` / `inlineBudget` settings;
 //! * `packages/coding-agent/src/core/settings-defaults.ts:57-60` — the default
-//!   `codemode.inlineBudget` of 3000 tokens.
+//!   `codemode.inlineBudget` of 3000 tokens;
+//! * `packages/codemode/src/runtime/host.ts:20-88` and
+//!   `packages/codemode/src/runtime/worker.ts:21-33` — the worker launcher that
+//!   the opt-in [`CodemodeTransport::ThreadWorker`] seam mirrors.
 //!
 //! # Seams and deviations
 //!
@@ -25,11 +28,29 @@
 //! [`CodemodeHost::with_append_entry`]) so the coordinator can bind them to
 //! `SessionManager::get_branch` / `append_custom_entry`.
 //!
+//! # Transport seam
+//!
+//! [`CodemodeHost::execute_code`] selects its VM backend through
+//! [`CodemodeTransport`]. The default [`CodemodeTransport::Inline`] runs
+//! `Sandbox::execute` on the calling thread — identical to the behavior before
+//! this seam existed, so no host changes unless it opts in. Opting into
+//! [`CodemodeTransport::ThreadWorker`] hands the same tools, globals, store,
+//! and deadline to `pi_codemode::ThreadWorkerTransport`, which runs the VM on
+//! an OS thread and relays nested tool calls back to this thread (the
+//! `host.ts:20-88` / `worker.ts:21-33` split). The resulting `CodemodeResult`
+//! flows through the same formatting path. The transport is local and offline
+//! (channels + the native QuickJS engine); it starts no socket or worker
+//! runtime and is inert unless a coordinator explicitly selects it via
+//! [`CodemodeHost::with_transport`]. `RemoteCodemodeTransport` remains a
+//! library API with no production call site (upstream's RPC isolate is out of
+//! scope); see `pi-codemode/WIRING.md`.
+//!
 //! Two upstream features are deliberately out of scope here and documented in
 //! `WIRING.md`: the `models.*` globals (no classifier/image model registry seam
-//! exists in this port yet) and worker-pool admission/streaming `onUpdate`
-//! progress (the in-process VM is synchronous). The `models` option only
-//! affects the declared globals and is off by default in this host.
+//! exists in this port yet) and streaming `onUpdate` progress (the in-process
+//! VM is synchronous). The `models` option only affects the declared globals
+//! and is off by default in this host. Worker-pool admission is available to
+//! callers that supply a `CodemodeTransport::ThreadWorker`.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -44,9 +65,10 @@ use pi_agent::types::AgentToolResult;
 use pi_ai::types::{ContentBlock, ImageContent, TextContent};
 use pi_codemode::{
     AbortFlag, CodemodeError, CodemodeErrorKind, CodemodeResult, CodemodeStoreWrites,
-    DEFAULT_INTERRUPT_BUDGET, ExecuteOptions, FnTool, OutputItem, RenderTool, RenderToolOptions,
-    Sandbox, SandboxOptions, Tool as CodemodeTool, ToolContext, ToolError, parse_codemode_source,
-    render_tool_sample, to_codemode_identifier,
+    DEFAULT_INTERRUPT_BUDGET, ExecuteOptions, FnTool, GlobalStartData, OutputItem, QuickJsWasm,
+    RenderTool, RenderToolOptions, Sandbox, SandboxOptions, ThreadWorkerTransport,
+    Tool as CodemodeTool, ToolContext, ToolError, ToolStartData, VmStartData, WorkerRequest,
+    parse_codemode_source, render_tool_sample, to_codemode_identifier,
 };
 use serde::Serialize;
 use serde_json::{Map, Value as Json, json};
@@ -261,6 +283,35 @@ pub fn execute_via_executor(
     };
     let (updates, _rx) = tokio::sync::mpsc::unbounded_channel();
     crate::runtime::block_on(executor.execute(call, updates))
+}
+
+/// Minimal valid wasm module header used as the thread worker's module token
+/// (`wasm.ts:5-8`). The worker transport runs the native `rquickjs` engine and
+/// only needs a header-validated token — no WebAssembly compilation happens;
+/// see `pi-codemode/WIRING.md`, deviation 1.
+const WORKER_WASM_TOKEN: &[u8] = b"\0asm\x01\0\0\0";
+
+/// Which VM backend executes a codemode script.
+///
+/// [`Self::Inline`] is upstream's `InlineCodemodeSandbox`
+/// (`runtime/inline.ts:115-126`); [`Self::ThreadWorker`] is the local analogue
+/// of `CodemodeSandbox` (`runtime/host.ts:76-88`, `runtime/worker.ts:21-33`).
+#[derive(Clone)]
+pub enum CodemodeTransport {
+    /// Run the VM on the calling thread. The default: identical to the host's
+    /// behavior before this seam existed.
+    Inline,
+    /// Run the VM on an OS thread through the real local worker transport. The
+    /// supplied transport controls worker admission and exit observation.
+    ThreadWorker(Arc<ThreadWorkerTransport>),
+}
+
+impl CodemodeTransport {
+    /// The default thread-worker backend (no custom worker admission).
+    #[must_use]
+    pub fn thread_worker() -> Self {
+        Self::ThreadWorker(Arc::new(ThreadWorkerTransport::default()))
+    }
 }
 
 /// Host-level options, from the extension registration (`index.ts:14-47`).
@@ -990,6 +1041,7 @@ pub struct CodemodeHost {
     tools: Vec<CallableTool>,
     invoker: Arc<dyn ToolInvoker>,
     options: CodemodeOptions,
+    transport: CodemodeTransport,
     store_reader: Arc<dyn Fn() -> BTreeMap<String, Json> + Send + Sync>,
     append_entry: Option<AppendEntryFn>,
 }
@@ -1014,6 +1066,7 @@ impl CodemodeHost {
                 .collect(),
             invoker: Arc::new(invoker),
             options: CodemodeOptions::default(),
+            transport: CodemodeTransport::Inline,
             store_reader: Arc::new(empty_store),
             append_entry: None,
         }
@@ -1023,6 +1076,16 @@ impl CodemodeHost {
     #[must_use]
     pub fn with_options(mut self, options: CodemodeOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Select the VM backend. Defaults to [`CodemodeTransport::Inline`]; the
+    /// worker backend is opt-in and starts only a local thread, never a socket.
+    /// Both backends produce the same [`CodemodeResult`] shape and share the
+    /// result formatting, store writes, and nested-call recording below.
+    #[must_use]
+    pub fn with_transport(mut self, transport: CodemodeTransport) -> Self {
+        self.transport = transport;
         self
     }
 
@@ -1192,13 +1255,12 @@ impl CodemodeHost {
             }
         };
         let store = (self.store_reader)();
-        let result = sandbox.execute(
+        let result = self.run_script(
+            &sandbox,
             &parsed.code,
-            ExecuteOptions {
-                store: Some(store),
-                timeout_ms: parsed.options.timeout_ms,
-                signal,
-            },
+            parsed.options.timeout_ms,
+            store,
+            signal,
         );
         sandbox.close();
         recorder.cancel_running();
@@ -1276,6 +1338,70 @@ impl CodemodeHost {
             details: Json::Object(details),
             is_error,
             ..AgentToolResult::default()
+        }
+    }
+
+    /// Dispatch one script to the selected backend and return the shared
+    /// [`CodemodeResult`] shape. Both paths use the same `Sandbox` tool table
+    /// (which implements `pi_codemode::ToolExecutor`) and the same store
+    /// snapshot; only the launch seam differs. This keeps the inline and
+    /// worker backends byte-for-byte equivalent in their result formatting.
+    #[must_use]
+    fn run_script(
+        &self,
+        sandbox: &Sandbox,
+        code: &str,
+        timeout_ms: Option<u64>,
+        store: BTreeMap<String, Json>,
+        signal: Option<AbortFlag>,
+    ) -> CodemodeResult {
+        match &self.transport {
+            CodemodeTransport::Inline => sandbox.execute(
+                code,
+                ExecuteOptions {
+                    store: Some(store),
+                    timeout_ms,
+                    signal,
+                },
+            ),
+            CodemodeTransport::ThreadWorker(transport) => {
+                let mut start = VmStartData::new(code);
+                start.tools = sandbox
+                    .tools()
+                    .iter()
+                    .map(|tool| ToolStartData {
+                        name: tool.name().to_string(),
+                        js_name: to_codemode_identifier(tool.name()),
+                        description: tool.description().unwrap_or_default().to_string(),
+                    })
+                    .collect();
+                start.globals = sandbox
+                    .globals()
+                    .iter()
+                    .map(|global| GlobalStartData {
+                        name: global.name().to_string(),
+                        spread: global.spread(),
+                    })
+                    .collect();
+                start.memory_limit_bytes = Some(CODEMODE_MEMORY_LIMIT_BYTES);
+                // `VmStartData.store` carries JSON text (`protocol.ts:20`).
+                start.store = store
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
+                        )
+                    })
+                    .collect();
+                let token = QuickJsWasm::from_bytes(WORKER_WASM_TOKEN)
+                    .expect("the embedded wasm header is valid");
+                let mut request = WorkerRequest::new(code).with_wasm(token);
+                request.start = start;
+                request.timeout_ms = timeout_ms;
+                request.signal = signal.unwrap_or_default();
+                transport.execute(request, sandbox)
+            }
         }
     }
 }
@@ -1481,6 +1607,7 @@ fn samples_get(samples: &BTreeMap<String, String>, identifier: &str) -> Json {
 mod tests {
     use super::*;
     use pi_agent::types::ToolSpec;
+    use pi_codemode::{WorkerAdmission, WorkerExit, WorkerReservation};
 
     fn ok_result(text: &str) -> AgentToolResult {
         AgentToolResult {
@@ -1640,6 +1767,47 @@ mod tests {
         assert!(text.contains("42"), "{text}");
         assert_eq!(result.details["calls"][0]["name"], "echo");
         assert_eq!(result.details["calls"][0]["status"], "ok");
+    }
+
+    #[test]
+    fn thread_worker_transport_runs_a_tool_call_through_the_worker() {
+        struct CountingAdmission {
+            acquired: Arc<AtomicU64>,
+            started: Arc<AtomicU64>,
+        }
+        impl WorkerAdmission for CountingAdmission {
+            fn acquire(&self) -> Result<WorkerReservation, String> {
+                self.acquired.fetch_add(1, Ordering::SeqCst);
+                Ok(WorkerReservation::new(|| {}))
+            }
+            fn on_worker_started(&self, _exited: WorkerExit) {
+                self.started.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let acquired = Arc::new(AtomicU64::new(0));
+        let started = Arc::new(AtomicU64::new(0));
+        let worker = ThreadWorkerTransport::new(Arc::new(CountingAdmission {
+            acquired: Arc::clone(&acquired),
+            started: Arc::clone(&started),
+        }));
+        let host = host(vec![echo_tool()], echo_invoker())
+            .with_transport(CodemodeTransport::ThreadWorker(Arc::new(worker)));
+        let result = host.execute_code(
+            "call-worker",
+            "const r = await tools.echo({ n: 21 }); return r.value * 2;",
+            None,
+        );
+        let text = text_of_result(&result);
+        assert!(!result.is_error, "{text}");
+        assert!(text.contains("42"), "{text}");
+        assert_eq!(result.details["calls"][0]["name"], "echo");
+        assert_eq!(result.details["calls"][0]["status"], "ok");
+        // Proof the call went through ThreadWorkerTransport rather than the
+        // inline VM: the worker was admitted and observed exactly once, while
+        // its nested call still reached the host invoker (the "echo" row).
+        assert_eq!(acquired.load(Ordering::SeqCst), 1);
+        assert_eq!(started.load(Ordering::SeqCst), 1);
     }
 
     #[test]

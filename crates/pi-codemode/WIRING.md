@@ -126,8 +126,10 @@ host swaps them without changing its tools:
   observes the real thread exit through `onWorkerStarted(WorkerExit)`, and
   returns `Failed to load QuickJS` / `No worker available in …` /
   `Failed to start worker` / `Worker exited with code …` as sandbox errors.
-  Supply a validated `QuickJsWasm` token via `WorkerRequest::with_wasm`;
-  without one the launch fails with upstream's exact wasm-load error.
+  Supply a header-validated `QuickJsWasm` token via
+  `QuickJsWasm::from_bytes` / `WorkerRequest::with_wasm`; without one the
+  launch fails with upstream's exact wasm-load error. No WebAssembly
+  compilation happens — the token only proves a module was supplied.
 - `RemoteCodemodeTransport` implements the client side of
   `RemoteCodemodeSandbox` (`remote.ts:199-277`): it obtains a
   `CodemodeRemote` per execution from an injected factory, answers calls from
@@ -135,24 +137,58 @@ host swaps them without changing its tools:
   early return into the exact upstream sandbox error. `serve_remote` is the
   server side (`remote.ts:104-197`) and `InProcessRemote` composes the two in
   one process — upstream explicitly allows an in-process remote in tests.
-- `load_quickjs_wasm` validates the `\0asm` header and retains the bytes, but
-  never compiles them (see deviation 1). `InProcessRemote` and
-  `ThreadWorkerTransport` run the VM with the native `rquickjs` engine.
+- `load_quickjs_wasm` is the honest "compile the module" API: because there is
+  no WebAssembly host in this port, it **fails** for every input with upstream's
+  exact `Failed to load QuickJS: …` launcher wrapper instead of retaining bytes
+  it can never compile (see deviation 1). `QuickJsWasm::from_bytes` is the
+  separate, non-compiling token validator the native-engine transports use.
+  `InProcessRemote` and `ThreadWorkerTransport` run the VM with the native
+  `rquickjs` engine.
+
+### Host seam (`pi-coding-agent/src/codemode_host.rs`)
+
+Production code reaches the transports through `CodemodeHost`:
+
+- `CodemodeTransport::Inline` (the default) runs `Sandbox::execute` on the
+  calling thread — byte-for-byte the behavior before this slice, so nothing
+  changes unless a host opts in.
+- `CodemodeTransport::ThreadWorker(Arc<ThreadWorkerTransport>)` is selected with
+  `CodemodeHost::with_transport(...)`. `execute_code` then builds a
+  `WorkerRequest` from the same tools/globals/store/timeout that the inline path
+  uses and hands it to `ThreadWorkerTransport::execute`, with the `Sandbox`
+  itself acting as the `ToolExecutor`. The resulting `CodemodeResult` flows
+  through the *same* formatting, store-write, and nested-call code as the
+  inline path. The transport is local and offline (OS thread + channels, native
+  engine); no socket or worker runtime is started. The seam is inert by
+  default — the coordinator would have to opt in via a settings flag, which is
+  deliberately not wired here.
+- `RemoteCodemodeTransport` and `serve_remote` stay library APIs: upstream's
+  Cloudflare/Workers RPC isolate has no host here, so no production call site
+  is wired for them (deviation 1). A test asserts nested calls traverse
+  `ThreadWorkerTransport` (via a recording `WorkerAdmission`) and still reach
+  the host tool invoker.
 
 ## Remaining deviations (deliberate)
 
 1. **Worker threads / Cloudflare / wasm compilation.** The local equivalents
    in `transport.rs` are real thread/channel and injected-client transports,
-   but a true Node/Bun `worker_threads` runtime, a Cloudflare Durable Object
-   isolate, and WebAssembly compilation are not hosted: they need a new
-   platform or dependency. `load_quickjs_wasm` validates and retains the
-   module bytes but never compiles them — `rquickjs` links QuickJS natively —
-   so it fails with upstream's exact `Failed to load QuickJS: …` message when
-   no module is supplied. It is deliberately not faking a compiled module.
-   `WorkerTransportStub`, `RemoteTransportStub`, `WasmLoaderStub`, and the
-   `*_error` helpers in `admission.rs` remain for API compatibility and carry
-   upstream's exact error strings. The wasm `Stats`/`HMAC`/WHATWG URL shims are
-   likewise unported.
+   but a true Node/Bun `worker_threads` runtime and a Cloudflare Durable Object
+   isolate are not hosted: they need a new platform (a worker runtime and an
+   RPC isolate this crate cannot provide). A full WebAssembly runtime is
+   likewise out of scope: it would require adding a `quickjs-wasi`-style wasm
+   module plus a WebAssembly engine dependency and a WASI host to virtualize
+   `clock_time_get`/`random_get` (the deterministic clock/RNG shims in
+   `vm.rs`). `rquickjs` already links QuickJS natively, so adding a second
+   engine would duplicate the VM and change the fingerprint/schema. Rather
+   than fake a compiled module, `load_quickjs_wasm` is honest: for *every*
+   input it fails with upstream's exact `Failed to load QuickJS: …` launcher
+   wrapper (`host.ts:25-27`), because compilation cannot happen here. The
+   native-engine transports use the separate `QuickJsWasm::from_bytes` token,
+   which validates the `\0asm` header but never claims to compile. The
+   `WorkerTransportStub`, `RemoteTransportStub`, `WasmLoaderStub`, and `*_error`
+   helpers in `admission.rs` remain for API compatibility and carry upstream's
+   exact error strings. The wasm `Stats`/`HMAC`/WHATWG URL shims are likewise
+   unported.
 2. **Deterministic engine shims.** Upstream virtualizes WASI `clock_time_get`,
    `random_get`, timezone, and removes `WeakRef`/`FinalizationRegistry` at VM
    creation (`vm.ts:103-125,170-180`). `rquickjs` has no WASI layer, so the

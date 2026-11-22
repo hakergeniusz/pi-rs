@@ -23,9 +23,13 @@
 //!   over an injected [`CodemodeRemote`] trait. An in-process object is a real
 //!   remote in upstream too (`remote.ts:70-72`); [`InProcessRemote`] is that
 //!   case.
-//! - [`load_quickjs_wasm`] validates and retains the module bytes but never
-//!   compiles them: `rquickjs` links QuickJS natively. Compiling wasm is a
-//!   documented deviation (`WIRING.md`, deviation 1).
+//! - [`load_quickjs_wasm`] is honest about the absent WebAssembly host: it
+//!   fails with upstream's exact `Failed to load QuickJS: …` wrapper for every
+//!   input instead of retaining bytes it never compiles. The native-engine
+//!   transports take a validated [`QuickJsWasm`] token built with
+//!   [`QuickJsWasm::from_bytes`]. Compiling wasm would need a new dependency
+//!   and a WebAssembly runtime this port deliberately does not add
+//!   (`WIRING.md`, deviation 1).
 //!
 //! All three report upstream's exact error strings from [`crate::admission`].
 //! The `*_Stub` markers in that module remain for API compatibility; new hosts
@@ -57,12 +61,28 @@ use crate::vm::{
     run_vm,
 };
 
-/// Validated bytes of `quickjs-wasi/quickjs.wasm` (`wasm.ts:5-8`). The token is
-/// inert: this port links QuickJS natively and never compiles the module.
+/// A validated *token* standing in for `quickjs-wasi/quickjs.wasm`
+/// (`wasm.ts:5-8`). It is not a compiled module: this port links QuickJS
+/// natively, so the thread/remote transports only need proof that a module was
+/// supplied. Use [`load_quickjs_wasm`] when a real WebAssembly runtime is
+/// required; it fails honestly here (see `WIRING.md`, deviation 1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuickJsWasm(Vec<u8>);
 
 impl QuickJsWasm {
+    /// Validate the `\0asm` header (`wasm.ts:21-35`) and retain the bytes as a
+    /// launcher token. This performs **no** compilation: the native `rquickjs`
+    /// engine ignores the bytes. The error uses upstream's exact launcher
+    /// wrapper (`host.ts:25-27`).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CodemodeError> {
+        if !bytes.starts_with(b"\0asm") {
+            return Err(CodemodeError::sandbox(wasm_load_error(
+                "invalid WebAssembly module",
+            )));
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
     /// The retained module bytes.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
@@ -72,22 +92,26 @@ impl QuickJsWasm {
 
 /// The local analogue of `loadQuickJSWasm` (`wasm.ts:21-35`).
 ///
-/// Upstream reads and compiles the default wasm file; this port can only read
-/// and validate a module a caller supplies. With no module the error is the
-/// exact launcher message (`host.ts:25-27`). With a module the bytes are kept
-/// but never compiled — see `WIRING.md` deviation 1.
+/// Upstream reads a wasm file and calls `WebAssembly.compile(bytes)`. This port
+/// has no WebAssembly host (`rquickjs` links QuickJS natively and no wasm crate
+/// is pulled in), so it can never fulfil that contract: even a valid module is
+/// reported with upstream's exact launcher wrapper
+/// (`host.ts:25-27`, `Failed to load QuickJS: …`) instead of being silently
+/// retained as if compilation had succeeded. Callers that only need the
+/// launcher token for the native-engine transports should use
+/// [`QuickJsWasm::from_bytes`], which validates the header without pretending
+/// to compile. A full runtime is out of scope because it needs a new
+/// WebAssembly dependency plus a WASI host for the deterministic clock/RNG
+/// shims (`WIRING.md`, deviation 1).
 pub fn load_quickjs_wasm(bytes: Option<&[u8]>) -> Result<QuickJsWasm, CodemodeError> {
-    let Some(bytes) = bytes else {
-        return Err(CodemodeError::sandbox(wasm_load_error(
-            "no wasm module provided",
-        )));
+    let cause = match bytes {
+        None => "no wasm module provided",
+        Some(bytes) if !bytes.starts_with(b"\0asm") => "invalid WebAssembly module",
+        Some(_) => {
+            "WebAssembly.compile is unavailable (no WebAssembly host; this port links QuickJS natively)"
+        }
     };
-    if !bytes.starts_with(b"\0asm") {
-        return Err(CodemodeError::sandbox(wasm_load_error(
-            "invalid WebAssembly module",
-        )));
-    }
-    Ok(QuickJsWasm(bytes.to_vec()))
+    Err(CodemodeError::sandbox(wasm_load_error(cause)))
 }
 
 fn sandbox_result(error: CodemodeError) -> CodemodeResult {
@@ -292,9 +316,15 @@ impl ThreadWorkerTransport {
     #[must_use]
     #[allow(clippy::too_many_lines)] // mirrors host.ts:20-74; split when extending
     pub fn execute(&self, request: WorkerRequest, executor: &dyn ToolExecutor) -> CodemodeResult {
-        // host.ts:22-27 — validate the wasm before reserving worker capacity.
-        if let Err(error) = load_quickjs_wasm(request.wasm.as_ref().map(QuickJsWasm::bytes)) {
-            return sandbox_result(error);
+        // host.ts:22-27 — the worker needs a wasm module before capacity is
+        // reserved. `QuickJsWasm` is already header-validated at construction;
+        // the native `rquickjs` engine runs the VM, so no compilation (and no
+        // WebAssembly host) is needed here. `load_quickjs_wasm` is the honest
+        // compile API and fails here by design (WIRING.md, deviation 1).
+        if request.wasm.is_none() {
+            return sandbox_result(CodemodeError::sandbox(wasm_load_error(
+                "no wasm module provided",
+            )));
         }
 
         // host.ts:30 — reserve capacity; a denial becomes a sandbox error.
@@ -1028,7 +1058,7 @@ mod tests {
     const WASM: &[u8] = b"\0asm\x01\0\0\0";
 
     fn wasm() -> QuickJsWasm {
-        load_quickjs_wasm(Some(WASM)).expect("valid wasm header")
+        QuickJsWasm::from_bytes(WASM).expect("valid wasm header")
     }
 
     fn double_tool() -> Arc<dyn ToolExecutor + Send + Sync> {
@@ -1065,13 +1095,26 @@ mod tests {
     }
 
     #[test]
-    fn wasm_loader_validates_the_magic_header() {
-        let error = load_quickjs_wasm(Some(b"nope")).expect_err("invalid module");
+    fn wasm_loader_reports_upstream_error_without_a_runtime_even_for_valid_bytes() {
+        // There is no WebAssembly host: even a well-formed module cannot be
+        // compiled, so the honest compile API fails with upstream's exact
+        // launcher wrapper instead of retaining the bytes (WIRING.md #1).
+        let error = load_quickjs_wasm(Some(WASM)).expect_err("no wasm runtime");
+        assert_eq!(error.kind, CodemodeErrorKind::Sandbox);
+        assert_eq!(
+            error.message,
+            "Failed to load QuickJS: WebAssembly.compile is unavailable (no WebAssembly host; this port links QuickJS natively)"
+        );
+    }
+
+    #[test]
+    fn wasm_token_validates_the_magic_header() {
+        let error = QuickJsWasm::from_bytes(b"nope").expect_err("invalid module");
         assert_eq!(
             error.message,
             "Failed to load QuickJS: invalid WebAssembly module"
         );
-        let module = load_quickjs_wasm(Some(WASM)).expect("valid module");
+        let module = QuickJsWasm::from_bytes(WASM).expect("valid module");
         assert_eq!(module.bytes(), WASM);
     }
 

@@ -24,7 +24,8 @@
 //!   admission and the exact transport error strings);
 //! - [`transport`] — `runtime/host.ts:1-88`, `runtime/worker.ts:1-39`,
 //!   `runtime/remote.ts:52-277`, `wasm.ts:1-35` (local thread/channel worker
-//!   transport, injected-client remote transport, and wasm module loader).
+//!   transport, injected-client remote transport, header-validated wasm token,
+//!   and an honest wasm compile API that fails without a WebAssembly host).
 //!
 //! # Engine choice (deviation)
 //!
@@ -41,7 +42,9 @@
 //!   isolate, and WebAssembly compilation still need a platform this crate
 //!   cannot provide. [`transport`] supplies honest local equivalents (an OS
 //!   thread with channels, an injected [`transport::CodemodeRemote`] trait,
-//!   and wasm byte validation) and reports upstream's exact error strings;
+//!   a header-validated wasm token for the launcher, and a compile API that
+//!   fails with upstream's exact `Failed to load QuickJS: …` wrapper because
+//!   no WebAssembly host exists) and reports upstream's exact error strings;
 //!   the remaining gaps are documented in `WIRING.md`. `start()` / `deliver()`
 //!   is implemented over an OS thread with a JS-level virtual clock rather
 //!   than upstream's WASI shims.
