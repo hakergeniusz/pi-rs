@@ -1,8 +1,10 @@
 # Image subsystem — host wiring notes
 
-This directory is a **self-contained, not-yet-wired** port of pi 1.5.2's image
-attachment/input pipeline. The coordinator owns the host edits; this file is
-the exact recipe.
+This directory is a port of pi 1.5.2's image attachment/input pipeline. The
+**primary host wiring has landed** (`e8308bb`): `read.rs`, `file_processor.rs`
+and the interactive `convertToLlm` path call into this module. The notes below
+record the original recipe and the remaining tails; see `docs/GAP-STATUS.md`
+for current coverage.
 
 ## Files added
 
@@ -20,6 +22,12 @@ pub mod images;
 ```
 
 ## Host call sites (edit these, not this directory)
+
+**Status:** `read.rs`, `file_processor.rs` and the interactive `convertToLlm`
+filter are **wired** (`e8308bb`); `lib.rs` registers `pub mod images`. Still
+open: the print/JSON/RPC `convertToLlm` paths, clipboard-image paste/temp files,
+live `ShowImagesChange` refresh, and `normalize_tool_result_images` on tool/MCP
+image blocks. The recipe below is retained for those tails.
 
 ### `crates/pi-coding-agent/src/tools/read.rs`
 
