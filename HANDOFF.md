@@ -3722,6 +3722,33 @@ Rust; budget a coordinator fix round per slice (compile → clippy → tests). T
 real bugs were found only by the gates: an inverted Levenshtein substitution
 cost and an OAuth legacy-credential migration that dropped the token.
 
+## 2026-11-22 — parity wave + host builds
+
+**Build workflow changed:** podman containers and both images removed per
+operator request. `scripts/host-build.sh` is now the build entry point
+(Rust 1.100 on host; `CARGO_TARGET_DIR=.build-cache/target` on disk because
+the `/tmp` tmpfs has a user quota that fills on `--all-targets`). Its gate
+matches CI (fmt, clippy `-D warnings`, tests, fmt-check, library-only NDF).
+Full host gate green before every push; CI all-green after. Debug and release
+binaries built on host (`pi 0.1.0`, release 22 MB).
+
+**Parity wave landed (all subagent slices gated + integrated):**
+cache warmer (`d2558af`, 29 tests + host trait), RPC's final 10 commands
+(`497e306`), E4 `node:*` builtins + host packages (`6901712`), `/mcp`→`!`
+bash via PTY (`87f53ee`, 6 tests), serde_json `float_roundtrip`
+(`d09554b`), upstream coding-agent docs under `docs/upstream/` (`dd115cc`,
+47 files with pi-rs notes), and codemode host wiring (`515fc3f`). Two real
+bugs found by gates: an inverted hex-encoding assumption in a test and a
+`file://` URL authority normalization bug in the node shim.
+
+**Honest 1:1 status:** still not exact parity. Deliberate deviations remain
+(no `/share` or `/bug` — Radius upload policy; Node/Workers-only codemode
+transports; partial WHATWG URL/`Stats`/crypto shims; timer ownership in the
+cache warmer; no CJS interop or per-path `/reload` unload; macOS release
+assets pending runner availability). The upstream feature surface is
+otherwise covered; remaining differences are mechanism-level and documented
+in module docs and `docs/upstream/` notes.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
