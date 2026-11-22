@@ -680,7 +680,14 @@ impl rquickjs::loader::Loader for ExtensionLoader {
                 Ok(source) => source,
                 Err(err) => return Err(throw_js_error(ctx, &err.to_string())),
             };
-        let source = fold_require_expressions(&source);
+        // Folding is only meaningful for sources that actually call
+        // `require(...)`; skip the scan for the common ESM-only module so a
+        // large embedded template literal cannot stall module loading.
+        let source = if source.contains("require(") {
+            fold_require_expressions(&source)
+        } else {
+            source
+        };
         let source = if crate::cjs::detect(&source) == crate::cjs::ModuleFormat::Cjs {
             crate::cjs::wrap(Path::new(name), &source)
         } else {
