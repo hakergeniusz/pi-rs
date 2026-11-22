@@ -104,9 +104,8 @@ impl ToolExecutor for ChannelExecutor {
                 args,
             });
         }
-        let reply = match self.replies.recv() {
-            Ok(reply) => reply,
-            Err(_) => return Err(ToolError::new("Execution aborted")),
+        let Ok(reply) = self.replies.recv() else {
+            return Err(ToolError::new("Execution aborted"));
         };
         if reply.ok {
             Ok(reply
@@ -168,6 +167,7 @@ impl Sandbox {
     /// Run `code` deterministically with host-answered calls
     /// (`execution.ts:519-566`). Script failures never become Rust errors;
     /// only invalid options and a closed sandbox are rejected here.
+    #[allow(clippy::too_many_lines)] // mirrors the TS start() flow; split when extending
     pub fn start(&self, code: &str, options: CodemodeRunOptions) -> Result<CodemodeRun, String> {
         if self.is_closed() {
             return Err("Sandbox is closed".to_string());
@@ -361,8 +361,8 @@ impl CodemodeRun {
                     properties,
                 },
             );
-            let next_seq = state.next_seq;
-            while let Some(reply) = state.early.remove(&next_seq) {
+            let mut next = state.next_seq;
+            while let Some(reply) = state.early.remove(&next) {
                 if let Some(reply_now) = reply.now {
                     let mut clock = self
                         .clock
@@ -372,10 +372,11 @@ impl CodemodeRun {
                         *clock = reply_now;
                     }
                 }
-                idle.push((state.next_seq, state.issued));
+                idle.push((next, state.issued));
                 let _ = self.replies.send(reply);
-                state.next_seq += 1;
+                next += 1;
             }
+            state.next_seq = next;
         }
         for (seq, issued) in idle {
             if let Some(on_idle) = &self.on_idle {

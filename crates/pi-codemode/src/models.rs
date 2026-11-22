@@ -161,10 +161,13 @@ impl ModelInfo {
         })
     }
 
-    /// The JSON object handed back to the script.
+    /// The JSON object handed back to the script. `headers` is dropped here as
+    /// well as in [`Self::from_json`]: a host-built `ModelInfo` may still carry
+    /// it, and upstream's `toModelInfo` never exposes credentials.
     #[must_use]
     pub fn to_json(&self) -> Json {
         let mut object = self.fields.clone();
+        object.retain(|key, _| key != "headers");
         object.insert("provider".to_string(), Json::String(self.provider.clone()));
         object.insert("id".to_string(), Json::String(self.id.clone()));
         Json::Object(object.into_iter().collect())
@@ -389,6 +392,7 @@ const CLASSIFIER_CONTEXT_SHAPE: &str = "{ state: { ... }, images?: [{ type: \"im
 const IMAGES_CONTEXT_SHAPE: &str = "{ input: [{ type: \"text\", text: <prompt> }, ...optional { type: \"image\", data: <base64>, mimeType } references] }";
 
 /// Port of `checkClassifierContext` (`execute.ts:176-235`).
+#[allow(clippy::too_many_lines)] // mirrors upstream checkClassifierContext; split when extending
 pub fn check_classifier_context(context: &Json) -> Result<(), ToolError> {
     let fail = |problem: &str| {
         ToolError::new(format!(
@@ -585,10 +589,10 @@ fn model_call(
     if let Some(error) = result.error_message {
         object.insert("errorMessage".to_string(), Json::String(error));
     }
-    if let Some(cost) = result.usage_cost {
-        if let Some(number) = serde_json::Number::from_f64(cost) {
-            object.insert("cost".to_string(), Json::Number(number));
-        }
+    if let Some(cost) = result.usage_cost
+        && let Some(number) = serde_json::Number::from_f64(cost)
+    {
+        object.insert("cost".to_string(), Json::Number(number));
     }
     object.insert(
         "imageCount".to_string(),
@@ -650,8 +654,8 @@ pub fn model_globals(runtime: Arc<dyn ModelRuntime>) -> Vec<Arc<dyn Tool>> {
                             describe_args(&args)
                         ))
                     };
-                    let provider = args.get(1).and_then(Json::as_str).ok_or_else(|| error())?.to_string();
-                    let id = args.get(2).and_then(Json::as_str).ok_or_else(|| error())?.to_string();
+                    let provider = args.get(1).and_then(Json::as_str).ok_or_else(&error)?.to_string();
+                    let id = args.get(2).and_then(Json::as_str).ok_or_else(&error)?.to_string();
                     Ok(get_model
                         .get_model_of_type(model_type, &provider, &id)
                         .map_or(Json::Null, |model| model.to_json()))
@@ -765,6 +769,32 @@ mod tests {
         }
     }
 
+    struct ImageOnlyRegistry;
+
+    impl ModelRuntime for ImageOnlyRegistry {
+        fn get_models_of_type(&self, _: ModelType, _: Option<&str>) -> Vec<ModelInfo> {
+            Vec::new()
+        }
+        fn get_available_of_type(&self, _: ModelType, _: Option<&str>) -> Vec<ModelInfo> {
+            Vec::new()
+        }
+        fn get_model_of_type(
+            &self,
+            model_type: ModelType,
+            provider: &str,
+            id: &str,
+        ) -> Option<ModelInfo> {
+            (model_type == ModelType::Image && provider == "typesafe" && id == "jev-latest")
+                .then(|| model("typesafe", "jev-latest"))
+        }
+        fn classify(&self, _: &ModelInfo, _: &Json) -> Result<ModelCallResult, String> {
+            unreachable!("resolution fails before the call")
+        }
+        fn generate_images(&self, _: &ModelInfo, _: &Json) -> Result<ModelCallResult, String> {
+            unreachable!("resolution fails before the call")
+        }
+    }
+
     fn globals() -> Vec<Arc<dyn Tool>> {
         model_globals(Arc::new(StubRegistry))
     }
@@ -855,30 +885,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(unknown.message.contains("Unknown classifier model \"x/y\""));
-        struct ImageOnlyRegistry;
-        impl ModelRuntime for ImageOnlyRegistry {
-            fn get_models_of_type(&self, _: ModelType, _: Option<&str>) -> Vec<ModelInfo> {
-                Vec::new()
-            }
-            fn get_available_of_type(&self, _: ModelType, _: Option<&str>) -> Vec<ModelInfo> {
-                Vec::new()
-            }
-            fn get_model_of_type(
-                &self,
-                model_type: ModelType,
-                provider: &str,
-                id: &str,
-            ) -> Option<ModelInfo> {
-                (model_type == ModelType::Image && provider == "typesafe" && id == "jev-latest")
-                    .then(|| model("typesafe", "jev-latest"))
-            }
-            fn classify(&self, _: &ModelInfo, _: &Json) -> Result<ModelCallResult, String> {
-                unreachable!("resolution fails before the call")
-            }
-            fn generate_images(&self, _: &ModelInfo, _: &Json) -> Result<ModelCallResult, String> {
-                unreachable!("resolution fails before the call")
-            }
-        }
         let wrong_tool = model_globals(Arc::new(ImageOnlyRegistry))
             .into_iter()
             .find(|tool| tool.name() == "models.classify")

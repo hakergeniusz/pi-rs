@@ -361,7 +361,7 @@ pub type IdleCallback = Arc<dyn Fn(u32, u32) + Send + Sync>;
 /// Options of a deterministic run (`types.ts:206-226`). The sandbox's own
 /// tools and globals are not used: the run declares its own, and every call is
 /// forwarded to `on_call` (`runtime/execution.ts:519-543`).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CodemodeRunOptions {
     /// VM clock start, in ms since the epoch.
     pub started_at: f64,
@@ -386,6 +386,26 @@ pub struct CodemodeRunOptions {
     pub on_idle: Option<IdleCallback>,
 }
 
+impl Default for CodemodeRunOptions {
+    /// Upstream requires `startedAt`; leaving it unset is `undefined`, which
+    /// fails the `Number.isFinite(startedAt)` check. `NaN` is this port's
+    /// equivalent so the default options cannot start a run.
+    fn default() -> Self {
+        Self {
+            started_at: f64::NAN,
+            seed: 0,
+            tools: Vec::new(),
+            globals: Vec::new(),
+            store: None,
+            signal: None,
+            timeout_ms: None,
+            on_started: None,
+            on_call: None,
+            on_idle: None,
+        }
+    }
+}
+
 /// A running deterministic execution (`types.ts:228-243`).
 ///
 /// The VM runs on a worker thread so that `start()` returns immediately and
@@ -402,6 +422,14 @@ pub struct CodemodeRun {
     pub(crate) result: Arc<Mutex<Option<CodemodeResult>>>,
     pub(crate) on_idle: Option<IdleCallback>,
     pub(crate) worker: Option<std::thread::JoinHandle<()>>,
+}
+
+// The VM reply sender is not `Debug`, but test helpers call `unwrap_err()` on
+// results carrying `CodemodeRun` as the Ok type; a stable label is enough.
+impl std::fmt::Debug for CodemodeRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CodemodeRun")
+    }
 }
 
 #[cfg(test)]
@@ -446,13 +474,5 @@ mod tests {
         };
         assert!(!err.is_ok());
         assert_eq!(err.error().map_or("", |e| e.message.as_str()), "boom");
-    }
-}
-
-// The VM reply sender is not `Debug`, but test helpers call `unwrap_err()` on
-// results carrying `CodemodeRun` as the Ok type; a stable label is enough.
-impl std::fmt::Debug for CodemodeRun {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("CodemodeRun")
     }
 }

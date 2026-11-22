@@ -52,6 +52,13 @@ impl Drop for WorkerReservation {
     }
 }
 
+// The release callback is not `Debug`; tests only need a stable label.
+impl std::fmt::Debug for WorkerReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WorkerReservation")
+    }
+}
+
 /// How the host observes a worker's actual exit (`onWorkerStarted`,
 /// `types.ts:156-162`): upstream passes a promise that resolves on `exit`.
 pub struct WorkerExit(Receiver<()>);
@@ -270,14 +277,7 @@ mod tests {
             WasmLoaderStub::unsupported(),
         ] {
             assert_eq!(error.kind, CodemodeErrorKind::Sandbox);
-            assert!(!error.message.is_empty());
+            assert_ne!(error.message, "");
         }
-    }
-}
-
-// The release callback is not `Debug`; tests only need a stable label.
-impl std::fmt::Debug for WorkerReservation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("WorkerReservation")
     }
 }
