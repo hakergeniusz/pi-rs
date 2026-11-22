@@ -387,7 +387,7 @@ pub(crate) fn resolve_function_calling_mode(
     Ok(choice)
 }
 
-const JSON_SCHEMA_META_DECLARATIONS: [&str; 7] = [
+const JSON_SCHEMA_META_DECLARATIONS: [&str; 8] = [
     "$schema",
     "$id",
     "$anchor",
@@ -395,6 +395,7 @@ const JSON_SCHEMA_META_DECLARATIONS: [&str; 7] = [
     "$vocabulary",
     "$comment",
     "$defs",
+    "definitions",
 ];
 
 const JSON_SCHEMA_NAME_MAPS: [&str; 6] = [
