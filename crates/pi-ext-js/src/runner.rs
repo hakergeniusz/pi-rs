@@ -7742,7 +7742,7 @@ export default function (pi) {
         assert_eq!(runner.flags()[0].name, "mode");
 
         let paths = [PathBuf::from("<test-0>")];
-        runner.reload_with_sources(&paths, &[Some(RELOAD_V2)]);
+        let _ = runner.reload_with_sources(&paths, &[Some(RELOAD_V2)]);
         runner.bind().expect("bind");
 
         assert!(runner.tool("old_tool").is_none());
@@ -7763,6 +7763,7 @@ export default function (pi) {
     }
 
     #[test]
+    #[allow(clippy::items_after_statements)] // fixture source constants read best next to their use
     fn reload_preserves_stale_ctx_protocol_and_fresh_contexts() {
         const CAPTURE: &str = r#"
 export default function (pi) {
@@ -7790,7 +7791,7 @@ export default function (pi) {
 }
 "#;
         let paths = [PathBuf::from("<test-0>")];
-        runner.reload_with_sources(&paths, &[Some(FRESH)]);
+        let _ = runner.reload_with_sources(&paths, &[Some(FRESH)]);
         runner.bind().expect("bind");
         runner
             .emit(&json!({ "type": "use" }))
@@ -7803,6 +7804,7 @@ export default function (pi) {
     }
 
     #[test]
+    #[allow(clippy::items_after_statements)] // fixture source constants read best next to their use
     fn reload_drops_mcp_registrations_and_connections() {
         let directory = tempfile::tempdir().expect("tempdir");
         let server = crate::mcp_manager::write_fixture_server(directory.path()).expect("fixture");
@@ -7820,7 +7822,7 @@ export default function (pi) {
         // Reload with a source that registers no MCP server at all.
         const EMPTY: &str = "export default function (pi) {}";
         let paths = [PathBuf::from("<test-0>")];
-        runner.reload_with_sources(&paths, &[Some(EMPTY)]);
+        let _ = runner.reload_with_sources(&paths, &[Some(EMPTY)]);
         runner.bind().expect("bind");
         assert!(
             runner

@@ -688,7 +688,7 @@ pub fn reload(
     settings: &SettingsManager,
     runner: &Arc<Mutex<pi_ext_js::ExtensionRunner>>,
 ) -> Vec<Diagnostic> {
-    use pi_ext_js::loader::{discover_cli_paths, discover_extensions, load_paths};
+    use pi_ext_js::loader::{discover_cli_paths, discover_extensions};
 
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     // `--no-extensions` still loads CLI extensions
@@ -706,16 +706,14 @@ pub fn reload(
     // `reload`).
     runner.core().lock().expect("host core").settings = Value::Object(settings.get_settings());
 
-    // The final pass: everything trusted allows, minus already-loaded
-    // modules (`loadFinalExtensionSet`, `resource-loader.ts:791-833`).
-    let loaded: HashSet<String> = runner.extension_paths().into_iter().collect();
-    let remaining: Vec<PathBuf> = discovered
+    // Upstream clears the extension factory cache and re-evaluates every
+    // file on /reload (`resource-loader.ts:541-545`); no loaded-set filter.
+    let paths: Vec<PathBuf> = discovered
         .iter()
         .filter(|entry| project_trusted || entry.origin != pi_ext_js::ExtensionOrigin::Project)
         .map(|entry| entry.path.clone())
-        .filter(|path| !loaded.contains(&path.to_string_lossy().into_owned()))
         .collect();
-    let result = load_paths(&mut runner, &remaining);
+    let result = runner.reload(&paths);
     for load_error in &result.errors {
         diagnostics.push(error(format!(
             "Failed to load extension \"{}\": {}",
