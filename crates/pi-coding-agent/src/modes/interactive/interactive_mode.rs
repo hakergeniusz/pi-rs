@@ -3847,7 +3847,7 @@ impl InteractiveMode {
                 // a second `!` while a pty command is live is rejected and
                 // the draft is put back. Esc (wired below) cancels it first.
                 if self.bash_run.is_some() {
-                    self.editor_mut().editor.set_text(text);
+                    self.editor_mut().editor.set_text(&text);
                     self.show_warning(
                         "A bash command is already running. Press Esc to cancel it first.",
                     );
@@ -6200,8 +6200,8 @@ impl InteractiveMode {
                     done = Some(result);
                     break;
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty)
-                | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty
+                    | std::sync::mpsc::TryRecvError::Disconnected) => break,
             }
         }
         let Some(result) = done else {

@@ -245,9 +245,8 @@ fn worker(
             };
         }
     };
-    if let Some(pid) = child.id()
-        && let Ok(mut guard) = control.pid.lock()
-    {
+    let pid = child.id();
+    if let Ok(mut guard) = control.pid.lock() {
         *guard = Some(pid);
     }
     if let Some(pipe) = child.stdin.take()
@@ -264,10 +263,7 @@ fn worker(
         }
         // A blocking read is fine: `^C`/kill makes the child close the pty,
         // which ends the read. The watchdog bounds a stubborn job.
-        let read = match stdout.read(&mut buffer) {
-            Ok(read) => read,
-            Err(_) => break,
-        };
+        let Ok(read) = stdout.read(&mut buffer) else { break };
         if read == 0 {
             break;
         }
@@ -280,7 +276,7 @@ fn worker(
         *guard = None;
     }
     let status = child.wait();
-    output.finish(cancel.load(Ordering::SeqCst), exit_code_from(&status))
+    output.finish(cancel.load(Ordering::SeqCst), Some(exit_code_from(&status)))
 }
 
 /// The rolling output window of `appendText` (`bash-executor.ts:77-106`),
@@ -339,15 +335,12 @@ impl PtyOutput {
         let full = self.chunks.concat();
         let truncation = truncate_tail(&full, TruncationOptions::default());
         let full_output_path = if truncation.truncated {
-            match self.temp.take() {
-                Some((path, file)) => {
-                    let _ = file.sync_all();
-                    Some(path)
-                }
-                None => {
-                    let path = crate::tools::output_accumulator::temp_file_path("pi-bash");
-                    std::fs::write(&path, &full).ok().map(|()| path)
-                }
+            if let Some((path, file)) = self.temp.take() {
+                let _ = file.sync_all();
+                Some(path)
+            } else {
+                let path = crate::tools::output_accumulator::temp_file_path("pi-bash");
+                std::fs::write(&path, &full).ok().map(|()| path)
             }
         } else {
             self.temp.map(|(path, file)| {
@@ -367,23 +360,23 @@ impl PtyOutput {
 
 /// pi's signal convention (`bash.ts:174-177`): a signal-killed shell reports
 /// `128 + signal` rather than no exit code.
-fn exit_code_from(status: &std::io::Result<ExitStatus>) -> Option<i32> {
+fn exit_code_from(status: &std::io::Result<ExitStatus>) -> i32 {
     match status {
         Ok(status) => match status.code() {
-            Some(code) => Some(code),
+            Some(code) => code,
             None => {
                 #[cfg(unix)]
                 {
                     use std::os::unix::process::ExitStatusExt;
-                    Some(128 + status.signal().unwrap_or(0))
+                    128 + status.signal().unwrap_or(0)
                 }
                 #[cfg(not(unix))]
                 {
-                    Some(1)
+                    1
                 }
             }
         },
-        Err(_) => Some(1),
+        Err(_) => 1,
     }
 }
 
@@ -423,9 +416,10 @@ mod tests {
     }
 
     /// Drain a run to its `Done` event, collecting streamed chunks.
+    #[allow(clippy::needless_pass_by_value)] // the test helper consumes its run
     fn collect(run: BashPtyRun) -> (Vec<String>, BashPtyResult) {
         let mut chunks = Vec::new();
-        for event in run.events.iter() {
+        for event in &run.events {
             match event {
                 BashPtyEvent::Chunk(text) => chunks.push(text),
                 BashPtyEvent::Done(result) => return (chunks, result),
