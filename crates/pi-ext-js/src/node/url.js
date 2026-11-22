@@ -84,7 +84,13 @@ export class URL {
     this.search = match[4] === undefined ? "" : `?${match[4]}`;
     this.hash = match[5] === undefined ? "" : `#${match[5]}`;
     this.searchParams = new URLSearchParams(match[4] ?? "");
-    this.href = `${this.protocol}${this.host ? `//${this.host}` : ""}${this.pathname}${this.search}${this.hash}`;
+    // WHATWG keeps the empty authority for `file:` URLs (file:///path).
+    const authority = this.host
+      ? `//${this.host}`
+      : this.protocol === "file:"
+        ? "//"
+        : "";
+    this.href = `${this.protocol}${authority}${this.pathname}${this.search}${this.hash}`;
   }
 
   toString() {

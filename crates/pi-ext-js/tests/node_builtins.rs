@@ -93,7 +93,7 @@ fn genuinely_unavailable_host_packages_keep_the_e1_error() {
             "<unavailable>",
             Some(
                 "import { Text } from \"@earendil-works/pi-tui\";\n\
-                 export default function (): void { void Text; }\n",
+                 export default function () { void Text; }\n",
             ),
         )
         .expect_err("unavailable host package must reject");

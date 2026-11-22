@@ -55,7 +55,9 @@ gate() {
   echo "=== fmt --check ==="
   nice -n 19 cargo fmt --all -- --check || rc=1
   echo "=== NDF ==="
-  nice -n 19 cargo check --workspace --all-targets --offline --no-default-features || rc=1
+  # Match CI exactly: the ext-js-gated test helpers are not built without the
+  # feature; only the library shape must compile.
+  nice -n 19 cargo check -p pi-coding-agent --offline --no-default-features || rc=1
   echo "GATE_RC=$rc"
   return "$rc"
 }
