@@ -76,10 +76,55 @@
 use crate::auth::{Credential, read_stored_credential};
 use crate::models_config::{ExtensionProviderConfig, ModelsJsonProvider};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+/// Upstream's `ModelsError` (`models/error.ts`, thrown at
+/// `auth/resolve.ts:143,175,188`): the kind (`"oauth"`/`"auth"`) plus the
+/// exact message, with the underlying flow error kept as a cause. The wire
+/// ladder uses this typed failure instead of collapsing a refresh error into
+/// the generic "no API key found" outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelsError {
+    pub kind: &'static str,
+    pub message: String,
+    pub cause: Option<String>,
+}
+
+impl ModelsError {
+    /// `new ModelsError("oauth", "OAuth refresh failed for <provider>", {cause})`
+    /// (`auth/resolve.ts:142-144`).
+    #[must_use]
+    pub fn oauth_refresh_failed(provider: &str, cause: Option<String>) -> Self {
+        Self {
+            kind: "oauth",
+            message: format!("OAuth refresh failed for {provider}"),
+            cause,
+        }
+    }
+
+    /// `new ModelsError("auth", "Credential store modify failed for <provider>")`
+    /// (`auth/resolve.ts:147`).
+    #[must_use]
+    pub fn credential_store_failed(provider: &str, cause: Option<String>) -> Self {
+        Self {
+            kind: "auth",
+            message: format!("Credential store modify failed for {provider}"),
+            cause,
+        }
+    }
+}
+
+impl fmt::Display for ModelsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ModelsError {}
 
 /// `RADIUS_PROVIDER_ID` (`core/radius.ts:3`).
 pub const RADIUS_PROVIDER_ID: &str = "radius";

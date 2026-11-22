@@ -1,15 +1,23 @@
 //! GitHub Copilot device-code OAuth (`packages/ai/src/auth/oauth/github-copilot.ts`).
 //!
 //! Ground truth: client id and Copilot headers (`:11-20`), domain/URL/token
-//! helpers (`:42-88`), model catalogue parsing (`:90-134`), device flow
+//! helpers (`:42-88`), model catalogue parsing (`:90-134`), the bounded
+//! `fetchWithRateLimitRetry` 429 back-off (`:139-167`), device flow
 //! (`:207-305`), Copilot token refresh (`:307-361`), model enabling
 //! (`:363-426`), login (`:428-479`) and `githubCopilotOAuth` (`:487-501`).
 //!
-//! Deviations: the 429 back-off and best-effort policy-enable POSTs are not
-//! ported (they only widen an already-authenticated model catalogue); the
-//! catalogue is fetched once with the same headers and parsed with the same
-//! picker/policy rules. Enterprise URLs are only synthesized for non-default
-//! domains; tests substitute the loopback endpoint table for `github.com`.
+//! Deviations: the best-effort policy-enable POSTs are not ported (they only
+//! widen an already-authenticated model catalogue); when the catalogue is
+//! fetched the same picker/policy rules apply. The upstream refresh path
+//! deliberately disables 429 retry for its catalogue fetch
+//! (`refreshGitHubCopilotToken`, `:347-361`, passes `{0, 0}`), which the port
+//! preserves; the bounded back-off is applied to the token refresh request
+//! itself and to the login catalogue fetch (`{2, 5000}`), so a throttled
+//! refresh is retried instead of failing the whole wire request. Enterprise
+//! URLs are only synthesized for non-default domains; tests substitute the
+//! loopback endpoint table for `github.com`.
+
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -21,7 +29,7 @@ use super::http::{form_encode, normalize_domain, send};
 use super::trusted_url::trusted_http_url;
 use super::{
     AuthError, AuthEvent, AuthPrompt, CancelToken, EndpointConfig, FlowConfig, Interaction,
-    OAuthCredential,
+    OAuthCredential, RetryPolicy,
 };
 
 const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -89,6 +97,10 @@ async fn get_json(
         request = request.header(*name, *value);
     }
     let response = send(request, cancel).await?;
+    json_from_response(response).await
+}
+
+async fn json_from_response(response: reqwest::Response) -> Result<Value, AuthError> {
     let status = response.status();
     let text = response
         .text()
@@ -98,6 +110,140 @@ async fn get_json(
         return Err(http_error(status, &text));
     }
     serde_json::from_str::<Value>(&text).map_err(|error| AuthError::Message(error.to_string()))
+}
+
+/// The per-request timeout upstream adds to every retried fetch
+/// (`AbortSignal.timeout(5000)`, `github-copilot.ts:151`).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `Date.parse`-style parsing of an IMF-fixdate `Retry-After` header
+/// (`Sun, 06 Nov 1994 08:49:37 GMT`). Other upstream-accepted legacy formats
+/// are treated as unparseable, which has the same observable effect as
+/// upstream's `!Number.isFinite(delayMs)` branch: give up and return the 429.
+fn parse_http_date(text: &str) -> Option<i64> {
+    let parts: Vec<&str> = text.trim().split_whitespace().collect();
+    let [weekday, day, month, year, time, zone] = parts.as_slice() else {
+        return None;
+    };
+    if !weekday.ends_with(',') || *zone != "GMT" {
+        return None;
+    }
+    let day: i64 = day.parse().ok()?;
+    let year: i64 = year.parse().ok()?;
+    let month = match *month {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let clock: Vec<i64> = time
+        .split(':')
+        .map(str::parse::<i64>)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let [hours, minutes, seconds] = clock.as_slice() else {
+        return None;
+    };
+    if !(1..=31).contains(day) || !(0..=23).contains(hours) || !(0..=59).contains(minutes) || !(0..=59).contains(seconds) {
+        return None;
+    }
+    // Days from the Unix epoch (Howard Hinnant's civil calendar algorithm).
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + *hours * 3600 + *minutes * 60 + *seconds)
+}
+
+/// `fetchWithRateLimitRetry` (`github-copilot.ts:139-167`): retry a throttled
+/// (429) GET with upstream's `500 * 2 ** retry` exponential delay, an
+/// optional `Retry-After` override (numeric seconds or an IMF-fixdate), a
+/// five-second per-request timeout and an optional overall elapsed budget.
+///
+/// Dropping the 429 response between attempts is the Rust equivalent of
+/// upstream's `response.body?.cancel()`. The delay and budget make the
+/// loop synthetic-testable: a loopback server can answer `Retry-After: 0`
+/// for an immediate retry, or a large value to hit the budget and stop.
+async fn fetch_with_rate_limit_retry(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(&str, String)],
+    cancel: &CancelToken,
+    policy: &RetryPolicy,
+) -> Result<reqwest::Response, AuthError> {
+    let deadline = (policy.max_retries > 0 && policy.max_elapsed_ms > 0)
+        .then(|| Instant::now() + Duration::from_millis(policy.max_elapsed_ms));
+    for retry in 0..=policy.max_retries {
+        if cancel.is_cancelled() {
+            return Err(AuthError::Cancelled);
+        }
+        let mut request = client
+            .get(url)
+            .timeout(REQUEST_TIMEOUT)
+            .header("Accept", "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, value.as_str());
+        }
+        let response = send(request, cancel).await?;
+        if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS
+            || retry == policy.max_retries
+        {
+            return Ok(response);
+        }
+
+        // `let delayMs = 500 * 2 ** retry`, then the Retry-After override
+        // (`github-copilot.ts:155-162`).
+        let mut delay_ms = 500_u64.saturating_mul(1_u64 << retry.min(31));
+        if let Some(value) = response.headers().get(reqwest::header::RETRY_AFTER)
+            && let Ok(text) = value.to_str()
+        {
+            if let Some(seconds) = text.trim().parse::<f64>().ok() {
+                if !seconds.is_finite() || seconds < 0.0 {
+                    return Ok(response);
+                }
+                delay_ms = (seconds * 1000.0) as u64;
+            } else if let Some(target) = parse_http_date(text) {
+                delay_ms = target.saturating_sub(super::now_ms()).max(0) as u64;
+            } else {
+                return Ok(response);
+            }
+        }
+        if let Some(deadline) = deadline
+            && Duration::from_millis(delay_ms) >= deadline.saturating_duration_since(Instant::now())
+        {
+            return Ok(response);
+        }
+        drop(response);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        if cancel.is_cancelled() {
+            return Err(AuthError::Cancelled);
+        }
+    }
+    // The loop always returns from inside (the last attempt cannot retry).
+    unreachable!("fetchWithRateLimitRetry always returns on its final attempt")
+}
+
+async fn get_json_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(&str, String)],
+    cancel: &CancelToken,
+    policy: &RetryPolicy,
+) -> Result<Value, AuthError> {
+    let response = fetch_with_rate_limit_retry(client, url, headers, cancel, policy).await?;
+    json_from_response(response).await
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -259,14 +405,15 @@ fn model_ids(value: &Value) -> Result<Vec<String>, AuthError> {
         .collect())
 }
 
-/// `fetchGitHubCopilotModels` (`github-copilot.ts:169-196`) with the
-/// retry policy omitted (see module docs).
+/// `fetchGitHubCopilotModels` (`github-copilot.ts:169-196`), with upstream's
+/// injected `retryPolicy` used for every 429 response.
 async fn fetch_models(
     token: &str,
     enterprise_domain: Option<&str>,
     endpoints: &EndpointConfig,
     client: &reqwest::Client,
     cancel: &CancelToken,
+    policy: &RetryPolicy,
 ) -> Result<Vec<String>, AuthError> {
     let url = format!("{}/models", base_url(token, enterprise_domain));
     // Only the `github.com` default endpoint is overridable in tests.
@@ -280,24 +427,21 @@ async fn fetch_models(
     } else {
         url
     };
-    let value = get_json(
-        client,
-        &url,
-        &[
-            ("Authorization", &format!("Bearer {token}")),
-            ("User-Agent", USER_AGENT),
-            ("Editor-Version", "vscode/1.107.0"),
-            ("Editor-Plugin-Version", "copilot-chat/0.35.0"),
-            ("Copilot-Integration-Id", "vscode-chat"),
-            ("X-GitHub-Api-Version", COPILOT_API_VERSION),
-        ],
-        cancel,
-    )
-    .await?;
+    let headers = [
+        ("Authorization", format!("Bearer {token}")),
+        ("User-Agent", USER_AGENT.to_string()),
+        ("Editor-Version", "vscode/1.107.0".to_string()),
+        ("Editor-Plugin-Version", "copilot-chat/0.35.0".to_string()),
+        ("Copilot-Integration-Id", "vscode-chat".to_string()),
+        ("X-GitHub-Api-Version", COPILOT_API_VERSION.to_string()),
+    ];
+    let value = get_json_with_retry(client, &url, &headers, cancel, policy).await?;
     model_ids(&value)
 }
 
-/// `refreshGitHubCopilotAccessToken` (`github-copilot.ts:307-342`).
+/// `refreshGitHubCopilotAccessToken` (`github-copilot.ts:307-342`). The token
+/// fetch goes through `fetchWithRateLimitRetry` with the injected policy so a
+/// 429 while refreshing does not fail the wire request (`github-copilot.ts:139-167`).
 async fn refresh_access_token(
     refresh_token: &str,
     enterprise_domain: Option<&str>,
@@ -306,19 +450,15 @@ async fn refresh_access_token(
     cancel: &CancelToken,
 ) -> Result<OAuthCredential, AuthError> {
     let (_, _, token_url) = get_urls("github.com", endpoints);
-    let value = get_json(
-        client,
-        &token_url,
-        &[
-            ("Authorization", &format!("Bearer {refresh_token}")),
-            ("User-Agent", USER_AGENT),
-            ("Editor-Version", "vscode/1.107.0"),
-            ("Editor-Plugin-Version", "copilot-chat/0.35.0"),
-            ("Copilot-Integration-Id", "vscode-chat"),
-        ],
-        cancel,
-    )
-    .await?;
+    let headers = [
+        ("Authorization", format!("Bearer {refresh_token}")),
+        ("User-Agent", USER_AGENT.to_string()),
+        ("Editor-Version", "vscode/1.107.0".to_string()),
+        ("Editor-Plugin-Version", "copilot-chat/0.35.0".to_string()),
+        ("Copilot-Integration-Id", "vscode-chat".to_string()),
+    ];
+    let value =
+        get_json_with_retry(client, &token_url, &headers, cancel, &endpoints.retry_policy).await?;
     let token = value.get("token").and_then(Value::as_str);
     let expires_at = value.get("expires_at").and_then(Value::as_f64);
     if token.is_none() || expires_at.is_none() {
@@ -355,12 +495,15 @@ pub async fn refresh(
         cancel,
     )
     .await?;
+    // Upstream's refresh deliberately disables 429 retry for the catalogue
+    // fetch (`refreshGitHubCopilotToken`, `:352-354`, passes `{0, 0}`).
     credential.available_model_ids = fetch_models(
         &credential.access,
         enterprise_domain,
         &config.github_copilot,
         &config.client,
         cancel,
+        &RetryPolicy::default(),
     )
     .await?;
     Ok(credential)
@@ -421,12 +564,15 @@ pub async fn login(
         &interaction.cancellation(),
     )
     .await?;
+    // Login uses upstream's `{2, 5000}` retry budget for the catalogue fetch
+    // (`loginGitHubCopilot`, `:463-468`).
     credential.available_model_ids = fetch_models(
         &credential.access,
         enterprise_domain.as_deref(),
         &config.github_copilot,
         &config.client,
         &interaction.cancellation(),
+        &config.github_copilot.retry_policy,
     )
     .await?;
     Ok(credential)
@@ -641,5 +787,102 @@ mod tests {
             flow.await.expect("flow").unwrap_err().to_string(),
             CANCEL_MESSAGE
         );
+    }
+
+    #[test]
+    fn http_date_retry_after_parses_like_upstream_date_parse() {
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        assert_eq!(parse_http_date("not a date"), None);
+        assert_eq!(parse_http_date("Sun, 06 Foo 1994 08:49:37 GMT"), None);
+    }
+
+    /// A throttled token refresh retries with the injected policy. The
+    /// loopback server supplies `Retry-After: 0`, so the test is fast and
+    /// deterministic while still exercising the full retry loop.
+    #[tokio::test]
+    async fn token_refresh_retries_429_with_the_upstream_budget() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let server = FakeServer::start_with_headers(move |request| {
+            if request.contains("GET /models") {
+                return (200, Vec::new(), token_and_models(request).1);
+            }
+            let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count < 2 {
+                (
+                    429,
+                    vec![("Retry-After".to_string(), "0".to_string())],
+                    String::new(),
+                )
+            } else {
+                (200, Vec::new(), r#"{"token":"copilot-token","expires_at":4102444800}"#.to_string())
+            }
+        });
+        let config = configured(&server);
+        assert_eq!(
+            config.github_copilot.retry_policy,
+            RetryPolicy {
+                max_retries: 2,
+                max_elapsed_ms: 5000
+            }
+        );
+        let credential = refresh("gh-token", None, &CancelToken::new(), &config)
+            .await
+            .expect("refresh after backoff");
+        assert_eq!(credential.access, "copilot-token");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|request| request.contains("/copilot_internal/v2/token"))
+                .count(),
+            3
+        );
+    }
+
+    /// A delay beyond the injected elapsed budget stops the retry loop and
+    /// surfaces the 429, rather than sleeping for the server's `Retry-After`.
+    #[tokio::test]
+    async fn token_refresh_honors_the_elapsed_budget() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let server = FakeServer::start_with_headers(move |_request| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (
+                429,
+                vec![("Retry-After".to_string(), "30".to_string())],
+                String::new(),
+            )
+        });
+        let mut config = configured(&server);
+        config.github_copilot.retry_policy.max_elapsed_ms = 1;
+        let error = refresh("gh-token", None, &CancelToken::new(), &config)
+            .await
+            .expect_err("throttled refresh");
+        assert_eq!(error.to_string(), "429 Too Many Requests: ");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// With no retry policy (upstream's `{0, 0}` catalogue fetch) a 429 is
+    /// returned immediately — the same behavior the port had before the
+    /// back-off was ported.
+    #[tokio::test]
+    async fn no_policy_means_no_retry() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let server = FakeServer::start_with_headers(move |_request| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (429, Vec::new(), String::new())
+        });
+        let mut config = configured(&server);
+        config.github_copilot.retry_policy = RetryPolicy::default();
+        assert!(refresh("gh-token", None, &CancelToken::new(), &config)
+            .await
+            .is_err());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

@@ -18,7 +18,9 @@
 //!   (`:122-185`), device flow (`:187-287`), browser login (`:289-400`),
 //!   refresh (`:405-438`).
 //! - `oauth/github-copilot.ts` — domain/token helpers (`:42-88`), device flow
-//!   (`:207-305`), refresh/model catalogue (`:307-361`), login (`:428-501`).
+//!   (`:207-305`), refresh/model catalogue (`:307-361`), login (`:428-501`),
+//!   `fetchWithRateLimitRetry`'s bounded 429 back-off (`:139-167`) and the
+//!   `toAuth` proxy base URL (`:494-500`).
 //!
 //! Deviations (see `WIRING.md` at the worktree root):
 //! - The app-owned interaction callbacks become the concrete
@@ -358,6 +360,26 @@ impl Interaction {
     }
 }
 
+/// Upstream's `retryPolicy` object for `fetchWithRateLimitRetry`
+/// (`github-copilot.ts:139-167`): `maxRetries` extra attempts (each backed off
+/// `500 * 2 ** retry` ms unless `Retry-After` says otherwise) and an optional
+/// `maxElapsedMs` overall budget. `{0, 0}` disables retrying, as in the
+/// refresh path upstream (`github-copilot.ts:352-354`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    pub max_retries: usize,
+    pub max_elapsed_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 0,
+            max_elapsed_ms: 0,
+        }
+    }
+}
+
 /// Per-provider URLs and callback binding. `Default` is the verbatim
 /// upstream table; tests override individual fields with loopback URLs.
 #[derive(Debug, Clone)]
@@ -371,6 +393,9 @@ pub struct EndpointConfig {
     pub callback_host: String,
     pub callback_port: u16,
     pub callback_path: String,
+    /// Copilot 429 back-off (`fetchWithRateLimitRetry`); `Default` keeps the
+    /// other flows' verbatim no-retry behavior.
+    pub retry_policy: RetryPolicy,
 }
 
 impl Default for EndpointConfig {
@@ -385,6 +410,7 @@ impl Default for EndpointConfig {
             callback_host: "127.0.0.1".to_string(),
             callback_port: 0,
             callback_path: "/callback".to_string(),
+            retry_policy: RetryPolicy::default(),
         }
     }
 }
@@ -426,6 +452,13 @@ impl Default for FlowConfig {
                 device_user_code_url: "https://github.com/login/device/code".to_string(),
                 device_token_url: "https://github.com/login/oauth/access_token".to_string(),
                 token_url: "https://api.githubcopilot.com/copilot_internal/v2/token".to_string(),
+                // Upstream's `fetchWithRateLimitRetry` budget for Copilot
+                // (`maxRetries: 2, maxElapsedMs: 5000`), applied to the token
+                // and catalogue fetches (`github-copilot.ts:180, 396-400`).
+                retry_policy: RetryPolicy {
+                    max_retries: 2,
+                    max_elapsed_ms: 5000,
+                },
                 ..EndpointConfig::default()
             },
         }
@@ -489,15 +522,41 @@ pub async fn refresh(
 
 /// `OAuthAuth.toAuth` (`anthropic.ts:304-306`, `openai-codex.ts:435-437`,
 /// `github-copilot.ts:494-500`): API key from the access token, plus the
-/// Copilot proxy base URL derived from it.
+/// Copilot proxy base URL derived from it. Upstream passes
+/// `copilotEnterpriseDomain(credential)` — the normalized `enterpriseUrl` —
+/// so the enterprise fallback (`https://copilot-api.<domain>`) is honored
+/// when the token carries no `proxy-ep`.
 #[must_use]
 pub fn to_auth(provider_id: &str, credential: &OAuthCredential) -> (String, Option<String>) {
     let base_url = if provider_id == "github-copilot" {
-        github_copilot::base_url_from_token(&credential.access, None)
+        let domain = credential
+            .enterprise_url
+            .as_deref()
+            .and_then(http::normalize_domain);
+        github_copilot::base_url_from_token(&credential.access, domain.as_deref())
     } else {
         None
     };
     (credential.access.clone(), base_url)
+}
+
+/// The request base URL `toAuth` derives for Copilot from a bare wire token
+/// (`github-copilot.ts:68-88`, `:494-500`). Other providers return `None`
+/// (their model catalog carries the base URL).
+#[must_use]
+pub fn base_url_for_wire_token(provider_id: &str, token: &str) -> Option<String> {
+    to_auth(
+        provider_id,
+        &OAuthCredential {
+            access: token.to_string(),
+            refresh: String::new(),
+            expires: 0,
+            account_id: None,
+            enterprise_url: None,
+            available_model_ids: Vec::new(),
+        },
+    )
+    .1
 }
 
 /// `Date.now()` in milliseconds — injected here so tests can assert expiry
@@ -570,6 +629,34 @@ mod tests {
                 Some("https://api.individual.githubcopilot.com".to_string())
             )
         );
+        // Upstream's `toAuth` feeds `copilotEnterpriseDomain(credential)` into
+        // `getGitHubCopilotBaseUrl`: a proxy-ep in the token wins, otherwise
+        // the normalized `enterpriseUrl` supplies the fallback host.
+        let copilot = OAuthCredential {
+            access: "tid=1;proxy-ep=proxy.individual.githubcopilot.com;".to_string(),
+            ..credential.clone()
+        };
+        assert_eq!(
+            to_auth("github-copilot", &copilot),
+            (
+                copilot.access.clone(),
+                Some("https://api.individual.githubcopilot.com".to_string())
+            )
+        );
+        let enterprise = OAuthCredential {
+            access: "tok".to_string(),
+            enterprise_url: Some("https://ghe.company.com/".to_string()),
+            ..credential
+        };
+        assert_eq!(
+            to_auth("github-copilot", &enterprise).1,
+            Some("https://copilot-api.ghe.company.com".to_string())
+        );
+        assert_eq!(
+            base_url_for_wire_token("github-copilot", "tid=1;proxy-ep=proxy.acme.dev;"),
+            Some("https://api.acme.dev".to_string())
+        );
+        assert_eq!(base_url_for_wire_token("anthropic", "tok"), None);
     }
 
     #[tokio::test]

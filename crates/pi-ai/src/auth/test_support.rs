@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 type Handler = dyn Fn(&str) -> (u16, String) + Send + Sync;
+type HeaderHandler = dyn Fn(&str) -> (u16, Vec<(String, String)>, String) + Send + Sync;
 
 /// The handler receives the full request text (request line, headers and,
 /// when present in the first read, the body).
@@ -27,11 +28,23 @@ impl FakeServer {
     /// Bind a loopback listener and serve until the server is dropped.
     #[must_use]
     pub fn start(handler: impl Fn(&str) -> (u16, String) + Send + Sync + 'static) -> Self {
+        Self::start_with_headers(move |request| {
+            let (status, body) = handler(request);
+            (status, Vec::new(), body)
+        })
+    }
+
+    /// [`FakeServer::start`] with explicit response headers, so a test can
+    /// drive `Retry-After`-sensitive flows (e.g. Copilot's 429 back-off).
+    #[must_use]
+    pub fn start_with_headers(
+        handler: impl Fn(&str) -> (u16, Vec<(String, String)>, String) + Send + Sync + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake server");
         let address = listener.local_addr().expect("fake server address");
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let handler: Arc<Handler> = Arc::new(handler);
+        let handler: Arc<HeaderHandler> = Arc::new(handler);
         let thread_stop = Arc::clone(&stop);
         let thread_requests = Arc::clone(&requests);
         let thread = std::thread::spawn(move || {
@@ -61,10 +74,18 @@ impl FakeServer {
                             .lock()
                             .expect("fake server requests")
                             .push(line.clone());
-                        let (status, body) = handler(&request);
-                        let reason = if status == 200 { "OK" } else { "Bad Request" };
+                        let (status, headers, body) = handler(&request);
+                        let reason = match status {
+                            200 => "OK",
+                            429 => "Too Many Requests",
+                            _ => "Bad Request",
+                        };
+                        let extra = headers
+                            .iter()
+                            .map(|(name, value)| format!("{name}: {value}\r\n"))
+                            .collect::<String>();
                         let head = format!(
-                            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
                             body.len()
                         );
                         let _ = stream.write_all(head.as_bytes());
