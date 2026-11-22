@@ -120,9 +120,9 @@ pub fn default_transformer() -> &'static dyn ImageTransformer {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[allow(unused_imports)]
     use image::GenericImageView;
-    use super::*;
 
     use image::RgbImage;
     use image::codecs::bmp::BmpEncoder;

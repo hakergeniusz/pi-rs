@@ -447,8 +447,14 @@ async fn refresh_access_token(
         ("Editor-Plugin-Version", "copilot-chat/0.35.0".to_string()),
         ("Copilot-Integration-Id", "vscode-chat".to_string()),
     ];
-    let value =
-        get_json_with_retry(client, &token_url, &headers, cancel, &endpoints.retry_policy).await?;
+    let value = get_json_with_retry(
+        client,
+        &token_url,
+        &headers,
+        cancel,
+        &endpoints.retry_policy,
+    )
+    .await?;
     let token = value.get("token").and_then(Value::as_str);
     let expires_at = value.get("expires_at").and_then(Value::as_f64);
     if token.is_none() || expires_at.is_none() {
@@ -808,7 +814,11 @@ mod tests {
                     String::new(),
                 )
             } else {
-                (200, Vec::new(), r#"{"token":"copilot-token","expires_at":4102444800}"#.to_string())
+                (
+                    200,
+                    Vec::new(),
+                    r#"{"token":"copilot-token","expires_at":4102444800}"#.to_string(),
+                )
             }
         });
         let config = configured(&server);
@@ -870,9 +880,11 @@ mod tests {
         });
         let mut config = configured(&server);
         config.github_copilot.retry_policy = RetryPolicy::default();
-        assert!(refresh("gh-token", None, &CancelToken::new(), &config)
-            .await
-            .is_err());
+        assert!(
+            refresh("gh-token", None, &CancelToken::new(), &config)
+                .await
+                .is_err()
+        );
         assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

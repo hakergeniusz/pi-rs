@@ -794,180 +794,181 @@ impl RemoteCodemodeTransport {
             let output = Arc::clone(&output);
             let calls = Arc::clone(&calls);
             move |messages| {
-            if stop.is_aborted()
-                || terminal
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_some()
-            {
-                return Ok(RemoteReply::Stop);
-            }
-            let mut answer = None;
-            for message in messages {
-                match message {
-                    RemoteMessage::Vm(WorkerToHostMessage::Output { item }) => {
-                        output
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(item.clone());
-                    }
-                    RemoteMessage::Vm(WorkerToHostMessage::Call {
-                        id,
-                        target,
-                        name,
-                        args,
-                    }) => {
-                        let arguments = serde_json::from_str(args.as_deref().unwrap_or("null"))
-                            .unwrap_or(Json::Null);
-                        let context = ToolContext {
-                            signal: stop.clone(),
-                        };
-                        let started = Instant::now();
-                        let reply = match executor.call(*id, *target, name, arguments, &context) {
-                            Ok(value) => HostToWorkerMessage::new(
-                                *id,
-                                true,
-                                serde_json::to_string(&value).ok(),
-                            ),
-                            Err(error) => {
-                                let mut reply =
-                                    HostToWorkerMessage::new(*id, false, Some(error.message));
-                                reply.properties = error.properties.and_then(|properties| {
-                                    serde_json::to_string(&Json::Object(
-                                        properties.into_iter().collect(),
-                                    ))
-                                    .ok()
-                                });
-                                reply
-                            }
-                        };
-                        let status = if reply.ok {
-                            CallStatus::Ok
-                        } else {
-                            CallStatus::Error
-                        };
-                        calls
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(Call {
-                                name: name.clone(),
-                                status,
-                                duration_ms: started.elapsed().as_secs_f64() * 1000.0,
-                            });
-                        answer = Some(RemoteReply::Result(reply));
-                    }
-                    RemoteMessage::Vm(WorkerToHostMessage::DoneOk {
-                        value,
-                        writes,
-                        during,
-                    }) => {
-                        let parsed =
-                            parse_json_field(value.as_deref(), "return value").and_then(|value| {
-                                parse_store_writes(writes).map(|writes| (value, writes))
-                            });
-                        let (value, store_writes) = match parsed {
-                            Ok(parsed) => parsed,
-                            Err(message) => {
-                                *terminal
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(sandbox_message(message));
-                                continue;
-                            }
-                        };
-                        let items = std::mem::take(
-                            &mut *output
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        );
-                        let recorded = std::mem::take(
-                            &mut *calls
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        );
-                        *terminal
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(CodemodeResult::Ok {
-                                value,
-                                output: items,
-                                calls: recorded,
-                                store_writes,
-                                during: *during,
-                            });
-                    }
-                    RemoteMessage::Vm(WorkerToHostMessage::DoneError { error, during }) => {
-                        let error = parse_script_error(error).unwrap_or_else(|message| {
-                            CodemodeError::sandbox(format!("Sandbox bridge broken: {message}"))
-                        });
-                        let items = std::mem::take(
-                            &mut *output
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        );
-                        let recorded = std::mem::take(
-                            &mut *calls
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        );
-                        *terminal
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(CodemodeResult::Err {
-                                error,
-                                output: items,
-                                calls: recorded,
-                                during: *during,
-                            });
-                    }
-                    RemoteMessage::Vm(WorkerToHostMessage::Crash { message }) => {
-                        let items = std::mem::take(
-                            &mut *output
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        );
-                        let recorded = std::mem::take(
-                            &mut *calls
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        );
-                        *terminal
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(CodemodeResult::Err {
-                                error: CodemodeError::sandbox(message),
-                                output: items,
-                                calls: recorded,
-                                during: None,
-                            });
-                    }
-                    RemoteMessage::Failure(error) => {
-                        let items = std::mem::take(
-                            &mut *output
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        );
-                        let recorded = std::mem::take(
-                            &mut *calls
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        );
-                        *terminal
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(CodemodeResult::Err {
-                                error: error.clone(),
-                                output: items,
-                                calls: recorded,
-                                during: None,
-                            });
-                    }
-                    RemoteMessage::Vm(
-                        WorkerToHostMessage::Started { .. } | WorkerToHostMessage::Idle { .. },
-                    ) => {}
+                if stop.is_aborted()
+                    || terminal
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_some()
+                {
+                    return Ok(RemoteReply::Stop);
                 }
-            }
-            Ok(answer.unwrap_or(RemoteReply::None))
+                let mut answer = None;
+                for message in messages {
+                    match message {
+                        RemoteMessage::Vm(WorkerToHostMessage::Output { item }) => {
+                            output
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(item.clone());
+                        }
+                        RemoteMessage::Vm(WorkerToHostMessage::Call {
+                            id,
+                            target,
+                            name,
+                            args,
+                        }) => {
+                            let arguments = serde_json::from_str(args.as_deref().unwrap_or("null"))
+                                .unwrap_or(Json::Null);
+                            let context = ToolContext {
+                                signal: stop.clone(),
+                            };
+                            let started = Instant::now();
+                            let reply = match executor.call(*id, *target, name, arguments, &context)
+                            {
+                                Ok(value) => HostToWorkerMessage::new(
+                                    *id,
+                                    true,
+                                    serde_json::to_string(&value).ok(),
+                                ),
+                                Err(error) => {
+                                    let mut reply =
+                                        HostToWorkerMessage::new(*id, false, Some(error.message));
+                                    reply.properties = error.properties.and_then(|properties| {
+                                        serde_json::to_string(&Json::Object(
+                                            properties.into_iter().collect(),
+                                        ))
+                                        .ok()
+                                    });
+                                    reply
+                                }
+                            };
+                            let status = if reply.ok {
+                                CallStatus::Ok
+                            } else {
+                                CallStatus::Error
+                            };
+                            calls
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(Call {
+                                    name: name.clone(),
+                                    status,
+                                    duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+                                });
+                            answer = Some(RemoteReply::Result(reply));
+                        }
+                        RemoteMessage::Vm(WorkerToHostMessage::DoneOk {
+                            value,
+                            writes,
+                            during,
+                        }) => {
+                            let parsed = parse_json_field(value.as_deref(), "return value")
+                                .and_then(|value| {
+                                    parse_store_writes(writes).map(|writes| (value, writes))
+                                });
+                            let (value, store_writes) = match parsed {
+                                Ok(parsed) => parsed,
+                                Err(message) => {
+                                    *terminal
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(sandbox_message(message));
+                                    continue;
+                                }
+                            };
+                            let items = std::mem::take(
+                                &mut *output
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            );
+                            let recorded = std::mem::take(
+                                &mut *calls
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            );
+                            *terminal
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(CodemodeResult::Ok {
+                                    value,
+                                    output: items,
+                                    calls: recorded,
+                                    store_writes,
+                                    during: *during,
+                                });
+                        }
+                        RemoteMessage::Vm(WorkerToHostMessage::DoneError { error, during }) => {
+                            let error = parse_script_error(error).unwrap_or_else(|message| {
+                                CodemodeError::sandbox(format!("Sandbox bridge broken: {message}"))
+                            });
+                            let items = std::mem::take(
+                                &mut *output
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            );
+                            let recorded = std::mem::take(
+                                &mut *calls
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            );
+                            *terminal
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(CodemodeResult::Err {
+                                    error,
+                                    output: items,
+                                    calls: recorded,
+                                    during: *during,
+                                });
+                        }
+                        RemoteMessage::Vm(WorkerToHostMessage::Crash { message }) => {
+                            let items = std::mem::take(
+                                &mut *output
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            );
+                            let recorded = std::mem::take(
+                                &mut *calls
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            );
+                            *terminal
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(CodemodeResult::Err {
+                                    error: CodemodeError::sandbox(message),
+                                    output: items,
+                                    calls: recorded,
+                                    during: None,
+                                });
+                        }
+                        RemoteMessage::Failure(error) => {
+                            let items = std::mem::take(
+                                &mut *output
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            );
+                            let recorded = std::mem::take(
+                                &mut *calls
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            );
+                            *terminal
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(CodemodeResult::Err {
+                                    error: error.clone(),
+                                    output: items,
+                                    calls: recorded,
+                                    during: None,
+                                });
+                        }
+                        RemoteMessage::Vm(
+                            WorkerToHostMessage::Started { .. } | WorkerToHostMessage::Idle { .. },
+                        ) => {}
+                    }
+                }
+                Ok(answer.unwrap_or(RemoteReply::None))
             }
         });
 

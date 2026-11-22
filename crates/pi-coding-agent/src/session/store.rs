@@ -669,8 +669,9 @@ pub fn list_sessions_in_dir_with_progress(
                 partial.push(info.clone());
             }
             if let Some(callback) = on_progress {
-                let publish =
-                    loaded == 1 || loaded.is_multiple_of(SESSION_LIST_PUBLISH_INTERVAL) || loaded == total;
+                let publish = loaded == 1
+                    || loaded.is_multiple_of(SESSION_LIST_PUBLISH_INTERVAL)
+                    || loaded == total;
                 let snapshot = publish.then(|| sort_session_infos(partial.clone()));
                 callback(loaded, total, snapshot.as_deref());
             }

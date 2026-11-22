@@ -12291,10 +12291,9 @@ impl InteractiveMode {
             // re-registration can change the visible tool list; redraw so the
             // footer/autocomplete see the new state on this frame.
             Ok(outcome) if !outcome.is_idle() => self.tui.request_render(),
-            Ok(_) | Err(_) => {}
-            // Server-state failures are reported by the runner itself; the
-            // tick's result is deliberately dropped (extensions/mod.rs's
-            // transform/tool tick points do the same).
+            Ok(_) | Err(_) => {} // Server-state failures are reported by the runner itself; the
+                                 // tick's result is deliberately dropped (extensions/mod.rs's
+                                 // transform/tool tick points do the same).
         }
     }
 

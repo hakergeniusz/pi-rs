@@ -63,8 +63,7 @@ fn is_truthy_env_flag(value: Option<&str>) -> bool {
 
 /// Where the daemon lives. [`RemoteTarget::Disabled`] is the default and never
 /// constructs a connection.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum RemoteTarget {
     /// No remote environment configured (the inert default).
     #[default]
@@ -82,8 +81,6 @@ pub enum RemoteTarget {
         user: Option<String>,
     },
 }
-
-
 
 /// The settings view consumed by [`HostRemoteEnv::from_settings`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -692,7 +689,7 @@ mod tests {
         assert!(daemon.calls().iter().any(|call| call == "exec"));
         assert_eq!(daemon.ticks(), vec![7]);
         // The daemon owns process cleanup; the client does not kill a finished exec.
-        assert!(daemon.killed().is_empty());
+        assert_eq!(daemon.killed(), Vec::<(u64, u64)>::new());
     }
 
     #[test]

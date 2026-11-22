@@ -467,9 +467,9 @@ pub fn oversized_temp_note(mime_type: &str, path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[allow(unused_imports)]
     use image::GenericImageView;
-    use super::*;
 
     struct PngConverter;
 

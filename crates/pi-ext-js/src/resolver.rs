@@ -627,7 +627,8 @@ impl rquickjs::loader::Resolver for ExtensionResolver {
         // Bare specifiers walk ancestor `node_modules`, like upstream's
         // `createRequire`. Host packages we cannot serve keep their E1 error
         // instead of being shadowed by an installed copy (jiti aliases win).
-        if !name.starts_with("node:") && !is_unavailable_host_module(name)
+        if !name.starts_with("node:")
+            && !is_unavailable_host_module(name)
             && let Some(resolved) = resolve_bare(&base_dir, name)
         {
             return Ok(resolved.to_string_lossy().into_owned());
