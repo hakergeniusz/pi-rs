@@ -846,4 +846,17 @@ mod tests {
             CodemodeResult::Err { .. } => unreachable!(),
         }
     }
+
+    #[test]
+    fn vm_exposes_no_dynamic_require() {
+        // Upstream deliberately omits `require` and modules from the sandbox
+        // (`runtime/execution.ts:451-458`); QuickJS has no CommonJS loader.
+        let sandbox = sandbox(vec![], vec![]);
+        let result = sandbox.execute("return typeof require;", ExecuteOptions::default());
+        assert!(result.is_ok(), "{result:?}");
+        match result {
+            CodemodeResult::Ok { value, .. } => assert_eq!(value, json!("undefined")),
+            CodemodeResult::Err { .. } => unreachable!(),
+        }
+    }
 }

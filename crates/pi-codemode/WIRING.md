@@ -110,20 +110,49 @@ off in the current `pi-coding-agent` host).
 [`admission.rs`](src/admission.rs) exposes `WorkerAdmission` with
 `acquire() -> WorkerReservation` and `on_worker_started(WorkerExit)`. The
 inline VM uses `NoopWorkerAdmission`. A host that runs its own worker pool can
-implement the trait and call it around its launcher; this crate never starts
-one thread per execution on its own (the deterministic run's single replay
-thread is the exception).
+implement the trait and call it around its launcher.
+
+### Transports
+
+[`transport.rs`](src/transport.rs) provides three local, synchronous
+equivalents of upstream's launchers. They share the tool-executor seam, so a
+host swaps them without changing its tools:
+
+- `ThreadWorkerTransport::execute(WorkerRequest, &dyn ToolExecutor)` runs one
+  VM on an OS thread and relays output and tool calls over channels. The VM
+  thread owns the script; the calling thread runs the host tools and posts
+  replies — the same split as `CodemodeSandbox` (`host.ts:20-88`,
+  `worker.ts:21-33`). It reserves worker capacity through `WorkerAdmission`,
+  observes the real thread exit through `onWorkerStarted(WorkerExit)`, and
+  returns `Failed to load QuickJS` / `No worker available in …` /
+  `Failed to start worker` / `Worker exited with code …` as sandbox errors.
+  Supply a validated `QuickJsWasm` token via `WorkerRequest::with_wasm`;
+  without one the launch fails with upstream's exact wasm-load error.
+- `RemoteCodemodeTransport` implements the client side of
+  `RemoteCodemodeSandbox` (`remote.ts:199-277`): it obtains a
+  `CodemodeRemote` per execution from an injected factory, answers calls from
+  an exchange callback, and turns a reach error, an RPC rejection, or an
+  early return into the exact upstream sandbox error. `serve_remote` is the
+  server side (`remote.ts:104-197`) and `InProcessRemote` composes the two in
+  one process — upstream explicitly allows an in-process remote in tests.
+- `load_quickjs_wasm` validates the `\0asm` header and retains the bytes, but
+  never compiles them (see deviation 1). `InProcessRemote` and
+  `ThreadWorkerTransport` run the VM with the native `rquickjs` engine.
 
 ## Remaining deviations (deliberate)
 
-1. **Worker threads / Cloudflare / wasm transports.** `CodemodeSandbox`
-   (`node:worker_threads`), `RemoteCodemodeSandbox` / `serveCodemodeRemote`
-   (Workers RPC / Durable Objects), `loadQuickJSWasm`, and the wasm `Stats`/
-   `HMAC`/WHATWG URL shims have no Rust transport here. `WorkerTransportStub`,
-   `RemoteTransportStub`, `WasmLoaderStub`, and the `*_error` helpers in
-   `admission.rs` carry upstream's exact error strings so downstream code can
-   compile against the upstream API surface. They are data-only: no fake
-   transport is invented.
+1. **Worker threads / Cloudflare / wasm compilation.** The local equivalents
+   in `transport.rs` are real thread/channel and injected-client transports,
+   but a true Node/Bun `worker_threads` runtime, a Cloudflare Durable Object
+   isolate, and WebAssembly compilation are not hosted: they need a new
+   platform or dependency. `load_quickjs_wasm` validates and retains the
+   module bytes but never compiles them — `rquickjs` links QuickJS natively —
+   so it fails with upstream's exact `Failed to load QuickJS: …` message when
+   no module is supplied. It is deliberately not faking a compiled module.
+   `WorkerTransportStub`, `RemoteTransportStub`, `WasmLoaderStub`, and the
+   `*_error` helpers in `admission.rs` remain for API compatibility and carry
+   upstream's exact error strings. The wasm `Stats`/`HMAC`/WHATWG URL shims are
+   likewise unported.
 2. **Deterministic engine shims.** Upstream virtualizes WASI `clock_time_get`,
    `random_get`, timezone, and removes `WeakRef`/`FinalizationRegistry` at VM
    creation (`vm.ts:103-125,170-180`). `rquickjs` has no WASI layer, so the
@@ -149,6 +178,16 @@ thread is the exception).
    runs: the in-process driver settles synchronously and has no separate
    terminal message to attach it to. Replaying across a restart requires the
    host to persist the run's `seq`/`issued` itself.
+6. **Dynamic `require` / `node_modules` resolution.** Upstream deliberately
+   exposes no `require` (or timers, `fetch`, `process`, modules) inside the VM
+   (`runtime/execution.ts:451-458`): the script sees only `tools`, globals,
+   the output helpers, and `store`/`load`. QuickJS has no CommonJS loader, and
+   `rquickjs::Context::full` provides ECMA built-ins only, so there is no
+   `require` global to forward. Installing one would break both 1:1 fidelity
+   and the sandbox boundary, so dynamic `require` is intentionally not
+   ported. A test asserts `typeof require === "undefined"` in the VM. The
+   `createRequire` call in upstream's `wasm.ts` is a host-side module resolver
+   for the wasm file, not a script-visible API.
 
 Everything else — declarations, source parsing, prelude/bridge marshalling,
 tool records, store writes, error kinds, and the `execute()` result schema —

@@ -17,6 +17,17 @@
 //! (`runtime/vm.ts:23-36,94-125,314-320`) installed before the prelude freezes
 //! the intrinsics, and the [`crate::stream::UpdateSink`] seam for the host's
 //! `onUpdate` snapshots (`coding-agent/…/execute.ts:496-520`).
+//!
+//! # No dynamic `require` in the VM (deliberate)
+//!
+//! Upstream's sandbox exposes only `tools`, globals, the output helpers, and
+//! `store`/`load` — explicitly "no timers, `fetch`, `process`, `require`,
+//! modules" (`runtime/execution.ts:451-458`). QuickJS has no CommonJS loader,
+//! and `rquickjs::Context::full` supplies ECMA built-ins only, so there is no
+//! `require` global to forward. Installing one would break both 1:1 fidelity
+//! and the sandbox isolation guarantee, so dynamic `require` and
+//! `node_modules` resolution are deliberately not ported. A test in
+//! [`crate::sandbox`] asserts `typeof require === "undefined"`.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -660,14 +671,14 @@ fn bridge_error(message: impl Into<String>) -> CodemodeError {
     ))
 }
 
-fn parse_json_field(text: Option<&str>, what: &str) -> Result<Json, String> {
+pub(crate) fn parse_json_field(text: Option<&str>, what: &str) -> Result<Json, String> {
     match text {
         None => Ok(Json::Null),
         Some(text) => serde_json::from_str(text).map_err(|_| format!("{what} is not valid JSON")),
     }
 }
 
-fn parse_store_writes(text: &str) -> Result<CodemodeStoreWrites, String> {
+pub(crate) fn parse_store_writes(text: &str) -> Result<CodemodeStoreWrites, String> {
     let value: Json =
         serde_json::from_str(text).map_err(|_| "store writes are not valid JSON".to_string())?;
     let entries = value
@@ -699,7 +710,7 @@ fn parse_store_writes(text: &str) -> Result<CodemodeStoreWrites, String> {
     Ok(writes)
 }
 
-fn parse_script_error(text: &str) -> Result<CodemodeError, String> {
+pub(crate) fn parse_script_error(text: &str) -> Result<CodemodeError, String> {
     let parsed: Json =
         serde_json::from_str(text).map_err(|_| "script error is not valid JSON".to_string())?;
     let object = parsed

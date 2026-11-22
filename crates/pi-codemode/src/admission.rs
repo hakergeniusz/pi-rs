@@ -11,12 +11,16 @@
 //! the script settled`), plus `packages/codemode/src/wasm.ts:21-35`.
 //!
 //! The inline VM needs no workers, so [`NoopWorkerAdmission`] is the default.
-//! Hosts that do run a worker pool can implement [`WorkerAdmission`] and call
-//! it from their own launcher; the crate never starts a thread per execution.
+//! Hosts that run a worker pool can implement [`WorkerAdmission`] and call it
+//! from their own launcher. [`crate::transport::ThreadWorkerTransport`] does
+//! that with an OS thread and channels, and
+//! [`crate::transport::RemoteCodemodeTransport`] supplies the remote transport
+//! over an injected client; see [`crate::transport`] and `WIRING.md`.
+//!
 //! [`WorkerTransportStub`], [`RemoteTransportStub`], and [`WasmLoaderStub`]
-//! are data-only stubs: they carry upstream's error strings and a typed
-//! `unsupported` error so downstream code can compile against the upstream
-//! API surface without inventing a transport (see `WIRING.md`).
+//! remain as data-only markers for API compatibility. They carry upstream's
+//! error strings so downstream code can still compile against the upstream
+//! surface; new hosts should use the real transports in [`crate::transport`].
 
 use std::sync::mpsc::Receiver;
 

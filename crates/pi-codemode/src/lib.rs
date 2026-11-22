@@ -21,7 +21,10 @@
 //! - [`models`] — `coding-agent/…/execute.ts:110-150,742-850` (`models.*`);
 //! - [`grammar`] — `coding-agent/…/tool.ts:433-440` (constrained sampling);
 //! - [`admission`] — `types.ts:134-163`, `runtime/host.ts:20-74` (worker
-//!   admission and typed stubs for transports this port cannot host).
+//!   admission and the exact transport error strings);
+//! - [`transport`] — `runtime/host.ts:1-88`, `runtime/worker.ts:1-39`,
+//!   `runtime/remote.ts:52-277`, `wasm.ts:1-35` (local thread/channel worker
+//!   transport, injected-client remote transport, and wasm module loader).
 //!
 //! # Engine choice (deviation)
 //!
@@ -34,12 +37,14 @@
 //!   upstream's `InlineCodemodeSandbox` (`runtime/inline.ts:115-126`);
 //! - the tool executor is a synchronous trait ([`Tool`]). A host whose tools
 //!   are async must adapt them by blocking (see `WIRING.md`);
-//! - `CodemodeSandbox` (worker threads), `RemoteCodemodeSandbox` /
-//!   `serveCodemodeRemote` (RPC isolates), and wasm loading have no Rust
-//!   transport here; their data types and error strings are ported as stubs in
-//!   [`admission`] (documented in `WIRING.md`). `start()` / `deliver()` is
-//!   implemented over an OS thread with a JS-level virtual clock rather than
-//!   upstream's WASI shims.
+//! - a true `CodemodeSandbox` (Node/Bun worker threads), a Cloudflare RPC
+//!   isolate, and WebAssembly compilation still need a platform this crate
+//!   cannot provide. [`transport`] supplies honest local equivalents (an OS
+//!   thread with channels, an injected [`transport::CodemodeRemote`] trait,
+//!   and wasm byte validation) and reports upstream's exact error strings;
+//!   the remaining gaps are documented in `WIRING.md`. `start()` / `deliver()`
+//!   is implemented over an OS thread with a JS-level virtual clock rather
+//!   than upstream's WASI shims.
 //!
 //! `cargo`-level note: all crates share the workspace toolchain; this crate
 //! uses no `unsafe` and stays within the repo's pedantic lint policy.
@@ -57,6 +62,7 @@ pub mod protocol;
 pub mod sandbox;
 pub mod source;
 pub mod stream;
+pub mod transport;
 pub mod types;
 pub mod vm;
 
@@ -98,6 +104,11 @@ pub use source::{
     ParsedCodemodeSource, parse_codemode_source,
 };
 pub use stream::{StreamTarget, UpdateEvent, UpdateSink, noop_update_sink};
+pub use transport::{
+    CodemodeRemote, InProcessRemote, QuickJsWasm, RemoteCodemodeTransport, RemoteExchange,
+    RemoteFactory, RemoteMessage, RemoteReply, RemoteRequest, RemoteServeOptions,
+    ThreadWorkerTransport, WorkerRequest, load_quickjs_wasm, serve_remote,
+};
 pub use types::{
     AbortFlag, Call, CallStatus, CodemodeDeclaredGlobal, CodemodeDeclaredTool, CodemodeDuring,
     CodemodeError, CodemodeErrorKind, CodemodeHostCall, CodemodeJsonSchema, CodemodeOutcome,
