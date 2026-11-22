@@ -57,6 +57,30 @@
 //! path — see `HANDOFF.md` for the remaining delta versus upstream's fully
 //! overlapping async commands.
 //!
+//! Cancellation is the one command that does not wait for the gate: `abort`
+//! (`rpc-mode.ts:447-450`) flips a shared [`RpcAbortState`] at read time, with
+//! neither the gate nor the runtime lock, and the in-flight prompt's run holds
+//! a clone of that signal (`session.abort()` → `agent.abort()` → the run's
+//! `AbortSignal`, `agent-session.ts:2601-2611`). The abort *response* still
+//! travels through the gate so the wire keeps input order. A fresh signal is
+//! installed for each prompt, so an idle abort cannot cancel a later run —
+//! the same slot semantics as upstream's per-run controller.
+//!
+//! Remaining dispatch delta (precise): every gated command — including
+//! read-only ones such as `get_state`, `get_entries`, `get_tree` and
+//! `get_messages` — still queues behind a slow in-flight prompt. Upstream's
+//! `await handleCommand` lets those overlap because they read `session` on its
+//! event loop; here they need `&PrintRuntime`/`&mut PrintRuntime` through the
+//! single `Mutex<&mut PrintRuntime>`, so real overlap would require an
+//! `RwLock`-style runtime refactor outside this file. The turnstile also
+//! serializes response *emission* in input order, whereas upstream emits each
+//! response when its promise settles. Only the cancellation flag is shared
+//! ahead of the gate; the port's agent loop reports a mid-stream abort as an
+//! error stop with `<provider> stream ended without a terminal event`
+//! (`pi-agent/src/agent_loop.rs:729-754`) rather than upstream's aborted
+//! terminal assistant message (`Request was aborted`) — that message text is
+//! an agent-core concern, not owned by this module.
+//!
 //! Session replacement (`new_session`/`fork`/`switch_session`/`clone`) routes
 //! through [`rebind_session`] after a successful swap, mirroring upstream's
 //! `rebindSession()` (`rpc-mode.ts:317-371`): the RPC dialog surface is
@@ -1427,6 +1451,18 @@ fn field_bool(value: &Value, key: &str) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// Whether a request line is `abort`, read only by the dispatch loop so the
+/// cancellation flag can be flipped ahead of the gate. The authoritative parse
+/// (and its verbatim error strings) still happens in [`dispatch_line`], so a
+/// junk `type` never triggers a cancellation here.
+fn is_abort_line(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|value| value.get("type")?.as_str().map(str::to_string))
+        .as_deref()
+        == Some("abort")
+}
+
 /// `clampThinkingLevel` (`pi-ai/src/models.ts:1318-1336`): keep a level the
 /// model supports, else walk the extended order forward then backward from
 /// the request.
@@ -1699,6 +1735,43 @@ impl RpcDispatchStats {
     }
 }
 
+/// The per-run cancellation slot, shared between the read loop and the gated
+/// prompt worker. `abort` flags the current run's signal at read time, without
+/// the gate or the runtime lock; `begin_run` installs a fresh slot for each
+/// prompt so an abort of a finished run cannot cancel a later one. This is the
+/// port's stand-in for `AgentSession`'s per-run `AbortController`
+/// (`agent-session.ts:2601-2611` → `agent.abort()`), which upstream's
+/// `rpc-mode.ts:447-450` triggers from the command loop.
+#[derive(Debug, Clone)]
+pub struct RpcAbortState(Arc<Mutex<Arc<AbortSignal>>>);
+
+impl RpcAbortState {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Arc::new(AbortSignal::new()))))
+    }
+
+    /// Installs and returns the signal for a prompt about to start a run.
+    fn begin_run(&self) -> Arc<AbortSignal> {
+        let signal = Arc::new(AbortSignal::new());
+        *self.0.lock().expect("rpc abort state") = Arc::clone(&signal);
+        signal
+    }
+
+    /// `session.abort()` (`rpc-mode.ts:447-450`, `agent-session.ts:2601-2611`):
+    /// flag whichever run currently owns the slot. Idle aborts only reach the
+    /// previous run's (already settled) signal and are inert for future runs.
+    fn abort(&self) {
+        self.0.lock().expect("rpc abort state").abort();
+    }
+
+    /// Whether the current slot has been flagged — used by tests to prove the
+    /// read-loop flip reached the in-flight run without the runtime lock.
+    #[cfg(test)]
+    fn aborted(&self) -> bool {
+        self.0.lock().expect("rpc abort state").aborted()
+    }
+}
+
 /// The RPC plumbing shared by the command loop and the dialog bridge.
 pub struct RpcBridge {
     /// Command lines the reader thread forwards — everything that is not
@@ -1944,8 +2017,11 @@ fn wait_for_capacity(stats: &RpcDispatchStats) {
 /// Serves commands until stdin closes (`onInputEnd`, `rpc-mode.ts:826-839`).
 /// Each line is dispatched on its own scoped thread (`void handleInputLine`,
 /// `:832-834`) behind a bounded, FIFO gate; the receive loop never waits for
-/// a command to finish. The extension UI stays bound for the whole run:
-/// dialogs opened by any command's extension events cross the stream, and
+/// a command to finish. `abort` is the exception: its flag flip happens on the
+/// reader thread, ahead of the gate and without the runtime lock, so a gated
+/// prompt observes cancellation while it holds the gate (`rpc-mode.ts:447-450`,
+/// `agent-session.ts:2601-2611`). The extension UI stays bound for the whole
+/// run: dialogs opened by any command's extension events cross the stream, and
 /// [`rebind_session`] re-binds it after a session replacement.
 pub fn run_rpc_mode(
     runtime: &mut PrintRuntime,
@@ -1958,6 +2034,9 @@ pub fn run_rpc_mode(
     // Seeded from the startup setting; `dynamic_block_images_converter`
     // re-reads it per convertToLlm call (sdk.ts:296-331).
     let block_flag = Arc::new(AtomicBool::new(block_images));
+    // Shared run-cancellation slot: the reader flips it on `abort`, the gated
+    // prompt worker installs a fresh one per run and runs against that clone.
+    let abort_state = Arc::new(RpcAbortState::new());
     let first_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let (stats, commands) = {
@@ -1973,6 +2052,13 @@ pub fn run_rpc_mode(
         loop {
             let line = commands.lock().expect("rpc commands").recv();
             let Ok(line) = line else { break };
+            // Upstream's fire-and-forget handler runs `abort` immediately on
+            // the event loop; the port does the same at read time so the flag
+            // reaches an in-flight prompt without waiting for the gate or the
+            // runtime mutex. The response still goes through the gate below.
+            if is_abort_line(&line) {
+                abort_state.abort();
+            }
             wait_for_capacity(&stats);
             stats.enter();
             let my_seq = seq;
@@ -1980,6 +2066,7 @@ pub fn run_rpc_mode(
             let runtime = Arc::clone(&runtime);
             let bridge = Arc::clone(&bridge);
             let flag = Arc::clone(&block_flag);
+            let abort_state = Arc::clone(&abort_state);
             let first_error = Arc::clone(&first_error);
             let stats = Arc::clone(&stats);
             let gate = &gate;
@@ -1988,7 +2075,8 @@ pub fn run_rpc_mode(
                 gate.run_ordered(my_seq, || {
                     let mut rt = runtime.lock().expect("rpc runtime");
                     let mut br = bridge.lock().expect("rpc bridge");
-                    if let Err(error) = dispatch_line(&mut rt, &mut br, &line, &flag) {
+                    if let Err(error) = dispatch_line(&mut rt, &mut br, &line, &flag, &abort_state)
+                    {
                         let mut slot = first_error.lock().expect("rpc first error");
                         if slot.is_none() {
                             *slot = Some(error);
@@ -2023,6 +2111,7 @@ fn dispatch_line(
     bridge: &mut RpcBridge,
     line: &str,
     block_flag: &Arc<AtomicBool>,
+    abort_state: &RpcAbortState,
 ) -> Result<(), String> {
     let (incoming, id, type_name) = match parse_request(line) {
         Ok(parsed) => parsed,
@@ -2053,7 +2142,14 @@ fn dispatch_line(
             return Ok(());
         }
     };
-    match handle_command(runtime, bridge, incoming, id.as_deref(), block_flag) {
+    match handle_command(
+        runtime,
+        bridge,
+        incoming,
+        id.as_deref(),
+        block_flag,
+        abort_state,
+    ) {
         Ok(CommandOutcome::Success(data)) => write_line(
             &bridge.out,
             &RpcResponse::success(id.as_deref(), type_name.as_deref().unwrap_or(""), data),
@@ -2152,6 +2248,7 @@ fn handle_command(
     command: RpcCommand,
     id: Option<&str>,
     block_flag: &Arc<AtomicBool>,
+    abort_state: &RpcAbortState,
 ) -> Result<CommandOutcome, String> {
     let out = Arc::clone(&bridge.out);
     match command {
@@ -2192,6 +2289,11 @@ fn handle_command(
             // Post-preflight failures are swallowed upstream (the `.catch`
             // checks `preflightSucceeded`, `rpc-mode.ts:425-429`): the run's
             // failure already surfaced as its `agent_end`.
+            // Install this run's cancellation slot just before starting it:
+            // upstream's `agent.abort()` flips a fresh per-run controller
+            // (`agent-session.ts:2601-2611`), and the reader thread may have
+            // already flipped an `abort` while this worker was gated.
+            let signal = abort_state.begin_run();
             if run_agent_turn(
                 runtime,
                 vec![prompt],
@@ -2199,6 +2301,7 @@ fn handle_command(
                 Arc::clone(&out),
                 Arc::clone(&bridge.queued_texts),
                 Arc::clone(block_flag),
+                &signal,
             )
             .is_err()
             {
@@ -2266,10 +2369,12 @@ fn handle_command(
             )))
         }
         RpcCommand::Abort => {
-            // `session.abort()` (`rpc-mode.ts:447-450`): no run is in flight
-            // under the thread-per-command model, so the abort request is a
-            // no-op; the signal plumbing wires in with the concurrent
-            // dispatch rework (P6/P7).
+            // `session.abort()` (`rpc-mode.ts:447-450`): the signal flip already
+            // happened on the reader thread, ahead of the gate and without the
+            // runtime lock, so a gated prompt sees it while still in flight.
+            // This gated arm only emits the standard data-less success frame
+            // in input order (an idle abort is inert, as upstream's
+            // `if (this._isAgentRunActive)` guard at agent-session.ts:2602).
             Ok(CommandOutcome::Success(None))
         }
         RpcCommand::ClearQueue => {
@@ -2860,6 +2965,7 @@ fn run_agent_turn(
     output: RpcOut,
     queued_texts: Arc<Mutex<QueuedTexts>>,
     block_flag: Arc<AtomicBool>,
+    signal: &Arc<AbortSignal>,
 ) -> Result<(), String> {
     let executor = runtime.executor.clone();
     let specs: Vec<ToolSpec> = executor.tools();
@@ -2874,7 +2980,8 @@ fn run_agent_turn(
         writer: output,
         queued_texts,
     };
-    let signal = Arc::new(AbortSignal::new());
+    // `signal` is the run's slot from `RpcAbortState` — the reader thread can
+    // flip it while this worker still holds the gate and the runtime lock.
     // Under a virtual selection every request routes first
     // (`_installAgentRequestProjection`).
     #[cfg(feature = "ext-js")]
@@ -2949,7 +3056,7 @@ fn run_agent_turn(
                 inner: &mut sink,
                 retry_attempt: retry.attempt(),
                 settings: runtime.retry_settings,
-                signal: Arc::clone(&signal),
+                signal: Arc::clone(signal),
             };
             crate::runtime::block_on(pi_agent::run_agent_loop(
                 user_prompts.clone(),
@@ -2958,7 +3065,7 @@ fn run_agent_turn(
                 &config,
                 queues,
                 &mut aware,
-                &signal,
+                signal,
                 loop_stream_fn.as_ref(),
             ))
         };
@@ -2978,7 +3085,7 @@ fn run_agent_turn(
                 delay_ms,
                 error_message: error_message.clone(),
             }));
-            if retry.sleep(delay_ms, &signal) {
+            if retry.sleep(delay_ms, signal) {
                 continue;
             }
             crate::runtime::block_on(sink.emit(pi_agent::events::AgentEvent::AutoRetryEnd {
@@ -3364,6 +3471,82 @@ mod tests {
                 }
             }
             self.inner.stream(request)
+        }
+    }
+
+    /// A tool whose future never settles on its own. The agent loop's abort
+    /// race (`pi-agent/src/agent_loop.rs:1112-1118`) drops it and reports
+    /// upstream's verbatim `Operation aborted` tool result — the observable
+    /// "abort error text" of a cancelled prompt.
+    struct HangingTool {
+        entered: Arc<AtomicBool>,
+    }
+
+    impl pi_agent::types::ToolExecutor for HangingTool {
+        fn tools(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "hang".to_string(),
+                description: "blocks until the run is aborted".to_string(),
+                parameters: json!({ "type": "object", "properties": {} }),
+                execution_mode: None,
+                constrained_sampling: None,
+            }]
+        }
+
+        fn execute(
+            &self,
+            _call: pi_agent::types::AgentToolCall,
+            _updates: tokio::sync::mpsc::UnboundedSender<pi_agent::types::AgentToolResult>,
+        ) -> pi_agent::types::BoxFuture<'_, Result<pi_agent::types::AgentToolResult, String>>
+        {
+            self.entered.store(true, Ordering::SeqCst);
+            Box::pin(async { std::future::pending().await })
+        }
+    }
+
+    /// First turn issues the hanging tool call; any later turn (the loop can
+    /// request again after the aborted tool result) answers with plain text.
+    struct ToolCallStream {
+        calls: AtomicUsize,
+    }
+
+    impl pi_agent::types::StreamFn for ToolCallStream {
+        fn stream(
+            &self,
+            request: pi_agent::types::StreamRequest,
+        ) -> futures::stream::BoxStream<'static, pi_ai::types::AssistantMessageEvent> {
+            use pi_ai::types::AssistantMessageEvent;
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                return TextScript {
+                    calls: AtomicUsize::new(1),
+                }
+                .stream(request);
+            }
+            let partial = serde_json::from_value::<pi_ai::types::AssistantMessage>(json!({
+                "role": "assistant",
+                "content": [{ "type": "toolCall", "id": "c1", "name": "hang", "arguments": {} }],
+                "api": "test",
+                "provider": "test",
+                "model": "test-model",
+                "usage": {
+                    "input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0,
+                    "totalTokens": 15,
+                    "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0,
+                              "cacheWrite": 0.0, "total": 0.0 }
+                },
+                "stopReason": "toolUse",
+                "timestamp": 0
+            }))
+            .expect("tool call assistant message");
+            Box::pin(futures::stream::iter(vec![
+                AssistantMessageEvent::Start {
+                    partial: partial.clone(),
+                },
+                AssistantMessageEvent::Done {
+                    reason: pi_ai::types::StopReason::ToolUse,
+                    message: partial,
+                },
+            ]))
         }
     }
 
@@ -5322,6 +5505,115 @@ mod tests {
             .position(|line| line.contains(r#""id":"s1""#))
             .expect("state response");
         assert!(prompt < seen, "responses follow input order: {lines:?}");
+        assert_eq!(stats.started(), 2);
+        assert_eq!(stats.active(), 0, "both commands retired");
+    }
+
+    /// The cancellation slot is per-run: an abort of the current run must not
+    /// leak into the next prompt's signal (`agent.abort()`'s fresh controller,
+    /// `agent-session.ts:2601-2611`).
+    #[test]
+    fn rpc_abort_state_flags_only_the_current_run() {
+        let state = RpcAbortState::new();
+        let first = state.begin_run();
+        assert!(!first.aborted());
+        state.abort();
+        assert!(first.aborted());
+        assert!(state.aborted());
+
+        let second = state.begin_run();
+        assert!(!second.aborted(), "a new run gets a fresh signal");
+        assert!(!state.aborted(), "the slot follows the new run");
+        state.abort();
+        assert!(second.aborted());
+    }
+
+    /// Upstream's `abort` command (`rpc-mode.ts:447-450`) calls
+    /// `session.abort()`, which flips the run's `AbortSignal` and makes the
+    /// in-flight tool report `Operation aborted` (`agent-loop.ts:1112-1118`).
+    /// The flip must happen on the reader thread: if `abort` waited for the
+    /// FIFO gate or the runtime lock, the hanging tool below would never stop.
+    #[test]
+    fn rpc_mode_abort_cancels_an_in_flight_prompt_with_upstreams_error_text() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entered = Arc::new(AtomicBool::new(false));
+        let mut runtime = test_runtime(
+            dir.path(),
+            Arc::new(ToolCallStream {
+                calls: AtomicUsize::new(0),
+            }),
+        );
+        runtime.executor = Arc::new(HangingTool {
+            entered: Arc::clone(&entered),
+        });
+        let stats = Arc::clone(&fixture.bridge().dispatch_stats);
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        fixture.write_line(r#"{"type":"prompt","id":"p1","message":"hang"}"#);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prompt never reached the hanging tool"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // The prompt worker still holds the gate and the runtime lock. The
+        // abort line is dispatched outside both, so the tool is cancelled.
+        fixture.write_line(r#"{"type":"abort","id":"a1"}"#);
+        let lines = loop {
+            let lines = fixture.output_lines();
+            let has_error = lines.iter().any(|line| line.contains("Operation aborted"));
+            let has_abort = lines.iter().any(|line| line.contains(r#""id":"a1""#));
+            if has_error && has_abort {
+                break lines;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "abort never cancelled the in-flight prompt: {lines:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        drop(fixture.writer);
+        mode.join();
+
+        let parsed: Vec<Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("wire line"))
+            .collect();
+        let prompt = parsed
+            .iter()
+            .position(|value| value["id"] == json!("p1"))
+            .expect("prompt response");
+        let aborted = parsed
+            .iter()
+            .position(|value| value["id"] == json!("a1"))
+            .expect("abort response");
+        let error = parsed
+            .iter()
+            .position(|value| value.to_string().contains("Operation aborted"))
+            .expect("upstream's abort error text");
+        assert!(prompt < error && error < aborted, "wire order: {lines:?}");
+
+        assert_eq!(parsed[prompt]["command"], "prompt");
+        assert_eq!(parsed[prompt]["data"]["disposition"], "started");
+        assert!(
+            parsed[error]["type"] == "tool_execution_end" || parsed[error]["type"] == "message_end",
+            "abort error crossed as a tool event: {}",
+            parsed[error]
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(r#""type":"agent_settled""#)
+                    && line.contains(r#""aborted":true"#)),
+            "the run settled as aborted: {lines:?}"
+        );
+        assert_eq!(parsed[aborted]["command"], "abort");
+        assert_eq!(parsed[aborted]["success"], true);
+        assert!(parsed[aborted].get("data").is_none());
         assert_eq!(stats.started(), 2);
         assert_eq!(stats.active(), 0, "both commands retired");
     }
