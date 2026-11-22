@@ -12,6 +12,11 @@
 //! outbox, answers tool calls after the current JS stack has unwound, and
 //! drains pending jobs between rounds. This is the same shape as upstream's
 //! inline launcher (messages deferred to a microtask).
+//!
+//! Two additions serve the fidelity slices: a deterministic bootstrap
+//! (`runtime/vm.ts:23-36,94-125,314-320`) installed before the prelude freezes
+//! the intrinsics, and the [`crate::stream::UpdateSink`] seam for the host's
+//! `onUpdate` snapshots (`coding-agent/…/execute.ts:496-520`).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,6 +32,7 @@ use crate::protocol::{
     CallTargetKind, GlobalStartData, HostToWorkerMessage, ToolStartData, WorkerToHostMessage,
 };
 use crate::sandbox::ToolExecutor;
+use crate::stream::{StreamTarget, UpdateEvent};
 use crate::types::{
     AbortFlag, Call, CallStatus, CodemodeError, CodemodeErrorKind, CodemodeResult,
     CodemodeStoreWrites, OutputItem, ToolContext,
@@ -36,7 +42,7 @@ use crate::types::{
 /// (`runtime/inline.ts:39`). Default: 100,000.
 pub const DEFAULT_INTERRUPT_BUDGET: u64 = 100_000;
 /// QuickJS stack guard for an inline execution (`runtime/inline.ts:41-42`).
-const INLINE_MAX_STACK_SIZE: usize = 256 * 1024;
+pub const INLINE_MAX_STACK_SIZE: usize = 256 * 1024;
 /// Safety valve for the message/job loop. Upstream's equivalent is the
 /// interrupt budget; this bounds bridge round trips a hostile script can
 /// trigger with `await` on many tools.
@@ -63,6 +69,12 @@ pub struct VmOptions<'a> {
     pub interrupt_budget: u64,
     /// Caller's abort flag.
     pub signal: Option<AbortFlag>,
+    /// Deterministic mode: virtual clock and seeded randomness.
+    pub deterministic: Option<crate::protocol::DeterministicData>,
+    /// Shared virtual clock (`Date.now()` reads it through a native function).
+    pub clock: Option<Arc<Mutex<f64>>>,
+    /// Progress callback called from the driver loop.
+    pub update_sink: Option<crate::stream::UpdateSink>,
 }
 
 enum Terminal {
@@ -181,6 +193,53 @@ pub fn run_vm(options: &VmOptions<'_>, executor: &dyn ToolExecutor) -> CodemodeR
                 return sandbox_outcome(format!("Failed to install the sandbox bridge: {error}"));
             }
         };
+        // Deterministic mode must change the intrinsics *before* the prelude's
+        // lockdown freezes them (`runtime/vm.ts:170-180` creates the VM with a
+        // virtual clock and seeded PRNG before evaluating the prelude).
+        if let Some(deterministic) = options.deterministic {
+            let clock = options
+                .clock
+                .clone()
+                .unwrap_or_else(|| Arc::new(Mutex::new(deterministic.started_at)));
+            let clock_fn = match Function::new(ctx.clone(), move || -> String {
+                let guard = clock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.to_string()
+            }) {
+                Ok(clock_fn) => clock_fn,
+                Err(error) => {
+                    return sandbox_outcome(format!(
+                        "Failed to install the virtual clock: {error}"
+                    ));
+                }
+            };
+            if let Err(error) = ctx.globals().set("__codemodeNow", clock_fn) {
+                return sandbox_outcome(format!("Failed to install the virtual clock: {error}"));
+            }
+            // mulberry32 (`vm.ts:83-92`), with one draw per call and a clock
+            // that only advances when a result is delivered.
+            let bootstrap = format!(
+                r#"(function (seed) {{
+	"use strict";
+	let state = seed >>> 0;
+	Math.random = function () {{
+		state = (state + 0x6d2b79f5) >>> 0;
+		let value = Math.imul(state ^ (state >>> 15), 1 | state);
+		value = (value + Math.imul(value ^ (value >>> 7), 61 | value)) ^ value;
+		return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+	}};
+	Date.now = function () {{ return Number(__codemodeNow()); }};
+	try {{ delete globalThis.WeakRef; delete globalThis.FinalizationRegistry; }} catch (error) {{}}
+}})({});"#,
+                deterministic.seed
+            );
+            if let Err(error) = ctx.eval::<Value, _>(bootstrap) {
+                return sandbox_outcome(format!(
+                    "Failed to install deterministic intrinsics: {error}"
+                ));
+            }
+        }
         let prelude = match ctx.eval::<Function, _>(PRELUDE_SOURCE) {
             Ok(prelude) => prelude,
             Err(error) => {
@@ -259,6 +318,7 @@ pub fn run_vm(options: &VmOptions<'_>, executor: &dyn ToolExecutor) -> CodemodeR
             &signal,
             &interrupted,
             started + std::time::Duration::from_millis(timeout_ms),
+            options.update_sink.as_ref(),
         );
     }
     context.with(|ctx| {
@@ -380,6 +440,7 @@ fn script_exception(ctx: &Ctx<'_>, error: &rquickjs::Error) -> CodemodeError {
 }
 
 #[allow(clippy::too_many_lines)] // mirrors upstream's driver loop; split when extending
+#[allow(clippy::too_many_arguments)] // VM handles, bridge state, and the update sink
 fn drive(
     context: &Context,
     runtime: &Runtime,
@@ -388,6 +449,7 @@ fn drive(
     signal: &AbortFlag,
     interrupted: &Arc<AtomicBool>,
     deadline: Instant,
+    update_sink: Option<&crate::stream::UpdateSink>,
 ) -> RunOutcome {
     let mut outcome = RunOutcome::default();
     for _ in 0..MAX_LOOP_ITERATIONS {
@@ -412,7 +474,12 @@ fn drive(
                     break;
                 }
                 match message {
-                    WorkerToHostMessage::Output { item } => outcome.output.push(item),
+                    WorkerToHostMessage::Output { item } => {
+                        if let Some(sink) = update_sink {
+                            sink(UpdateEvent::Output(item.clone()));
+                        }
+                        outcome.output.push(item);
+                    }
                     WorkerToHostMessage::DoneOk { value, writes, .. } => {
                         match (
                             parse_json_field(value.as_deref(), "return value"),
@@ -463,7 +530,19 @@ fn drive(
                         let tool_context = ToolContext {
                             signal: signal.clone(),
                         };
-                        let reply = match executor.call(target, &name, arguments, &tool_context) {
+                        if let Some(sink) = update_sink {
+                            sink(UpdateEvent::CallStarted {
+                                id,
+                                target: match target {
+                                    CallTargetKind::Tool => StreamTarget::Tool,
+                                    CallTargetKind::Global => StreamTarget::Global,
+                                },
+                                name: name.clone(),
+                                args: arguments.clone(),
+                            });
+                        }
+                        let reply = match executor.call(id, target, &name, arguments, &tool_context)
+                        {
                             Ok(value) => HostToWorkerMessage::new(
                                 id,
                                 true,
@@ -480,14 +559,22 @@ fn drive(
                                 reply
                             }
                         };
+                        let status = if reply.ok {
+                            CallStatus::Ok
+                        } else {
+                            CallStatus::Error
+                        };
+                        if let Some(sink) = update_sink {
+                            sink(UpdateEvent::CallFinished {
+                                id,
+                                name: name.clone(),
+                                status,
+                            });
+                        }
                         if target == CallTargetKind::Tool {
                             outcome.calls.push(Call {
                                 name,
-                                status: if reply.ok {
-                                    CallStatus::Ok
-                                } else {
-                                    CallStatus::Error
-                                },
+                                status,
                                 duration_ms: started.elapsed().as_secs_f64() * 1000.0,
                             });
                         }
@@ -557,6 +644,11 @@ fn drive(
             )));
             break;
         }
+    }
+    if let Some(sink) = update_sink {
+        sink(UpdateEvent::Finished {
+            ok: matches!(outcome.terminal, Some(Terminal::Done { .. })),
+        });
     }
     outcome
 }

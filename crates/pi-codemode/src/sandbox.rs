@@ -9,6 +9,9 @@
 //! plus a closure-backed [`FnTool`]. Because the embedded engine is
 //! synchronous, `execute` is synchronous too: an async host tool must be
 //! adapted by blocking before returning (documented in `WIRING.md`).
+//! Deterministic runs (`runtime/execution.ts:519-566`) are implemented in
+//! [`crate::deterministic`], which shares this tool executor seam; progress
+//! callbacks are described in [`crate::stream`].
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -182,11 +185,14 @@ impl Tool for FnTool {
 /// The host side of the JS→tool bridge (`runtime/execution.ts:378-408`).
 ///
 /// Implemented by [`Sandbox`]; a test double can implement it directly to
-/// exercise [`crate::vm::run_vm`] without a full sandbox.
+/// exercise [`crate::vm::run_vm`] without a full sandbox. `id` is the VM's own
+/// call number (`prelude-source.ts:182-185`), which a deterministic run uses
+/// to match the host's answer to the waiting call.
 pub trait ToolExecutor {
     /// Execute one call from the VM.
     fn call(
         &self,
+        id: u32,
         target: CallTargetKind,
         name: &str,
         args: Json,
@@ -248,36 +254,52 @@ fn is_simple_identifier(name: &str) -> bool {
 }
 
 /// Validate global names (`runtime/execution.ts:151-167`): identifiers or
-/// `namespace.member`, not shadowing a built-in or each other.
-fn check_globals(globals: &[Arc<dyn Tool>]) -> Result<(), String> {
-    let mut names = HashSet::new();
+/// `namespace.member`, not shadowing a built-in or each other. Shared with
+/// deterministic runs, which declare globals as data rather than [`Tool`]s.
+pub(crate) fn check_global_names<'a>(names: impl Iterator<Item = &'a str>) -> Result<(), String> {
+    let mut seen = HashSet::new();
     let mut namespaces = HashSet::new();
-    for global in globals {
-        let parts: Vec<&str> = global.name().split('.').collect();
+    for name in names {
+        let parts: Vec<&str> = name.split('.').collect();
         if parts.len() > 2
             || parts.iter().any(|part| !is_simple_identifier(part))
             || RESERVED_GLOBALS.contains(&parts[0])
         {
-            return Err(format!("Invalid global name \"{}\"", global.name()));
+            return Err(format!("Invalid global name \"{name}\""));
         }
-        if !names.insert(global.name().to_string()) {
-            return Err(format!(
-                "Global \"{}\" is already registered",
-                global.name()
-            ));
+        if !seen.insert(name.to_string()) {
+            return Err(format!("Global \"{name}\" is already registered"));
         }
         if parts.len() == 2 {
             namespaces.insert(parts[0].to_string());
         }
     }
     for namespace in namespaces {
-        if names.contains(&namespace) {
+        if seen.contains(&namespace) {
             return Err(format!(
                 "Global \"{namespace}\" conflicts with the namespace \"{namespace}\""
             ));
         }
     }
     Ok(())
+}
+
+fn check_globals(globals: &[Arc<dyn Tool>]) -> Result<(), String> {
+    check_global_names(globals.iter().map(|global| global.name()))
+}
+
+/// Defaults a deterministic run inherits from its sandbox
+/// (`runtime/execution.ts:542-555`).
+#[derive(Clone)]
+pub(crate) struct SandboxDefaults {
+    /// Overall deadline.
+    pub(crate) timeout_ms: Option<u64>,
+    /// Heap limit.
+    pub(crate) memory_limit_bytes: Option<u64>,
+    /// Interrupt polls before a synchronous script times out.
+    pub(crate) interrupt_budget: u64,
+    /// Progress callback installed with [`Sandbox::with_update_sink`].
+    pub(crate) update_sink: Option<crate::stream::UpdateSink>,
 }
 
 /// A sandbox holding a tool table and execution defaults. Each [`execute`]
@@ -289,6 +311,7 @@ pub struct Sandbox {
     memory_limit_bytes: Option<u64>,
     interrupt_budget: u64,
     closed: AtomicBool,
+    update_sink: Option<crate::stream::UpdateSink>,
 }
 
 impl Sandbox {
@@ -318,7 +341,31 @@ impl Sandbox {
             memory_limit_bytes: options.memory_limit_bytes,
             interrupt_budget: options.interrupt_budget,
             closed: AtomicBool::new(false),
+            update_sink: None,
         })
+    }
+
+    /// Install a progress callback for `execute()` and `start()` runs
+    /// (`execute.ts:496-520`). It runs on the VM thread; keep it cheap.
+    #[must_use]
+    pub fn with_update_sink(mut self, sink: crate::stream::UpdateSink) -> Self {
+        self.update_sink = Some(sink);
+        self
+    }
+
+    /// Defaults inherited by deterministic runs.
+    pub(crate) fn defaults(&self) -> SandboxDefaults {
+        SandboxDefaults {
+            timeout_ms: self.timeout_ms,
+            memory_limit_bytes: self.memory_limit_bytes,
+            interrupt_budget: self.interrupt_budget,
+            update_sink: self.update_sink.clone(),
+        }
+    }
+
+    /// Whether new executions and deterministic runs are rejected.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     /// Register a tool. Errors when the name is already taken
@@ -401,6 +448,9 @@ impl Sandbox {
             timeout_ms: options.timeout_ms.or(self.timeout_ms),
             interrupt_budget: self.interrupt_budget,
             signal: options.signal,
+            deterministic: None,
+            clock: None,
+            update_sink: self.update_sink.clone(),
         };
         run_vm(&vm_options, self)
     }
@@ -418,6 +468,7 @@ pub type InlineCodemodeSandbox = Sandbox;
 impl ToolExecutor for Sandbox {
     fn call(
         &self,
+        _id: u32,
         target: CallTargetKind,
         name: &str,
         args: Json,
@@ -733,5 +784,65 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn update_sink_reports_output_calls_and_completion() {
+        use crate::stream::UpdateEvent;
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink_recorded = Arc::clone(&recorded);
+        let sandbox = Sandbox::new(SandboxOptions {
+            tools: vec![echo_tool()],
+            ..SandboxOptions::default()
+        })
+        .expect("sandbox")
+        .with_update_sink(Arc::new(move |event| {
+            sink_recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+        }));
+        let result = sandbox.execute(
+            "text('a'); const r = await tools.double({ n: 3 }); text(String(r.value)); return r.value;",
+            ExecuteOptions::default(),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let recorded = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event, UpdateEvent::Output(OutputItem::Text { text, .. }) if text == "a"))
+        );
+        assert!(recorded.iter().any(
+            |event| matches!(event, UpdateEvent::CallStarted { name, .. } if name == "double")
+        ));
+        assert!(recorded.iter().any(|event| matches!(
+            event,
+            UpdateEvent::CallFinished {
+                status: CallStatus::Ok,
+                ..
+            }
+        )));
+        assert!(matches!(
+            recorded.last(),
+            Some(UpdateEvent::Finished { ok: true })
+        ));
+    }
+
+    #[test]
+    fn model_globals_are_reachable_as_a_namespace() {
+        let globals = crate::models::model_globals(Arc::new(crate::models::EmptyModelRuntime));
+        let sandbox = sandbox(vec![], globals);
+        let result = sandbox.execute(
+            "return (await models.getModelsOfType('chat')).length;",
+            ExecuteOptions::default(),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        match result {
+            CodemodeResult::Ok { value, .. } => assert_eq!(value, json!(0)),
+            CodemodeResult::Err { .. } => unreachable!(),
+        }
     }
 }

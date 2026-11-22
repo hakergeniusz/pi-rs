@@ -5,10 +5,16 @@
 //! cross the JS bridge are represented with `serde_json::Value` (the Rust
 //! analogue of upstream's JSON round trip). The transport-specific option
 //! fields (`wasm`, `workerUrl`, `acquireWorker`, `onWorkerStarted`) are omitted
-//! because this port runs the VM in-process; see `WIRING.md`.
+//! because this port runs the VM in-process; see `WIRING.md`. Deterministic
+//! runs (`types.ts:206-243`) carry the host callbacks and the channel state
+//! used by [`crate::deterministic`].
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+
+use crate::protocol::HostToWorkerMessage;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
@@ -344,9 +350,18 @@ pub enum CodemodeOutcome {
     },
 }
 
-/// Options of a deterministic run (`types.ts:206-226`). Kept so downstream
-/// code compiles; the in-process VM does not expose `start()` (see `WIRING.md`).
-#[derive(Debug, Clone, Default)]
+/// Callback invoked with the VM's fingerprint before a deterministic script
+/// runs (`types.ts:217-218`).
+pub type StartedCallback = Arc<dyn Fn(&str) + Send + Sync>;
+/// Callback invoked for every call the script makes (`types.ts:219-220`).
+pub type CallCallback = Arc<dyn Fn(&CodemodeHostCall) + Send + Sync>;
+/// Callback invoked after each result is applied (`types.ts:221-225`).
+pub type IdleCallback = Arc<dyn Fn(u32, u32) + Send + Sync>;
+
+/// Options of a deterministic run (`types.ts:206-226`). The sandbox's own
+/// tools and globals are not used: the run declares its own, and every call is
+/// forwarded to `on_call` (`runtime/execution.ts:519-543`).
+#[derive(Clone, Default)]
 pub struct CodemodeRunOptions {
     /// VM clock start, in ms since the epoch.
     pub started_at: f64,
@@ -360,18 +375,33 @@ pub struct CodemodeRunOptions {
     pub store: Option<std::collections::BTreeMap<String, Json>>,
     /// Abort signal.
     pub signal: Option<AbortFlag>,
-    /// Deadline of this run.
+    /// Deadline of this run, in ms. `None` means the upstream default of no
+    /// deadline (`execution.ts:549`).
     pub timeout_ms: Option<f64>,
+    /// The VM's fingerprint, before the script runs.
+    pub on_started: Option<StartedCallback>,
+    /// The script made a call; answer it with [`crate::CodemodeRun::deliver`].
+    pub on_call: Option<CallCallback>,
+    /// Result `seq` was applied; `issued` calls have been made so far.
+    pub on_idle: Option<IdleCallback>,
 }
 
-/// A running deterministic execution (`types.ts:228-243`). Kept for API
-/// parity; constructed only by hosts implementing a replay transport.
-#[derive(Clone)]
+/// A running deterministic execution (`types.ts:228-243`).
+///
+/// The VM runs on a worker thread so that `start()` returns immediately and
+/// the host can answer calls from [`Self::deliver`]. Results are applied in
+/// `seq` order, the virtual clock never moves backwards, and a result number
+/// can be used only once — the host-side semantics of upstream's `Execution`.
+/// [`Self::wait`] joins the worker and returns the final result.
 pub struct CodemodeRun {
-    /// The run's result.
-    pub result: Arc<dyn std::future::Future<Output = CodemodeResult> + Send + Sync>,
-    /// Whether the outcome has been decided.
-    pub finished: bool,
+    pub(crate) replies: Sender<HostToWorkerMessage>,
+    pub(crate) state: Arc<Mutex<crate::deterministic::DeliveryState>>,
+    pub(crate) clock: Arc<Mutex<f64>>,
+    pub(crate) signal: AbortFlag,
+    pub(crate) finished: Arc<AtomicBool>,
+    pub(crate) result: Arc<Mutex<Option<CodemodeResult>>>,
+    pub(crate) on_idle: Option<IdleCallback>,
+    pub(crate) worker: Option<std::thread::JoinHandle<()>>,
 }
 
 #[cfg(test)]
