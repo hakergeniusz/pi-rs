@@ -23,6 +23,8 @@ base64 = { workspace = true }
 # which the `regex` crate does not support. 0.14 mis-dispatches alternations
 # that mix lookarounds with plain branches — 0.16.2 fixed it.
 fancy-regex = "0.16"
+# Bedrock SigV4 signing (hand-rolled HMAC-SHA256 on top of sha2; already in the workspace lockfile).
+sha2 = { workspace = true }
 
 [lints]
 workspace = true
