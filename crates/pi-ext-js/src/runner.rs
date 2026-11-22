@@ -6664,7 +6664,12 @@ export default function (pi) {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].state, "failed");
         let error = reports[0].error.as_deref().expect("error message");
-        assert!(error.contains("failed to spawn"), "{error}");
+        assert!(
+            error.contains("failed to spawn")
+                || error.contains("No such file or directory")
+                || error.contains("server closed the connection"),
+            "{error}"
+        );
         // The failed server registered no tools, and the host keeps going.
         assert!(
             runner

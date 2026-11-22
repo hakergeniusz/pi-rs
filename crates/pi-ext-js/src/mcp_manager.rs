@@ -2341,7 +2341,9 @@ done
             manager.poll_notifications();
             changes = manager.take_tool_changes();
             if changes.is_empty() {
-                std::thread::yield_now();
+                // The worker processes PollNotifications on its own thread;
+                // give it a real scheduling slice rather than a bare yield.
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
         changes

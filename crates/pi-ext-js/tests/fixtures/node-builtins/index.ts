@@ -50,7 +50,11 @@ export default function (): void {
       symlinkSync(file, link);
       break;
     } catch (error) {
-      if ((error as { code?: string } | null)?.code !== "EEXIST") throw error;
+      // The Rust host op surfaces OS errors as message text, not a JS
+      // `code` property — accept both shapes.
+      const code = (error as { code?: string } | null)?.code;
+      const message = String((error as Error | null)?.message ?? error);
+      if (code !== "EEXIST" && !message.includes("EEXIST")) throw error;
     }
   }
 

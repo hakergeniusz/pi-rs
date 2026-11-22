@@ -12,13 +12,13 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
+use super::callback::CallbackResult;
 use super::callback::{
     CallbackOptions, CallbackServer, ManualPrompt, wait_for_callback_or_manual_input,
 };
 use super::device_code::{
     DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
-use super::callback::CallbackResult;
 use super::http::{form_encode, parse_authorization_input, send};
 use super::pkce;
 use super::{
