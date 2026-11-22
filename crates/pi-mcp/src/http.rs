@@ -1954,9 +1954,11 @@ mod tests {
             .await
             .expect("answered over SSE");
         assert_eq!(result["ok"], true);
+        // Owned transport: `get_mut` borrows the receiver directly, so no
+        // `MutexGuard` is held across `recv().await` (uncontended in tests).
         let inbound = transport
             .inbound
-            .lock()
+            .get_mut()
             .expect("inbound mutex poisoned")
             .recv()
             .await
@@ -1989,7 +1991,7 @@ mod tests {
             .expect("answered");
         let inbound = transport
             .inbound
-            .lock()
+            .get_mut()
             .expect("inbound mutex poisoned")
             .recv()
             .await
@@ -2082,7 +2084,7 @@ mod tests {
         assert_eq!(result["batched"], true);
         let inbound = transport
             .inbound
-            .lock()
+            .get_mut()
             .expect("inbound mutex poisoned")
             .recv()
             .await
@@ -2308,7 +2310,7 @@ mod tests {
             Duration::from_secs(5),
             transport
                 .inbound
-                .lock()
+                .get_mut()
                 .expect("inbound mutex poisoned")
                 .recv(),
         )

@@ -688,7 +688,8 @@ impl StartupWait {
             return StartupTick::TimedOut;
         }
         StartupTick::Waiting {
-            remaining: self.wait - elapsed,
+            // `elapsed >= self.wait` returned above, so this is infallible.
+            remaining: self.wait.checked_sub(elapsed).unwrap(),
         }
     }
 
@@ -938,7 +939,7 @@ fn failed_error_text(servers: &HashMap<String, ServerEntry>, name: &str, fallbac
         .get(name)
         .and_then(|entry| match &entry.state {
             ServerState::Failed { error, .. } => Some(error.clone()),
-            _ => None,
+            ServerState::Connected { .. } => None,
         })
         .unwrap_or_else(|| fallback.to_string())
 }
@@ -1242,12 +1243,12 @@ fn resource_reply(
         Some(ServerState::Connected { .. }) => None,
         None => return Err(format!("MCP server \"{server}\" is not connected")),
     };
-    if let Some((spawn, timeout)) = reconnect {
-        if let Err(error) = connect_with_spawn(runtime, servers, server, spawn, timeout, auth_dir) {
-            // Same stderr-augmented `connectFailed` text as the other
-            // reconnect paths (`runtime.ts:411-420`).
-            return Err(failed_error_text(servers, server, &error.to_string()));
-        }
+    if let Some((spawn, timeout)) = reconnect
+        && let Err(error) = connect_with_spawn(runtime, servers, server, spawn, timeout, auth_dir)
+    {
+        // Same stderr-augmented `connectFailed` text as the other
+        // reconnect paths (`runtime.ts:411-420`).
+        return Err(failed_error_text(servers, server, &error.to_string()));
     }
     let entry = servers
         .get(server)
@@ -2341,9 +2342,9 @@ done
             manager.poll_notifications();
             changes = manager.take_tool_changes();
             if changes.is_empty() {
-                // The worker processes PollNotifications on its own thread;
-                // give it a real scheduling slice rather than a bare yield.
-                std::thread::sleep(Duration::from_millis(10));
+                // Let the manager worker thread run instead of busy-yielding,
+                // which can starve it under a parallel test load.
+                std::thread::sleep(Duration::from_millis(5));
             }
         }
         changes
@@ -2409,7 +2410,7 @@ done
         assert_eq!(changes.len(), 1, "{changes:?}");
         let error = changes[0].error.as_deref().expect("refresh error");
         assert!(error.starts_with("Failed to refresh tools: "), "{error}");
-        assert!(changes[0].tools.is_empty());
+        assert_eq!(changes[0].tools, Vec::<Json>::new());
         manager.shutdown_all();
     }
 
