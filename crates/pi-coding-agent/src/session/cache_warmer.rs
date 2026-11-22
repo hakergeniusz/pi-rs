@@ -94,7 +94,7 @@ impl CacheWarmingMode {
     /// `getCacheWarmingMode`: only the three known values are honoured, the
     /// rest (including invalid values) fall back to `"idle"`.
     #[must_use]
-    pub const fn from_mode_str(value: &str) -> Self {
+    pub fn from_mode_str(value: &str) -> Self {
         match value {
             "off" => Self::Off,
             "streaming" => Self::Streaming,
@@ -331,7 +331,7 @@ pub fn last_prompt_tokens(entries: &[SessionEntry]) -> u64 {
 /// `getCacheWarmingDelayMs` (cache-warming.ts:45-49): refresh at 90% of the TTL
 /// while preserving at least ten seconds of margin, never earlier than 1 ms.
 #[must_use]
-pub const fn get_cache_warming_delay_ms(ttl_ms: u64) -> Option<u64> {
+pub fn get_cache_warming_delay_ms(ttl_ms: u64) -> Option<u64> {
     if ttl_ms <= 10_000 {
         return None;
     }
@@ -675,25 +675,22 @@ impl<H: CacheWarmerHost> CacheWarmer<H> {
         }
         let request = self.run.as_ref().map(build_stream_request);
         if let Some(request) = request {
-            match self.host.stream_warm(request).await {
-                Ok(outcome) => {
-                    if !self.validate_run(id) {
-                        return;
-                    }
-                    if !matches!(outcome.stop_reason, StopReason::Error | StopReason::Aborted) {
-                        let entry = WarmUsageEntry {
-                            kind: "cache_warm".to_string(),
-                            provider: outcome.provider,
-                            model: outcome.model,
-                            usage: outcome.usage,
-                            note: extension_override.then(|| "extension override".to_string()),
-                        };
-                        self.host.append_usage(entry.clone());
-                        self.host.on_warmed(entry);
-                    }
+            // Cache warming is best-effort and must not affect the agent.
+            if let Ok(outcome) = self.host.stream_warm(request).await {
+                if !self.validate_run(id) {
+                    return;
                 }
-                // Cache warming is best-effort and must not affect the agent.
-                Err(_) => {}
+                if !matches!(outcome.stop_reason, StopReason::Error | StopReason::Aborted) {
+                    let entry = WarmUsageEntry {
+                        kind: "cache_warm".to_string(),
+                        provider: outcome.provider,
+                        model: outcome.model,
+                        usage: outcome.usage,
+                        note: extension_override.then(|| "extension override".to_string()),
+                    };
+                    self.host.append_usage(entry.clone());
+                    self.host.on_warmed(entry);
+                }
             }
         }
         if self.run.as_ref().is_some_and(|run| run.id == id) {
@@ -851,7 +848,8 @@ fn format_cache_warming_decision_time(next_warm_at: Option<i64>, now: i64) -> St
     if next_warm_at <= now {
         return "Decision now".to_string();
     }
-    let mut remaining_seconds = (next_warm_at - now).div_ceil(1000);
+    let delta = next_warm_at - now;
+    let mut remaining_seconds = (delta + 999) / 1000;
     let hours = remaining_seconds / 3600;
     remaining_seconds %= 3600;
     let minutes = remaining_seconds / 60;
@@ -891,12 +889,12 @@ pub fn format_cache_warming_status(status: &CacheWarmingStatus, now: i64) -> Str
     let details = if status.extension_override {
         format!(
             "extension override, {}",
-            format_cache_warming_economics(decision)
+            format_cache_warming_economics(&decision)
         )
     } else {
         format!(
             "{} -> {}",
-            format_cache_warming_economics(decision),
+            format_cache_warming_economics(&decision),
             decision.action.as_str()
         )
     };
@@ -1093,8 +1091,8 @@ mod tests {
         })
     }
 
-    fn current() -> Arc<dyn Fn() -> bool + Send + Sync> {
-        Arc::new(|| true)
+    fn current() -> impl Fn() -> bool + Send + Sync + 'static {
+        || true
     }
 
     // --- pure policy -------------------------------------------------------
@@ -1219,7 +1217,7 @@ mod tests {
         // warm $0.003 + $15/M × 1 = $0.003015; savings $0.031485 < $0.05.
         assert_eq!(streaming.action, CacheWarmingAction::Stop);
         assert_eq!(idle.action, CacheWarmingAction::Stop);
-        assert!((streaming.warm_cost - 0.003015).abs() < 1e-9);
+        assert!((streaming.warm_cost - 0.003_015).abs() < 1e-9);
 
         let huge = evaluate_cache_warming(&m, 100_000, CacheWarmingPhase::Streaming);
         assert_eq!(huge.action, CacheWarmingAction::Warm);

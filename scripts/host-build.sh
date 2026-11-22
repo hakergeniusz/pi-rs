@@ -28,6 +28,10 @@ export CARGO_PROFILE_RELEASE_DEBUG=0
 export CARGO_NET_OFFLINE=true
 export XDG_CACHE_HOME="${PI_CACHE_DIR:-/tmp/opencode/pi-rs-cache}"
 
+# Stale host-level overrides from earlier PTY smoke tests make test fixtures
+# write to /pi; the crate's tests manage their own synthetic dirs.
+unset PI_CODING_AGENT_DIR PI_CODING_AGENT_SESSION_DIR
+
 mkdir -p "$CARGO_TARGET_DIR" "$XDG_CACHE_HOME"
 cd "$(dirname "$0")/.." || exit 1
 
