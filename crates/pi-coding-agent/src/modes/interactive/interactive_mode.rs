@@ -18228,6 +18228,13 @@ export default function (pi) {
             .push(ExtensionSelectorEvent::Selected("Summarize".to_string()));
         mode.pump();
 
+        // The worker starts asynchronously; under CI load two pumps are not
+        // always enough. Wait for the staged navigation before asserting.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mode.tree_navigation.is_none() && Instant::now() < deadline {
+            mode.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
         // The worker starts; the summary status rides the editor border.
         assert!(mode.tree_navigation.is_some(), "navigation staged");
         for _ in 0..200 {
