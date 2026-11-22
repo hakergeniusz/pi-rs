@@ -229,8 +229,11 @@ impl CancelToken {
     }
 
     /// Flip the signal; later `cancelled()` callers observe it too.
+    ///
+    /// `watch::Sender::send` drops the value when no receiver is subscribed
+    /// yet, so use `send_replace` to keep cancellation sticky.
     pub fn cancel(&self) {
-        let _ = self.tx.send(true);
+        self.tx.send_replace(true);
     }
 
     /// Wait until cancellation (`AbortSignal`'s `abort` event).
@@ -247,11 +250,15 @@ impl CancelToken {
     }
 }
 
+/// One pending prompt's answer channel (factored out to keep
+/// [`Interaction`]'s field type readable).
+type AnswerSender = oneshot::Sender<Result<String, AuthError>>;
+
 /// The host side of `ProviderAuthInteraction` (`auth/types.ts:153-168`): the
 /// flow sends prompts/notifications out and awaits answers over oneshots.
 pub struct Interaction {
     messages: mpsc::Sender<InteractionMessage>,
-    answers: Arc<Mutex<BTreeMap<u64, oneshot::Sender<Result<String, AuthError>>>>>,
+    answers: Arc<Mutex<BTreeMap<u64, AnswerSender>>>,
     cancel: CancelToken,
     next_id: AtomicU64,
 }
@@ -575,17 +582,21 @@ mod tests {
         token.cancelled().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn interaction_prompt_answers_by_id() {
         let (interaction, receiver) = Interaction::new();
-        let task = tokio::spawn(async move {
-            interaction
-                .prompt(AuthPrompt::Text {
-                    message: "value?".to_string(),
-                    placeholder: None,
-                })
-                .await
-        });
+        let interaction = Arc::new(interaction);
+        let task = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move {
+                interaction
+                    .prompt(AuthPrompt::Text {
+                        message: "value?".to_string(),
+                        placeholder: None,
+                    })
+                    .await
+            })
+        };
         let message = receiver.recv().expect("prompt message");
         let InteractionMessage::Prompt { id, prompt } = message else {
             panic!("expected a prompt, got {message:?}");
@@ -605,17 +616,21 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn interaction_cancel_rejects_open_prompts() {
         let (interaction, receiver) = Interaction::new();
-        let task = tokio::spawn(async move {
-            interaction
-                .prompt(AuthPrompt::ManualCode {
-                    message: "code?".to_string(),
-                    placeholder: None,
-                })
-                .await
-        });
+        let interaction = Arc::new(interaction);
+        let task = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move {
+                interaction
+                    .prompt(AuthPrompt::ManualCode {
+                        message: "code?".to_string(),
+                        placeholder: None,
+                    })
+                    .await
+            })
+        };
         let InteractionMessage::Prompt { id, .. } = receiver.recv().expect("prompt") else {
             panic!("expected a prompt");
         };

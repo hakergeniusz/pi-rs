@@ -51,7 +51,7 @@ async fn post_json(client: &reqwest::Client, url: &str, body: Value) -> Result<S
         .text()
         .await
         .map_err(|error| AuthError::Message(error.to_string()))?;
-    if status < 200 || status >= 300 {
+    if !(200..300).contains(&status) {
         return Err(AuthError::Message(format!(
             "HTTP request failed. status={status}; url={url}; body={text}"
         )));
@@ -360,7 +360,8 @@ mod tests {
     use crate::auth::{CANCEL_MESSAGE, InteractionMessage};
     use std::io::{Read, Write};
     use std::net::TcpStream;
-    use std::sync::mpsc::{self, Receiver};
+    use std::sync::Arc;
+    use std::sync::mpsc::Receiver;
     use std::time::Instant;
 
     fn token_response() -> (u16, String) {
@@ -423,13 +424,17 @@ mod tests {
         assert_eq!(String::from_utf8(decoded).expect("utf8"), CLIENT_ID);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_code_login_exchanges_tokens_with_five_minute_skew() {
         let server = FakeServer::start(|_| token_response());
         let (interaction, messages) = Interaction::new();
+        let interaction = Arc::new(interaction);
         let mut config = FlowConfig::default();
         config.anthropic.token_url = server.url("/v1/oauth/token");
-        let flow = tokio::spawn(async move { login(&interaction, &config).await });
+        let flow = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move { login(&interaction, &config).await })
+        };
 
         let (id, prompt) = next_prompt(&messages);
         assert_eq!(
@@ -467,20 +472,24 @@ mod tests {
         let credential = flow.await.expect("flow").expect("credential");
         assert_eq!(credential.access, "access-1");
         assert_eq!(credential.refresh, "refresh-1");
-        assert!(credential.expires >= before + 3600_000 - FIVE_MINUTES_MS);
-        assert!(credential.expires <= now_ms() + 3600_000 - FIVE_MINUTES_MS);
+        assert!(credential.expires >= before + 3_600_000 - FIVE_MINUTES_MS);
+        assert!(credential.expires <= now_ms() + 3_600_000 - FIVE_MINUTES_MS);
         let requests = server.requests();
         assert!(requests[0].contains("POST /v1/oauth/token"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn browser_login_uses_the_callback_server() {
         let server = FakeServer::start(|_| token_response());
         let (interaction, messages) = Interaction::new();
+        let interaction = Arc::new(interaction);
         let mut config = FlowConfig::default();
         config.anthropic.callback_port = 0;
         config.anthropic.token_url = server.url("/v1/oauth/token");
-        let flow = tokio::spawn(async move { login(&interaction, &config).await });
+        let flow = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move { login(&interaction, &config).await })
+        };
 
         let (id, _) = next_prompt(&messages);
         interaction.answer(id, Ok("browser".to_string()));
@@ -494,13 +503,17 @@ mod tests {
         assert_eq!(credential.access, "access-1");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn state_mismatch_is_reported() {
         let server = FakeServer::start(|_| token_response());
         let (interaction, messages) = Interaction::new();
+        let interaction = Arc::new(interaction);
         let mut config = FlowConfig::default();
         config.anthropic.token_url = server.url("/v1/oauth/token");
-        let flow = tokio::spawn(async move { login(&interaction, &config).await });
+        let flow = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move { login(&interaction, &config).await })
+        };
         let (id, _) = next_prompt(&messages);
         interaction.answer(id, Ok("copy_code".to_string()));
         next_auth_url(&messages);
@@ -512,11 +525,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_method_is_reported_verbatim() {
         let (interaction, messages) = Interaction::new();
+        let interaction = Arc::new(interaction);
         let config = FlowConfig::default();
-        let flow = tokio::spawn(async move { login(&interaction, &config).await });
+        let flow = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move { login(&interaction, &config).await })
+        };
         let (id, _) = next_prompt(&messages);
         interaction.answer(id, Ok("other".to_string()));
         assert_eq!(
@@ -525,18 +542,22 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_login_reports_login_cancelled() {
         let (interaction, messages) = Interaction::new();
+        let interaction = Arc::new(interaction);
         let cancel = interaction.cancellation();
         let config = FlowConfig::default();
-        let flow = tokio::spawn(async move { login(&interaction, &config).await });
+        let flow = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move { login(&interaction, &config).await })
+        };
         let (id, _) = next_prompt(&messages);
         cancel.cancel();
         interaction.answer(id, Ok("browser".to_string()));
         assert_eq!(
-            flow.await.expect("flow").unwrap_err(),
-            AuthError::Message(CANCEL_MESSAGE.to_string())
+            flow.await.expect("flow").unwrap_err().to_string(),
+            CANCEL_MESSAGE
         );
     }
 
@@ -551,8 +572,8 @@ mod tests {
             .expect("refresh");
         assert_eq!(credential.access, "access-1");
         assert_eq!(credential.refresh, "refresh-1");
-        assert!(credential.expires >= before + 3600_000 - FIVE_MINUTES_MS);
-        assert!(credential.expires <= now_ms() + 3600_000 - FIVE_MINUTES_MS);
+        assert!(credential.expires >= before + 3_600_000 - FIVE_MINUTES_MS);
+        assert!(credential.expires <= now_ms() + 3_600_000 - FIVE_MINUTES_MS);
         assert!(server.requests()[0].contains("POST /v1/oauth/token"));
     }
 

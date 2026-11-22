@@ -14,7 +14,7 @@ type Handler = dyn Fn(&str) -> (u16, String) + Send + Sync;
 
 /// The handler receives the full request text (request line, headers and,
 /// when present in the first read, the body).
-
+///
 /// A tiny HTTP server: one canned response per request line.
 pub struct FakeServer {
     base: String,

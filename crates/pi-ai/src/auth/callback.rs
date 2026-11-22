@@ -82,10 +82,10 @@ impl CallbackServer {
         let path = options.path.to_string();
         let state = options.state.map(str::to_string);
         let cancel = options.cancel.clone();
-        let timeout = options.timeout.unwrap_or(Duration::from_secs(15 * 60));
+        let timeout = options.timeout.unwrap_or(Duration::from_mins(15));
         std::thread::spawn(move || {
             serve(
-                listener,
+                &listener,
                 &provider_name,
                 &path,
                 state.as_deref(),
@@ -152,7 +152,7 @@ enum CallbackStep {
 }
 
 fn serve(
-    listener: TcpListener,
+    listener: &TcpListener,
     provider_name: &str,
     path: &str,
     state: Option<&str>,
@@ -245,7 +245,7 @@ fn handle_request(
     path: &str,
     expected_state: Option<&str>,
 ) -> (u16, String, CallbackStep) {
-    if method != "GET" || !target.split('?').next().is_some_and(|value| value == path) {
+    if method != "GET" || target.split('?').next().is_none_or(|value| value != path) {
         return (
             404,
             oauth_error_html("Callback route not found.", None),
@@ -293,7 +293,6 @@ fn handle_request(
 
 fn write_response(stream: &mut std::net::TcpStream, status: u16, page: &str) {
     let reason = match status {
-        200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
         409 => "Conflict",
@@ -410,6 +409,7 @@ mod tests {
     use super::*;
     use crate::auth::InteractionMessage;
     use std::net::TcpStream;
+    use std::sync::Arc;
 
     fn callback_get(uri: &str, query: &str) -> String {
         let url = uri.strip_prefix("http://").expect("http uri");
@@ -483,17 +483,21 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn manual_input_wins_when_the_callback_is_cancelled() {
         let (interaction, receiver) = Interaction::new();
+        let interaction = Arc::new(interaction);
         let mut callback = Some(server(None, Duration::from_secs(5)));
         let prompt = ManualPrompt {
             message: "paste code".to_string(),
             placeholder: "http://localhost/callback".to_string(),
         };
-        let task = tokio::spawn(async move {
-            wait_for_callback_or_manual_input(&interaction, &mut callback, &prompt).await
-        });
+        let task = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move {
+                wait_for_callback_or_manual_input(&interaction, &mut callback, &prompt).await
+            })
+        };
         let InteractionMessage::Prompt { id, .. } = receiver.recv().expect("prompt") else {
             panic!("manual prompt expected");
         };

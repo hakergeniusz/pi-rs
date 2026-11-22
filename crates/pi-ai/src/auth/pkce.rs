@@ -8,6 +8,7 @@
 //! is read from `/dev/urandom` (a time/pid SHA-256 stream is the fallback on
 //! systems without it) because the port has no `rand` dependency.
 
+use std::fmt::Write;
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -56,8 +57,10 @@ pub fn generate() -> Result<Pkce, AuthError> {
 pub fn state_hex() -> String {
     random_bytes(16)
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .fold(String::with_capacity(32), |mut state, byte| {
+            write!(state, "{byte:02x}").expect("writing to a String cannot fail");
+            state
+        })
 }
 
 fn random_bytes(length: usize) -> Vec<u8> {

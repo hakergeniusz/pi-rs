@@ -1,4 +1,4 @@
-//! OpenAI Codex / ChatGPT browser and device-code OAuth
+//! `OpenAI` Codex / `ChatGPT` browser and device-code OAuth
 //! (`packages/ai/src/auth/oauth/openai-codex.ts`).
 //!
 //! Ground truth: constants (`:22-37`), state/random bytes (`:62-67`),
@@ -504,6 +504,7 @@ mod tests {
     use crate::auth::http::form_decode;
     use crate::auth::test_support::FakeServer;
     use crate::auth::{CANCEL_MESSAGE, InteractionMessage};
+    use std::sync::Arc;
     use std::sync::mpsc::Receiver;
     use std::time::{Duration, Instant};
 
@@ -575,25 +576,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn device_code_404_is_verbatim() {
+    #[tokio::test]
+    async fn device_code_404_is_verbatim() {
         let server = FakeServer::start(|_| (404, String::new()));
         let mut config = FlowConfig::default();
         config.openai_codex.device_user_code_url = server.url("/usercode");
-        let error = futures::executor::block_on(start_device_auth(
-            &config.openai_codex,
-            &config.client,
-            &CancelToken::new(),
-        ))
-        .unwrap_err()
-        .to_string();
+        let error = start_device_auth(&config.openai_codex, &config.client, &CancelToken::new())
+            .await
+            .unwrap_err()
+            .to_string();
         assert_eq!(
             error,
             "OpenAI Codex device code login is not enabled for this server. Use browser login or verify the server URL."
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn device_code_login_exchanges_the_authorization_code() {
         let server = FakeServer::start(|request| {
             if request.contains("POST /usercode") {
@@ -611,11 +609,15 @@ mod tests {
             }
         });
         let (interaction, messages) = Interaction::new();
+        let interaction = Arc::new(interaction);
         let mut config = FlowConfig::default();
         config.openai_codex.device_user_code_url = server.url("/usercode");
         config.openai_codex.device_token_url = server.url("/device-token");
         config.openai_codex.token_url = server.url("/token");
-        let flow = tokio::spawn(async move { login(&interaction, &config).await });
+        let flow = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move { login(&interaction, &config).await })
+        };
         let (id, _) = next_prompt(&messages);
         interaction.answer(id, Ok("device_code".to_string()));
         match next_event(&messages) {
@@ -642,25 +644,26 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn browser_login_rejects_a_state_mismatch() {
         let (interaction, messages) = Interaction::new();
+        let interaction = Arc::new(interaction);
         let config = FlowConfig::default();
-        let flow = tokio::spawn(async move { login(&interaction, &config).await });
+        let flow = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move { login(&interaction, &config).await })
+        };
         let (id, _) = next_prompt(&messages);
         interaction.answer(id, Ok("browser".to_string()));
         // Consume the auth_url notification.
         next_event(&messages);
         loop {
-            match messages
+            if let InteractionMessage::Prompt { id, .. } = messages
                 .recv_timeout(Duration::from_secs(5))
                 .expect("interaction message")
             {
-                InteractionMessage::Prompt { id, .. } => {
-                    interaction.answer(id, Ok("code=x&state=wrong".to_string()));
-                    break;
-                }
-                _ => {}
+                interaction.answer(id, Ok("code=x&state=wrong".to_string()));
+                break;
             }
         }
         assert_eq!(
@@ -699,18 +702,22 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_login_reports_login_cancelled() {
         let (interaction, messages) = Interaction::new();
+        let interaction = Arc::new(interaction);
         let cancel = interaction.cancellation();
         let config = FlowConfig::default();
-        let flow = tokio::spawn(async move { login(&interaction, &config).await });
+        let flow = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move { login(&interaction, &config).await })
+        };
         let (id, _) = next_prompt(&messages);
         cancel.cancel();
         let _ = interaction.answer(id, Ok("browser".to_string()));
         assert_eq!(
-            flow.await.expect("flow").unwrap_err(),
-            AuthError::Message(CANCEL_MESSAGE.to_string())
+            flow.await.expect("flow").unwrap_err().to_string(),
+            CANCEL_MESSAGE
         );
     }
 

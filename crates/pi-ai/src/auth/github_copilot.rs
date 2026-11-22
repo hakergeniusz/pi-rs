@@ -73,7 +73,7 @@ fn base_url(token: &str, enterprise_domain: Option<&str>) -> String {
 }
 
 /// `fetchJson`'s non-ok branch (`:198-205`).
-fn http_error(status: reqwest::StatusCode, text: String) -> AuthError {
+fn http_error(status: reqwest::StatusCode, text: &str) -> AuthError {
     let reason = status.canonical_reason().unwrap_or_default();
     AuthError::Message(format!("{} {reason}: {text}", status.as_u16()))
 }
@@ -95,7 +95,7 @@ async fn get_json(
         .await
         .map_err(|error| AuthError::Message(error.to_string()))?;
     if !status.is_success() {
-        return Err(http_error(status, text));
+        return Err(http_error(status, &text));
     }
     serde_json::from_str::<Value>(&text).map_err(|error| AuthError::Message(error.to_string()))
 }
@@ -134,7 +134,7 @@ async fn start_device_flow(
         .await
         .map_err(|error| AuthError::Message(error.to_string()))?;
     if !status.is_success() {
-        return Err(http_error(status, text));
+        return Err(http_error(status, &text));
     }
     let value = serde_json::from_str::<Value>(&text)
         .map_err(|_| AuthError::Message("Invalid device code response".to_string()))?;
@@ -274,7 +274,9 @@ async fn fetch_models(
         endpoints
             .token_url
             .strip_suffix("/copilot_internal/v2/token")
-            .map_or(url.clone(), |prefix| format!("{prefix}models"))
+            .map_or(url.clone(), |prefix| {
+                format!("{}/models", prefix.trim_end_matches('/'))
+            })
     } else {
         url
     };
@@ -435,6 +437,8 @@ mod tests {
     use super::*;
     use crate::auth::InteractionMessage;
     use crate::auth::test_support::FakeServer;
+    use serde_json::json;
+    use std::sync::Arc;
     use std::sync::mpsc::Receiver;
     use std::time::{Duration, Instant};
 
@@ -527,12 +531,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn device_login_refreshes_and_filters_models() {
         let server = FakeServer::start(token_and_models);
         let config = configured(&server);
         let (interaction, messages) = Interaction::new();
-        let flow = tokio::spawn(async move { login(&interaction, &config).await });
+        let interaction = Arc::new(interaction);
+        let flow = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move { login(&interaction, &config).await })
+        };
         let (id, prompt) = next_prompt(&messages);
         assert_eq!(
             prompt,
@@ -544,10 +552,11 @@ mod tests {
         interaction.answer(id, Ok(String::new()));
         let credential = tokio::time::timeout(Duration::from_secs(10), flow)
             .await
-            .expect("flow")
+            .expect("flow timer")
+            .expect("flow task")
             .expect("credential");
         assert!(credential.access.starts_with("copilot-token"));
-        assert_eq!(credential.expires, 4102444800_000 - FIVE_MINUTES_MS);
+        assert_eq!(credential.expires, 4_102_444_800_000 - FIVE_MINUTES_MS);
         assert_eq!(credential.available_model_ids, vec!["gpt-5".to_string()]);
         assert!(
             server
@@ -565,11 +574,11 @@ mod tests {
             .await
             .expect("refresh");
         assert_eq!(credential.refresh, "gh-token");
-        assert_eq!(credential.expires, 4102444800_000 - FIVE_MINUTES_MS);
+        assert_eq!(credential.expires, 4_102_444_800_000 - FIVE_MINUTES_MS);
         assert_eq!(credential.available_model_ids, vec!["gpt-5".to_string()]);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn untrusted_verification_uri_is_rejected() {
         let server = FakeServer::start(|request| {
             if request.contains("POST /usercode") {
@@ -583,7 +592,11 @@ mod tests {
         });
         let config = configured(&server);
         let (interaction, messages) = Interaction::new();
-        let flow = tokio::spawn(async move { login(&interaction, &config).await });
+        let interaction = Arc::new(interaction);
+        let flow = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move { login(&interaction, &config).await })
+        };
         let (id, _) = next_prompt(&messages);
         interaction.answer(id, Ok(String::new()));
         assert_eq!(
@@ -592,12 +605,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn invalid_enterprise_domain_is_reported() {
         let server = FakeServer::start(token_and_models);
         let config = configured(&server);
         let (interaction, messages) = Interaction::new();
-        let flow = tokio::spawn(async move { login(&interaction, &config).await });
+        let interaction = Arc::new(interaction);
+        let flow = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move { login(&interaction, &config).await })
+        };
         let (id, _) = next_prompt(&messages);
         interaction.answer(id, Ok("bad domain??".to_string()));
         assert_eq!(
@@ -606,19 +623,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_login_reports_login_cancelled() {
         let server = FakeServer::start(token_and_models);
         let config = configured(&server);
         let (interaction, messages) = Interaction::new();
+        let interaction = Arc::new(interaction);
         let cancel = interaction.cancellation();
-        let flow = tokio::spawn(async move { login(&interaction, &config).await });
+        let flow = {
+            let interaction = Arc::clone(&interaction);
+            tokio::spawn(async move { login(&interaction, &config).await })
+        };
         let (id, _) = next_prompt(&messages);
         cancel.cancel();
         let _ = interaction.answer(id, Ok(String::new()));
         assert_eq!(
-            flow.await.expect("flow").unwrap_err(),
-            AuthError::Message(CANCEL_MESSAGE.to_string())
+            flow.await.expect("flow").unwrap_err().to_string(),
+            CANCEL_MESSAGE
         );
     }
 }
