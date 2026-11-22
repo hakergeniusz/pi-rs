@@ -9,19 +9,22 @@
 //! `<file name="{absolute}"></file>` reference block. There is no size cap:
 //! upstream reads whatever the user points at.
 //!
-//! Known divergence: upstream `processImage` converts bmp (and other
-//! unsupported formats) to png via sharp, and can resize; the print path
-//! passes `autoResizeImages: false`, so resizing is faithfully absent here,
-//! but bmp conversion is not implemented — bmp yields upstream's
-//! could-not-convert text (tracked for the P6 interactive image pipeline).
+//! Images go through [`crate::images::process_image`] with
+//! `autoResizeImages: false` (the print path's setting) and the unavailable
+//! pixel transformer: supported formats pass through byte-for-byte, and bmp
+//! takes upstream's could-not-convert text because there is no PNG converter
+//! installed. Detection is shared with the read tool via
+//! [`crate::images::detect_supported_image_format`].
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use pi_ai::types::ImageContent;
 
+use crate::images::{
+    ImageProcessResult, ImageSettings, ResizeOptions, UnavailableTransformer,
+    detect_supported_image_format, to_image_content,
+};
 use crate::tools::path_utils::resolve_read_path;
 
 /// `processFileArguments` (`file-processor.ts:25-88`): text blocks and image
@@ -31,10 +34,6 @@ pub struct ProcessedFiles {
     pub text: String,
     pub images: Vec<ImageContent>,
 }
-
-/// Upstream's could-not-convert message (`image-process.ts:82`).
-const UNCONVERTIBLE_IMAGE: &str =
-    "[Image omitted: could not be converted to a supported inline image format.]";
 
 /// Processes `@file` arguments into text content and image attachments.
 ///
@@ -62,30 +61,43 @@ pub fn process_file_arguments(file_args: &[String], cwd: &Path) -> Result<Proces
         let bytes = std::fs::read(&absolute).map_err(|error| {
             format!("Error: Could not read file {}: {error}", absolute.display())
         })?;
-        // The four provider-supported formats pass through
-        // `normalizeImage` unchanged (`image-process.ts:49-53`), so with
-        // `autoResizeImages: false` the attachment is the raw bytes.
-        if let Some(mime_type) = detect_supported_image_mime(&bytes) {
-            if mime_type == "image/bmp" {
-                // Upstream converts bmp to png (`convertImageBytesToPng`);
-                // the port has no image pipeline, so it takes upstream's
-                // conversion-failure path.
-                let _ = writeln!(
-                    processed.text,
-                    "<file name=\"{}\">{UNCONVERTIBLE_IMAGE}</file>",
-                    absolute.display()
-                );
-                continue;
+        if let Some(format) = detect_supported_image_format(&bytes) {
+            // The print path passes `autoResizeImages: false` (`main.ts:270`),
+            // so supported formats are attached with their raw bytes.
+            let settings = ImageSettings {
+                auto_resize: false,
+                ..ImageSettings::default()
+            };
+            match crate::images::process_image(
+                &bytes,
+                format.mime_type(),
+                &settings,
+                &ResizeOptions::default(),
+                &UnavailableTransformer,
+            ) {
+                ImageProcessResult::Processed {
+                    data,
+                    mime_type,
+                    hints,
+                } => {
+                    processed.images.push(to_image_content(data, mime_type));
+                    let hints = hints.join("\n");
+                    let _ = writeln!(
+                        processed.text,
+                        "<file name=\"{}\">{hints}</file>",
+                        absolute.display()
+                    );
+                }
+                ImageProcessResult::Failed { message } => {
+                    // BMP and other unconvertible formats take the same
+                    // omission path as upstream's missing sharp backend.
+                    let _ = writeln!(
+                        processed.text,
+                        "<file name=\"{}\">{message}</file>",
+                        absolute.display()
+                    );
+                }
             }
-            processed.images.push(ImageContent {
-                data: BASE64_STANDARD.encode(&bytes),
-                mime_type: mime_type.to_string(),
-            });
-            let _ = writeln!(
-                processed.text,
-                "<file name=\"{}\"></file>",
-                absolute.display()
-            );
         } else {
             let lossy = String::from_utf8_lossy(&bytes);
             let content = strip_bom(&lossy);
@@ -104,135 +116,15 @@ fn strip_bom(content: &str) -> &str {
     content.strip_prefix('\u{feff}').unwrap_or(content)
 }
 
-/// `detectSupportedImageMimeType` (`utils/mime.ts:13-32`): magic-byte sniff,
-/// `None` for anything that is not a supported (or convertible) image.
-fn detect_supported_image_mime(bytes: &[u8]) -> Option<&'static str> {
-    if starts_with(bytes, &[0xff, 0xd8, 0xff]) {
-        // 0xff 0xd8 0xff 0xf7 is a lossless JPEG, which upstream refuses.
-        return if bytes.get(3) == Some(&0xf7) {
-            None
-        } else {
-            Some("image/jpeg")
-        };
-    }
-    if starts_with(bytes, &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) {
-        return if is_png(bytes) && !is_animated_png(bytes) {
-            Some("image/png")
-        } else {
-            None
-        };
-    }
-    if starts_with_ascii(bytes, 0, b"GIF87a") || starts_with_ascii(bytes, 0, b"GIF89a") {
-        return Some("image/gif");
-    }
-    if starts_with_ascii(bytes, 0, b"RIFF") && starts_with_ascii(bytes, 8, b"WEBP") {
-        return Some("image/webp");
-    }
-    if starts_with_ascii(bytes, 0, b"BM") && is_bmp(bytes) {
-        return Some("image/bmp");
-    }
-    None
-}
-
-/// `isPng`: a PNG signature plus the IHDR chunk header.
-fn is_png(bytes: &[u8]) -> bool {
-    bytes.len() >= 16 && read_u32_be(bytes, 8) == 13 && starts_with_ascii(bytes, 12, b"IHDR")
-}
-
-/// `isAnimatedPng`: an `acTL` chunk before the first `IDAT`.
-fn is_animated_png(bytes: &[u8]) -> bool {
-    let mut offset = 8usize; // PNG_SIGNATURE.length
-    while offset + 8 <= bytes.len() {
-        let chunk_length = read_u32_be(bytes, offset) as usize;
-        let chunk_type_offset = offset + 4;
-        if starts_with_ascii(bytes, chunk_type_offset, b"acTL") {
-            return true;
-        }
-        if starts_with_ascii(bytes, chunk_type_offset, b"IDAT") {
-            return false;
-        }
-        let next_offset = offset + 8 + chunk_length + 4;
-        if next_offset <= offset || next_offset > bytes.len() {
-            return false;
-        }
-        offset = next_offset;
-    }
-    false
-}
-
-/// `isBmp` (`mime.ts:57-81`): header sanity plus the DIB color planes and
-/// bits-per-pixel fields.
-fn is_bmp(bytes: &[u8]) -> bool {
-    if bytes.len() < 26 {
-        return false;
-    }
-    let declared_file_size = read_u32_le(bytes, 2);
-    let pixel_data_offset = read_u32_le(bytes, 10);
-    let dib_header_size = read_u32_le(bytes, 14);
-    if declared_file_size != 0 && declared_file_size < 26 {
-        return false;
-    }
-    if pixel_data_offset < 14 + dib_header_size {
-        return false;
-    }
-    if declared_file_size != 0 && pixel_data_offset >= declared_file_size {
-        return false;
-    }
-    let (color_planes, bits_per_pixel);
-    if dib_header_size == 12 {
-        color_planes = read_u16_le(bytes, 22);
-        bits_per_pixel = read_u16_le(bytes, 24);
-    } else if (40..=124).contains(&dib_header_size) {
-        if bytes.len() < 30 {
-            return false;
-        }
-        color_planes = read_u16_le(bytes, 26);
-        bits_per_pixel = read_u16_le(bytes, 28);
-    } else {
-        return false;
-    }
-    color_planes == 1 && [1, 4, 8, 16, 24, 32].contains(&bits_per_pixel)
-}
-
-fn read_u16_le(bytes: &[u8], offset: usize) -> u32 {
-    u32::from(u16::from_le_bytes([
-        *bytes.get(offset).unwrap_or(&0),
-        *bytes.get(offset + 1).unwrap_or(&0),
-    ]))
-}
-
-fn read_u32_be(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_be_bytes([
-        *bytes.get(offset).unwrap_or(&0),
-        *bytes.get(offset + 1).unwrap_or(&0),
-        *bytes.get(offset + 2).unwrap_or(&0),
-        *bytes.get(offset + 3).unwrap_or(&0),
-    ])
-}
-
-fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        *bytes.get(offset).unwrap_or(&0),
-        *bytes.get(offset + 1).unwrap_or(&0),
-        *bytes.get(offset + 2).unwrap_or(&0),
-        *bytes.get(offset + 3).unwrap_or(&0),
-    ])
-}
-
-fn starts_with(bytes: &[u8], prefix: &[u8]) -> bool {
-    bytes.len() >= prefix.len() && bytes[..prefix.len()] == *prefix
-}
-
-fn starts_with_ascii(bytes: &[u8], offset: usize, prefix: &[u8]) -> bool {
-    bytes.len() >= offset + prefix.len() && &bytes[offset..offset + prefix.len()] == prefix
-}
-
 #[cfg(test)]
 mod tests {
     // `assert!(v.is_empty())` stays: the `assert_eq!(v, [])` alternative is
     // noisier for these fixture assertions.
     #![allow(clippy::assert_is_empty)]
     use super::*;
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
@@ -335,8 +227,40 @@ mod tests {
         let processed = process_file_arguments(&["image.bmp".to_string()], dir.path()).expect("ok");
         assert!(processed.images.is_empty());
         assert!(
-            processed.text.contains(UNCONVERTIBLE_IMAGE),
+            processed.text.contains(crate::images::UNCONVERTIBLE_IMAGE),
             "{processed:?}"
+        );
+    }
+
+    #[test]
+    fn gif_and_webp_args_attach_images_in_argument_order() {
+        let dir = tempdir();
+        // Header-valid synthetic files; with autoResizeImages: false the
+        // images module attaches the bytes unchanged.
+        let gif = b"GIF89a\x01\x00\x01\x00";
+        let mut webp = b"RIFF\x16\x00\x00\x00WEBP".to_vec();
+        webp.extend_from_slice(b"VP8L\x0a\x00\x00\x00\x2f\x00\x00\x00\x00");
+        let gif_path = write(&dir, "image.gif", gif);
+        let webp_path = write(&dir, "image.webp", &webp);
+
+        let processed = process_file_arguments(
+            &["image.gif".to_string(), "image.webp".to_string()],
+            dir.path(),
+        )
+        .expect("ok");
+
+        assert_eq!(processed.images.len(), 2);
+        assert_eq!(processed.images[0].mime_type, "image/gif");
+        assert_eq!(processed.images[0].data, BASE64_STANDARD.encode(gif));
+        assert_eq!(processed.images[1].mime_type, "image/webp");
+        assert_eq!(processed.images[1].data, BASE64_STANDARD.encode(&webp));
+        assert_eq!(
+            processed.text,
+            format!(
+                "<file name=\"{}\"></file>\n<file name=\"{}\"></file>\n",
+                gif_path.display(),
+                webp_path.display()
+            )
         );
     }
 

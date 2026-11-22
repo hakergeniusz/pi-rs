@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pi_agent::agent_loop::{AgentLoopConfig, DefaultConvertToLlm};
+use pi_agent::agent_loop::AgentLoopConfig;
 use pi_agent::agent_message::AgentMessage;
 use pi_agent::events::{AgentEvent, AgentEventSink};
 use pi_agent::queues::Queues;
@@ -1459,6 +1459,68 @@ fn model_thinking_levels(settings: &SettingsManager) -> BTreeMap<String, String>
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// `sdk.ts:296-331`: the `blockImages` defense-in-depth filter installed on
+/// the agent's `convertToLlm` seam. It runs after `defaultConvertToLlm` has
+/// folded the session's custom roles into user messages, and replaces every
+/// image block with upstream's "Image reading is disabled." text, deduping
+/// consecutive placeholders. Upstream reads the setting on every call; this
+/// host snapshots it when it rebuilds the loop config for each run, so a
+/// setting change takes effect from the next run on.
+fn filter_block_images(messages: Vec<AgentMessage>, block_images: bool) -> Vec<AgentMessage> {
+    if !block_images {
+        return messages;
+    }
+    messages
+        .into_iter()
+        .map(|message| match message {
+            AgentMessage::User(mut user) => {
+                if let pi_ai::types::UserContent::Blocks(blocks) = &user.content {
+                    let loose: Vec<pi_ai::types::ContentBlock> = blocks
+                        .iter()
+                        .cloned()
+                        .map(pi_ai::types::ContentBlock::from)
+                        .collect();
+                    let filtered = crate::images::filter_blocked_images(&loose, true);
+                    user.content = pi_ai::types::UserContent::Blocks(
+                        filtered
+                            .into_iter()
+                            .filter_map(input_content_from_block)
+                            .collect(),
+                    );
+                }
+                AgentMessage::User(user)
+            }
+            AgentMessage::ToolResult(mut result) => {
+                let loose: Vec<pi_ai::types::ContentBlock> = result
+                    .content
+                    .iter()
+                    .cloned()
+                    .map(pi_ai::types::ContentBlock::from)
+                    .collect();
+                let filtered = crate::images::filter_blocked_images(&loose, true);
+                result.content = filtered
+                    .into_iter()
+                    .filter_map(input_content_from_block)
+                    .collect();
+                AgentMessage::ToolResult(result)
+            }
+            other => other,
+        })
+        .collect()
+}
+
+/// User and tool-result messages carry only `TextContent | ImageContent`;
+/// thinking/tool-call blocks cannot appear there.
+fn input_content_from_block(
+    block: pi_ai::types::ContentBlock,
+) -> Option<pi_ai::types::InputContent> {
+    match block {
+        pi_ai::types::ContentBlock::Text(text) => Some(pi_ai::types::InputContent::Text(text)),
+        pi_ai::types::ContentBlock::Image(image) => Some(pi_ai::types::InputContent::Image(image)),
+        pi_ai::types::ContentBlock::Thinking(_) | pi_ai::types::ContentBlock::ToolCall(_) => None,
+    }
 }
 
 /// The wire name of a level recorded on an assistant message (TS
@@ -6528,6 +6590,9 @@ impl InteractiveMode {
             &self.session,
         );
         let (api_key, access_token) = self.run_wire_credential();
+        // The config is rebuilt for every run, so this snapshot of the live
+        // setting picks up selector changes made between prompts.
+        let block_images = self.settings.get_block_images();
         let config = AgentLoopConfig {
             model: self.model.clone(),
             thinking_level: self.thinking_level,
@@ -6549,7 +6614,9 @@ impl InteractiveMode {
             prepare_request: None,
             prepare_next_turn: None,
             transform_context: self.transform_context(),
-            convert_to_llm: Arc::new(DefaultConvertToLlm),
+            convert_to_llm: Arc::new(move |messages: Vec<AgentMessage>| {
+                filter_block_images(pi_agent::default_convert_to_llm(messages), block_images)
+            }),
         };
 
         let (tx, rx) = std::sync::mpsc::channel::<LoopEvent>();
@@ -17978,5 +18045,68 @@ export default function (pi) {
             .push(TreeSelectorEvent::LabelChange(user_id.clone(), None));
         mode.pump();
         assert_eq!(mode.session.get_label(&user_id), None);
+    }
+    // --- block_images convertToLlm wiring (sdk.ts:296-331) ------------------
+
+    #[test]
+    fn block_images_filter_replaces_and_dedupes_converted_messages() {
+        use pi_ai::types::{
+            ImageContent, InputContent, TextContent, ToolResultMessage, UserContent, UserMessage,
+        };
+
+        let image = InputContent::Image(ImageContent {
+            data: "abc".to_string(),
+            mime_type: "image/png".to_string(),
+        });
+        let text = InputContent::Text(TextContent {
+            text: "hello".to_string(),
+            text_signature: None,
+        });
+        let messages = vec![
+            AgentMessage::User(UserMessage {
+                content: UserContent::Blocks(vec![image.clone(), image, text.clone()]),
+                timestamp: 1,
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![text.clone()],
+                details: None,
+                usage: None,
+                nested_calls: None,
+                is_error: false,
+                timestamp: 2,
+                duration_ms: None,
+            }),
+        ];
+
+        let filtered = super::filter_block_images(messages.clone(), true);
+        let AgentMessage::User(user) = &filtered[0] else {
+            panic!("first message stays a user message");
+        };
+        let UserContent::Blocks(blocks) = &user.content else {
+            panic!("blocks stay blocks");
+        };
+        assert_eq!(blocks.len(), 2, "consecutive placeholders are deduped");
+        assert_eq!(
+            blocks[0].as_text(),
+            Some(crate::images::IMAGE_READING_DISABLED)
+        );
+        assert_eq!(blocks[1].as_text(), Some("hello"));
+        assert_eq!(
+            super::filter_block_images(messages.clone(), false),
+            messages
+        );
+        assert_eq!(filtered[1], messages[1]);
+    }
+
+    #[test]
+    fn block_images_filter_skips_string_user_content() {
+        use pi_ai::types::{UserContent, UserMessage};
+        let messages = vec![AgentMessage::User(UserMessage {
+            content: UserContent::Text("plain text".to_string()),
+            timestamp: 3,
+        })];
+        assert_eq!(super::filter_block_images(messages.clone(), true), messages);
     }
 }

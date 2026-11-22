@@ -15,6 +15,9 @@
 //!   it returns pi's `sed -n` fallback instruction (`read.ts:320-323`);
 //! * image files are detected by content signature (`utils/mime.ts`) and
 //!   returned as `[text note, image block]`, the same shape pi returns.
+//!   Image processing goes through [`crate::images::process_image`]
+//!   (`utils/image-process.ts`), so resize hints, conversion hints and
+//!   omission notes follow upstream exactly.
 //!
 //! Two paths select lines, exactly as pi does: whole-file in memory for
 //! unusual ranges (`read.ts:132-138`), and a streaming reader that stores
@@ -22,11 +25,13 @@
 //! (`read.ts:144-229`). A regular file is read up to its size when opened,
 //! so text appended during the read is not counted (`read.ts:76-87`).
 //!
-//! Deviation: `processImage` resizing and BMP→PNG conversion are not ported
-//! (they need an image codec). A PNG/JPEG/GIF/WebP image passes through
-//! unchanged with no resize hints — pi's shape with `autoResizeImages:
-//! false` and no conversion — and a BMP takes pi's conversion-failure path
-//! (`read.ts:285-288`), the omission note.
+//! Deviations: the builtin [`ToolContext`] carries no model metadata, so
+//! `getNonVisionImageNote(ctx.model)` (`read.ts:274`) always takes its
+//! "no model" arm and the conservative fallback resize options are used.
+//! The pixel transform is [`crate::images::UnavailableTransformer`] (pi's
+//! Photon-when-unavailable state): images within the inline limits pass
+//! through byte-for-byte, and oversized ones take pi's could-not-resize
+//! omission path (`read.ts:282-285`).
 
 use std::fs;
 use std::io::Read;
@@ -35,6 +40,10 @@ use pi_agent::types::AbortSignal;
 use pi_agent::types::AgentToolResult;
 use serde_json::{Value, json};
 
+use crate::images::{
+    ImageProcessResult, ImageSettings, ResizeOptions, UnavailableTransformer, read_failure_note,
+    read_image_note, to_image_content,
+};
 use crate::tools::path_utils::resolve_read_path;
 use crate::tools::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncationOptions, TruncationResult, format_size,
@@ -189,69 +198,48 @@ fn execute_image(
 ) -> Result<AgentToolResult, ToolError> {
     let bytes = fs::read(absolute_path)
         .map_err(|error| ToolError(io_error_node_message(&error, absolute_path, "open")))?;
-    match process_image(&bytes, mime_type) {
-        ProcessedImage::Omitted(message) => {
-            let note = format!("Read image file [{mime_type}]\n{message}");
+    // No model metadata reaches a builtin tool, so upstream's
+    // `getNonVisionImageNote(ctx.model)` takes its no-model arm and
+    // `fallbackResizeOptions` applies.
+    match crate::images::process_image(
+        &bytes,
+        mime_type,
+        &ImageSettings::default(),
+        &ResizeOptions::default(),
+        &UnavailableTransformer,
+    ) {
+        ImageProcessResult::Failed { message } => {
+            let note = read_failure_note(mime_type, &message, false);
             Ok(AgentToolResult {
                 structured_content: Some(json!(note)),
                 ..text_result(note)
             })
         }
-        ProcessedImage::Image {
+        ImageProcessResult::Processed {
             data,
-            mime_type,
+            mime_type: processed_mime_type,
             hints,
         } => {
-            let mut note = format!("Read image file [{mime_type}]");
-            if !hints.is_empty() {
-                note.push('\n');
-                note.push_str(&hints.join("\n"));
-            }
+            let note = read_image_note(&processed_mime_type, &hints, false);
             // pi's `toReadOutput` (`read.ts:99-103`): the image shape for
             // programmatic callers.
             Ok(AgentToolResult {
                 content: vec![
                     text_block(note.clone()),
-                    pi_ai::types::ContentBlock::Image(pi_ai::types::ImageContent {
-                        data: data.clone(),
-                        mime_type: mime_type.clone(),
-                    }),
+                    pi_ai::types::ContentBlock::Image(to_image_content(
+                        data.clone(),
+                        processed_mime_type.clone(),
+                    )),
                 ],
                 structured_content: Some(json!({
                     "type": "image",
                     "data": data,
-                    "mimeType": mime_type,
+                    "mimeType": processed_mime_type,
                     "note": note,
                 })),
                 ..AgentToolResult::default()
             })
         }
-    }
-}
-
-/// pi's `processImage` (`utils/image-process.ts`) reduced to what this build
-/// can do without an image codec: supported inline formats pass through with
-/// no resize hints; anything else takes the conversion-failure path.
-enum ProcessedImage {
-    Omitted(String),
-    Image {
-        data: String,
-        mime_type: String,
-        hints: Vec<String>,
-    },
-}
-
-fn process_image(bytes: &[u8], mime_type: &str) -> ProcessedImage {
-    match mime_type {
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp" => ProcessedImage::Image {
-            data: base64_encode(bytes),
-            mime_type: mime_type.to_string(),
-            hints: Vec::new(),
-        },
-        _ => ProcessedImage::Omitted(
-            "[Image omitted: could not be converted to a supported inline image format.]"
-                .to_string(),
-        ),
     }
 }
 
@@ -560,33 +548,10 @@ fn read_text_file(path: &std::path::Path) -> Result<String, ToolError> {
 }
 
 /// pi's `detectSupportedImageMimeType` (`utils/mime.ts:9-29`): content
-/// signature, not extension. Only the first 4100 bytes are sniffed.
+/// signature, not extension. Delegates to the images module's sniffer so the
+/// read tool and the `@file` processor share one detection rule.
 pub fn detect_supported_image_mime_type(bytes: &[u8]) -> Option<&'static str> {
-    if starts_with(bytes, &[0xff, 0xd8, 0xff]) {
-        // JPEG with the "JPEG XL" marker pi rejects.
-        return if bytes.get(3) == Some(&0xf7) {
-            None
-        } else {
-            Some("image/jpeg")
-        };
-    }
-    if starts_with(bytes, &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) {
-        return if is_png(bytes) && !is_animated_png(bytes) {
-            Some("image/png")
-        } else {
-            None
-        };
-    }
-    if starts_with_ascii(bytes, 0, b"GIF87a") || starts_with_ascii(bytes, 0, b"GIF89a") {
-        return Some("image/gif");
-    }
-    if starts_with_ascii(bytes, 0, b"RIFF") && starts_with_ascii(bytes, 8, b"WEBP") {
-        return Some("image/webp");
-    }
-    if starts_with_ascii(bytes, 0, b"BM") && is_bmp(bytes) {
-        return Some("image/bmp");
-    }
-    None
+    crate::images::detect_supported_image_format(bytes).map(crate::images::ImageFormat::mime_type)
 }
 
 /// pi's `detectSupportedImageMimeTypeFromFile` (`utils/mime.ts:31-41`).
@@ -603,115 +568,108 @@ fn detect_supported_image_mime_type_from_file(path: &std::path::Path) -> Option<
     detect_supported_image_mime_type(&buffer[..read])
 }
 
-fn starts_with(buffer: &[u8], prefix: &[u8]) -> bool {
-    buffer.len() >= prefix.len() && &buffer[..prefix.len()] == prefix
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn starts_with_ascii(buffer: &[u8], offset: usize, text: &[u8]) -> bool {
-    buffer.len() >= offset + text.len() && &buffer[offset..offset + text.len()] == text
-}
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
-fn is_png(buffer: &[u8]) -> bool {
-    buffer.len() >= 16 && read_u32_be(buffer, 8) == 13 && starts_with_ascii(buffer, 12, b"IHDR")
-}
-
-fn is_animated_png(buffer: &[u8]) -> bool {
-    let mut offset = 8usize;
-    while offset + 8 <= buffer.len() {
-        let chunk_length = read_u32_be(buffer, offset) as usize;
-        let chunk_type_offset = offset + 4;
-        if starts_with_ascii(buffer, chunk_type_offset, b"acTL") {
-            return true;
-        }
-        if starts_with_ascii(buffer, chunk_type_offset, b"IDAT") {
-            return false;
-        }
-        let next_offset = offset + 8 + chunk_length + 4;
-        if next_offset <= offset || next_offset > buffer.len() {
-            return false;
-        }
-        offset = next_offset;
+    /// Synthetic PNG with a valid signature/IHDR and the given header size.
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend_from_slice(&13_u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[0_u8; 9]); // color/compression/filter/interlace + CRC
+        bytes
     }
-    false
-}
 
-fn is_bmp(buffer: &[u8]) -> bool {
-    if buffer.len() < 26 {
-        return false;
+    /// Synthetic, header-valid BMP (unsupported for inline attachment).
+    fn bmp() -> Vec<u8> {
+        let mut bytes = vec![b'B', b'M'];
+        bytes.extend_from_slice(&30_u32.to_le_bytes()); // declared file size
+        bytes.extend_from_slice(&[0_u8; 4]); // reserved
+        bytes.extend_from_slice(&26_u32.to_le_bytes()); // pixel data offset
+        bytes.extend_from_slice(&12_u32.to_le_bytes()); // BITMAPCOREHEADER
+        bytes.extend_from_slice(&1_u16.to_le_bytes()); // width
+        bytes.extend_from_slice(&1_u16.to_le_bytes()); // height
+        bytes.extend_from_slice(&1_u16.to_le_bytes()); // color planes
+        bytes.extend_from_slice(&24_u16.to_le_bytes()); // bits per pixel
+        bytes.extend_from_slice(&[0_u8; 4]);
+        bytes
     }
-    let declared_file_size = read_u32_le(buffer, 2) as usize;
-    let pixel_data_offset = read_u32_le(buffer, 10) as usize;
-    let dib_header_size = read_u32_le(buffer, 14) as usize;
-    if declared_file_size != 0 && declared_file_size < 26 {
-        return false;
-    }
-    if pixel_data_offset < 14 + dib_header_size {
-        return false;
-    }
-    if declared_file_size != 0 && pixel_data_offset >= declared_file_size {
-        return false;
-    }
-    let (color_planes, bits_per_pixel) = if dib_header_size == 12 {
-        if buffer.len() < 26 {
-            return false;
-        }
-        (
-            read_u16_le(buffer, 22) as usize,
-            read_u16_le(buffer, 24) as usize,
-        )
-    } else if (40..=124).contains(&dib_header_size) {
-        if buffer.len() < 30 {
-            return false;
-        }
-        (
-            read_u16_le(buffer, 26) as usize,
-            read_u16_le(buffer, 28) as usize,
-        )
-    } else {
-        return false;
-    };
-    color_planes == 1 && matches!(bits_per_pixel, 1 | 4 | 8 | 16 | 24 | 32)
-}
 
-fn read_u16_le(bytes: &[u8], offset: usize) -> u16 {
-    u16::from(bytes[offset]) | (u16::from(bytes[offset + 1]) << 8)
-}
-
-fn read_u32_be(bytes: &[u8], offset: usize) -> u32 {
-    (bytes[offset] as u32) * 0x0100_0000
-        + (bytes[offset + 1] as u32) * 0x0001_0000
-        + (bytes[offset + 2] as u32) * 0x0000_0100
-        + bytes[offset + 3] as u32
-}
-
-fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
-    bytes[offset] as u32
-        + (bytes[offset + 1] as u32) * 0x100
-        + (bytes[offset + 2] as u32) * 0x1_0000
-        + (bytes[offset + 3] as u32) * 0x100_0000
-}
-
-/// Standard base64, the encoding every provider expects for image content.
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((triple >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHABET[((triple >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[((triple >> 6) & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(triple & 0x3f) as usize] as char
-        } else {
-            '='
-        });
+    async fn read_bytes(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> AgentToolResult {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).expect("write synthetic image");
+        let context = ToolContext::new(dir.path());
+        let arguments = json!({ "path": path.display().to_string() });
+        execute(&arguments, &context, &AbortSignal::new())
+            .await
+            .expect("read succeeds")
     }
-    out
+
+    #[tokio::test]
+    async fn reads_an_image_as_a_text_note_and_image_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bytes = png(2, 2);
+        let result = read_bytes(&dir, "image.png", &bytes).await;
+
+        assert_eq!(result.content.len(), 2);
+        assert_eq!(text_of(&result.content[0]), "Read image file [image/png]");
+        let pi_ai::types::ContentBlock::Image(image) = &result.content[1] else {
+            panic!("expected an image block");
+        };
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.data, BASE64_STANDARD.encode(&bytes));
+        assert_eq!(
+            result.structured_content,
+            Some(json!({
+                "type": "image",
+                "data": BASE64_STANDARD.encode(&bytes),
+                "mimeType": "image/png",
+                "note": "Read image file [image/png]",
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn unprocessable_image_returns_the_upstream_omission_note() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = read_bytes(&dir, "image.bmp", &bmp()).await;
+
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(
+            text_of(&result.content[0]),
+            format!(
+                "Read image file [image/bmp]\n{}",
+                crate::images::UNCONVERTIBLE_IMAGE
+            )
+        );
+        assert_eq!(
+            result.structured_content,
+            Some(json!(text_of(&result.content[0])))
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_image_takes_the_could_not_resize_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = read_bytes(&dir, "large.png", &png(4000, 3000)).await;
+
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(
+            text_of(&result.content[0]),
+            format!(
+                "Read image file [image/png]\n{}",
+                crate::images::COULD_NOT_RESIZE
+            )
+        );
+    }
+
+    fn text_of(block: &pi_ai::types::ContentBlock) -> &str {
+        block.as_text().expect("a text block")
+    }
 }
