@@ -23,8 +23,8 @@ porting, and consolidates conventions that were previously scattered through
 | `pi-agent` | `pi-agent-core` | agent loop, tool trait, steering/follow-up queues, events |
 | `pi-tui` | `pi-tui` | differential renderer, alt screen, editor, fuzzy, mouse, theme, oklab |
 | `pi-mcp` | `pi-mcp` | JSON-RPC types + stdio/streamable-HTTP transports, OAuth, resources |
-| `pi-codemode` | `pi-codemode` | inline VM, deterministic runs, `models.*`/grammar hook; Node/Workers transports stubbed |
-| `pi-env` | `pi-env` | daemon frame transport, remote env/files/process/PTY/watch, SSH (library only) |
+| `pi-codemode` | `pi-codemode` | inline VM, deterministic runs, `models.*`/grammar hook; real local thread + remote transports, Node/Workers/Cloudflare/wasm typed stubs |
+| `pi-env` | `pi-env` | daemon frame transport, remote env/files/process/PTY/watch, SSH; host-wired as `pi remote` via `pi-coding-agent::remote_env` (ticks/PTY/SSH onboarding host-driven) |
 | `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host, transpile/loader/runner, E0–E3 + E4 host packages |
 | `pi-coding-agent` (`pi` binary) | `pi-coding-agent` | the CLI — map below |
 

@@ -89,6 +89,16 @@ host overrides. The interactive TUI needs a real PTY (tmux works):
   script already passes `--offline` — don't pass it twice.
 - Do **not** edit `~/.zshrc` (user will fix stale `PI_CODING_AGENT_*` vars).
 
+### Known non-blocking warnings / deferred cleanup
+- Four unused-dependency declarations remain by decision (audit-verified, no
+  usage in `src/`): `pi-schema` in `pi-ai` (`crates/pi-ai/Cargo.toml:12`),
+  `pi-ai` in `pi-mcp` (`crates/pi-mcp/Cargo.toml:12`), and `serde` +
+  `thiserror` in `pi-schema` (`crates/pi-schema/Cargo.toml:12,14`). Removing
+  them churns `Cargo.lock`/workspace deps for no runtime gain; `-D warnings`
+  does not fail on manifest-level unused deps because the
+  `unused_crate_dependencies` lint is not enabled in `[workspace.lints.rust]`.
+  Left as warn-level cleanup.
+
 ## Next Steps
 1. **Only if asked** — the remaining mechanism tails in `AGENTS.md`:
    - RPC execution still serialized behind the FIFO turnstile (receives are
