@@ -44,6 +44,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 #[cfg(feature = "ext-js")]
 use std::sync::Mutex;
+#[cfg(feature = "ext-js")]
+use std::time::Instant;
 
 use pi_agent::types::ToolExecutor;
 #[cfg(feature = "ext-js")]
@@ -205,6 +207,23 @@ impl ExtensionHost {
         user_bash(self.runner.as_ref()?, command, exclude_from_context, cwd)
     }
 
+    /// One host-driven MCP tick (`index.ts:1154-1175`,
+    /// `runtime.ts:382-384`, `:432-442`): advance the bounded startup wait,
+    /// register the tools of settled connections, and drain
+    /// `notifications/tools/list_changed` re-registrations. The host decides
+    /// when to call this — no timer thread or `sleep` lives in the runner.
+    #[cfg(feature = "ext-js")]
+    pub fn mcp_tick(&self, now: Instant) -> Result<pi_ext_js::runner::McpTickOutcome, String> {
+        let Some(runner) = &self.runner else {
+            return Ok(pi_ext_js::runner::McpTickOutcome::default());
+        };
+        runner
+            .lock()
+            .expect("extension runner mutex poisoned")
+            .mcp_tick(now)
+            .map_err(|err| err.to_string())
+    }
+
     /// Emits one gate/teardown event (`session_before_*`,
     /// `session_shutdown`) and reports whether a handler voted
     /// `cancel: true` (`emitBeforeSwitch`, `agent-session-runtime.ts:133-166`;
@@ -271,6 +290,66 @@ pub fn emit_gate(
         .and_then(|result| result.get("cancel"))
         .and_then(Value::as_bool)
         .unwrap_or(false))
+}
+
+/// Drives the runner's host-owned MCP startup wait before the first prompt
+/// (`index.ts:1154-1175`) and reports whether the bound elapsed with servers
+/// still connecting. The runner only advances on an explicit tick, so the
+/// host supplies `now` on each pass; the short yield between passes lets the
+/// manager's worker make progress without a timer thread.
+#[cfg(feature = "ext-js")]
+fn settle_mcp_startup(runner: &mut pi_ext_js::ExtensionRunner) -> Result<Option<String>, String> {
+    use pi_ext_js::mcp_manager::StartupTick;
+
+    // Safety valve for the host loop: the runner's own bound is authoritative
+    // and normally shorter, this only guards against a stalled tick.
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let outcome = runner
+            .mcp_tick(Instant::now())
+            .map_err(|err| err.to_string())?;
+        match outcome.startup {
+            None | Some(StartupTick::Ready) => return Ok(None),
+            Some(StartupTick::TimedOut) => {
+                return Ok(Some(
+                    "MCP servers are still connecting; their tools become available once connected."
+                        .to_string(),
+                ));
+            }
+            Some(StartupTick::Waiting { .. }) => {
+                if Instant::now() >= deadline {
+                    return Ok(Some(
+                        "MCP servers are still connecting; their tools become available once connected."
+                            .to_string(),
+                    ));
+                }
+                // The worker connects on another thread; a short sleep keeps
+                // the host loop from spinning for the whole wait window.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+/// The upstream attention notice for failed MCP connections
+/// (`reportProblems`, `index.ts:641-653`), built from the settled reports.
+#[cfg(feature = "ext-js")]
+fn mcp_attention_diagnostic(reports: &[pi_ext_js::runner::McpServerReport]) -> Option<Diagnostic> {
+    let failures: Vec<String> = reports
+        .iter()
+        .filter(|report| report.state == "failed")
+        .map(|report| {
+            let error = report.error.as_deref().unwrap_or("unknown error");
+            let first_line = error.split('\n').next().unwrap_or(error);
+            format!("  {}: failed: {first_line}", report.name)
+        })
+        .collect();
+    (!failures.is_empty()).then(|| {
+        warning(format!(
+            "MCP servers need attention:\n{}\nRun /mcp to fix.",
+            failures.join("\n")
+        ))
+    })
 }
 
 /// What a `user_bash` interception decided (`UserBashEventResult`,
@@ -426,6 +505,14 @@ impl pi_agent::TransformContext for ExtensionContextTransform {
         messages: Vec<pi_agent::agent_message::AgentMessage>,
     ) -> BoxFuture<'_, Vec<pi_agent::agent_message::AgentMessage>> {
         Box::pin(async move {
+            // `transformContext` runs once per agent-loop turn, so it is the
+            // run-loop tick point for MCP notifications even when no
+            // extension tool is called this turn (`index.ts:382-384`).
+            let _ = self
+                .runner
+                .lock()
+                .expect("extension runner mutex poisoned")
+                .mcp_tick(Instant::now());
             let values: Vec<Value> = messages
                 .iter()
                 .map(|message| serde_json::to_value(message).unwrap_or(Value::Null))
@@ -586,6 +673,12 @@ impl ExtensionAwareExecutor {
             .as_ref()
             .expect("extension tools exist only with a runner");
         let mut runner = runner.lock().expect("extension runner mutex poisoned");
+        // The run loop is the host's tick point: a `list_changed`
+        // notification must be reflected before a codemode script or a
+        // direct MCP call reaches the tool it names (`runtime.ts:382-384`).
+        // A refresh failure is a server-state value upstream, never a tool
+        // error, so the tick's result is deliberately dropped here.
+        let _ = runner.mcp_tick(Instant::now());
         let value = runner
             .execute_tool(name, call_id, &arguments)
             .map_err(|error| error.to_string())?;
@@ -733,26 +826,23 @@ pub fn reload(
 
     // The MCP reconnect (`reportUnhandledMcpServers`,
     // `agent-session.ts:3872`): the extension closed its connections on
-    // `session_shutdown`; the same attention report as startup.
+    // `session_shutdown`. Connections start in the background and the host
+    // drives the bounded wait before the first prompt after the reload.
     match runner.connect_mcp_servers() {
-        Ok(reports) => {
-            let failures: Vec<String> = reports
-                .iter()
-                .filter(|report| report.state == "failed")
-                .map(|report| {
-                    let error = report.error.as_deref().unwrap_or("unknown error");
-                    let first_line = error.split('\n').next().unwrap_or(error);
-                    format!("  {}: failed: {first_line}", report.name)
-                })
-                .collect();
-            if !failures.is_empty() {
-                diagnostics.push(warning(format!(
-                    "MCP servers need attention:\n{}\nRun /mcp to fix.",
-                    failures.join("\n")
-                )));
+        Ok(_) => match settle_mcp_startup(&mut runner) {
+            Ok(notice) => {
+                if let Some(notice) = notice {
+                    diagnostics.push(warning(notice));
+                }
             }
-        }
+            Err(err) => {
+                diagnostics.push(warning(format!("Extension error: MCP startup wait: {err}")));
+            }
+        },
         Err(err) => diagnostics.push(warning(format!("Extension error: MCP connect: {err}"))),
+    }
+    if let Some(diagnostic) = mcp_attention_diagnostic(&runner.mcp_server_reports()) {
+        diagnostics.push(diagnostic);
     }
 
     // Bind-time registration failures report without failing the reload
@@ -929,30 +1019,28 @@ fn load_with_engine(
     // The reason is "startup"; the "reload" path arrives with the
     // session-reload work. `resources_discover` is P5.
 
-    // The MCP servers registered through `pi.registerMcpServer` connect on
-    // session_start (`index.ts:1112-1149`, the registered-servers half —
-    // `mcp.json` entries are P5). Failed connections are values: they
-    // report as one attention notice (`reportProblems`,
-    // `index.ts:641-653`), and the affected servers' tools stay absent.
+    // The MCP servers registered through `pi.registerMcpServer` start
+    // connecting on session_start (`index.ts:1112-1149`, the registered-
+    // servers half — `mcp.json` entries are P5). Connections are background
+    // work; the first prompt's bounded wait is driven by the host below,
+    // and the tools of settled connections register on that tick. Failed
+    // connections are values: one attention notice (`reportProblems`,
+    // `index.ts:641-653`) and no tools for the affected server.
     match runner.connect_mcp_servers() {
-        Ok(reports) => {
-            let failures: Vec<String> = reports
-                .iter()
-                .filter(|report| report.state == "failed")
-                .map(|report| {
-                    let error = report.error.as_deref().unwrap_or("unknown error");
-                    let first_line = error.split('\n').next().unwrap_or(error);
-                    format!("  {}: failed: {first_line}", report.name)
-                })
-                .collect();
-            if !failures.is_empty() {
-                diagnostics.push(warning(format!(
-                    "MCP servers need attention:\n{}\nRun /mcp to fix.",
-                    failures.join("\n")
-                )));
+        Ok(_) => match settle_mcp_startup(&mut runner) {
+            Ok(notice) => {
+                if let Some(notice) = notice {
+                    diagnostics.push(warning(notice));
+                }
             }
-        }
+            Err(err) => {
+                diagnostics.push(warning(format!("Extension error: MCP startup wait: {err}")));
+            }
+        },
         Err(err) => diagnostics.push(warning(format!("Extension error: MCP connect: {err}"))),
+    }
+    if let Some(diagnostic) = mcp_attention_diagnostic(&runner.mcp_server_reports()) {
+        diagnostics.push(diagnostic);
     }
 
     // Bind-time registration failures report without failing the load
@@ -1205,6 +1293,92 @@ export default function (pi) {
             .emit_gate(&json!({ "type": "session_before_fork", "entryId": "e1" }))
             .expect("gate");
         assert!(!cancelled, "handler-less events never cancel");
+    }
+
+    #[test]
+    fn host_mcp_tick_is_idle_without_servers() {
+        let headless = ExtensionHost {
+            runner: None,
+            extension_tools: Vec::new(),
+        };
+        assert!(
+            headless.mcp_tick(Instant::now()).expect("tick").is_idle(),
+            "headless hosts never tick MCP"
+        );
+
+        let host = host_with("export default function (pi) {}");
+        assert!(
+            host.mcp_tick(Instant::now()).expect("tick").is_idle(),
+            "a bound runner with no MCP servers is idle"
+        );
+    }
+
+    /// A synthetic stdio server answering `initialize` and `tools/list`
+    /// (the host-wiring half of the MCP fixture).
+    const SYNTH_SERVER: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"synth","version":"1.0.0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    #[test]
+    fn host_mcp_tick_settles_connections_and_registers_tools() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("synth.sh");
+        std::fs::write(&path, SYNTH_SERVER).expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod script");
+        }
+        let command = path.to_string_lossy();
+        let source = format!(
+            r#"export default function (pi) {{
+  pi.registerMcpServer("synth", {{ command: "{command}", exposure: "direct", timeout: 5 }});
+}}"#
+        );
+        let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
+            cwd: directory.path().to_string_lossy().into_owned(),
+            mode: "print".to_string(),
+            settings: json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        runner.load_extension("<mcp>", Some(&source)).expect("load");
+        runner.bind().expect("bind");
+        runner.connect_mcp_servers().expect("connect");
+        let host = ExtensionHost {
+            runner: Some(Arc::new(Mutex::new(runner))),
+            extension_tools: Vec::new(),
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let outcome = host.mcp_tick(Instant::now()).expect("tick");
+            if !matches!(
+                outcome.startup,
+                Some(pi_ext_js::mcp_manager::StartupTick::Waiting { .. })
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the host tick never settled");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let runner = host.runner.expect("runner");
+        let runner = runner.lock().expect("lock");
+        assert!(runner.tool("mcp__synth__echo").is_some());
+        assert!(
+            runner
+                .mcp_server_reports()
+                .iter()
+                .all(|report| report.state == "connected")
+        );
     }
 
     #[test]

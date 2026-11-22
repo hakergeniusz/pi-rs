@@ -35,7 +35,12 @@
 //! register into a synthetic record through the bridge
 //! (`__piMcpRegisterTools` — the `pi.registerTool` surface), and registry
 //! changes reconcile into `mcp_servers_change` emissions at the end of
-//! every dispatch (the change listener, `runner.ts:465-466`). The UI
+//! every dispatch (the change listener, `runner.ts:465-466`). Connections
+//! start in the background and the first prompt's bounded wait is driven by
+//! the host through [`ExtensionRunner::mcp_tick`] (`index.ts:1142`,
+//! `:1154-1175`); the same tick drains `notifications/tools/list_changed`
+//! and re-registers the refreshed tools (`runtime.ts:382-384`, `:432-442`).
+//! The UI
 //! surface (E3 slices 6a/6b) is the host half of `wrapUIPromptContext`
 //! (`runner.ts:577-613`): dialog methods emit the depth-gated
 //! `ui_prompt_*` pair around the mode's answer, interactive `ctx.ui.custom`
@@ -63,6 +68,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
@@ -78,6 +84,7 @@ use crate::events::{
     BoundaryDispatchResult, InputResult, ProjectTrustResult, SessionBeforeResult, SessionOutcome,
     ToolCallResult, ToolResultPatch, parse_session_outcome,
 };
+use crate::mcp_manager::{DEFAULT_STARTUP_WAIT_MS, StartupTick, StartupWait};
 use crate::mcp_registry::{
     create_mcp_tool_name, get_mcp_tool_exposure, mcp_namespace, to_tool_exposure,
 };
@@ -452,15 +459,18 @@ pub const MCP_EXTENSION_PATH: &str = "builtin:mcp";
 /// The runner's view of one MCP server (`McpServer`, `index.ts:103-116`).
 ///
 /// Headless subset: the registered config (for re-registration detection,
-/// `index.ts:1221-1228`), whether the connection is up, and the tool names
-/// currently offered.
+/// `index.ts:1221-1228`), whether the connection is up, the tool names
+/// currently offered, and the connect instructions (kept so a
+/// `list_changed` refresh rebuilds the same namespace).
 #[derive(Debug, Clone)]
 struct McpServerState {
     name: String,
     registered_config: Json,
     connected: bool,
+    disabled: bool,
     tools: Vec<String>,
     error: Option<String>,
+    instructions: Option<String>,
 }
 
 /// One server's status for the host report (`describeState`,
@@ -469,12 +479,34 @@ struct McpServerState {
 pub struct McpServerReport {
     /// The server name.
     pub name: String,
-    /// `"connected"` | `"failed"` | `"disabled"`.
+    /// `"connecting"` | `"connected"` | `"failed"` | `"disabled"`.
     pub state: String,
     /// Tools the server offered at connect.
     pub tool_count: usize,
-    /// The connect failure, when the state is `failed`.
+    /// The connect (or tool-refresh) failure, when the state is `failed`.
     pub error: Option<String>,
+}
+
+/// What one host-driven [`ExtensionRunner::mcp_tick`] accomplished.
+#[derive(Debug, Default)]
+pub struct McpTickOutcome {
+    /// The startup-wait state after this tick, or `None` when no startup
+    /// connection pass is active.
+    pub startup: Option<StartupTick>,
+    /// Connect outcomes that settled during this tick, as host reports.
+    pub settled: Vec<McpServerReport>,
+    /// Servers whose tools were re-registered from a `list_changed`
+    /// notification (`runtime.ts:432-442`).
+    pub re_registered: Vec<String>,
+}
+
+impl McpTickOutcome {
+    /// Whether this tick changed nothing (no startup progress, no settled
+    /// connections, and no tool re-registrations).
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.startup.is_none() && self.settled.is_empty() && self.re_registered.is_empty()
+    }
 }
 
 /// An error from a tool's `execute` (the host wraps it into an
@@ -572,6 +604,10 @@ pub struct ExtensionRunner {
     /// (`McpServer`, `index.ts:103-116` — the extension-registered half;
     /// `mcp.json` entries are P5).
     mcp_servers: Vec<McpServerState>,
+    /// The bounded first-prompt wait for connections started at
+    /// `session_start` (`index.ts:87-94`, `:1154-1175`). Advanced only by
+    /// the host through [`Self::mcp_tick`] — no timer thread.
+    mcp_startup: Option<StartupWait>,
     /// Last definition registered under each bridge tool name, to
     /// re-register withdrawn tools as hidden (`index.ts:377`).
     mcp_definitions: HashMap<String, Json>,
@@ -613,6 +649,7 @@ impl ExtensionRunner {
             ui_prompt_depth: 0,
             active_ui_prompt: None,
             mcp_servers: Vec::new(),
+            mcp_startup: None,
             mcp_definitions: HashMap::new(),
             mcp_tool_owners: HashMap::new(),
             mcp_draining: false,
@@ -868,19 +905,150 @@ impl ExtensionRunner {
     /// servers (`index.ts:1112-1149`, minus the `mcp.json` half, which is
     /// P5).
     ///
-    /// Every enabled server connects; failures are per-server values — the
-    /// failed state shows in the report and the server's tools stay
-    /// absent, never failing the host. Registry-state or engine failures
-    /// are the error value.
+    /// Upstream starts every enabled connection in the background
+    /// (`index.ts:1141-1142`) and lets the first prompt wait, bounded, for
+    /// the ones whose tools are declared to the model (`index.ts:1154-1175`).
+    /// This pass registers the pending connections in a [`StartupWait`] and
+    /// returns one `"connecting"` report per new server; the host reads the
+    /// settled reports through [`Self::mcp_tick`]. Failures are per-server
+    /// values, never a host error.
     pub fn connect_mcp_servers(&mut self) -> Result<Vec<McpServerReport>, JsHostError> {
         self.reconcile_mcp_servers()
+    }
+
+    /// One host-driven MCP tick: advance the startup wait, register the
+    /// tools of connections that settled, then drain
+    /// `notifications/tools/list_changed` and re-register the refreshed
+    /// tools (`index.ts:1154-1175`, `runtime.ts:382-384`, `:432-442`).
+    ///
+    /// There is no timer: the host supplies `now` and decides when to call
+    /// this. With no connections in flight and no tool changes it is a
+    /// no-op.
+    pub fn mcp_tick(&mut self, now: Instant) -> Result<McpTickOutcome, JsHostError> {
+        let mut outcome = McpTickOutcome::default();
+
+        // Take the wait out so the rest of the runner is free while tools
+        // are registered; it goes back only while the bound is still live.
+        let mut wait = self.mcp_startup.take();
+        let mut keep_waiting = false;
+        let settled = if let Some(wait) = wait.as_mut() {
+            let tick = wait.tick(now);
+            keep_waiting = matches!(tick, StartupTick::Waiting { .. });
+            outcome.startup = Some(tick);
+            wait.drain_settled()
+        } else {
+            Vec::new()
+        };
+        if keep_waiting {
+            self.mcp_startup = wait;
+        }
+        // When the bound elapses the wait is one-shot: upstream's late
+        // connections still register through their own ready promise, but
+        // the host-facing `StartupWait` cannot drain after `waited` flips.
+        // Those connections stay owned by the manager's worker.
+
+        let mut resources_changed = false;
+        for (name, result) in settled {
+            let Some(index) = self.mcp_servers.iter().position(|state| state.name == name) else {
+                continue;
+            };
+            let config = self.mcp_servers[index].registered_config.clone();
+            match result {
+                Ok(connect) => {
+                    self.ensure_mcp_extension_record()?;
+                    let tools = self.register_server_tools(
+                        &name,
+                        &config,
+                        &connect.tools,
+                        connect.instructions.as_deref(),
+                        &[],
+                    )?;
+                    let state = &mut self.mcp_servers[index];
+                    state.connected = true;
+                    state.tools.clone_from(&tools);
+                    state.error = None;
+                    state.instructions.clone_from(&connect.instructions);
+                    resources_changed |= connect.has_resources;
+                    outcome.settled.push(McpServerReport {
+                        name,
+                        state: "connected".to_string(),
+                        tool_count: tools.len(),
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    let state = &mut self.mcp_servers[index];
+                    state.connected = false;
+                    state.error = Some(error.clone());
+                    outcome.settled.push(McpServerReport {
+                        name,
+                        state: "failed".to_string(),
+                        tool_count: 0,
+                        error: Some(error),
+                    });
+                }
+            }
+        }
+        if resources_changed {
+            self.register_resource_tools()?;
+        }
+
+        // Without servers there is nothing to poll; keep the common
+        // headless path free of even the manager worker's round-trip.
+        if self.mcp_servers.is_empty() {
+            return Ok(outcome);
+        }
+        let changes = {
+            let manager = {
+                let core = self.core.lock().expect("host core mutex poisoned");
+                core.mcp_manager.clone()
+            };
+            // The manager's worker drains inbound messages at the top of
+            // every request iteration. `poll_notifications` is fire-and-
+            // forget, so a blocking round-trip is the barrier that makes the
+            // drain below deterministic (`mcp_manager.rs`, `worker_loop`).
+            manager.poll_notifications();
+            let _ = manager.servers_with_resources();
+            manager.take_tool_changes()
+        };
+        for change in changes {
+            let Some(index) = self
+                .mcp_servers
+                .iter()
+                .position(|state| state.name == change.server)
+            else {
+                continue;
+            };
+            if let Some(error) = change.error {
+                // Upstream keeps the last good tool list on a failed
+                // refresh and only records the error in the server state
+                // (`runtime.ts:438-440`).
+                self.mcp_servers[index].error = Some(error);
+                continue;
+            }
+            let config = self.mcp_servers[index].registered_config.clone();
+            let previous = self.mcp_servers[index].tools.clone();
+            let instructions = self.mcp_servers[index].instructions.clone();
+            let tools = self.register_server_tools(
+                &change.server,
+                &config,
+                &change.tools,
+                instructions.as_deref(),
+                &previous,
+            )?;
+            self.mcp_servers[index].tools = tools;
+            self.mcp_servers[index].error = None;
+            outcome.re_registered.push(change.server);
+        }
+        Ok(outcome)
     }
 
     /// The registry/connection reconciliation (`index.ts:1215-1248`
     /// without the event emission).
     ///
     /// Servers unregistered or re-registered with a new config are dropped
-    /// (tools hidden, connection closed); added ones connect.
+    /// (tools hidden, connection closed); added ones start connecting in
+    /// the background.
     #[allow(clippy::too_many_lines)] // mirrors the mcp_servers_change handler; split when extending
     fn reconcile_mcp_servers(&mut self) -> Result<Vec<McpServerReport>, JsHostError> {
         let (registered, cwd, manager) = {
@@ -921,6 +1089,13 @@ impl ExtensionRunner {
             .retain(|state| !removed.contains(&state.name));
 
         let mut reports = Vec::new();
+        // Reuse an in-flight wait across reconciles (a `session_start`
+        // handler may register a server after the first pass).
+        let mut wait = self
+            .mcp_startup
+            .take()
+            .unwrap_or_else(|| StartupWait::new(DEFAULT_STARTUP_WAIT_MS));
+        let mut pending = 0usize;
         for (name, config) in &registered {
             if self.mcp_servers.iter().any(|state| &state.name == name) {
                 continue;
@@ -934,8 +1109,10 @@ impl ExtensionRunner {
                     name: name.clone(),
                     registered_config: config.clone(),
                     connected: false,
+                    disabled: true,
                     tools: Vec::new(),
                     error: None,
+                    instructions: None,
                 });
                 reports.push(McpServerReport {
                     name: name.clone(),
@@ -945,47 +1122,31 @@ impl ExtensionRunner {
                 });
                 continue;
             }
-            match manager.connect(name, config, &cwd) {
-                Ok(outcome) => {
-                    self.ensure_mcp_extension_record()?;
-                    let tools = self.register_server_tools(
-                        name,
-                        config,
-                        &outcome.tools,
-                        outcome.instructions.as_deref(),
-                        &[],
-                    )?;
-                    self.mcp_servers.push(McpServerState {
-                        name: name.clone(),
-                        registered_config: config.clone(),
-                        connected: true,
-                        tools: tools.clone(),
-                        error: None,
-                    });
-                    reports.push(McpServerReport {
-                        name: name.clone(),
-                        state: "connected".to_string(),
-                        tool_count: tools.len(),
-                        error: None,
-                    });
-                }
-                Err(error) => {
-                    self.mcp_servers.push(McpServerState {
-                        name: name.clone(),
-                        registered_config: config.clone(),
-                        connected: false,
-                        tools: Vec::new(),
-                        error: Some(error.clone()),
-                    });
-                    reports.push(McpServerReport {
-                        name: name.clone(),
-                        state: "failed".to_string(),
-                        tool_count: 0,
-                        error: Some(error),
-                    });
-                }
-            }
+            // `StartupWait::add` starts the connection on the manager's
+            // worker without blocking the host (`index.ts:1142`).
+            wait.add(name, config, &cwd, &manager);
+            pending += 1;
+            self.mcp_servers.push(McpServerState {
+                name: name.clone(),
+                registered_config: config.clone(),
+                connected: false,
+                disabled: false,
+                tools: Vec::new(),
+                error: None,
+                instructions: None,
+            });
+            reports.push(McpServerReport {
+                name: name.clone(),
+                state: "connecting".to_string(),
+                tool_count: 0,
+                error: None,
+            });
         }
+        if pending > 0 {
+            self.mcp_startup = Some(wait);
+        }
+        // Resource tools are registered when a connection advertising the
+        // resources capability settles (`mcp_tick`).
         self.register_resource_tools()?;
         Ok(reports)
     }
@@ -1264,6 +1425,7 @@ impl ExtensionRunner {
         };
         manager.shutdown_all();
         self.mcp_servers.clear();
+        self.mcp_startup = None;
     }
 
     /// The current per-server status (`mcp_server_reports`).
@@ -1276,8 +1438,10 @@ impl ExtensionRunner {
                     "connected".to_string()
                 } else if state.error.is_some() {
                     "failed".to_string()
-                } else {
+                } else if state.disabled {
                     "disabled".to_string()
+                } else {
+                    "connecting".to_string()
                 },
                 tool_count: state.tools.len(),
                 error: state.error.clone(),
@@ -6570,6 +6734,89 @@ export default function (pi) {
 
     // ---- the native MCP server manager (`builtin:mcp`) ----
 
+    /// Drives the host tick until the bounded startup wait settles, then
+    /// returns the connect reports (`index.ts:1154-1175`).
+    fn settle_mcp(runner: &mut ExtensionRunner) -> Vec<McpServerReport> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut reports = Vec::new();
+        loop {
+            let outcome = runner.mcp_tick(Instant::now()).expect("mcp tick");
+            reports.extend(outcome.settled);
+            match outcome.startup {
+                None | Some(StartupTick::Ready | StartupTick::TimedOut) => break,
+                Some(StartupTick::Waiting { .. }) => {
+                    assert!(Instant::now() < deadline, "mcp startup wait did not settle");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+        reports
+    }
+
+    /// Answers the first `tools/list` with `old` plus a `list_changed`
+    /// notification, and the second with `new` (synthetic fixture,
+    /// `runtime.ts:382-384`).
+    const CHANGING_SERVER_SCRIPT: &str = r#"#!/bin/sh
+lists=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"changing","version":"1.0.0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      lists=$((lists + 1))
+      if [ "$lists" -eq 1 ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"old","inputSchema":{"type":"object"}}]}}\n' "$id"
+        printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"new","inputSchema":{"type":"object"}}]}}\n' "$id"
+      fi ;;
+  esac
+done
+"#;
+
+    #[test]
+    fn mcp_tick_is_idle_without_servers() {
+        let mut runner = runner_with(&["export default function (pi) {}"]);
+        let outcome = runner.mcp_tick(Instant::now()).expect("tick");
+        assert!(outcome.is_idle(), "{outcome:?}");
+        assert!(runner.mcp_server_reports().is_empty());
+        assert!(runner.mcp_startup.is_none());
+    }
+
+    #[test]
+    fn mcp_tick_re_registers_tools_on_list_changed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("changing.sh");
+        std::fs::write(&path, CHANGING_SERVER_SCRIPT).expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod script");
+        }
+        let command = path.to_string_lossy();
+        let source = format!(
+            r#"export default function (pi) {{
+  pi.registerMcpServer("changing", {{ command: "{command}", exposure: "direct", timeout: 5 }});
+}}"#
+        );
+        let mut runner = runner_with(&[source.as_str()]);
+        runner.connect_mcp_servers().expect("connect");
+        settle_mcp(&mut runner);
+        // The notification-driven refresh replaced the original tool; the
+        // withdrawn name stays registered but hidden (`index.ts:447-450`).
+        let tool = runner.tool("mcp__changing__new").expect("new tool");
+        assert_eq!(tool.exposure, "direct");
+        let old = runner.tool("mcp__changing__old").expect("old tool kept");
+        assert_eq!(old.exposure, "hidden");
+        assert_eq!(
+            runner.mcp_server_reports()[0].tool_count,
+            1,
+            "the refreshed list has one tool"
+        );
+    }
+
     /// The extension source registering the fixture server; `extra` adds
     /// handlers.
     fn mcp_extension_source(server: &std::path::Path, extra: &str) -> String {
@@ -6594,9 +6841,10 @@ export default function (pi) {{
         let server = crate::mcp_manager::write_fixture_server(directory.path()).expect("fixture");
         let source = mcp_extension_source(&server, "");
         let mut runner = runner_with(&[source.as_str()]);
-        // The session_start connection pass: one connected server with its
-        // three tools.
-        let reports = runner.connect_mcp_servers().expect("connect");
+        // The session_start pass starts the connection in the background;
+        // the host tick settles it before the first prompt.
+        runner.connect_mcp_servers().expect("connect");
+        let reports = settle_mcp(&mut runner);
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert_eq!(reports[0].name, "synth");
         assert_eq!(reports[0].state, "connected");
@@ -6660,7 +6908,8 @@ export default function (pi) {
 }
 "#;
         let mut runner = runner_with(&[source]);
-        let reports = runner.connect_mcp_servers().expect("connect");
+        runner.connect_mcp_servers().expect("connect");
+        let reports = settle_mcp(&mut runner);
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].state, "failed");
         let error = reports[0].error.as_deref().expect("error message");
@@ -6693,6 +6942,7 @@ export default function (pi) {{
         );
         let mut runner = runner_with(&[source.as_str()]);
         runner.connect_mcp_servers().expect("connect");
+        settle_mcp(&mut runner);
         // `exposure` defaults to codemode, which registers as the deferred
         // tool exposure (tools.ts:46-48) — not declared, not active.
         let tool = runner.tool("mcp__synth__echo").expect("tool");
@@ -6726,6 +6976,7 @@ export default function (pi) {{
         runner
             .emit(&json!({ "type": "session_start", "reason": "startup" }))
             .expect("emit");
+        settle_mcp(&mut runner);
         let tool = runner
             .tool("mcp__late__echo")
             .expect("late tool registered");
@@ -6747,6 +6998,7 @@ export default function (pi) {{
         let source = mcp_extension_source(&server, extra);
         let mut runner = runner_with(&[source.as_str()]);
         runner.connect_mcp_servers().expect("connect");
+        settle_mcp(&mut runner);
         runner.emit(&json!({ "type": "drop" })).expect("emit");
         // The connection is gone; the tools stay registered but
         // unreachable (index.ts:455-462).
@@ -7816,6 +8068,7 @@ export default function (pi) {
         let v1 = mcp_extension_source(&server, "");
         let mut runner = runner_with(&[v1.as_str()]);
         runner.connect_mcp_servers().expect("connect-before");
+        settle_mcp(&mut runner);
         assert_eq!(runner.mcp_server_reports().len(), 1);
         assert!(
             runner

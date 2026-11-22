@@ -15,6 +15,12 @@
 //! an extension may not re-register another extension's server, names that
 //! differ only in `-`/`_` share a namespace, and unregistering an unknown
 //! or foreign server is a silent no-op.
+//!
+//! Tool exposure resolution delegates to [`crate::mcp_manager::tool_exposure`],
+//! the faithful port of `getMcpToolExposure` (`core/mcp-servers.ts:169-178`):
+//! the `*`-pattern matcher there is upstream's escaped-regex
+//! `toolPatternRegExp` rather than the in-order literal scan this module once
+//! carried.
 
 use serde_json::Value;
 
@@ -329,55 +335,13 @@ fn url_host(url: &str) -> String {
 /// Exposure of one tool of a server: its `toolExposure` entry, else the
 /// server's `exposure` (`getMcpToolExposure`,
 /// `core/mcp-servers.ts:170-178`). Exact names win over patterns; among
-/// patterns the first match in the object wins. The pattern matcher
-/// approximates upstream's `*`-glob regex with an in-order literal scan.
+/// patterns the first match in the object wins. Resolution is shared with
+/// the manager's `list_changed` re-registration path through
+/// [`crate::mcp_manager::tool_exposure`] so both paths use upstream's
+/// escaped-regex `*`-matcher.
 #[must_use]
 pub fn get_mcp_tool_exposure(config: &Value, tool_name: &str) -> String {
-    if let Some(overrides) = config.get("toolExposure").and_then(Value::as_object) {
-        if let Some(exact) = overrides.get(tool_name)
-            && let Some(exposure) = exact.as_str()
-        {
-            return exposure.to_string();
-        }
-        for (pattern, exposure) in overrides {
-            if pattern.contains('*')
-                && tool_pattern_matches(pattern, tool_name)
-                && let Some(exposure) = exposure.as_str()
-            {
-                return exposure.to_string();
-            }
-        }
-    }
-    config
-        .get("exposure")
-        .and_then(Value::as_str)
-        .unwrap_or("codemode")
-        .to_string()
-}
-
-/// Whether `name` matches a `*`-pattern (`toolPatternRegExp`,
-/// `core/mcp-servers.ts:21-27`): literal segments match in order, the first
-/// anchored to the start and the last to the end.
-fn tool_pattern_matches(pattern: &str, name: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    let mut rest = name;
-    let last = parts.len() - 1;
-    for (index, part) in parts.iter().enumerate() {
-        if index == 0 {
-            let Some(stripped) = rest.strip_prefix(part) else {
-                return false;
-            };
-            rest = stripped;
-        } else if index == last {
-            return rest.ends_with(part);
-        } else {
-            let Some(position) = rest.find(part) else {
-                return false;
-            };
-            rest = &rest[position + part.len()..];
-        }
-    }
-    true
+    crate::mcp_manager::tool_exposure(config, tool_name)
 }
 
 /// Tool exposure of an MCP exposure (`toToolExposure`,
@@ -608,6 +572,23 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn tool_exposure_delegates_to_the_faithful_glob_matcher() {
+        // The manager's matcher escapes regex metacharacters (`.` is literal)
+        // and backtracks across `*`, unlike the old in-order literal scan.
+        let config = json!({
+            "exposure": "codemode",
+            "toolExposure": {
+                "read.*": "hidden",
+                "a*ba*b": "direct"
+            }
+        });
+        assert_eq!(get_mcp_tool_exposure(&config, "read.foo"), "hidden");
+        assert_eq!(get_mcp_tool_exposure(&config, "readXfoo"), "codemode");
+        // A greedy first match would fail; upstream's regex backtracks.
+        assert_eq!(get_mcp_tool_exposure(&config, "abab"), "direct");
     }
 
     #[test]
