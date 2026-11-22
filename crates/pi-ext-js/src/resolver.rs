@@ -10,7 +10,10 @@
 //! E1 deliberately resolved *no* `node_modules`; E4 adds the `node:*` and
 //! host-package virtual modules served by [`node`] while keeping that same
 //! no-`node_modules` rule. Unknown specifiers still error with the E1
-//! explanation (`docs/EXTENSIONS.md` §6.3).
+//! explanation (`docs/EXTENSIONS.md` §6.3). The same table also serves CJS
+//! `require()` calls: [`crate::cjs::wrap`] lowers each static require into an
+//! ESM import, so both formats share this resolver and the virtual modules
+//! (upstream's jiti bridge, `core/extensions/loader.ts:42, 571-602`).
 
 use std::path::{Path, PathBuf};
 
@@ -152,11 +155,13 @@ fn throw_js_error(ctx: &Ctx<'_>, message: &str) -> rquickjs::Error {
     }
 }
 
-/// The resolution error for specifiers this host does not serve. The
+/// The resolution error text for specifiers this host does not serve. The
 /// host-package branch keeps the documented E1 string verbatim — bundled
-/// packages we cannot provide must keep failing the same way.
-fn throw_unavailable_module(ctx: &Ctx<'_>, name: &str) -> rquickjs::Error {
-    let message = if name.starts_with("node:") {
+/// packages we cannot provide must keep failing the same way. Exposed so
+/// the CJS `require` shim throws the same message as an ESM import
+/// (`crate::cjs`).
+pub fn unavailable_module_message(name: &str) -> String {
+    if name.starts_with("node:") {
         format!(
             "Module \"{name}\" is not polyfilled by the extensions host; see crates/pi-ext-js/src/node for the supported set"
         )
@@ -164,8 +169,12 @@ fn throw_unavailable_module(ctx: &Ctx<'_>, name: &str) -> rquickjs::Error {
         format!(
             "Module \"{name}\" could not be resolved by the extensions host (E1 supports relative paths and the bundled virtual modules; node_modules resolution lands in E4)"
         )
-    };
-    throw_js_error(ctx, &message)
+    }
+}
+
+/// The resolution error for specifiers this host does not serve.
+fn throw_unavailable_module(ctx: &Ctx<'_>, name: &str) -> rquickjs::Error {
+    throw_js_error(ctx, &unavailable_module_message(name))
 }
 
 /// The `rquickjs` resolver for extension modules: virtual specifiers map to
@@ -209,8 +218,11 @@ impl rquickjs::loader::Resolver for ExtensionResolver {
 
 /// The `rquickjs` loader: virtual modules serve their shim sources; files
 /// are read, TypeScript-stripped (`transpile::transpile`), and declared.
-/// A process-lifetime transpile cache keeps each source transformed once
-/// per host, mirroring upstream's module cache (`loader.ts:136-158`).
+/// CJS files are additionally wrapped by [`crate::cjs::wrap`] into ESM with
+/// a `module.exports` default export, so ESM extensions can `import` a CJS
+/// dependency and its static `require` calls resolve through this same
+/// loader. A process-lifetime transpile cache keeps each source transformed
+/// once per host, mirroring upstream's module cache (`loader.ts:136-158`).
 #[derive(Default)]
 pub struct ExtensionLoader {
     transpiled: Vec<(String, String)>,
@@ -247,6 +259,11 @@ impl rquickjs::loader::Loader for ExtensionLoader {
                 Ok(source) => source,
                 Err(err) => return Err(throw_js_error(ctx, &err.to_string())),
             };
+        let source = if crate::cjs::detect(&source) == crate::cjs::ModuleFormat::Cjs {
+            crate::cjs::wrap(Path::new(name), &source)
+        } else {
+            source
+        };
         self.transpiled.push((name.to_string(), source.clone()));
         Module::declare(ctx.clone(), name, source)
     }

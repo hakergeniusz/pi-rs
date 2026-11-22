@@ -10,6 +10,8 @@
 //!   replacement for Babel (`core/extensions/loader.ts:571-602`).
 //! - [`resolver`] — the virtual-module table (`virtual-modules.ts`),
 //!   relative-path resolution, and the directory entry rules.
+//! - [`cjs`] — the CommonJS↔ESM shim (E4): jiti's dual-format extension
+//!   loading (`core/extensions/loader.ts:42, 571-602, 659`).
 //! - [`engine`] + [`glue`] — the embedded runtime, the `pi` API object
 //!   with `createExtensionAPI`'s exact registration errors
 //!   (`core/extensions/loader.ts:253-561`), the headless contexts, and
@@ -28,6 +30,7 @@
 //! `node_modules` resolution, and no provider registration — each lands
 //! in E2–E4. Deviations as they appear are recorded in `HANDOFF.md`.
 
+pub mod cjs;
 pub mod engine;
 pub mod error;
 pub mod events;

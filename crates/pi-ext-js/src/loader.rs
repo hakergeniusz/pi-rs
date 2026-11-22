@@ -5,9 +5,12 @@
 //! then user `agentDir/extensions`, then explicit paths (directories
 //! resolve through the entry rules), with in-directory discovery one level
 //! deep (`discoverExtensionsInDir`, `loader.ts:803-835`) and
-//! errors-as-values (`loader.ts:646-668`). Trust gating is the caller's
-//! composition: the pre-trust pass loads only non-project origins so
-//! project extensions cannot handle `project_trust`
+//! errors-as-values (`loader.ts:646-668`). CJS extension files are wrapped
+//! by [`crate::cjs::entry_source`] before the engine declares them,
+//! mirroring jiti's dual-format import (`loader.ts:571-602`); an invalid
+//! factory keeps upstream's diagnostic (`loader.ts:659`). Trust gating is
+//! the caller's composition: the pre-trust pass loads only non-project
+//! origins so project extensions cannot handle `project_trust`
 //! (`resource-loader.ts:533-553`).
 
 use std::path::{Path, PathBuf};
@@ -198,12 +201,26 @@ pub fn load_paths(runner: &mut ExtensionRunner, paths: &[PathBuf]) -> LoadExtens
     let mut result = LoadExtensionsResult::default();
     for path in paths {
         let display = path.to_string_lossy().into_owned();
-        match runner.load_extension(&display, None) {
+        // CJS entries need the JS shim before the engine's ESM-only
+        // declaration; ESM paths stay on the engine's own read+transpile
+        // route. The factory check follows upstream's wording
+        // (`loader.ts:659`) even though the port's engine error is lowercase
+        // (`error.rs:23`).
+        let prepared = crate::cjs::entry_source(path);
+        match runner.load_extension(&display, prepared.as_deref()) {
             Ok(()) => result.extensions.push(display),
-            Err(error) => result.errors.push(LoadError {
-                path: display,
-                error: error.to_string(),
-            }),
+            Err(error) => {
+                let message = match error {
+                    crate::error::JsHostError::MissingFactory(_) => {
+                        crate::cjs::invalid_factory_error(&display)
+                    }
+                    other => other.to_string(),
+                };
+                result.errors.push(LoadError {
+                    path: display,
+                    error: message,
+                });
+            }
         }
     }
     result
