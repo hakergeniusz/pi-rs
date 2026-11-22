@@ -1,4 +1,4 @@
-//! CommonJS interop for extension modules (the E4 deviation closing the
+//! `CommonJS` interop for extension modules (the E4 deviation closing the
 //! deferred item in `docs/EXTENSIONS.md` §6.3: "ESM-only first — upstream
 //! extensions are ESM; CJS interop deferred").
 //!
@@ -34,7 +34,7 @@ use std::path::Path;
 pub enum ModuleFormat {
     /// Native ESM (`import`/`export`); the engine declares it as-is.
     Esm,
-    /// CommonJS (`module.exports`, `exports.x`, `require(...)`); needs the
+    /// `CommonJS` (`module.exports`, `exports.x`, `require(...)`); needs the
     /// shim from [`wrap`] before declaration.
     Cjs,
 }
@@ -137,7 +137,7 @@ fn scan(source: &str) -> Scan {
             match word.as_str() {
                 "import" | "export" => result.esm = true,
                 "module" if starts_with_at(&chars, index, ".exports") => result.cjs = true,
-                "exports" if matches!(peek_non_ws(&chars, index), Some('.') | Some('[')) => {
+                "exports" if matches!(peek_non_ws(&chars, index), Some('.' | '[')) => {
                     result.cjs = true;
                 }
                 "require" if peek_non_ws(&chars, index) == Some('(') => {

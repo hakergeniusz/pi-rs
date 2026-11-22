@@ -1,4 +1,4 @@
-//! E4 CJS interop exit gate: CommonJS extensions load through the same CLI
+//! E4 CJS interop exit gate: `CommonJS` extensions load through the same CLI
 //! path as ESM ones (`loader::load_paths`), with jiti-style `module.exports`,
 //! `exports.x`, and `require()` semantics (upstream
 //! `core/extensions/loader.ts:42, 571-602, 659`).
@@ -65,7 +65,7 @@ module.exports = function (pi) {
     );
 
     let mut runner = runner();
-    let result = load_paths(&mut runner, &[entry.clone()]);
+    let result = load_paths(&mut runner, std::slice::from_ref(&entry));
     assert_eq!(
         result.extensions,
         vec![entry.to_string_lossy().into_owned()]
