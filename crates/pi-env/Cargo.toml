@@ -1,0 +1,22 @@
+[package]
+name = "pi-env"
+description = "Local/remote execution environment, daemon connection and SSH transport (port of @earendil-works/pi-env)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# All already resolved in the workspace lockfile; no new external crate is
+# introduced by this port (see WIRING.md).
+base64 = { workspace = true }
+dirs = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true
