@@ -3816,6 +3816,161 @@ in fullscreen (`6d94910`) and the interrupt error missing the provider prefix
 upstream puts there (`273cc7f`). Theme was restored to `system`; the tmux
 session was restarted with the final release binary and left running.
 
+## 2026-11-22 — gap-closing wave (adapters, OAuth, env, telemetry, images, RPC/MCP/codemode)
+
+A parallel slice wave landed on `main` and was integrated in `16f0946`
+(compile/clippy fixups across `pi-env`, `pi-ai` auth, `pi-codemode`, `pi-mcp`
+and `pi-coding-agent`; MCP inbound receiver wrapped in a mutex so notifications
+can be drained). This section is written from the landed commits and their
+`WIRING.md` notes — **no parity is claimed where a mechanism is a typed stub or
+a host-driven API with no call site yet**. The compact coverage matrix lives in
+[`docs/GAP-STATUS.md`](docs/GAP-STATUS.md).
+
+### Seven provider adapters now registered (`e9cbc18`, `2179924`, `0e0086c`, `836af88`, `6f1fda5`, `2cdd215`)
+
+`pi-ai::providers::stream_fn_for` now dispatches all seven missing `api` ids:
+
+| Adapter | Module | Commit |
+|---|---|---|
+| Google Generative AI + Google Vertex | `providers/google.rs`, `google_shared.rs` | `e9cbc18`, sanitizer fix `2179924` |
+| AWS Bedrock Converse Stream | `providers/bedrock.rs`, `bedrock_sigv4.rs` | `0e0086c` |
+| OpenAI Responses + Azure Responses | `providers/openai_responses.rs`, `openai_responses_shared.rs`, `azure_openai_config.rs` | `836af88` |
+| Mistral Conversations | `providers/mistral.rs` | `6f1fda5` |
+| pi-messages (serialized assistant-message protocol) | `providers/pi_messages.rs` | `6f1fda5` |
+
+`2cdd215` is the registration/integration fix (arms, compile errors, stale test
+expectations and pedantic lints). Ports cover the SSE event state machines,
+thinking/thought-signature handling, tool calls, usage/cost, message conversion,
+SigV4 + binary AWS event-stream decoding, and the Responses reasoning/text/
+function/custom-tool event protocol; each adapter has canned-stream tests.
+Related fixes in the wave: the Google OpenAPI schema sanitizer strips
+`definitions` (`2179924`) and `findInitialModel` falls back to the first
+auth-filtered, adapter-supported model instead of erroring (`1911b77`), so bare
+`pi` starts again. `95dd3f3` fixed the settings selector passing width 0 to
+`DynamicBorder` (full-width rules now render, with a regression test).
+
+**Deviations (documented in each module):** `StreamOptions` has no `signal`,
+custom `fetch`, `env`, `project`/`location` or provider-specific fields — raw
+knobs ride in `metadata`, retries stay in `pi-ai::retry`, and cancellation is by
+dropping the stream. Vertex service-account ADC is not minted locally (caller
+passes a bearer token); Google strict-schema rewriting is a subset; Mistral
+`makeStrictJsonSchema` and pi-messages unknown-event forwarding are reduced;
+`sanitizeSurrogates` is a no-op on Rust UTF-8 strings.
+
+### Built-in OAuth login/refresh (`1323824`)
+
+New `pi-ai::auth` module ports the built-in provider flows from
+`auth/oauth/*.ts`: PKCE, loopback callback server and manual-code fallback,
+RFC 8628 device-code polling with upstream's `slow_down`/timeout strings, JWT
+account-id extraction, token exchange with 5-minute expiry skew, and refresh.
+Anthropic (browser + copy-code), OpenAI Codex (browser + device-code) and
+GitHub Copilot (device-code) are wired to interactive `/login` through
+`BuiltinLoginFlow`, reusing the existing auth picker and prompt components;
+credentials persist through the same `AuthStorage::modify` path. Unported
+providers keep the honest "OAuth login flows are not implemented in pi-rs yet"
+error. 51 synthetic-fixture tests in `pi-ai::auth`, 2 in `oauth.rs`, 2
+interactive-mode tests; no real credential files are read.
+
+**Open:** refresh is library-complete but **not called from the request path** —
+`resolve_wire_credential` still uses the stored access token directly, so the
+expiry-check + locked refresh is a follow-up. Copilot's 429 back-off and
+best-effort model-enable POSTs are not ported; the callback server uses
+`TcpListener` (with an added 15-minute safety timeout) and `sha2`+`base64`
+replace Web Crypto.
+
+### New `pi-env` crate (`98b1f20`, integrated in `16f0946`)
+
+`crates/pi-env` is now a workspace member: a ~6.5K-line port of all nine
+upstream `packages/env` modules — frame codec and injectable `Daemon`
+transport, Node-style error mapping, file listing, remote execution env with
+path resolution, pipe processes, PTYs, watch with reconnect, and SSH
+targeting/host keys/deploy. 46 unit tests run on scripted fake backends (no
+real SSH, socket or daemon). No new dependencies.
+
+**Library-only for now:** no host crate depends on it yet. Keepalive/watch
+ticks (`Daemon::tick` / `RemoteWatcher::tick`, monotonic ms), PTY/process input
+on a Tokio runtime, and explicit SSH host-key onboarding are host-driven per
+`crates/pi-env/WIRING.md`.
+
+### Telemetry exporters, ping and conformance (`3a16d41`)
+
+`telemetry::{ping,exporters,conformance}` add the anonymous install/update ping
+with upstream-exact `PI_OFFLINE` (truthy non-empty string) and `PI_TELEMETRY`
+(`isTruthyEnvFlag`) gating — version-only URL, no session/model/prompt/path —
+plus trait-shaped OTLP/HTTP span/metric exporters with batching and credential
+redaction, and the 12 upstream adapter-conformance cases. All egress is behind
+inert-by-default transports; no new dependencies, no network calls by default.
+The exporter surface is **additive**: upstream 1.5.2 ships no span/metric
+exporter, only the ping. Conformance is synchronous; two JS-lifetime cases
+(late calls on a span object, arbitrary async rejections) are not portable.
+
+**Open:** no host call sites yet — ping gating at the two changelog trigger
+points, attribution in client identity, exporter injection/flush and
+conformance invocation are recipes in the slice's `WIRING.md`, not wired into
+`main.rs`/interactive mode.
+
+### Image attachment pipeline (`b6e0054`)
+
+`pi-coding-agent::images` is a self-contained port of pi 1.5.2's image input
+subsystem (29 tests): magic-byte sniffing for jpeg/png/gif/webp/bmp with header
+dimension readers, the 2000×2000 / 4.5 MB resize policy behind an
+`ImageTransformer` seam, `ImageContent` construction, `blockImages` filtering,
+tool-result image normalization and temp-file spill helpers. The default
+transformer is "unavailable", matching upstream's Photon-unavailable paths;
+within-limit images pass through byte-for-byte.
+
+**Open:** the module is registered but **not yet wired** into `read.rs` or
+`cli/file_processor.rs` (which keep their inline image branches), no pixel
+backend dependency was added, and the `convertToLlm` filter / settings sweep
+call sites are listed in `crates/pi-coding-agent/src/images/WIRING.md`.
+
+### RPC / MCP / codemode fidelity gaps closed
+
+- **RPC (`45ebb53`)** — narrow `RpcHost` callbacks (inert defaults) now cover
+  the full preflight order: extension-command handlers, input handlers,
+  skill/template expansion, no-model gate and auth gate; `steer`/`follow_up`
+  share the input path, `queue_update` mirrors rewritten text, and
+  `set_model`/`cycle_model` emit `model_select` to **extension listeners only**
+  (upstream never sends that event on the RPC wire). 8 new tests (33 total in
+  the file). **Still host-bound:** serial command dispatch (so
+  `PromptDisposition::Queued`, mid-run `streamingBehavior` and `abort` are
+  idle), session/runtime rebind, `bash_execution_update` deltas, `set_model`
+  `checkAuth`, `thinking_level_select`, and signal handling/graceful shutdown.
+- **MCP (`2d93923`)** — `pi-ext-js::mcp_manager` gains host-driven
+  `StartupWait` (bounded first-prompt wait), background `begin_connect`,
+  `tools/list_changed` draining with tool re-registration through the faithful
+  escaped-regex `tool_exposure` matcher, and a stderr tail on connect failures;
+  `pi-mcp::types` preserves block-level `_meta`/`annotations` and top-level
+  result `_meta`. 12 new tests. **Still host-driven/open:** the startup tick,
+  notification poll and re-registration are not wired into the mode loop; stderr
+  capture uses a temp-file sink; notification handling is poll-based.
+- **Codemode (`2c7ac31`)** — `models.*` globals as a synchronous registry seam,
+  `onUpdate` sink, grammar-constrained sampling hook returning upstream's wire
+  shape, deterministic `start()`/`deliver()` over an inline VM thread, and a
+  worker-admission trait with typed error stubs. **Still open:** Node
+  `worker_threads` / Cloudflare Workers / wasm transports are data-only stubs;
+  the typed constrained-sampling config and `ToolDefinition` field are host
+  work; tools/`ModelRuntime` are synchronous (async hosts block).
+
+### Still open / out of scope
+
+- **Out-of-scope upstream workspaces:** `chord`, `pi-durable`, `evals`,
+  `apps/p2` — deliberately not ported.
+- **Policy omissions:** `/share` and `/bug` stay absent (Radius upload policy).
+- **Release:** macOS assets await a hosted runner; `v0.1.0` ships the two Linux
+  assets + checksums.
+- **Codemode transports:** Node/Workers-only transports and the wasm loader are
+  typed stubs, not fake implementations.
+- **Extensions host (E4 tail):** static CJS interop, per-path `/reload` unload,
+  `node:*` builtins and the `pi-ai`/`pi-tui`/`pi-agent-core`/`pi-codemode`/
+  `source` host packages have landed; **dynamic `require`, `node_modules`
+  resolution and `URL.canParse`** remain unported, as do a few unserved
+  `pi-ai` subpaths and type-only exports.
+- **Mechanism-level:** host-driven timers instead of `setTimeout` across the
+  new modules; pi-tui host-package shims are data-shape only; no live Agent loop
+  behind the `pi-agent-core` host package; serial RPC dispatch (above). The
+  integration commit notes verification was still in progress at commit time.
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).

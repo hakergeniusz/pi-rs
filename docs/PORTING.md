@@ -22,11 +22,15 @@ porting, and consolidates conventions that were previously scattered through
 | `pi-ai` | `pi-ai` | types, model catalog, per-provider SSE adapters |
 | `pi-agent` | `pi-agent-core` | agent loop, tool trait, steering/follow-up queues, events |
 | `pi-tui` | `pi-tui` | differential renderer, alt screen, editor, fuzzy, mouse, theme, oklab |
-| `pi-mcp` | `pi-mcp` | JSON-RPC types + stdio transport client |
-| `pi-codemode` | `pi-codemode` | stub |
+| `pi-mcp` | `pi-mcp` | JSON-RPC types + stdio/streamable-HTTP transports, OAuth, resources |
+| `pi-codemode` | `pi-codemode` | inline VM, deterministic runs, `models.*`/grammar hook; Node/Workers transports stubbed |
+| `pi-env` | `pi-env` | daemon frame transport, remote env/files/process/PTY/watch, SSH (library only) |
+| `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host, transpile/loader/runner, E0–E3 + E4 host packages |
 | `pi-coding-agent` (`pi` binary) | `pi-coding-agent` | the CLI — map below |
 
-Deferred upstream workspaces (out of scope): `chord`, `durable`, `apps/p2`.
+Deferred upstream workspaces (out of scope): `chord`, `durable`, `evals`,
+`apps/p2`. For the current upstream↔port coverage matrix see
+[GAP-STATUS.md](GAP-STATUS.md).
 
 ### `pi-coding-agent` module map
 

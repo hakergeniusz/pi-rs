@@ -50,18 +50,24 @@ wiring and the working status moving to the status row), and the
 `ctx.ui` themes API (`ctx.ui.theme` styling, `getAllThemes`/`getTheme`
 with by-handle styling adapters, `setTheme` by name — persisting
 `settings.theme` — or by Theme instance as `<in-memory>`) — E3 TUI
-bridging, the MCP streamable-HTTP transport, and the MCP OAuth module
-(discovery, PKCE sign-in flows, refresh with a singleflight, loopback
-callback) have landed; the remaining opens are the MCP host wiring
-(mcp-auth.json credential store, `pi mcp` CLI, `/mcp`), MCP
-resources, the package-manager npm arm, and the P7 tail. See
-[PLAN.md](PLAN.md) for the phased plan and [HANDOFF.md](HANDOFF.md)
-for the detailed, dated status.
+bridging, the MCP streamable-HTTP transport and OAuth module, the npm
+package-manager arm and the P7 tail have landed. The 2026-11-22 gap wave
+added seven provider adapters (Google GenAI/Vertex, Bedrock Converse,
+OpenAI/Azure Responses, Mistral Conversations, pi-messages), built-in
+OAuth login/refresh for Anthropic/Codex/Copilot, the new `pi-env` crate,
+the telemetry ping/exporter/conformance surface and a registered image
+attachment module. Remaining work is mostly host wiring for those library
+slices plus mechanism-level deviations; see
+[`docs/GAP-STATUS.md`](docs/GAP-STATUS.md) for the coverage matrix,
+[PLAN.md](PLAN.md) for the phased plan and [HANDOFF.md](HANDOFF.md) for the
+detailed, dated status.
 
 ## What works
 
 - **`pi -p "prompt"`** — print mode over the real agent loop: streaming
-  providers (anthropic, openai-completions, openai-codex-responses), the
+  providers (anthropic, openai-completions, openai-codex-responses, Google
+  GenAI/Vertex, Bedrock Converse, OpenAI/Azure Responses, Mistral
+  Conversations, pi-messages), the
   built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) with
   themed renderers, and the credential ladder (`--api-key` → stored `auth.json`
   → provider env vars).
@@ -99,15 +105,18 @@ for the detailed, dated status.
 | Crate | Port of | Status |
 |---|---|---|
 | `pi-schema` | `@earendil-works/pi-schema` | wire types |
-| `pi-ai` | `@earendil-works/pi-ai` | types, model catalog, provider adapters (SSE streaming) |
+| `pi-ai` | `@earendil-works/pi-ai` | types, model catalog, provider adapters (SSE streaming, incl. Google GenAI/Vertex, Bedrock Converse, OpenAI/Azure Responses, Mistral Conversations, pi-messages), built-in OAuth login/refresh |
 | `pi-agent` | `@earendil-works/pi-agent-core` | agent loop with steering/follow-up queues, transcript, events |
 | `pi-tui` | `@earendil-works/pi-tui` | differential renderer, editor, fuzzy/autocomplete, mouse, alt screen, theme, input listeners |
-| `pi-mcp` | `@earendil-works/pi-mcp` | JSON-RPC types + stdio + streamable-HTTP transport clients (session/protocol-version headers, SSE parser + resumption, GET stream) and the OAuth module (discovery, client settings, state provider, PKCE flows, sign-in, loopback callback; host wiring pending) |
+| `pi-mcp` | `@earendil-works/pi-mcp` | JSON-RPC types + stdio + streamable-HTTP transport clients (session/protocol-version headers, SSE parser + resumption, GET stream), the OAuth module (discovery, PKCE flows, sign-in, loopback callback), resources and fidelity APIs (startup wait, `list_changed` tool refresh, `_meta` preservation; host ticks pending) |
 | `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, UI dialogs over protocol, `user_bash`, context transforms, RPC dialog subprotocol, virtual-model routing, extension keyboard shortcuts + markdown transformers + entry/message/tool renderers and components over the handle bridge, interactive `ctx.ui.custom` + the dialog stack + overlay handles, OSC 7501 program status + `ctx.ui.setStatus`/setTitle, the small `ctx.ui` surfaces (widgets, footer/header factories, working-status family, editor text ops, toolsExpanded, onTerminalInput), autocomplete wrappers (`addAutocompleteProvider` chain + trigger union), the editor component (`setEditorComponent`/`getEditorComponent` — the delegate editor slot + the status row), the `ctx.ui` themes API (`theme`/`getAllThemes`/`getTheme`/`setTheme` — the engine-side sync half, `themeChanged` crossings for the mode-side visuals + persistence, RPC/headless stubs verbatim) (`tool-search` exit gate green; E3 TUI bridging complete) |
-| `pi-codemode` | `@earendil-works/pi-codemode` | stub |
-| `pi-coding-agent` (`pi` binary) | `@earendil-works/pi-coding-agent` | CLI, print/JSON/RPC/interactive modes, session store, tools, auth |
+| `pi-codemode` | `@earendil-works/pi-codemode` | inline VM, deterministic runs, `models.*` globals, grammar-constrained sampling hook; Node/Workers/wasm transports are typed stubs |
+| `pi-env` | `@earendil-works/pi-env` | daemon frame transport, remote env/files/process/PTY/watch, SSH; library only, not yet consumed by the binary |
+| `pi-coding-agent` (`pi` binary) | `@earendil-works/pi-coding-agent` | CLI, print/JSON/RPC/interactive modes, session store, tools, auth, images and telemetry modules |
 
-Deferred (not in the core scope): `chord`, `pi-durable`, `apps/p2`.
+Deferred (not in the core scope): `chord`, `pi-durable`, `evals`, `apps/p2`.
+`/share` and `/bug` are omitted by policy (Radius upload); macOS release assets
+await a hosted runner.
 
 ## Build
 

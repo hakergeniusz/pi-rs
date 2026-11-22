@@ -146,18 +146,32 @@ heavy gates in parallel; one RAM gate at a time.
 
 ## Current status
 
-`HANDOFF.md` has the details; `README.md` the summary. **v0.1.0 is tagged and
-released** (Linux x86_64/aarch64 assets + checksums). Landed: the full
-extensions arc E0→E3, all P7 items (cache warmer, PTY `!` bash, crash log,
-telemetry, output guard, piped stdin, docs port), the P5 remainder, all MCP
-opens, all 10 RPC commands, the npm arm, float-exact session JSON, the real
-`pi-codemode` crate + host wiring, and `node:*` builtins/host packages.
-Builds are host-side now (`scripts/host-build.sh`); podman was removed.
-`/share` and `/bug` stay deliberately omitted (Radius upload policy).
-Remaining mechanism-level deviations, in flight as parallel slices:
+`HANDOFF.md` has the dated details; `README.md` the user summary;
+[`docs/GAP-STATUS.md`](docs/GAP-STATUS.md) the upstream↔port coverage matrix.
+**v0.1.0 is tagged and released** (Linux x86_64/aarch64 assets + checksums).
+Builds are host-side (`scripts/host-build.sh`); podman was removed.
 
-1. E4: CJS interop, per-path `/reload` unload, the remaining `pi-*` virtual
-   packages, and fuller WHATWG URL / `Stats` / HMAC shims.
-2. Fidelity: RPC prompt preflight and typed-session tolerant-decode/unknown-key
-   byte preservation.
-3. Environment: macOS release assets await a hosted runner.
+Landed through the 2026-11-22 gap wave (integration `16f0946`): the full
+extensions arc E0→E3 plus the E4 items (CJS interop, per-path `/reload` unload,
+`pi-ai`/`pi-tui`/`pi-agent-core`/`pi-codemode`/`source` host packages, fuller
+WHATWG URL / `Stats` / HMAC shims), all P7 items, the P5 remainder, all MCP
+opens, all 10 RPC commands, float-exact / tolerant-decode session JSON, RPC
+prompt preflight, the real `pi-codemode` crate, the npm package-manager arm,
+**seven more provider adapters** (Google GenAI/Vertex, Bedrock Converse,
+OpenAI/Azure Responses, Mistral Conversations, pi-messages), **built-in OAuth
+login/refresh** (Anthropic, Codex, Copilot), the new **`pi-env`** crate, the
+**telemetry exporter/ping/conformance** surface, and the registered **image
+pipeline** module.
+
+Still open (no longer "in flight" — landed modules need host wiring, or are
+deliberate scope/mechanism decisions):
+
+1. Host wiring for library-only slices: `pi-env` (ticks/PTY/SSH onboarding),
+   images (`read.rs`/`file_processor.rs`, `convertToLlm` filter), telemetry
+   (ping gating, exporter injection), and MCP startup-wait/notification ticks.
+2. OAuth refresh is library-complete but not called from `resolve_wire_credential`;
+   RPC dispatch is still serial and session rebind/host events remain stubbed.
+3. Codemode Node/Workers/wasm transports are typed stubs; dynamic `require`,
+   `node_modules` resolution and `URL.canParse` remain unported.
+4. Out of scope: `chord`, `pi-durable`, `evals`, `apps/p2`. `/share` and `/bug`
+   stay omitted (Radius upload policy); macOS release assets await a runner.
