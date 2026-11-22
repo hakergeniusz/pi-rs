@@ -2695,13 +2695,16 @@ impl InteractiveMode {
     }
 
     /// Arms the theme controller's terminal plumbing: the mode-2031 scheme
-    /// listener, then the initial color query with its late-reply sink. The
-    /// closures cannot borrow the mode, so they queue into the mode's
-    /// report lists. Returns the query's start instant — the deadline clock.
+    /// listener and the auto-sync mode. The initial color query is *not*
+    /// issued here: this runs during construction, before `Tui::start`
+    /// enables raw mode, so the terminal's DA1 reply would be echoed into the
+    /// scrollback as `ESC[?…c` noise. [`Self::theme_issue_query`] is called
+    /// from `run` right after the terminal starts instead. The closures
+    /// cannot borrow the mode, so they queue into the mode's report lists.
     fn arm_theme_queries(
         tui: &mut Tui,
         auto_sync: bool,
-        late_reports: &Arc<Mutex<Vec<TerminalColors>>>,
+        _late_reports: &Arc<Mutex<Vec<TerminalColors>>>,
         scheme_reports: &Arc<Mutex<Vec<TerminalColorScheme>>>,
     ) -> Option<Instant> {
         // Mode-2031 reports reach the controller through a listener the TUI
@@ -2712,18 +2715,8 @@ impl InteractiveMode {
                 pending.push(scheme);
             }
         }));
-        // The initial color query (`applyFromSettings` →
-        // `requestTerminalColors`); late replies ride the sink.
-        let query_start = Some(Instant::now());
-        let late_queue = Arc::clone(late_reports);
-        let sink = Box::new(move |colors: TerminalColors| {
-            if let Ok(mut pending) = late_queue.lock() {
-                pending.push(colors);
-            }
-        });
-        let _ = tui.query_terminal_colors(100, Some(sink));
         tui.set_color_scheme_notifications(auto_sync);
-        query_start
+        None
     }
 
     /// Seeds the session flags from settings (`interactive-mode.ts`'s
@@ -6973,6 +6966,9 @@ impl InteractiveMode {
         self.tui
             .start()
             .map_err(|error| format!("failed to start the terminal: {error}"))?;
+        // Raw mode is now on, so the terminal's OSC/DA1 replies are consumed
+        // quietly instead of being echoed into the scrollback.
+        self.theme_issue_query();
         self.tui.request_render();
         // Raw stdin on its own thread: in raw mode the bytes are the
         // terminal's, and pi's stdin buffer needs them whole. crossterm's
@@ -7022,7 +7018,39 @@ impl InteractiveMode {
             self.tui.render_now(false);
         }
 
+        // Upstream `terminal.drainInput(1000, 50)` (`terminal.ts:443-475`):
+        // stop handing terminal replies to the app and discard whatever is
+        // still in flight before the TUI restores the terminal. Otherwise a
+        // late DA1/OSC reply sits in the tty input queue and is echoed into
+        // the parent shell when raw mode is turned off. Our raw-stdin thread
+        // feeds a channel instead of a JS `data` handler, so drain that.
+        self.drain_stdin(stdin_rx.as_ref());
         self.shutdown()
+    }
+
+    /// Discard pending raw-stdin bytes until the input is idle for 50 ms
+    /// (upstream's `idleMs`), bounded by 1 s (`maxMs`). Host-driven: no timer.
+    fn drain_stdin(&mut self, rx: Option<&std::sync::mpsc::Receiver<Vec<u8>>>) {
+        const MAX_MS: u64 = 1000;
+        const IDLE_MS: u64 = 50;
+        let Some(rx) = rx else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_millis(MAX_MS);
+        let mut last = Instant::now();
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(IDLE_MS)) {
+                Ok(_) => last = Instant::now(),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if last.elapsed() >= Duration::from_millis(IDLE_MS) {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        self.stdin_pending.clear();
+        self.stdin_buffer.clear();
     }
 
     /// Wait for stdin bytes (25 ms budget), decode and dispatch them, and
@@ -12817,9 +12845,12 @@ impl InteractiveMode {
         if !uses_default_dir {
             command = format!("pi --session-dir {session_dir} --session {session_id}");
         }
-        let _ = writeln!(
+        // `preserve_screen` leaves the final frame on the main screen with the
+        // cursor still on its last row. Start the hint on a fresh line so it
+        // cannot overprint the footer (an `ESC[?…c` reply or stale key hints).
+        let _ = write!(
             std::io::stdout(),
-            "\x1b[2mTo resume this session:\x1b[22m {command}"
+            "\r\n\x1b[2mTo resume this session:\x1b[22m {command}\n"
         );
         Ok(())
     }
