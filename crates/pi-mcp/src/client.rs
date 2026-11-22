@@ -1,5 +1,11 @@
 //! MCP client: one connected server, after the `initialize` handshake
 //! (upstream `client.ts:204-250`, over either transport).
+//!
+//! Server-initiated messages land on the transport's `inbound` channel — the
+//! port's stand-in for upstream's `client.onNotification` listeners
+//! (`extensions/mcp/runtime.ts:369`, `:382-384`). [`McpClient::try_recv_inbound`]
+//! lets the host drain them without a background task; the host re-lists
+//! tools on `notifications/tools/list_changed`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,8 +22,8 @@ use crate::resources::{
 };
 use crate::transport::{SpawnOptions, StdioTransport};
 use crate::types::{
-    CallToolParams, CallToolResult, ClientCapabilities, Implementation, InitializeParams,
-    InitializeResult, ToolsListResult,
+    CallToolParams, CallToolResult, ClientCapabilities, Implementation, InboundMessage,
+    InitializeParams, InitializeResult, ToolsListResult,
 };
 
 /// How to reach one MCP server (`mcp-servers.json` entry shape): a stdio
@@ -376,6 +382,16 @@ impl McpClient {
             .request("resources/read", Some(json!({ "uri": uri })), timeout)
             .await?;
         crate::resources::parse_read_resource_result(&value)
+    }
+
+    /// Drains one server-initiated message, if any, without waiting
+    /// (upstream's notification listeners, `runtime.ts:369`, `:382-384`).
+    /// The host polls this on its event loop; there is no internal timer.
+    pub fn try_recv_inbound(&self) -> Option<InboundMessage> {
+        match &self.transport {
+            ActiveTransport::Stdio(transport) => transport.inbound.try_recv().ok(),
+            ActiveTransport::Http(transport) => transport.inbound.try_recv().ok(),
+        }
     }
 
     /// Protocol liveness probe.

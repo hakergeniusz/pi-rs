@@ -1961,6 +1961,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_list_changed_notification_on_a_response_stream_reaches_inbound() {
+        // The manager's `tools/list_changed` re-registration depends on the
+        // transport routing server-initiated notifications even when they
+        // arrive on a request's response stream (`runtime.ts:382-384`).
+        let server = TestServer::spawn(Arc::new(|_request, stream| {
+            let body = format!(
+                "event: message\ndata: {}\n\nevent: message\ndata: {}\n\n",
+                json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}),
+                json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}),
+            );
+            write_sse_response(stream, "HTTP/1.1 200 OK", &body);
+        }));
+        let mut transport = StreamableHttpTransport::new(options(&server.url)).expect("transport");
+        transport.start().expect("start");
+        transport
+            .request("tools/list", None, Duration::from_secs(5))
+            .await
+            .expect("answered");
+        let inbound = transport.inbound.recv().await.expect("notification routed");
+        assert!(
+            matches!(inbound, InboundMessage::Notification(ref notification)
+                     if notification.method == "notifications/tools/list_changed"),
+            "{inbound:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_broken_response_stream_resumes_with_last_event_id() {
         let counter = Arc::new(StdMutex::new(true));
         let server = TestServer::spawn(Arc::new(move |request, stream| {

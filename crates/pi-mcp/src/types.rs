@@ -1,6 +1,13 @@
 //! MCP wire types: JSON-RPC 2.0 envelope plus the protocol messages the
 //! client needs (spec: `modelcontextprotocol.io`, protocol version
 //! [`crate::PROTOCOL_VERSION`]).
+//!
+//! Extension points beyond pi's immediate needs — `_meta` and block
+//! `annotations` on tool results, and the `*` tool-name patterns of
+//! `packages/coding-agent/src/core/mcp-servers.ts:17-34` — are kept verbatim
+//! so the host can forward them (upstream `extensions/mcp/tools.ts:228-232`,
+//! `:237-273`). Preserving them here is what lets `convertMcpResult` return
+//! the whole `CallToolResult` minus the top-level `_meta`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -250,25 +257,48 @@ pub struct CallToolResult {
     pub structured_content: Option<Value>,
     #[serde(rename = "isError", default)]
     pub is_error: bool,
+    /// Protocol metadata (`CallToolResult._meta`). `convertMcpResult` drops
+    /// this from the script result (`tools.ts:228`), but block-level `_meta`
+    /// survives because it is part of each [`ContentBlock`].
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// Content blocks a tool result may carry.
+///
+/// Every variant also keeps the spec's optional `_meta` and `annotations`
+/// fields so a decoded result serializes back exactly as the server sent it
+/// (upstream `tools.ts:228-232` forwards the whole result to scripts).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Value>,
+    },
     #[serde(rename = "image")]
     Image {
         data: String,
         #[serde(rename = "mimeType")]
         mime_type: String,
+        #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Value>,
     },
     #[serde(rename = "audio")]
     Audio {
         data: String,
         #[serde(rename = "mimeType")]
         mime_type: String,
+        #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Value>,
     },
     #[serde(rename = "resource_link")]
     ResourceLink {
@@ -282,9 +312,19 @@ pub enum ContentBlock {
         mime_type: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size: Option<f64>,
+        #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Value>,
     },
     #[serde(rename = "resource")]
-    Resource { resource: Value },
+    Resource {
+        resource: Value,
+        #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+        meta: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Value>,
+    },
 }
 
 /// An MCP tool's input schema in the shape LLM tool APIs accept
@@ -308,6 +348,68 @@ pub fn normalize_mcp_input_schema(schema: &Value) -> Value {
 
 fn json_schema_object() -> Value {
     serde_json::json!({ "type": "object", "properties": {} })
+}
+
+/// Whether `name` matches an MCP `*`-pattern (`toolPatternRegExp`,
+/// `packages/coding-agent/src/core/mcp-servers.ts:17-34`, used by
+/// `createToolNameMatcher` and `getMcpToolExposure`).
+///
+/// Upstream builds `^` + each `*`-separated literal (regex-escaped) joined
+/// by `.*` + `$`. This is the same language: literal parts are matched
+/// literally (so `.`, `+`, `?`, … never act as regex operators), `*` matches
+/// any run of characters except JavaScript line terminators (a regex `.`
+/// does not cross `\n`, `\r`, U+2028 or U+2029), and the whole name must be
+/// consumed. Matching is by backtracking, so a later literal is not forced
+/// to use the earliest possible position of an earlier one.
+#[must_use]
+pub fn tool_name_pattern_matches(pattern: &str, name: &str) -> bool {
+    let parts: Vec<Vec<char>> = pattern
+        .split('*')
+        .map(|part| part.chars().collect())
+        .collect();
+    let chars: Vec<char> = name.chars().collect();
+    match_parts(&parts, 0, &chars, 0)
+}
+
+/// Backtracking core of [`tool_name_pattern_matches`]: `parts[index]` is the
+/// literal that must follow the `.*` begun at `pos`. `index == 0` is pinned
+/// to `pos` by the regex's leading `^`; the final part must end at the name's
+/// end by the trailing `$`.
+fn match_parts(parts: &[Vec<char>], index: usize, chars: &[char], pos: usize) -> bool {
+    let Some(part) = parts.get(index) else {
+        return pos == chars.len();
+    };
+    let last = index + 1 == parts.len();
+    let mut start = pos;
+    loop {
+        if index == 0 && start != pos {
+            // The leading `^` pins the first literal to `pos`.
+            return false;
+        }
+        if let Some(end) = literal_at(part, chars, start)
+            && (!last || end == chars.len())
+            && match_parts(parts, index + 1, chars, end)
+        {
+            return true;
+        }
+        // A regex `.` stops at a JS line terminator, so the wildcard run
+        // cannot advance past one either.
+        if start == chars.len() || matches!(chars[start], '\n' | '\r' | '\u{2028}' | '\u{2029}') {
+            return false;
+        }
+        start += 1;
+    }
+}
+
+/// `Some(end)` when `part` occurs at `chars[start..]`, compared character by
+/// character. Literal matching is what upstream's regex escaping achieves.
+fn literal_at(part: &[char], chars: &[char], start: usize) -> Option<usize> {
+    if part.len() > chars.len().saturating_sub(start) {
+        return None;
+    }
+    (part.iter().enumerate())
+        .all(|(offset, expected)| chars[start + offset] == *expected)
+        .then_some(start + part.len())
 }
 
 #[cfg(test)]
@@ -362,5 +464,77 @@ mod tests {
         .expect("decode");
         assert_eq!(result.content.len(), 1);
         assert!(!result.is_error);
+    }
+
+    #[test]
+    fn tool_results_keep_block_meta_and_annotations() {
+        let result: CallToolResult = serde_json::from_value(json!({
+            "_meta": {"progressToken": 7},
+            "content": [
+                {"type": "text", "text": "hi",
+                 "_meta": {"trace": "abc"},
+                 "annotations": {"audience": ["assistant"], "priority": 0.9}},
+                {"type": "image", "data": "AAAA", "mimeType": "image/png",
+                 "annotations": {"readOnlyHint": true}},
+            ],
+            "isError": false,
+        }))
+        .expect("decode");
+        assert_eq!(result.meta, Some(json!({"progressToken": 7})));
+        let ContentBlock::Text {
+            meta, annotations, ..
+        } = &result.content[0]
+        else {
+            panic!("text block")
+        };
+        assert_eq!(*meta, Some(json!({"trace": "abc"})));
+        assert_eq!(
+            *annotations,
+            Some(json!({"audience": ["assistant"], "priority": 0.9}))
+        );
+        let ContentBlock::Image { annotations, .. } = &result.content[1] else {
+            panic!("image block")
+        };
+        assert_eq!(*annotations, Some(json!({"readOnlyHint": true})));
+        // Serializing the blocks round-trips the extension fields; the
+        // top-level `_meta` stays on the result for the caller to drop.
+        let blocks = serde_json::to_value(&result.content).expect("serialize");
+        assert_eq!(blocks[0]["_meta"], json!({"trace": "abc"}));
+        assert_eq!(blocks[1]["annotations"], json!({"readOnlyHint": true}));
+        let full = serde_json::to_value(&result).expect("serialize result");
+        assert_eq!(full["_meta"], json!({"progressToken": 7}));
+    }
+
+    #[test]
+    fn tool_name_patterns_match_upstream_glob_semantics() {
+        // Anchored at both ends, `*` crosses arbitrary substrings.
+        assert!(tool_name_pattern_matches("foo*", "foobar"));
+        assert!(tool_name_pattern_matches("*bar", "foobar"));
+        assert!(tool_name_pattern_matches("foo*bar", "foobazbar"));
+        assert!(!tool_name_pattern_matches("foo*bar", "foobarx"));
+        assert!(!tool_name_pattern_matches("foo*bar", "xfoobar"));
+        // An empty pattern part (leading, trailing, doubled `*`).
+        assert!(tool_name_pattern_matches("*", "anything"));
+        assert!(tool_name_pattern_matches("**", "anything"));
+        assert!(tool_name_pattern_matches("*foo*", "afoo b"));
+        // Literal regex operators are escaped upstream, so they match as
+        // ordinary characters here rather than as regex syntax.
+        assert!(tool_name_pattern_matches("a.b", "a.b"));
+        assert!(!tool_name_pattern_matches("a.b", "axb"));
+        assert!(tool_name_pattern_matches("a+b*c", "a+bXXc"));
+        assert!(!tool_name_pattern_matches("a+b*c", "abXXc"));
+        assert!(tool_name_pattern_matches("a[b]", "a[b]"));
+        assert!(!tool_name_pattern_matches("a[b]", "ab"));
+        // Backtracking: an earlier literal need not take the earliest slot.
+        assert!(tool_name_pattern_matches("a*ba*b", "abab"));
+        assert!(tool_name_pattern_matches("aba*aba", "abaXaba"));
+        assert!(!tool_name_pattern_matches("aba*aba", "ababa"));
+        // A regex `.` does not cross JS line terminators.
+        assert!(!tool_name_pattern_matches("a*b", "a\nb"));
+        assert!(!tool_name_pattern_matches("a*b", "a\u{2028}b"));
+        assert!(tool_name_pattern_matches("a*b", "a\tb"));
+        // Non-star patterns still behave as exact matches.
+        assert!(tool_name_pattern_matches("echo", "echo"));
+        assert!(!tool_name_pattern_matches("echo", "echo2"));
     }
 }

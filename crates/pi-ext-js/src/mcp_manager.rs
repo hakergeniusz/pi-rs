@@ -32,21 +32,42 @@
 //! The HTTP transports' background stream tasks are polled during the
 //! `block_on` windows the calls provide.
 //!
+//! The fidelity additions port four more upstream mechanisms:
+//!
+//! * `startupWaitMs` and the bounded first-prompt wait (`index.ts:87-94`,
+//!   `:145-148`, `:294-296`, `:1154-1175`): [`McpManager::begin_connect`]
+//!   starts a connection without blocking and [`StartupWait`] is a host-driven
+//!   tick (no timers) that reports `Ready`/`Waiting`/`TimedOut`.
+//! * `notifications/tools/list_changed` (`runtime.ts:382-384`, `:432-442`):
+//!   [`McpManager::poll_notifications`] drains the transports' inbound
+//!   channels, re-lists tools, and publishes [`ToolChange`]s for
+//!   re-registration. A failed refresh records upstream's exact
+//!   `Failed to refresh tools: …` text.
+//! * The stderr tail on connect failures (`runtime.ts:51`, `:400-405`,
+//!   `:411-420`): stdio servers get a bounded (2 000-char) stderr tail that
+//!   is appended to the connect error as upstream does.
+//! * Block-level `_meta`/`annotations` (`tools.ts:228-232`, `:237-273`): they
+//!   survive the wire decode and are forwarded in the script result, while
+//!   the top-level `_meta` is dropped. Tool-name `*`-patterns are matched
+//!   with [`pi_mcp::types::tool_name_pattern_matches`], the faithful port of
+//!   `core/mcp-servers.ts:17-34`.
+//!
 //! Not in this slice (recorded open): OAuth/`needs-auth` (`oauth.ts` and
 //! the HTTP arm's sign-in flow), resources (`resources.ts`), and the
 //! `/mcp` manager UI (`ui.ts`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{TryRecvError, channel};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value as Json, json};
 
 use pi_mcp::auth_provider::AuthProvider;
 use pi_mcp::oauth::auth_provider::{McpAuthProvider, McpAuthProviderOptions};
 use pi_mcp::oauth::{MCP_AUTH_FILE_NAME, McpOAuthCredentialStore, McpOAuthSettings};
-use pi_mcp::types::ContentBlock;
+use pi_mcp::types::{ContentBlock, InboundMessage};
 use pi_mcp::{CallToolResult, McpClient, McpError, McpServerConfig, McpTransportConfig};
 
 /// Upstream's per-connection default timeout (`DEFAULT_TIMEOUT_SECONDS`,
@@ -65,6 +86,15 @@ const COMMAND_VALUE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Delays between attempts to connect to an HTTP server that failed with a
 /// transient error (`CONNECT_RETRY_DELAYS_MS`, `runtime.ts:54`).
 const CONNECT_RETRY_DELAYS_MS: [u64; 2] = [250, 1_000];
+/// Default bound on the first prompt's wait for startup connections
+/// (`DEFAULT_STARTUP_WAIT_MS`, `index.ts:94`).
+pub const DEFAULT_STARTUP_WAIT_MS: u64 = 10_000;
+/// Characters of a failed stdio server's stderr kept for the connect error
+/// (`STDERR_TAIL_CHARS`, `runtime.ts:51`).
+const STDERR_TAIL_CHARS: usize = 2_000;
+/// Env key carrying the stdio stderr sink path into the child process (a
+/// port implementation detail; upstream reads `StdioTransport.stderr`).
+const STDERR_PATH_ENV: &str = "PI_MCP_STDERR_PATH";
 
 /// One configured server's connection state in the worker.
 ///
@@ -141,11 +171,26 @@ enum Request {
     ServersWithResources {
         reply: std::sync::mpsc::Sender<Vec<String>>,
     },
+    /// Host-driven tick: drain server-initiated notifications and re-list
+    /// tools on `notifications/tools/list_changed` (`runtime.ts:382-384`).
+    PollNotifications,
     ShutdownAll,
+}
+
+/// A server's tool list changed after a `notifications/tools/list_changed`
+/// notification (`runtime.ts:432-442`). The host re-registers the tools in
+/// `tools`; on a failed refresh `error` is upstream's exact
+/// `Failed to refresh tools: …` message and `tools` is empty.
+#[derive(Debug, Clone)]
+pub struct ToolChange {
+    pub server: String,
+    pub tools: Vec<Json>,
+    pub error: Option<String>,
 }
 
 /// A successful connect: the offered tools as JSON (decoded `McpTool`s) and
 /// the server's `initialize` instructions.
+#[derive(Debug)]
 pub struct ConnectOutcome {
     pub tools: Vec<Json>,
     pub instructions: Option<String>,
@@ -166,6 +211,9 @@ pub struct McpManager {
     /// Agent config dir holding `mcp-auth.json`; `None` disables OAuth
     /// attachment (headless engines that do not host credentials).
     auth_dir: Option<std::path::PathBuf>,
+    /// Tool re-registrations from `tools/list_changed`, drained by the host
+    /// (`runtime.ts:432-442`).
+    tool_changes: Arc<Mutex<Vec<ToolChange>>>,
 }
 
 impl McpManager {
@@ -178,10 +226,52 @@ impl McpManager {
     /// The worker's request channel, spawning the thread on first use.
     fn sender(&self) -> std::sync::mpsc::Sender<Request> {
         self.requests
-            .get_or_init(|| Mutex::new(spawn_worker(self.timeouts.clone(), self.auth_dir.clone())))
+            .get_or_init(|| {
+                Mutex::new(spawn_worker(
+                    self.timeouts.clone(),
+                    self.tool_changes.clone(),
+                    self.auth_dir.clone(),
+                ))
+            })
             .lock()
             .expect("mcp manager mutex poisoned")
             .clone()
+    }
+
+    /// Starts one connection without waiting for it, returning a handle the
+    /// host's [`StartupWait`] polls (`index.ts:1142` starts connections in
+    /// the background). The reply carries the same outcome as [`Self::connect`].
+    pub fn begin_connect(&self, name: &str, config: &Json, cwd: &str) -> PendingConnect {
+        let (reply, receiver) = channel();
+        // If the worker is gone the reply sender drops with the request, and
+        // `StartupWait::tick` records the disconnection as a settled error.
+        let _ = self.sender().send(Request::Connect {
+            name: name.to_string(),
+            config: config.clone(),
+            cwd: cwd.to_string(),
+            reply,
+        });
+        PendingConnect {
+            name: name.to_string(),
+            reply: receiver,
+        }
+    }
+
+    /// Host-driven tick for server-initiated notifications. The worker
+    /// re-lists tools on `notifications/tools/list_changed`; the host then
+    /// drains the resulting [`ToolChange`]s with [`Self::take_tool_changes`].
+    pub fn poll_notifications(&self) {
+        let _ = self.sender().send(Request::PollNotifications);
+    }
+
+    /// Tool re-registrations accumulated since the last drain.
+    pub fn take_tool_changes(&self) -> Vec<ToolChange> {
+        std::mem::take(
+            &mut *self
+                .tool_changes
+                .lock()
+                .expect("mcp tool changes mutex poisoned"),
+        )
     }
 
     /// The reply window for `server`: its configured timeout (twice over,
@@ -512,6 +602,115 @@ impl McpManager {
     }
 }
 
+/// One in-flight startup connection, polled by [`StartupWait`] instead of
+/// blocking the host (upstream's `server.ready` promise, `index.ts:113`,
+/// `:1160-1162`).
+pub struct PendingConnect {
+    name: String,
+    reply: std::sync::mpsc::Receiver<Result<ConnectOutcome, String>>,
+}
+
+/// The bounded wait the first prompt performs for servers whose tools are
+/// declared to the model (`index.ts:87-94`, `:145-148`, `:294-296`,
+/// `:1154-1175`). Entirely host-driven: the host supplies `now` on each
+/// tick, so no timer thread or `sleep` is involved.
+pub struct StartupWait {
+    started: Instant,
+    wait: Duration,
+    pending: Vec<PendingConnect>,
+    settled: Vec<(String, Result<ConnectOutcome, String>)>,
+    waited: bool,
+}
+
+/// What the host should do on one [`StartupWait::tick`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupTick {
+    /// No connections are pending (or the first prompt already waited).
+    Ready,
+    /// Still connecting; `remaining` is the time left before the bound.
+    Waiting { remaining: Duration },
+    /// The bound elapsed with connections still pending; upstream notifies
+    /// that their tools become available once connected (`index.ts:1172-1174`).
+    TimedOut,
+}
+
+impl StartupWait {
+    /// A wait of `wait_ms` starting now. The default is
+    /// [`DEFAULT_STARTUP_WAIT_MS`] (upstream `index.ts:94,296`).
+    #[must_use]
+    pub fn new(wait_ms: u64) -> Self {
+        Self::new_with_start(wait_ms, Instant::now())
+    }
+
+    /// [`Self::new`] with an explicit start instant, for host-driven tests.
+    #[must_use]
+    pub fn new_with_start(wait_ms: u64, started: Instant) -> Self {
+        Self {
+            started,
+            wait: Duration::from_millis(wait_ms),
+            pending: Vec::new(),
+            settled: Vec::new(),
+            waited: false,
+        }
+    }
+
+    /// Registers a server whose tools are `direct` and still connecting
+    /// (`index.ts:1160-1162`).
+    pub fn add(&mut self, name: &str, config: &Json, cwd: &str, manager: &McpManager) {
+        self.pending.push(manager.begin_connect(name, config, cwd));
+    }
+
+    /// Advances the wait. Settled connections move into [`Self::drain_settled`];
+    /// the first prompt proceeds when none remain or the bound elapsed. A
+    /// second call is a no-op, matching upstream's one-shot `waitedForStartup`.
+    pub fn tick(&mut self, now: Instant) -> StartupTick {
+        if self.waited {
+            return StartupTick::Ready;
+        }
+        let mut pending = Vec::new();
+        for connect in self.pending.drain(..) {
+            match connect.reply.try_recv() {
+                Ok(outcome) => self.settled.push((connect.name, outcome)),
+                Err(TryRecvError::Empty) => pending.push(connect),
+                Err(TryRecvError::Disconnected) => self
+                    .settled
+                    .push((connect.name, Err("MCP manager is not running".to_string()))),
+            }
+        }
+        self.pending = pending;
+        if self.pending.is_empty() {
+            self.waited = true;
+            return StartupTick::Ready;
+        }
+        let elapsed = now.saturating_duration_since(self.started);
+        if elapsed >= self.wait {
+            self.waited = true;
+            return StartupTick::TimedOut;
+        }
+        StartupTick::Waiting {
+            remaining: self.wait - elapsed,
+        }
+    }
+
+    /// Outcomes of connections that settled during earlier ticks.
+    pub fn drain_settled(&mut self) -> Vec<(String, Result<ConnectOutcome, String>)> {
+        std::mem::take(&mut self.settled)
+    }
+
+    /// Whether the first prompt has already waited (upstream
+    /// `waitedForStartup`, `index.ts:295`).
+    #[must_use]
+    pub fn waited(&self) -> bool {
+        self.waited
+    }
+
+    /// Connections still in flight.
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
+}
+
 /// The configured per-request timeout in seconds (`config.timeout ?? 60`,
 /// `runtime.ts:212-214`).
 fn config_timeout(config: &Json) -> Duration {
@@ -532,12 +731,13 @@ fn config_default_window() -> Duration {
 /// Spawns the worker thread; returns its request channel.
 fn spawn_worker(
     timeouts: Arc<Mutex<HashMap<String, Duration>>>,
+    tool_changes: Arc<Mutex<Vec<ToolChange>>>,
     auth_dir: Option<std::path::PathBuf>,
 ) -> std::sync::mpsc::Sender<Request> {
     let (sender, receiver) = std::sync::mpsc::channel::<Request>();
     std::thread::Builder::new()
         .name("pi-ext-js-mcp".to_string())
-        .spawn(move || worker_loop(&receiver, &timeouts, auth_dir.as_deref()))
+        .spawn(move || worker_loop(&receiver, &timeouts, &tool_changes, auth_dir.as_deref()))
         .expect("spawn MCP manager worker thread");
     sender
 }
@@ -549,6 +749,7 @@ fn spawn_worker(
 fn worker_loop(
     receiver: &std::sync::mpsc::Receiver<Request>,
     timeouts: &Arc<Mutex<HashMap<String, Duration>>>,
+    tool_changes: &Arc<Mutex<Vec<ToolChange>>>,
     auth_dir: Option<&std::path::Path>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -557,6 +758,9 @@ fn worker_loop(
         .expect("build MCP manager runtime");
     let mut servers: HashMap<String, ServerEntry> = HashMap::new();
     while let Ok(request) = receiver.recv() {
+        // Server-initiated messages can arrive while the worker is idle;
+        // drain them on every wake-up, not just on an explicit poll.
+        collect_tool_changes(&runtime, &mut servers, tool_changes);
         match request {
             Request::Connect {
                 name,
@@ -576,7 +780,12 @@ fn worker_loop(
                             auth_dir,
                         ) {
                             Ok(outcome) => Ok(outcome),
-                            Err(error) => Err(error.to_string()),
+                            // `connect_with_spawn` records the stderr-tail
+                            // augmented text in the Failed entry; surface
+                            // that exact text (`runtime.ts:411-420`).
+                            Err(error) => {
+                                Err(failed_error_text(&servers, &name, &error.to_string()))
+                            }
                         }
                     }
                     Err(error) => Err(error),
@@ -702,6 +911,9 @@ fn worker_loop(
                     .collect();
                 let _ = reply.send(names);
             }
+            Request::PollNotifications => {
+                // The drain at the top of the loop already handled them.
+            }
             Request::ShutdownAll => {
                 shutdown_all(&runtime, &mut servers);
                 timeouts
@@ -716,6 +928,128 @@ fn worker_loop(
         .lock()
         .expect("mcp timeouts mutex poisoned")
         .clear();
+}
+
+/// The connect error text recorded by `connectFailed` (`runtime.ts:411-420`):
+/// the stderr-augmented text stored by [`connect_with_spawn`], or `fallback`
+/// when no Failed entry was recorded.
+fn failed_error_text(servers: &HashMap<String, ServerEntry>, name: &str, fallback: &str) -> String {
+    servers
+        .get(name)
+        .and_then(|entry| match &entry.state {
+            ServerState::Failed { error, .. } => Some(error.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Drains server-initiated messages and re-lists tools on
+/// `notifications/tools/list_changed` (`runtime.ts:382-384`, `:432-442`),
+/// publishing the results for the host to re-register.
+fn collect_tool_changes(
+    runtime: &tokio::runtime::Runtime,
+    servers: &mut HashMap<String, ServerEntry>,
+    tool_changes: &Arc<Mutex<Vec<ToolChange>>>,
+) {
+    let names: Vec<String> = servers
+        .iter()
+        .filter_map(|(name, entry)| {
+            let ServerState::Connected { client, .. } = &entry.state else {
+                return None;
+            };
+            let mut changed = false;
+            while let Some(message) = client.try_recv_inbound() {
+                if let InboundMessage::Notification(notification) = &message
+                    && notification.method == "notifications/tools/list_changed"
+                {
+                    changed = true;
+                }
+            }
+            changed.then(|| name.clone())
+        })
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    let mut changes = Vec::new();
+    for name in names {
+        let Some(entry) = servers.get_mut(&name) else {
+            continue;
+        };
+        let ServerState::Connected {
+            client,
+            tools,
+            timeout,
+            ..
+        } = &mut entry.state
+        else {
+            continue;
+        };
+        let timeout = *timeout;
+        match runtime.block_on(client.tools_list_with_timeout(timeout)) {
+            Ok(list) => {
+                *tools = list
+                    .tools
+                    .iter()
+                    .map(|tool| serde_json::to_value(tool).unwrap_or(Json::Null))
+                    .collect();
+                changes.push(ToolChange {
+                    server: name,
+                    tools: tools.clone(),
+                    error: None,
+                });
+            }
+            Err(error) => {
+                // Upstream `refreshTools`'s error text, verbatim
+                // (`runtime.ts:439`).
+                changes.push(ToolChange {
+                    server: name,
+                    tools: Vec::new(),
+                    error: Some(format!("Failed to refresh tools: {error}")),
+                });
+            }
+        }
+    }
+    if !changes.is_empty() {
+        tool_changes
+            .lock()
+            .expect("mcp tool changes mutex poisoned")
+            .extend(changes);
+    }
+}
+
+/// The last `STDERR_TAIL_CHARS` characters of a failed stdio server's
+/// stderr (`sliceTail(transport.stderr.trim(), STDERR_TAIL_CHARS)`,
+/// `runtime.ts:403`). The UTF-16 code-unit boundary from upstream's
+/// `sliceTail` is approximated with a character boundary (stderr is ASCII in
+/// practice).
+fn stdio_stderr_tail(spawn: &McpServerConfig) -> Option<String> {
+    let McpTransportConfig::Stdio { env, .. } = &spawn.transport else {
+        return None;
+    };
+    let path = env.get(STDERR_PATH_ENV)?;
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(slice_tail_chars(text.trim(), STDERR_TAIL_CHARS))
+}
+
+/// Removes the stdio stderr sink once its tail has been read (or the
+/// connection succeeded); the port's stand-in for upstream dropping the
+/// transport's stderr buffer.
+fn clear_stderr_sink(spawn: &McpServerConfig) {
+    if let McpTransportConfig::Stdio { env, .. } = &spawn.transport
+        && let Some(path) = env.get(STDERR_PATH_ENV)
+    {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Upstream's `sliceTail` (`core/tools/truncate.ts:288-294`) by characters.
+fn slice_tail_chars(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    chars[chars.len() - max..].iter().collect()
 }
 
 /// Connects (or reconnects) one server, replacing any existing entry, with
@@ -823,19 +1157,28 @@ fn connect_with_spawn(
     let (client, tools, has_resources, instructions) = match attempt {
         Ok(attempt) => attempt,
         Err(error) => {
+            // Upstream `connectOnce` captures the stdio transport's stderr
+            // tail before `connectFailed` composes the error
+            // (`runtime.ts:400-405`, `:411-420`).
+            let error_text = match stdio_stderr_tail(&spawn) {
+                Some(tail) if !tail.is_empty() => format!("{error}\n{tail}"),
+                _ => error.to_string(),
+            };
+            clear_stderr_sink(&spawn);
             servers.insert(
                 name.to_string(),
                 ServerEntry {
                     state: ServerState::Failed {
                         spawn,
                         timeout,
-                        error: error.to_string(),
+                        error: error_text,
                     },
                 },
             );
             return Err(error);
         }
     };
+    clear_stderr_sink(&spawn);
     let previous = servers.insert(
         name.to_string(),
         ServerEntry {
@@ -900,8 +1243,11 @@ fn resource_reply(
         None => return Err(format!("MCP server \"{server}\" is not connected")),
     };
     if let Some((spawn, timeout)) = reconnect {
-        connect_with_spawn(runtime, servers, server, spawn, timeout, auth_dir)
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = connect_with_spawn(runtime, servers, server, spawn, timeout, auth_dir) {
+            // Same stderr-augmented `connectFailed` text as the other
+            // reconnect paths (`runtime.ts:411-420`).
+            return Err(failed_error_text(servers, server, &error.to_string()));
+        }
     }
     let entry = servers
         .get(server)
@@ -991,8 +1337,11 @@ fn call_tool_on(
                         return Err(format!("MCP server \"{server}\" is disabled."));
                     }
                 };
-                connect_with_spawn(runtime, servers, server, spawn, timeout, auth_dir)
-                    .map_err(|error| error.to_string())?;
+                if let Err(error) =
+                    connect_with_spawn(runtime, servers, server, spawn, timeout, auth_dir)
+                {
+                    return Err(failed_error_text(servers, server, &error.to_string()));
+                }
             }
             Err(error) => return Err(error.to_string()),
         }
@@ -1057,15 +1406,45 @@ fn spawn_config(name: &str, config: &Json, cwd: &str) -> Result<McpServerConfig,
     let working_dir = std::path::PathBuf::from(cwd).join(expand_home(
         config.get("cwd").and_then(Json::as_str).unwrap_or("."),
     ));
+    // The stdio transport discards stderr; route it to a private sink so a
+    // failed connect can include its tail like upstream's `stderr: "pipe"`
+    // (`runtime.ts:122`, `:400-405`).
+    let stderr_path = std::env::temp_dir().join(format!("pi-mcp-stderr-{:016x}", unique_suffix()));
+    env.insert(
+        STDERR_PATH_ENV.to_string(),
+        stderr_path.to_string_lossy().into_owned(),
+    );
+    let (command, args) = wrap_stdio_stderr(expand_home(command), args);
     Ok(McpServerConfig {
         name: name.to_string(),
         transport: McpTransportConfig::Stdio {
-            command: expand_home(command),
+            command,
             args,
             env,
             working_dir: Some(working_dir),
         },
     })
+}
+
+/// Wraps a stdio command so its stderr goes to `$PI_MCP_STDERR_PATH` while
+/// stdin/stdout stay untouched. `exec` keeps the server as the direct child
+/// (signals and exit codes are unchanged). On non-unix targets stderr stays
+/// discarded, like the unmodified transport.
+#[cfg(unix)]
+fn wrap_stdio_stderr(command: String, args: Vec<String>) -> (String, Vec<String>) {
+    let mut wrapped = vec![
+        "-c".to_string(),
+        "exec \"$@\" 2>\"$PI_MCP_STDERR_PATH\"".to_string(),
+        "sh".to_string(),
+        command,
+    ];
+    wrapped.extend(args);
+    ("/bin/sh".to_string(), wrapped)
+}
+
+#[cfg(not(unix))]
+fn wrap_stdio_stderr(command: String, args: Vec<String>) -> (String, Vec<String>) {
+    (command, args)
 }
 
 /// `expandHome` (`runtime.ts:92-98`): `~` and `~/…` name the home directory.
@@ -1348,8 +1727,9 @@ pub fn convert_mcp_result(server: &str, tool: &str, result: &CallToolResult) -> 
     if let Some(path) = &full_output_path {
         details["fullOutputPath"] = json!(path);
     }
-    // The script result is the `CallToolResult` without `_meta`
-    // (`tools.ts:228-232`); this port's decoder never carries `_meta`.
+    // The script result is the whole `CallToolResult` minus its top-level
+    // `_meta` (`tools.ts:228-232`). Block-level `_meta`/`annotations` are part
+    // of each decoded `ContentBlock` and survive serialization here.
     let mut script_result = json!({ "content": result.content });
     if let Some(structured) = &result.structured_content {
         script_result["structuredContent"] = structured.clone();
@@ -1388,8 +1768,10 @@ fn to_llm_content_fallback(result: &CallToolResult) -> Vec<Json> {
 /// which the port does not register yet — the arms never read it.
 fn block_to_content(_server: &str, block: &ContentBlock) -> Vec<Json> {
     match block {
-        ContentBlock::Text { text } => vec![json!({ "type": "text", "text": text })],
-        ContentBlock::Image { data, mime_type } => {
+        ContentBlock::Text { text, .. } => vec![json!({ "type": "text", "text": text })],
+        ContentBlock::Image {
+            data, mime_type, ..
+        } => {
             vec![json!({ "type": "image", "data": data, "mimeType": mime_type })]
         }
         ContentBlock::Audio { mime_type, .. } => {
@@ -1402,6 +1784,7 @@ fn block_to_content(_server: &str, block: &ContentBlock) -> Vec<Json> {
             description,
             mime_type,
             size,
+            ..
         } => {
             // `blockToContent`'s resource_link arm (`tools.ts:178-188`);
             // `readableResources` is false without the resource tools, so
@@ -1427,7 +1810,7 @@ fn block_to_content(_server: &str, block: &ContentBlock) -> Vec<Json> {
                 "text": format!("[Resource {uri} \"{label}\"{details}{description}]"),
             })]
         }
-        ContentBlock::Resource { resource } => {
+        ContentBlock::Resource { resource, .. } => {
             // `blockToContent`'s resource arm (`tools.ts:189-201`).
             let uri = resource
                 .get("uri")
@@ -1627,6 +2010,37 @@ fn unique_suffix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0u64, |elapsed| elapsed.as_nanos() as u64);
     counter.rotate_left(32) ^ nanos
+}
+
+/// Exposure of one tool of a server (`getMcpToolExposure`,
+/// `core/mcp-servers.ts:169-178`): an exact `toolExposure` name wins, then
+/// the first `*`-pattern in insertion order, then the server's `exposure`.
+///
+/// This is the faithful counterpart for re-registered tools from
+/// [`ToolChange`]: pattern matching delegates to
+/// [`pi_mcp::types::tool_name_pattern_matches`], the port of upstream's
+/// escaped-regex `toolPatternRegExp` (`core/mcp-servers.ts:17-34`) rather
+/// than the in-order literal scan used by the original registration path.
+#[must_use]
+pub fn tool_exposure(config: &Json, tool_name: &str) -> String {
+    if let Some(overrides) = config.get("toolExposure").and_then(Json::as_object) {
+        if let Some(exposure) = overrides.get(tool_name).and_then(Json::as_str) {
+            return exposure.to_string();
+        }
+        for (pattern, exposure) in overrides {
+            if pattern.contains('*')
+                && pi_mcp::types::tool_name_pattern_matches(pattern, tool_name)
+                && let Some(exposure) = exposure.as_str()
+            {
+                return exposure.to_string();
+            }
+        }
+    }
+    config
+        .get("exposure")
+        .and_then(Json::as_str)
+        .unwrap_or("codemode")
+        .to_string()
 }
 
 /// The synthetic stdio MCP server the bridge tests drive: a bash script
@@ -1860,5 +2274,259 @@ mod tests {
             },
         };
         assert!(http_auth_provider("local", &stdio, dir.path()).is_none());
+    }
+
+    /// Writes an executable synthetic server script into `dir`.
+    fn write_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod script");
+        }
+        path
+    }
+
+    /// Answers the first `tools/list` with `old` and a notification, then
+    /// the second with `new` (a synthetic stand-in for a live server that
+    /// changed its tools, `runtime.ts:382-384`).
+    const CHANGING_SERVER_SCRIPT: &str = r#"#!/bin/sh
+lists=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"changing","version":"1.0.0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      lists=$((lists + 1))
+      if [ "$lists" -eq 1 ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"old","inputSchema":{"type":"object"}}]}}\n' "$id"
+        printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"new","inputSchema":{"type":"object"}}]}}\n' "$id"
+      fi ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    /// As above, but the refresh fails with an RPC error so the worker
+    /// records upstream's `Failed to refresh tools: …` text.
+    const FAILING_REFRESH_SCRIPT: &str = r#"#!/bin/sh
+lists=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"flaky","version":"1.0.0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      lists=$((lists + 1))
+      if [ "$lists" -eq 1 ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"old","inputSchema":{"type":"object"}}]}}\n' "$id"
+        printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"refresh boom"}}\n' "$id"
+      fi ;;
+  esac
+done
+"#;
+
+    fn wait_for_tool_changes(manager: &McpManager) -> Vec<ToolChange> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut changes = manager.take_tool_changes();
+        while changes.is_empty() && Instant::now() < deadline {
+            manager.poll_notifications();
+            changes = manager.take_tool_changes();
+            if changes.is_empty() {
+                std::thread::yield_now();
+            }
+        }
+        changes
+    }
+
+    #[test]
+    fn connect_failure_appends_the_stderr_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = write_script(
+            dir.path(),
+            "failing.sh",
+            "#!/bin/sh\nprintf 'boom-on-stderr\\n' >&2\nexit 1\n",
+        );
+        let config = json!({"command": script.to_string_lossy(), "timeout": 2});
+        let manager = McpManager::default();
+        let error = manager
+            .connect("bad", &config, dir.path().to_str().expect("cwd"))
+            .expect_err("the server never answers initialize");
+        assert!(error.contains("\nboom-on-stderr"), "{error}");
+    }
+
+    #[test]
+    fn stderr_tail_keeps_only_the_last_2000_characters() {
+        let long = "x".repeat(STDERR_TAIL_CHARS + 500);
+        let tail = slice_tail_chars(long.trim(), STDERR_TAIL_CHARS);
+        assert_eq!(tail.len(), STDERR_TAIL_CHARS);
+        assert_eq!(tail, "x".repeat(STDERR_TAIL_CHARS));
+        assert_eq!(slice_tail_chars("short", STDERR_TAIL_CHARS), "short");
+    }
+
+    #[test]
+    fn list_changed_notification_re_registers_the_new_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = write_script(dir.path(), "changing.sh", CHANGING_SERVER_SCRIPT);
+        let config = json!({"command": script.to_string_lossy(), "timeout": 5});
+        let manager = McpManager::default();
+        let initial = manager
+            .connect("changing", &config, dir.path().to_str().expect("cwd"))
+            .expect("connect");
+        assert_eq!(initial.tools.len(), 1);
+        assert_eq!(initial.tools[0]["name"], "old");
+
+        let changes = wait_for_tool_changes(&manager);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].server, "changing");
+        assert!(changes[0].error.is_none(), "{changes:?}");
+        assert_eq!(changes[0].tools.len(), 1);
+        assert_eq!(changes[0].tools[0]["name"], "new");
+        manager.shutdown_all();
+    }
+
+    #[test]
+    fn failed_tool_refresh_records_the_upstream_error_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = write_script(dir.path(), "flaky.sh", FAILING_REFRESH_SCRIPT);
+        let config = json!({"command": script.to_string_lossy(), "timeout": 5});
+        let manager = McpManager::default();
+        manager
+            .connect("flaky", &config, dir.path().to_str().expect("cwd"))
+            .expect("connect");
+
+        let changes = wait_for_tool_changes(&manager);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        let error = changes[0].error.as_deref().expect("refresh error");
+        assert!(error.starts_with("Failed to refresh tools: "), "{error}");
+        assert!(changes[0].tools.is_empty());
+        manager.shutdown_all();
+    }
+
+    #[test]
+    fn startup_wait_is_bounded_and_one_shot() {
+        let now = Instant::now();
+        let (keep_open, receiver) = channel::<Result<ConnectOutcome, String>>();
+        let mut wait = StartupWait::new_with_start(100, now);
+        wait.pending.push(PendingConnect {
+            name: "slow".to_string(),
+            reply: receiver,
+        });
+        assert_eq!(
+            wait.tick(now),
+            StartupTick::Waiting {
+                remaining: Duration::from_millis(100)
+            }
+        );
+        assert_eq!(wait.pending(), 1);
+        assert_eq!(
+            wait.tick(now + Duration::from_millis(99)),
+            StartupTick::Waiting {
+                remaining: Duration::from_millis(1)
+            }
+        );
+        assert_eq!(
+            wait.tick(now + Duration::from_millis(100)),
+            StartupTick::TimedOut
+        );
+        assert!(wait.waited());
+        assert_eq!(
+            wait.tick(now + Duration::from_millis(500)),
+            StartupTick::Ready
+        );
+        drop(keep_open);
+    }
+
+    #[test]
+    fn startup_wait_settles_against_the_fixture_server() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = write_fixture_server(dir.path()).expect("fixture");
+        let config = json!({"command": script.to_string_lossy(), "timeout": 5});
+        let manager = McpManager::default();
+        let mut wait = StartupWait::new(5_000);
+        wait.add(
+            "synth",
+            &config,
+            dir.path().to_str().expect("cwd"),
+            &manager,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match wait.tick(Instant::now()) {
+                StartupTick::Ready | StartupTick::TimedOut => break,
+                StartupTick::Waiting { .. } => {
+                    assert!(Instant::now() < deadline, "startup wait did not settle");
+                    std::thread::yield_now();
+                }
+            }
+        }
+        let settled = wait.drain_settled();
+        assert_eq!(settled.len(), 1, "{settled:?}");
+        assert_eq!(settled[0].0, "synth");
+        assert!(settled[0].1.is_ok(), "{:?}", settled[0].1);
+        manager.shutdown_all();
+    }
+
+    #[test]
+    fn converted_results_keep_block_meta_and_drop_top_level_meta() {
+        let result: CallToolResult = serde_json::from_value(json!({
+            "_meta": {"secret": true},
+            "content": [{
+                "type": "text", "text": "hello",
+                "_meta": {"trace": 1}, "annotations": {"priority": 0.5}
+            }],
+            "structuredContent": {"ok": true},
+        }))
+        .expect("decode");
+        let mapped = convert_mcp_result("synth", "echo", &result);
+        let script = &mapped["structuredContent"];
+        assert_eq!(script["content"][0]["text"], "hello");
+        assert_eq!(script["content"][0]["_meta"], json!({"trace": 1}));
+        assert_eq!(
+            script["content"][0]["annotations"],
+            json!({"priority": 0.5})
+        );
+        assert!(script.get("_meta").is_none(), "top-level _meta dropped");
+        assert_eq!(script["structuredContent"], json!({"ok": true}));
+    }
+
+    #[test]
+    fn tool_exposure_uses_the_faithful_glob_matcher() {
+        let config = json!({
+            "exposure": "codemode",
+            "toolExposure": {
+                "read.*": "hidden",
+                "write*": "direct",
+                "exact": "deferred"
+            }
+        });
+        assert_eq!(tool_exposure(&config, "exact"), "deferred");
+        assert_eq!(tool_exposure(&config, "read.foo"), "hidden");
+        // Upstream escapes the `.`, so it is not a regex wildcard.
+        assert_eq!(tool_exposure(&config, "readXfoo"), "codemode");
+        assert_eq!(tool_exposure(&config, "writeThing"), "direct");
+        assert_eq!(tool_exposure(&config, "other"), "codemode");
+    }
+
+    #[test]
+    fn plain_call_tool_regression_still_works() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = write_fixture_server(dir.path()).expect("fixture");
+        let config = json!({"command": script.to_string_lossy(), "timeout": 5});
+        let manager = McpManager::default();
+        manager
+            .connect("synth", &config, dir.path().to_str().expect("cwd"))
+            .expect("connect");
+        let result = manager.call_tool("synth", "echo", json!({"text": "hi"}));
+        assert_eq!(result["result"]["content"][0]["text"], "echo-ok");
+        manager.shutdown_all();
     }
 }
