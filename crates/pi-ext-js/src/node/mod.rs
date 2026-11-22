@@ -38,7 +38,8 @@
 //! real Node built-ins):
 //!
 //! - `node:url` → WHATWG URL Standard + `node:url` (`fileURLToPath`,
-//!   `pathToFileURL`, `URL`, `URLSearchParams`),
+//!   `pathToFileURL`, `URL`, `URL.canParse`, `URLSearchParams`); the static is
+//!   used by upstream's `web-url.ts:9` and `extensions/mcp/tools.ts:161`,
 //! - `node:fs` → `fs.Stats` / `fs.lstatSync` (symlinks are *not* followed),
 //! - `node:crypto` → `crypto.createHmac` (RFC 2104 / FIPS 198-1, SHA-256 and
 //!   SHA-512 block sizes),

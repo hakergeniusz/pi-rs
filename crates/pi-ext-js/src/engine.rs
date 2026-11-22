@@ -2458,6 +2458,56 @@ mod tests {
     }
 
     #[test]
+    fn url_can_parse_matches_the_constructor() {
+        let dir = std::env::temp_dir().join(format!("pi-ext-js-url-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let entry = dir.join("url.ts");
+        std::fs::write(
+            &entry,
+            r#"import { URL } from "node:url";
+export default function (): void {
+  const cases: Array<[string, string | undefined]> = [
+    ["https://example.com/a", undefined],
+    ["not a url", undefined],
+    ["../a", "https://example.com/base/path"],
+    ["../a", "not a base"],
+    ["custom:thing", undefined],
+    ["  https://example.com  ", undefined],
+    ["https://", undefined],
+  ];
+  (globalThis as Record<string, unknown>).__canParse = JSON.stringify(
+    cases.map(([value, base]) => URL.canParse(value, base)),
+  );
+  (globalThis as Record<string, unknown>).__ctorAgrees = JSON.stringify(
+    cases.map(([value, base]) => {
+      let constructed = true;
+      try { new URL(value, base); } catch { constructed = false; }
+      return URL.canParse(value, base) === constructed;
+    }),
+  );
+}
+"#,
+        )
+        .expect("write");
+        let host = host();
+        let index = host
+            .begin_extension(&entry.to_string_lossy())
+            .expect("begin");
+        host.load_extension_module(index, &entry.to_string_lossy(), None)
+            .expect("node:url now resolves");
+        assert_eq!(
+            host.eval_for_tests("globalThis.__canParse").expect("eval"),
+            "[true,false,true,false,true,true,false]"
+        );
+        assert_eq!(
+            host.eval_for_tests("globalThis.__ctorAgrees")
+                .expect("eval"),
+            "[true,true,true,true,true,true,true]"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn supported_node_imports_resolve_and_unsupported_ones_reject() {
         let dir = std::env::temp_dir().join(format!("pi-ext-js-node-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");

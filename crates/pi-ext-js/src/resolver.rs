@@ -7,13 +7,31 @@
 //! directory (jiti), and the entry rules (`loader.ts:748-750`: `.ts`/`.js`
 //! only; `loader.ts:761-791`: `index.ts` before `index.js`).
 //!
-//! E1 deliberately resolved *no* `node_modules`; E4 adds the `node:*` and
-//! host-package virtual modules served by [`node`] while keeping that same
-//! no-`node_modules` rule. Unknown specifiers still error with the E1
-//! explanation (`docs/EXTENSIONS.md` §6.3). The same table also serves CJS
-//! `require()` calls: [`crate::cjs::wrap`] lowers each static require into an
-//! ESM import, so both formats share this resolver and the virtual modules
-//! (upstream's jiti bridge, `core/extensions/loader.ts:42, 571-602`).
+//! E4 adds the `node:*` and host-package virtual modules served by [`node`],
+//! plus the `node_modules` walk upstream delegates to Node/jiti through
+//! `createRequire` (`core/extensions/loader.ts:42, 78-89`). A bare specifier
+//! is looked up in `node_modules` directories from the importing file's
+//! directory upwards; the package's `main`/`exports` string target (or its
+//! `index.ts`/`index.js`) is then resolved with the same entry rules as a
+//! relative import. Virtual modules and aliases keep priority, matching
+//! upstream's `getAliases()` table (`loader.ts:72-131`).
+//!
+//! Genuinely missing modules still error with the documented E1 explanation
+//! verbatim (`docs/EXTENSIONS.md` §6.3), for compatibility with the existing
+//! diagnostic; only the resolution path behind it changed. The same table
+//! also serves CJS `require()` calls: [`crate::cjs::wrap`] lowers each static
+//! require into an ESM import, so both formats share this resolver and the
+//! virtual modules (upstream's jiti bridge, `core/extensions/loader.ts:42,
+//! 571-602`). [`fold_require_expressions`] lifts dynamically computed but
+//! statically resolvable `require(...)` specifiers into that same static path;
+//! expressions that cannot be folded keep the original E1 error.
+//!
+//! Remaining delta from full Node/jiti resolution: no `exports` patterns or
+//! conditional-target arrays beyond the string/`default`/`import` subset,
+//! no `imports`/`tsconfigPaths`, no `package.json` `type: module` distinction
+//! (both `.ts` and `.js` are transpiled by the same oxc strip), no `.mjs`,
+//! `.cjs` or `.json` extensions, and no symlink/realpath-aware caching
+//! (upstream's pnpm case, `test/suite/regressions/8092`).
 
 use std::path::{Path, PathBuf};
 
@@ -143,6 +161,402 @@ fn is_extension_file(path: &Path) -> bool {
     )
 }
 
+/// Splits a bare specifier into its package name and subpath. Scoped names
+/// keep both segments (`@scope/pkg`), matching Node's package boundary; a
+/// relative or absolute specifier, a backslash, and `..` segments are not
+/// package names and return `None`.
+fn package_parts(specifier: &str) -> Option<(&str, &str)> {
+    if specifier.is_empty() || specifier.starts_with('.') || specifier.starts_with('/') {
+        return None;
+    }
+    if specifier.contains('\\') {
+        return None;
+    }
+    let name_end = if let Some(scoped) = specifier.strip_prefix('@') {
+        let first = scoped.find('/')?;
+        let second = scoped[first + 1..]
+            .find('/')
+            .map_or(scoped.len(), |offset| first + 1 + offset);
+        if first == 0 || second == first + 1 {
+            return None;
+        }
+        1 + second
+    } else {
+        specifier.find('/').unwrap_or(specifier.len())
+    };
+    let (name, rest) = specifier.split_at(name_end);
+    let subpath = rest.strip_prefix('/').unwrap_or(rest);
+    if subpath
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        && !subpath.is_empty()
+    {
+        return None;
+    }
+    Some((name, subpath))
+}
+
+fn package_json_field(dir: &Path, field: &str) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let without_bom = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let value: serde_json::Value = serde_json::from_str(without_bom).ok()?;
+    value.get(field).cloned()
+}
+
+/// The string target of one `exports` entry. Node's conditional objects are
+/// limited here to the string/condition-string subset; arrays and wildcard
+/// patterns are documented as a remaining delta in the module docs.
+fn exports_target<'a>(exports: &'a serde_json::Value, subpath: &str) -> Option<&'a str> {
+    if subpath.is_empty()
+        && let Some(target) = exports.as_str()
+    {
+        return Some(target);
+    }
+    let key = if subpath.is_empty() {
+        ".".to_string()
+    } else {
+        format!("./{subpath}")
+    };
+    let target = exports.as_object()?.get(&key)?;
+    if let Some(text) = target.as_str() {
+        return Some(text);
+    }
+    let conditions = target.as_object()?;
+    for condition in ["import", "default", "node", "require"] {
+        if let Some(text) = conditions
+            .get(condition)
+            .and_then(serde_json::Value::as_str)
+        {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn resolve_package_file(package_dir: &Path, subpath: &str) -> Option<PathBuf> {
+    if let Some(exports) = package_json_field(package_dir, "exports")
+        && let Some(target) = exports_target(&exports, subpath)
+        && let Some(resolved) = resolve_relative(package_dir, target.trim_start_matches("./"))
+    {
+        return Some(resolved);
+    }
+    if subpath.is_empty() {
+        if let Some(main) = package_json_field(package_dir, "main")
+            && let Some(main) = main.as_str()
+            && let Some(resolved) = resolve_relative(package_dir, main)
+        {
+            return Some(resolved);
+        }
+        return resolve_relative(package_dir, ".");
+    }
+    resolve_relative(package_dir, subpath)
+}
+
+/// Resolves a bare specifier by walking `node_modules` from `base_dir`
+/// through its ancestors (the Node/jiti algorithm upstream gets from
+/// `createRequire`, `loader.ts:42`). The nearest installed package wins;
+/// inside one package `exports`, then `main`, then `index.ts`/`index.js`
+/// decide the file. Returns `None` for genuinely missing modules so the
+/// caller raises the unchanged E1 explanation.
+pub fn resolve_bare(base_dir: &Path, specifier: &str) -> Option<PathBuf> {
+    let (name, subpath) = package_parts(specifier)?;
+    for ancestor in base_dir.ancestors() {
+        let package_dir = ancestor.join("node_modules").join(name);
+        if package_dir.is_dir()
+            && let Some(resolved) = resolve_package_file(&package_dir, subpath)
+        {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic `require` lifting.
+//
+// Upstream's jiti resolves `require(expr)` at runtime. This host's CJS shim
+// only creates ESM imports for literal specifiers, so the source is folded
+// first: a `require(...)` argument built from string literals, simple `const`
+// string bindings and `+` becomes the equivalent literal require (and thus
+// the same static import/namespace). Anything else is left untouched, so the
+// shim's existing unresolved-module error stays byte-identical.
+// ---------------------------------------------------------------------------
+
+fn is_ident_start(character: char) -> bool {
+    character.is_ascii_alphabetic() || character == '_' || character == '$'
+}
+
+fn is_ident_continue(character: char) -> bool {
+    is_ident_start(character) || character.is_ascii_digit()
+}
+
+fn skip_whitespace(chars: &[char], mut index: usize) -> usize {
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn skip_quoted(chars: &[char], start: usize) -> Option<usize> {
+    let delimiter = chars.get(start).copied()?;
+    let mut index = start + 1;
+    let mut escaped = false;
+    while index < chars.len() {
+        match (chars[index], escaped) {
+            (character, false) if character == delimiter => return Some(index + 1),
+            ('\\', false) => escaped = true,
+            (_, true) => escaped = false,
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn skip_comment(chars: &[char], index: usize) -> Option<usize> {
+    match chars.get(index + 1) {
+        Some('/') => {
+            let mut at = index + 2;
+            while at < chars.len() && chars[at] != '\n' {
+                at += 1;
+            }
+            Some(at)
+        }
+        Some('*') => {
+            let mut at = index + 2;
+            while at + 1 < chars.len() && !(chars[at] == '*' && chars[at + 1] == '/') {
+                at += 1;
+            }
+            Some((at + 2).min(chars.len()))
+        }
+        _ => None,
+    }
+}
+
+/// Finds the closing parenthesis of `require(...)`; `argument_end` excludes
+/// it and `close` is the index just after it.
+fn call_argument(chars: &[char], start: usize) -> Option<(usize, usize)> {
+    let mut index = start;
+    let mut depth = 0_usize;
+    while index < chars.len() {
+        match chars[index] {
+            '\'' | '"' | '`' => index = skip_quoted(chars, index)?,
+            '/' if matches!(chars.get(index + 1), Some('/' | '*')) => {
+                index = skip_comment(chars, index)?;
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                index += 1;
+            }
+            ')' if depth == 0 => return Some((index, index + 1)),
+            ')' | ']' | '}' => {
+                depth = depth.checked_sub(1)?;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Where a `const NAME = <expression>` initializer ends (semicolon, comma,
+/// newline at depth zero, or EOF).
+fn initializer_end(chars: &[char], start: usize) -> usize {
+    let mut index = start;
+    let mut depth = 0_usize;
+    while index < chars.len() {
+        match chars[index] {
+            '\'' | '"' | '`' => match skip_quoted(chars, index) {
+                Some(next) => index = next,
+                None => return chars.len(),
+            },
+            '/' if matches!(chars.get(index + 1), Some('/' | '*')) => {
+                index = skip_comment(chars, index).unwrap_or(chars.len());
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                index += 1;
+            }
+            ')' | ']' | '}' if depth == 0 => return index,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                index += 1;
+            }
+            ';' | ',' | '\n' if depth == 0 => return index,
+            _ => index += 1,
+        }
+    }
+    index
+}
+
+fn wraps_single_expression(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.first() != Some(&'(') || chars.last() != Some(&')') {
+        return false;
+    }
+    let mut index = 0_usize;
+    let mut depth = 0_i32;
+    while index < chars.len() {
+        match chars[index] {
+            '\'' | '"' | '`' => match skip_quoted(&chars, index) {
+                Some(next) => index = next,
+                None => return false,
+            },
+            '(' => {
+                depth += 1;
+                index += 1;
+            }
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    depth == 0
+}
+
+/// Folds the deliberately small expression grammar the port can resolve
+/// without a JS evaluator: string literals, literal templates, `const`
+/// string bindings already seen in the file, parentheses and `+`.
+fn fold_expression(expression: &str, consts: &[(String, String)]) -> Option<String> {
+    let text = expression.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if wraps_single_expression(text) {
+        return fold_expression(&text[1..text.len() - 1], consts);
+    }
+    let first = text.chars().next()?;
+    if matches!(first, '\'' | '"') && text.len() >= 2 && text.ends_with(first) {
+        let inner = &text[1..text.len() - 1];
+        return (!inner.contains('\\')).then(|| inner.to_string());
+    }
+    if first == '`' && text.len() >= 2 && text.ends_with('`') {
+        let inner = &text[1..text.len() - 1];
+        return (!inner.contains("${") && !inner.contains('\\')).then(|| inner.to_string());
+    }
+    if text.chars().all(is_ident_continue) {
+        return consts
+            .iter()
+            .rev()
+            .find(|(name, _)| name == text)
+            .map(|(_, value)| value.clone());
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = 0_usize;
+    let mut depth = 0_i32;
+    let mut plus = None;
+    while index < chars.len() {
+        match chars[index] {
+            '\'' | '"' | '`' => index = skip_quoted(&chars, index)?,
+            '(' | '[' | '{' => {
+                depth += 1;
+                index += 1;
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                index += 1;
+            }
+            '+' if depth == 0 => plus = Some(index),
+            _ => index += 1,
+        }
+    }
+    if let Some(at) = plus {
+        let left: String = chars[..at].iter().collect();
+        let right: String = chars[at + 1..].iter().collect();
+        return Some(fold_expression(&left, consts)? + &fold_expression(&right, consts)?);
+    }
+    None
+}
+
+/// Rewrites statically resolvable `require(expr)` arguments into string
+/// literals. Strings, templates and comments are skipped so prose and
+/// already-static requires are never touched; unsupported expressions keep
+/// their source verbatim and therefore the original error at runtime.
+#[allow(clippy::too_many_lines)] // one lexical pass; split only when extending the grammar
+pub fn fold_require_expressions(js: &str) -> String {
+    let chars: Vec<char> = js.chars().collect();
+    let mut consts: Vec<(String, String)> = Vec::new();
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    let mut index = 0_usize;
+    while index < chars.len() {
+        match chars[index] {
+            '\'' | '"' | '`' => {
+                index = skip_quoted(&chars, index).unwrap_or(chars.len());
+                continue;
+            }
+            '/' if matches!(chars.get(index + 1), Some('/' | '*')) => {
+                index = skip_comment(&chars, index).unwrap_or(chars.len());
+                continue;
+            }
+            _ => {}
+        }
+        if !is_ident_start(chars[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < chars.len() && is_ident_continue(chars[index]) {
+            index += 1;
+        }
+        let word: String = chars[start..index].iter().collect();
+        let preceded_by_dot = start > 0 && chars[start - 1] == '.';
+        if preceded_by_dot {
+            continue;
+        }
+        if word == "const" {
+            let name_at = skip_whitespace(&chars, index);
+            if let Some(&first) = chars.get(name_at)
+                && is_ident_start(first)
+            {
+                let mut name_end = name_at + 1;
+                while name_end < chars.len() && is_ident_continue(chars[name_end]) {
+                    name_end += 1;
+                }
+                let equals = skip_whitespace(&chars, name_end);
+                if chars.get(equals) == Some(&'=') && !matches!(chars.get(equals + 1), Some('=')) {
+                    let value_at = skip_whitespace(&chars, equals + 1);
+                    let value_end = initializer_end(&chars, value_at);
+                    let value: String = chars[value_at..value_end].iter().collect();
+                    if let Some(value) = fold_expression(&value, &consts) {
+                        let name: String = chars[name_at..name_end].iter().collect();
+                        consts.push((name, value));
+                        index = value_end;
+                        continue;
+                    }
+                }
+            }
+        }
+        if word == "require" {
+            let open = skip_whitespace(&chars, index);
+            if chars.get(open) == Some(&'(')
+                && let Some((argument_end, close)) = call_argument(&chars, open + 1)
+            {
+                let argument: String = chars[open + 1..argument_end].iter().collect();
+                if let Some(literal) = fold_expression(&argument, &consts) {
+                    let quoted = serde_json::to_string(&literal).unwrap_or_else(|_| "\"\"".into());
+                    replacements.push((open + 1, argument_end, quoted));
+                    index = close;
+                    continue;
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut at = 0_usize;
+    for (start, end, replacement) in replacements {
+        out.extend(chars[at..start].iter().copied());
+        out.push_str(&replacement);
+        at = end;
+    }
+    out.extend(chars[at..].iter().copied());
+    out
+}
+
 /// Raises a JavaScript `Error` with `message` so import failures carry the
 /// documented explanations instead of an opaque engine error.
 fn throw_js_error(ctx: &Ctx<'_>, message: &str) -> rquickjs::Error {
@@ -194,12 +608,12 @@ impl rquickjs::loader::Resolver for ExtensionResolver {
         if virtual_module_source(name).is_some() {
             return Ok(format!("virtual:{name}"));
         }
+        let base_dir = Path::new(base)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         let is_relative = name.starts_with("./") || name.starts_with("../");
         if is_relative || name.starts_with('/') {
-            let base_dir = Path::new(base)
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_default();
             let scoped = if name.starts_with('/') {
                 PathBuf::from(name)
             } else {
@@ -209,6 +623,14 @@ impl rquickjs::loader::Resolver for ExtensionResolver {
                 return Ok(scoped.to_string_lossy().into_owned());
             }
             if let Some(resolved) = resolve_relative(&base_dir, name) {
+                return Ok(resolved.to_string_lossy().into_owned());
+            }
+        }
+        // Bare specifiers walk ancestor `node_modules`, like upstream's
+        // `createRequire`. Host packages we cannot serve keep their E1 error
+        // instead of being shadowed by an installed copy (jiti aliases win).
+        if !name.starts_with("node:") && !is_unavailable_host_module(name) {
+            if let Some(resolved) = resolve_bare(&base_dir, name) {
                 return Ok(resolved.to_string_lossy().into_owned());
             }
         }
@@ -259,6 +681,7 @@ impl rquickjs::loader::Loader for ExtensionLoader {
                 Ok(source) => source,
                 Err(err) => return Err(throw_js_error(ctx, &err.to_string())),
             };
+        let source = fold_require_expressions(&source);
         let source = if crate::cjs::detect(&source) == crate::cjs::ModuleFormat::Cjs {
             crate::cjs::wrap(Path::new(name), &source)
         } else {
@@ -266,5 +689,191 @@ impl rquickjs::loader::Loader for ExtensionLoader {
         };
         self.transpiled.push((name.to_string(), source.clone()));
         Module::declare(ctx.clone(), name, source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{HostCore, JsHost};
+
+    fn write(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir parent");
+        }
+        std::fs::write(path, contents).expect("write");
+    }
+
+    fn test_host() -> JsHost {
+        JsHost::new(HostCore {
+            cwd: "/tmp".to_string(),
+            mode: "print".to_string(),
+            settings: serde_json::json!({}),
+            ..Default::default()
+        })
+        .expect("host")
+    }
+
+    #[test]
+    fn node_modules_resolution_walks_ancestors_and_reads_scoped_manifests() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let nested = root.join("project").join("nested");
+        write(
+            &root.join("node_modules/ancestor-pkg/index.ts"),
+            "export const tag: string = \"ancestor\";\n",
+        );
+        write(
+            &root.join("node_modules/@scope/tool/package.json"),
+            r#"{"main":"dist/main.js"}"#,
+        );
+        write(
+            &root.join("node_modules/@scope/tool/dist/main.js"),
+            "module.exports = {};\n",
+        );
+        write(
+            &root.join("node_modules/empty/index.json"),
+            "{\"not\":\"an entry\"}",
+        );
+        write(
+            &nested.join("node_modules/local-pkg/index.js"),
+            "module.exports = {};\n",
+        );
+
+        assert_eq!(
+            resolve_bare(&nested, "local-pkg"),
+            Some(nested.join("node_modules/local-pkg/index.js"))
+        );
+        assert_eq!(
+            resolve_bare(&nested, "ancestor-pkg"),
+            Some(root.join("node_modules/ancestor-pkg/index.ts"))
+        );
+        assert_eq!(
+            resolve_bare(&nested, "@scope/tool"),
+            Some(root.join("node_modules/@scope/tool/dist/main.js"))
+        );
+        assert_eq!(resolve_bare(&nested, "empty"), None);
+        assert_eq!(resolve_bare(&nested, "not-installed"), None);
+        assert_eq!(resolve_bare(&nested, "../relative"), None);
+        assert_eq!(resolve_bare(&nested, "@scope/tool/../../escape"), None);
+        // Genuinely missing modules keep the E1 wording verbatim.
+        assert_eq!(
+            unavailable_module_message("not-installed"),
+            "Module \"not-installed\" could not be resolved by the extensions host (E1 supports relative paths and the bundled virtual modules; node_modules resolution lands in E4)"
+        );
+    }
+
+    #[test]
+    fn node_modules_resolves_exports_strings_and_subpaths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let package = dir.path().join("node_modules/exported");
+        write(
+            &package.join("package.json"),
+            r#"{"exports":{".":"./dist/index.js","./util":{"import":"./src/util.ts","default":"./src/util.js"}},"main":"legacy.js"}"#,
+        );
+        write(&package.join("dist/index.js"), "module.exports = {};\n");
+        write(
+            &package.join("src/util.ts"),
+            "export const tag: string = \"u\";\n",
+        );
+        write(&package.join("src/util.js"), "module.exports = {};\n");
+        write(&package.join("raw/extra.js"), "module.exports = {};\n");
+
+        assert_eq!(
+            resolve_bare(dir.path(), "exported"),
+            Some(package.join("dist/index.js"))
+        );
+        assert_eq!(
+            resolve_bare(dir.path(), "exported/util"),
+            Some(package.join("src/util.ts"))
+        );
+        // With no matching exports key, fall back to the file rules inside
+        // the package (Node's own direct-subpath behavior).
+        assert_eq!(
+            resolve_bare(dir.path(), "exported/raw/extra"),
+            Some(package.join("raw/extra.js"))
+        );
+        assert_eq!(resolve_bare(dir.path(), "exported/missing"), None);
+    }
+
+    #[test]
+    fn fold_require_expressions_lifts_simple_specifiers() {
+        let source = r#"
+const PREFIX = "type" + "box";
+const first = require(PREFIX);
+const second = require('@scope/' + 'pkg');
+const third = require(`node:path`);
+const fourth = require(( "a" + "b" ));
+const dynamic = require(globalThis.__name);
+const note = "require('not-a-real-import')";
+// require("comment-only")
+"#;
+        let folded = fold_require_expressions(source);
+        assert!(folded.contains("require(\"typebox\")"), "{folded}");
+        assert!(folded.contains("require(\"@scope/pkg\")"), "{folded}");
+        assert!(folded.contains("require(\"node:path\")"), "{folded}");
+        assert!(folded.contains("require(\"ab\")"), "{folded}");
+        assert!(folded.contains("require(globalThis.__name)"), "{folded}");
+        assert!(
+            folded.contains("\"require('not-a-real-import')\""),
+            "{folded}"
+        );
+        assert!(folded.contains("// require(\"comment-only\")"), "{folded}");
+    }
+
+    #[test]
+    fn dynamic_require_and_node_modules_share_the_static_import_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &dir.path().join("node_modules/pi-test-dep/index.js"),
+            "exports.tag = \"from-node-modules\";\n",
+        );
+        let entry = dir.path().join("entry.js");
+        write(
+            &entry,
+            "const name = \"pi-\" + \"test-dep\";\nconst dep = require(name);\nmodule.exports = function () { globalThis.__dyn = dep.tag; };\n",
+        );
+        let prepared = crate::cjs::entry_source(&entry).expect("prepared");
+        assert!(
+            prepared.contains("import * as __piCjsDep0 from \"pi-test-dep\""),
+            "{prepared}"
+        );
+        let host = test_host();
+        let index = host
+            .begin_extension(&entry.to_string_lossy())
+            .expect("begin");
+        host.load_extension_module(index, &entry.to_string_lossy(), Some(&prepared))
+            .expect("load");
+        assert_eq!(
+            host.eval_for_tests("globalThis.__dyn").expect("eval"),
+            "from-node-modules"
+        );
+    }
+
+    #[test]
+    fn unsupported_dynamic_require_keeps_the_documented_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = dir.path().join("entry.js");
+        write(
+            &entry,
+            "module.exports = function () { return require(globalThis.__name); };\n",
+        );
+        let host = test_host();
+        host.eval_for_tests("globalThis.__name = \"no-such-pkg\";")
+            .expect("setup");
+        let prepared = crate::cjs::entry_source(&entry).expect("prepared");
+        assert!(!prepared.contains("import * as"), "{prepared}");
+        let index = host
+            .begin_extension(&entry.to_string_lossy())
+            .expect("begin");
+        let error = host
+            .load_extension_module(index, &entry.to_string_lossy(), Some(&prepared))
+            .expect_err("unresolved");
+        assert!(
+            error
+                .to_string()
+                .contains(&unavailable_module_message("no-such-pkg")),
+            "{error}"
+        );
     }
 }

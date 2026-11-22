@@ -11,7 +11,9 @@
 //   * path percent-encoding (existing `%XX` escapes are preserved),
 //   * `URLSearchParams` mutations synchronise `search` and `href`,
 //   * relative resolution against a base (network-path, absolute-path,
-//     query-only, fragment-only and dot-segment forms).
+//     query-only, fragment-only and dot-segment forms),
+//   * the static `URL.canParse(input, base)`, which shares this parser so it
+//     agrees with the constructor (`web-url.ts:9`, `extensions/mcp/tools.ts:161`).
 
 import { Buffer } from "node:buffer";
 
@@ -443,6 +445,18 @@ export class URLSearchParams {
 }
 
 export class URL {
+  // WHATWG `URL.canParse(input, base)`: true exactly when the `URL`
+  // constructor would succeed. Coercion and base handling mirror the
+  // constructor; the parse itself is shared, so the two never disagree.
+  static canParse(input, base) {
+    try {
+      parseUrlParts(String(input), base === undefined ? undefined : String(base));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   constructor(input, base) {
     this._parts = parseUrlParts(String(input), base === undefined ? undefined : String(base));
     this._href = "";

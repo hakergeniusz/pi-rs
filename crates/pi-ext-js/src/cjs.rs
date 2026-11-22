@@ -24,7 +24,11 @@
 //! (`loader.ts:659`); [`invalid_factory_error`] is used by the CLI loading
 //! path so a CJS module whose export is not a function reports identically.
 //! Unresolvable `require` specifiers reuse [`crate::resolver`]'s exact ESM
-//! resolution error strings rather than inventing another message.
+//! resolution error strings rather than inventing another message. The
+//! resolver also folds statically resolvable `require(expr)` arguments into
+//! literal requires before this shim runs, so computed specifiers share the
+//! static-import namespace and only genuinely dynamic expressions keep the
+//! unresolved-module error.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -299,6 +303,9 @@ pub fn wrap(path: &Path, js: &str) -> String {
 pub fn entry_source(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let js = crate::transpile::transpile(path, &String::from_utf8_lossy(&bytes)).ok()?;
+    // Shallow `require(expr)` folding lives in the resolver so entry and
+    // imported modules share one implementation.
+    let js = crate::resolver::fold_require_expressions(&js);
     (detect(&js) == ModuleFormat::Cjs).then(|| wrap(path, &js))
 }
 
