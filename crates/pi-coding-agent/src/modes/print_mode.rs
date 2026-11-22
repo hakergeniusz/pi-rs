@@ -559,12 +559,27 @@ pub fn resolve_model_with(
             .or_else(|| crate::models_state::lookup(provider, id))
     };
     let Some(pattern) = pattern else {
-        // Fall back to the settings default; otherwise ask for a model.
-        return match (default_provider, default_model) {
-            (Some(provider), Some(id)) => lookup(provider, id)
-                .ok_or_else(|| format!("Default model not found in catalog: {provider}/{id}")),
-            _ => Err("No model specified. Use --model <pattern> (e.g. anthropic/claude-sonnet-4) or set defaultProvider/defaultModel in settings".to_string()),
+        // Upstream `findInitialModel`: settings default first, then the first
+        // available model with configured auth, then the first model in the
+        // composed catalog. It never errors here — a bare `pi` still starts.
+        if let (Some(provider), Some(id)) = (default_provider, default_model) {
+            return lookup(provider, id)
+                .ok_or_else(|| format!("Default model not found in catalog: {provider}/{id}"));
+        }
+        let catalog = crate::models_state::all();
+        let auth_path = crate::config::get_auth_path();
+        let supported = |model: &pi_ai::types::Model| {
+            pi_ai::providers::stream_fn_for(&model.api).is_some()
         };
+        return catalog
+            .iter()
+            .find(|model| {
+                supported(model)
+                    && resolve_wire_credential(&model.provider, None, &auth_path).is_some()
+            })
+            .or_else(|| catalog.iter().find(|model| supported(model)))
+            .cloned()
+            .ok_or_else(|| "No models available in the catalog".to_string());
     };
     let found = if let Some(provider) = &pattern.provider {
         lookup(provider, &pattern.id)
@@ -1078,8 +1093,11 @@ mod tests {
         let error = resolve_model(Some(&pattern), None, None).unwrap_err();
         assert!(error.contains("not found"));
 
-        // No pattern and no settings default asks for a model.
-        assert!(resolve_model(None, None, None).is_err());
+        // No pattern and no settings default starts with an initial model
+        // (upstream `findInitialModel`, model-resolver.ts:549-620).
+        let initial = resolve_model(None, None, None).expect("initial model");
+        assert_ne!(initial.provider, "");
+        assert_ne!(initial.id, "");
     }
 
     #[test]
