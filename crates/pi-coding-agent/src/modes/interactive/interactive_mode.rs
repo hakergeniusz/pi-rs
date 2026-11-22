@@ -10,6 +10,18 @@
 //! mounted over the same component tree (`switchTuiMode`,
 //! `interactive-mode.ts:641-700`); the selector dialogs are editor-slot
 //! swaps, and the extension host is deferred.
+//!
+//! Image/MCP wiring parity (`sdk.ts:296-331`, `tool-result-images.ts:24-67`,
+//! `interactive-mode.ts:5153-5174`, `extensions/mcp/runtime.ts:382-384`):
+//! the mode owns a live [`crate::images::ImageSettings`] cell, refreshed from
+//! the settings manager on every image setting change (and on `/reload`).
+//! `blockImages` is read from that cell on **every** `convertToLlm` call —
+//! upstream's `settingsManager.getBlockImages()` — and the same cell feeds
+//! the tool rows' `showImages` render flag and the `afterToolCall` image
+//! normalizer. The host pump drives `ExtensionRunner::mcp_tick` once per
+//! frame (no timers), matching the MCP runtime's host-supplied tick.
+//! Clipboard-image paste (`interactive-mode.ts:3296-3305`) still needs a
+//! clipboard read hook in the host; there is none in `crate::clipboard` yet.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -24,7 +36,8 @@ use pi_agent::events::{AgentEvent, AgentEventSink};
 use pi_agent::queues::Queues;
 use pi_agent::transcript::tool_declaration;
 use pi_agent::types::{
-    AbortSignal, AgentContext, QueueMode, ThinkingLevel, ToolExecutionMode, ToolExecutor,
+    AbortSignal, AfterToolCall, AfterToolCallOverride, AgentContext, AgentToolCall,
+    AgentToolResult, BoxFuture, QueueMode, ThinkingLevel, ToolExecutionMode, ToolExecutor,
 };
 use pi_tui::color::{TextAttributes, style_text_with_ansi};
 use pi_tui::component::{Component, ComponentMutation};
@@ -47,6 +60,7 @@ use crate::config::settings::{
     FullscreenExitOutput, FullscreenScrollbar, SettingsManager, SettingsManagerCreateOptions,
     format_http_idle_timeout_ms,
 };
+use crate::images::{ImageSettings, ImageTransformer, ResizeOptions, UnavailableTransformer};
 use crate::modes::print_mode::PrintRuntime;
 use crate::session::store::{NewSessionOptions, SessionManager};
 
@@ -1465,9 +1479,10 @@ fn model_thinking_levels(settings: &SettingsManager) -> BTreeMap<String, String>
 /// the agent's `convertToLlm` seam. It runs after `defaultConvertToLlm` has
 /// folded the session's custom roles into user messages, and replaces every
 /// image block with upstream's "Image reading is disabled." text, deduping
-/// consecutive placeholders. Upstream reads the setting on every call; this
-/// host snapshots it when it rebuilds the loop config for each run, so a
-/// setting change takes effect from the next run on.
+/// consecutive placeholders. The `blockImages` argument is resolved from the
+/// mode's live settings cell on **every** `convertToLlm` call (see
+/// [`live_block_images_converter`]), which is upstream's dynamic
+/// `settingsManager.getBlockImages()` read.
 fn filter_block_images(messages: Vec<AgentMessage>, block_images: bool) -> Vec<AgentMessage> {
     if !block_images {
         return messages;
@@ -1520,6 +1535,79 @@ fn input_content_from_block(
         pi_ai::types::ContentBlock::Text(text) => Some(pi_ai::types::InputContent::Text(text)),
         pi_ai::types::ContentBlock::Image(image) => Some(pi_ai::types::InputContent::Image(image)),
         pi_ai::types::ContentBlock::Thinking(_) | pi_ai::types::ContentBlock::ToolCall(_) => None,
+    }
+}
+
+/// `sdk.ts:296-331`: the `convertToLlm` wrapper built by the interactive host
+/// for one run. The wrapper itself is immutable; the `blockImages` decision is
+/// read from the shared cell on every call, so the mid-session `/settings`
+/// toggle takes effect on the very next provider request (upstream re-reads
+/// `settingsManager.getBlockImages()` rather than capturing a boolean).
+fn live_block_images_converter(
+    live_images: Arc<Mutex<ImageSettings>>,
+) -> Arc<dyn pi_agent::ConvertToLlm> {
+    Arc::new(move |messages: Vec<AgentMessage>| {
+        let block_images = live_images.lock().expect("image settings").block_images;
+        filter_block_images(pi_agent::default_convert_to_llm(messages), block_images)
+    })
+}
+
+/// `agent-session.ts:744-785`: the `afterToolCall` half of the tool pipeline.
+/// Images returned by extension/MCP tools are arbitrary base64 payloads; they
+/// are normalized once as they enter history so an oversized image cannot
+/// poison every later provider request. The upstream hook first emits
+/// `tool_result` and then normalizes; interactive mode has no extension
+/// `tool_result` hook in this port, so this hook is the normalization seam.
+struct ImageNormalizingAfterHook {
+    live_images: Arc<Mutex<ImageSettings>>,
+    resize_options: ResizeOptions,
+    transformer: Arc<dyn ImageTransformer + Send + Sync>,
+}
+
+impl ImageNormalizingAfterHook {
+    fn new(live_images: Arc<Mutex<ImageSettings>>, resize_options: ResizeOptions) -> Self {
+        Self {
+            live_images,
+            resize_options,
+            transformer: Arc::new(UnavailableTransformer),
+        }
+    }
+}
+
+impl AfterToolCall for ImageNormalizingAfterHook {
+    fn call<'a>(
+        &'a self,
+        _assistant_message: &'a pi_ai::types::AssistantMessage,
+        _tool_call: &'a AgentToolCall,
+        result: &'a AgentToolResult,
+        _is_error: bool,
+    ) -> BoxFuture<'a, Option<AfterToolCallOverride>> {
+        Box::pin(async move {
+            if !result
+                .content
+                .iter()
+                .any(|block| matches!(block, pi_ai::types::ContentBlock::Image(_)))
+            {
+                return None;
+            }
+            let settings = *self.live_images.lock().expect("image settings");
+            let normalized = crate::images::normalize_tool_result_images(
+                &result.content,
+                &settings,
+                &self.resize_options,
+                self.transformer.as_ref(),
+            );
+            // Upstream returns the original array when nothing changed and the
+            // host then skips rewriting the result entirely.
+            if normalized == result.content {
+                None
+            } else {
+                Some(AfterToolCallOverride {
+                    content: Some(normalized),
+                    ..AfterToolCallOverride::default()
+                })
+            }
+        })
     }
 }
 
@@ -1838,6 +1926,12 @@ pub struct InteractiveMode {
     /// The settings manager the dialog reads and writes
     /// (`this.settingsManager`, `interactive-mode.ts`).
     settings: SettingsManager,
+    /// The live image-settings snapshot shared with the run thread and the
+    /// tool rows. Upstream reads `settingsManager.getBlockImages()` on every
+    /// `convertToLlm` call (`sdk.ts:296-331`); this cell is that read's Rust
+    /// equivalent — refreshed on every image setting change and `/reload`,
+    /// and dereferenced per call instead of once per run.
+    live_images: Arc<Mutex<ImageSettings>>,
     /// The agent loop's steering/follow-up queues, shared with the worker
     /// thread and persistent across runs (upstream: `agent.queues`).
     queues: Arc<Mutex<Queues>>,
@@ -1966,6 +2060,10 @@ impl InteractiveMode {
         );
         let (agent_dir, settings, hide_thinking_block, output_pad, queues) =
             Self::startup_settings(options, runtime);
+        // The live image settings (E4 image wiring): one cell shared by the
+        // settings handlers, the tool rows and the agent-loop seams. Seeded
+        // from the boot settings; every later change refreshes it in place.
+        let live_images = Arc::new(Mutex::new(ImageSettings::from_settings(&settings)));
         // The renderer choice: the `--tui-mode` flag wins, otherwise the
         // settings (`getTuiMode`, default fullscreen).
         let tui_mode = options.tui_mode.unwrap_or_else(|| settings.get_tui_mode());
@@ -1990,6 +2088,7 @@ impl InteractiveMode {
             markdown_transform_ctx,
             #[cfg(feature = "ext-js")]
             markdown_transform_chain,
+            live_images,
             session: std::mem::replace(
                 &mut runtime.session,
                 SessionManager::in_memory(
@@ -3273,7 +3372,7 @@ impl InteractiveMode {
                     let pi_ai::types::AssistantContent::ToolCall(call) = block else {
                         continue;
                     };
-                    let mut tool = ToolExecutionComponent::new(
+                    let mut tool = ToolExecutionComponent::with_image_settings(
                         &call.name,
                         &call.id,
                         serde_json::Value::Object(call.arguments.clone()),
@@ -3281,6 +3380,7 @@ impl InteractiveMode {
                         &self.session.get_cwd().to_string_lossy(),
                         crate::tools::renderers::renderers_for(&call.name),
                         self.resolve_tool_renderers(&call.name),
+                        Arc::clone(&self.live_images),
                     );
                     tool.set_args_complete();
                     tool.set_expanded(self.tool_output_expanded);
@@ -3386,7 +3486,7 @@ impl InteractiveMode {
                 }
                 continue;
             }
-            let component = ToolExecutionComponent::new(
+            let component = ToolExecutionComponent::with_image_settings(
                 &call.name,
                 &call.id,
                 serde_json::Value::Object(call.arguments.clone()),
@@ -3394,6 +3494,7 @@ impl InteractiveMode {
                 &self.session.get_cwd().to_string_lossy(),
                 crate::tools::renderers::renderers_for(&call.name),
                 self.resolve_tool_renderers(&call.name),
+                Arc::clone(&self.live_images),
             );
             let index = self.add_to_chat(Box::new(component));
             self.pending_tools
@@ -5280,6 +5381,16 @@ impl InteractiveMode {
         self.restore_editor();
     }
 
+    /// Rebuild the live image-settings snapshot after any image setting
+    /// changed in the `/settings` dialog or a `/reload`. Upstream's consumers
+    /// call `getShowImages()`/`getBlockImages()` on the settings manager
+    /// directly; this host shares one cell with the run thread and the tool
+    /// rows, so the cell is the equivalent of those live reads.
+    fn refresh_image_settings(&mut self) {
+        *self.live_images.lock().expect("image settings") =
+            ImageSettings::from_settings(&self.settings);
+    }
+
     /// The `/settings` dialog's event handlers
     /// (`showSettingsSelector`'s callbacks, `interactive-mode.ts:5148-5331`).
     #[allow(clippy::too_many_lines)] // mirrors the TS callback object; split when extending
@@ -5307,21 +5418,29 @@ impl InteractiveMode {
             }
             SettingsSelectorEvent::ShowImagesChange(enabled) => {
                 // `onShowImagesChange` (`interactive-mode.ts:5153-5160`):
-                // persist; the live `ToolExecutionComponent.setShowImages`
-                // sweep lands with the image subsystem.
+                // persist, then push the new image options to every consumer.
+                // Upstream sweeps `ToolExecutionComponent.setShowImages` over
+                // the chat children; here the rows read the shared cell, so
+                // rebuilding it plus a render is the equivalent.
                 self.settings.set_show_images(enabled);
+                self.refresh_image_settings();
+                self.tui.request_render();
             }
             SettingsSelectorEvent::ImageWidthCellsChange(width) => {
                 // `onImageWidthCellsChange` (`interactive-mode.ts:5161-5168`).
                 self.settings.set_image_width_cells(width);
+                self.refresh_image_settings();
             }
             SettingsSelectorEvent::AutoResizeImagesChange(enabled) => {
                 // `onAutoResizeImagesChange` (`interactive-mode.ts:5169-5171`).
                 self.settings.set_image_auto_resize(enabled);
+                self.refresh_image_settings();
             }
             SettingsSelectorEvent::BlockImagesChange(blocked) => {
-                // `onBlockImagesChange` (`interactive-mode.ts:5172-5174`).
+                // `onBlockImagesChange` (`interactive-mode.ts:5172-5174`): the
+                // live cell is re-read on the next `convertToLlm` call.
                 self.settings.set_block_images(blocked);
+                self.refresh_image_settings();
             }
             SettingsSelectorEvent::EnableSkillCommandsChange(enabled) => {
                 // `onEnableSkillCommandsChange`
@@ -6213,7 +6332,7 @@ impl InteractiveMode {
                 return;
             }
         };
-        let component = ToolExecutionComponent::new(
+        let component = ToolExecutionComponent::with_image_settings(
             "bash",
             &format!("bash-{}", self.chat_len()),
             serde_json::json!({ "command": command }),
@@ -6221,6 +6340,7 @@ impl InteractiveMode {
             &self.session.get_cwd().to_string_lossy(),
             crate::tools::renderers::renderers_for("bash"),
             None,
+            Arc::clone(&self.live_images),
         );
         let index = self.add_to_chat(Box::new(component));
         if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
@@ -6349,7 +6469,7 @@ impl InteractiveMode {
         full_output_path: Option<String>,
         started: Instant,
     ) {
-        let component = ToolExecutionComponent::new(
+        let component = ToolExecutionComponent::with_image_settings(
             "bash",
             &format!("bash-{}", self.chat_len()),
             serde_json::json!({ "command": command }),
@@ -6357,6 +6477,7 @@ impl InteractiveMode {
             &self.session.get_cwd().to_string_lossy(),
             crate::tools::renderers::renderers_for("bash"),
             None,
+            Arc::clone(&self.live_images),
         );
         let index = self.add_to_chat(Box::new(component));
         if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
@@ -6590,9 +6711,19 @@ impl InteractiveMode {
             &self.session,
         );
         let (api_key, access_token) = self.run_wire_credential();
-        // The config is rebuilt for every run, so this snapshot of the live
-        // setting picks up selector changes made between prompts.
-        let block_images = self.settings.get_block_images();
+        // The config is rebuilt for every run, but `convertToLlm` deliberately
+        // captures the shared cell rather than a boolean: upstream calls
+        // `getBlockImages()` per request, so a toggle mid-stream is honoured
+        // by the very next request (`sdk.ts:296-331`).
+        let live_images = Arc::clone(&self.live_images);
+        // `agent-session.ts:767-771`: the model's own resize profile, when it
+        // has one, overlays the conservative defaults for image normalization.
+        let resize_options = self
+            .model
+            .input_limits
+            .and_then(|limits| limits.images)
+            .and_then(|images| images.resize)
+            .map_or_else(ResizeOptions::default, ResizeOptions::from);
         let config = AgentLoopConfig {
             model: self.model.clone(),
             thinking_level: self.thinking_level,
@@ -6603,7 +6734,10 @@ impl InteractiveMode {
             tool_execution: ToolExecutionMode::Parallel,
             hooks: pi_agent::types::ToolCallHooks {
                 before: None,
-                after: None,
+                after: Some(Arc::new(ImageNormalizingAfterHook::new(
+                    Arc::clone(&live_images),
+                    resize_options,
+                ))),
             },
             finish_turn: None,
             #[cfg(feature = "ext-js")]
@@ -6614,9 +6748,7 @@ impl InteractiveMode {
             prepare_request: None,
             prepare_next_turn: None,
             transform_context: self.transform_context(),
-            convert_to_llm: Arc::new(move |messages: Vec<AgentMessage>| {
-                filter_block_images(pi_agent::default_convert_to_llm(messages), block_images)
-            }),
+            convert_to_llm: live_block_images_converter(live_images),
         };
 
         let (tx, rx) = std::sync::mpsc::channel::<LoopEvent>();
@@ -8312,6 +8444,9 @@ impl InteractiveMode {
             eprintln!("Warning: Extension error: invalidate: {error}");
         }
         self.settings.reload();
+        // The image settings can change on disk too (`settings.json`), so the
+        // live cell follows the reload just like the in-dialog toggles.
+        self.refresh_image_settings();
         // `syncQueueModesFromSettings` (`agent-session.ts:2863+`): both
         // queue modes re-read from the reloaded settings.
         {
@@ -10913,8 +11048,10 @@ impl InteractiveMode {
                 // copy (`interactive-mode.ts:3024-3047`): the mode routes
                 // them like the built-in editor's own handlers. `escape` →
                 // the interrupt action (the port's escape binding), `ctrlD`
-                // → exit; `pasteImage` is a no-op (the port has no
-                // clipboard-image paste); `app:*` resolve through the
+                // → exit; `pasteImage` stays a no-op until the host exposes a
+                // clipboard-image read hook (upstream's `readClipboardImage`
+                // at `interactive-mode.ts:3296-3305`; `crate::clipboard` has
+                // only the write half today); `app:*` resolve through the
                 // action table.
                 "editorAction" => {
                     let action = request
@@ -12130,11 +12267,42 @@ impl InteractiveMode {
         }
     }
 
+    /// One host-driven MCP tick (`extensions/mcp/runtime.ts:382-384`,
+    /// `:432-442`; `index.ts:1154-1175`). Upstream's manager owns timers, but
+    /// this port's runner has none: the interactive pump *is* the clock that
+    /// advances the bounded startup wait and drains `tools/list_changed`
+    /// re-registrations. Called every frame even with no run in flight.
+    #[cfg(feature = "ext-js")]
+    fn pump_mcp(&mut self) {
+        let Some(runner) = &self.extension_runner else {
+            return;
+        };
+        let outcome = runner
+            .lock()
+            .expect("extension runner mutex poisoned")
+            .mcp_tick(Instant::now());
+        match outcome {
+            // A settled connection registers tools and a `list_changed`
+            // re-registration can change the visible tool list; redraw so the
+            // footer/autocomplete see the new state on this frame.
+            Ok(outcome) if !outcome.is_idle() => self.tui.request_render(),
+            Ok(_) => {}
+            // Server-state failures are reported by the runner itself; the
+            // tick's result is deliberately dropped (extensions/mod.rs's
+            // transform/tool tick points do the same).
+            Err(_) => {}
+        }
+    }
+
     /// One loop iteration without terminal input: editor events, agent
     /// events, spinner frames. `run` calls this between input polls; the
     /// scripted tests drive it directly with a capture terminal.
     #[allow(clippy::too_many_lines)] // mirrors the TS event loop shape; split when extending
     fn pump(&mut self) {
+        // MCP startup/list_changed ticks run on the host's clock — the pump.
+        #[cfg(feature = "ext-js")]
+        self.pump_mcp();
+
         // Editor events: take them out before acting on them, so the
         // mutex guard does not pin `self`.
         let editor_events = std::mem::take(&mut *self.editor_events.lock().expect("editor events"));
@@ -18108,5 +18276,214 @@ export default function (pi) {
             timestamp: 3,
         })];
         assert_eq!(super::filter_block_images(messages.clone(), true), messages);
+    }
+
+    // --- live image/MCP wiring tails ----------------------------------------
+
+    /// `sdk.ts:296-331`: one converter instance must re-read `blockImages`
+    /// on every call — the mid-session toggle is the whole point. The old
+    /// host captured the bool when building the loop config.
+    #[test]
+    fn live_block_images_converter_rereads_the_setting_per_call() {
+        use pi_ai::types::{ImageContent, InputContent, UserContent, UserMessage};
+
+        let messages = vec![AgentMessage::User(UserMessage {
+            content: UserContent::Blocks(vec![InputContent::Image(ImageContent {
+                data: "abc".to_string(),
+                mime_type: "image/png".to_string(),
+            })]),
+            timestamp: 1,
+        })];
+        let live = Arc::new(Mutex::new(ImageSettings {
+            block_images: false,
+            ..ImageSettings::default()
+        }));
+        // The converter built once, up front, is reused for both calls.
+        let converter = super::live_block_images_converter(Arc::clone(&live));
+
+        let first = crate::runtime::block_on(converter.call(messages.clone()));
+        assert_eq!(first, messages, "disabled: the image passes through");
+
+        live.lock().expect("image settings").block_images = true;
+        let second = crate::runtime::block_on(converter.call(messages));
+        let AgentMessage::User(user) = &second[0] else {
+            panic!("user message stays a user message");
+        };
+        let UserContent::Blocks(blocks) = &user.content else {
+            panic!("blocks stay blocks");
+        };
+        assert_eq!(
+            blocks[0].as_text(),
+            Some(crate::images::IMAGE_READING_DISABLED),
+            "the same converter sees the mid-run toggle"
+        );
+    }
+
+    /// `interactive-mode.ts:5153-5160`: the selector change rebuilds the live
+    /// image options the tool rows and the two agent-loop seams read.
+    #[test]
+    fn show_images_change_refreshes_the_live_image_cell() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stream: Arc<dyn pi_agent::types::StreamFn> = Arc::new(ScriptedStream {
+            calls: AtomicUsize::new(0),
+            file_path: "unused".to_string(),
+        });
+        let (mut mode, _capture) = fixture_with_stream(dir.path(), stream);
+        let initial = mode.live_images.lock().expect("image settings").show_images;
+        assert!(initial, "the synthetic boot settings show images");
+
+        mode.handle_settings_event(SettingsSelectorEvent::ShowImagesChange(false));
+        assert!(
+            !mode.live_images.lock().expect("image settings").show_images,
+            "the live cell follows the selector"
+        );
+    }
+
+    /// A tiny transformer that can re-encode BMP as PNG, so normalization is
+    /// observable without a real pixel backend (`images::UnavailableTransformer`
+    /// would keep the original block, which is the production state).
+    struct ToPngTransformer;
+
+    impl ImageTransformer for ToPngTransformer {
+        fn convert_to_png(&self, _input: &[u8]) -> Option<Vec<u8>> {
+            Some(b"png-bytes".to_vec())
+        }
+    }
+
+    /// `agent-session.ts:765-784`: tool/MCP image blocks are normalized once
+    /// as they enter history, after the extension hook (absent here). A
+    /// text-only result must not even allocate a normalized copy.
+    #[test]
+    fn after_hook_normalizes_tool_result_images() {
+        use pi_ai::types::ContentBlock;
+
+        let live = Arc::new(Mutex::new(ImageSettings {
+            auto_resize: false,
+            ..ImageSettings::default()
+        }));
+        let mut hook = super::ImageNormalizingAfterHook::new(live, ResizeOptions::default());
+        hook.transformer = Arc::new(ToPngTransformer);
+        let assistant = scripted_assistant(&[], StopReason::Stop);
+        let tool_call: AgentToolCall = serde_json::from_value(serde_json::json!({
+            "id": "call-1",
+            "name": "read",
+            "arguments": {}
+        }))
+        .expect("tool call");
+
+        let bmp = AgentToolResult {
+            content: vec![ContentBlock::Image(pi_ai::types::ImageContent {
+                data: base64::engine::general_purpose::STANDARD.encode(b"bmp-bytes"),
+                mime_type: "image/bmp".to_string(),
+            })],
+            ..AgentToolResult::default()
+        };
+        let override_ = crate::runtime::block_on(hook.call(&assistant, &tool_call, &bmp, false))
+            .expect("image result is rewritten");
+        let content = override_.content.expect("content override");
+        let ContentBlock::Image(image) = &content[0] else {
+            panic!("first block is the normalized image");
+        };
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(
+            image.data,
+            base64::engine::general_purpose::STANDARD.encode(b"png-bytes")
+        );
+        assert!(matches!(&content[1], ContentBlock::Text(text)
+                if text.text.contains("Image converted from image/bmp to image/png.")));
+
+        let text_only = AgentToolResult {
+            content: vec![ContentBlock::Text(TextContent {
+                text: "hello".to_string(),
+                text_signature: None,
+            })],
+            ..AgentToolResult::default()
+        };
+        assert!(
+            crate::runtime::block_on(hook.call(&assistant, &tool_call, &text_only, false))
+                .is_none(),
+            "text-only results are left alone"
+        );
+    }
+
+    /// A synthetic stdio MCP server answering `initialize`/`tools/list` —
+    /// the same fixture the extension host tests use (`extensions/mod.rs`).
+    #[cfg(all(feature = "ext-js", unix))]
+    const SYNTH_MCP_SERVER: &str = r#"#!/bin/sh
+ while IFS= read -r line; do
+   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+   case "$line" in
+     *'"method":"initialize"'*)
+       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"synth","version":"1.0.0"}}}\n' "$id" ;;
+     *'"method":"tools/list"'*)
+       printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+   esac
+ done
+ "#;
+
+    /// `runtime.ts:382-384`: the interactive pump is the MCP clock. With no
+    /// agent run in flight, repeated pumps must still settle the startup
+    /// wait and register the server's tools.
+    #[cfg(all(feature = "ext-js", unix))]
+    #[test]
+    fn pump_drives_the_mcp_startup_tick() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("synth.sh");
+        std::fs::write(&script, SYNTH_MCP_SERVER).expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+        let command = script.to_string_lossy();
+        let source = format!(
+            r#"export default function (pi) {{
+  pi.registerMcpServer("synth", {{ command: "{command}", exposure: "direct", timeout: 5 }});
+}}"#
+        );
+        let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
+            cwd: dir.path().to_string_lossy().into_owned(),
+            mode: "tui".to_string(),
+            settings: serde_json::json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        runner.load_extension("<mcp>", Some(&source)).expect("load");
+        runner.bind().expect("bind");
+        runner.connect_mcp_servers().expect("connect");
+        let runner = Arc::new(Mutex::new(runner));
+
+        let stream: Arc<dyn pi_agent::types::StreamFn> = Arc::new(ScriptedStream {
+            calls: AtomicUsize::new(0),
+            file_path: "unused".to_string(),
+        });
+        let terminal = CaptureTerminal::with_size(TerminalSize {
+            columns: 100,
+            rows: 40,
+        });
+        let options = InteractiveOptions {
+            auth_path: Some(dir.path().join("auth.json")),
+            ..InteractiveOptions::default()
+        };
+        let mut runtime = test_runtime(dir.path(), stream);
+        runtime.extension_runner = Some(Arc::clone(&runner));
+        let mut mode = InteractiveMode::new(&mut runtime, &options, Box::new(terminal));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            mode.pump();
+            if runner
+                .lock()
+                .expect("runner")
+                .tool("mcp__synth__echo")
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pump never drove an MCP tick"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }

@@ -12,7 +12,11 @@
 //! renderers cross the handle bridge as adopted components
 //! ([`super::component_proxy::ComponentProxy`]) with builtin/absent slots
 //! falling back to the text paths (`tool-execution.ts:299-344`). The
-//! image-block display of results is deferred with the image work.
+//! image-block display of results is deferred with the image work; the
+//! `showImages` render-context flag (`tool-execution.ts:122-144`, fed by the
+//! mode's `onShowImagesChange` sweep at `interactive-mode.ts:5153-5160`) is
+//! read from a shared live [`ImageSettings`] cell, so a mid-session settings
+//! change reaches every row on its next frame without a component sweep.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -25,6 +29,7 @@ use pi_tui::components::mouse_region::MouseRegion;
 use pi_tui::components::text::Text;
 use pi_tui::mouse::{MouseButton, MouseEvent, MouseEventKind, MouseEventResult};
 
+use crate::images::ImageSettings;
 use crate::tools::renderers::ToolRenderers;
 
 use super::super::theme;
@@ -204,6 +209,10 @@ pub struct ToolExecutionComponent {
     /// The expansion a region click asked for; the closure cannot borrow the
     /// component, so `handle_mouse` reconciles it with `self.expanded`.
     click_toggle: Arc<AtomicBool>,
+    /// The mode's live image-settings cell (`interactive-mode.ts:5153-5160`).
+    /// `showImages` is read per render instead of being frozen at mount, so a
+    /// `ShowImagesChange` reaches an already-open row.
+    image_settings: Arc<Mutex<ImageSettings>>,
 }
 
 impl ToolExecutionComponent {
@@ -215,6 +224,32 @@ impl ToolExecutionComponent {
         cwd: &str,
         renderers: Option<ToolRenderers>,
         js: Option<JsToolRenderers>,
+    ) -> Self {
+        Self::with_image_settings(
+            tool_name,
+            tool_call_id,
+            args,
+            output_pad,
+            cwd,
+            renderers,
+            js,
+            Arc::new(Mutex::new(ImageSettings::default())),
+        )
+    }
+
+    /// The host-facing constructor: the mode threads its shared image-settings
+    /// cell (`ImageSettings::from_settings` refreshed on every image setting
+    /// change) so the `showImages` flag is live for this row's render context.
+    #[must_use]
+    pub fn with_image_settings(
+        tool_name: &str,
+        tool_call_id: &str,
+        args: serde_json::Value,
+        output_pad: usize,
+        cwd: &str,
+        renderers: Option<ToolRenderers>,
+        js: Option<JsToolRenderers>,
+        image_settings: Arc<Mutex<ImageSettings>>,
     ) -> Self {
         let mut component = ToolExecutionComponent {
             tool_name: tool_name.to_string(),
@@ -236,6 +271,7 @@ impl ToolExecutionComponent {
             js,
             content_box: BoxComponent::new(1, 1),
             click_toggle: Arc::new(AtomicBool::new(false)),
+            image_settings,
         };
         component.update_display();
         component
@@ -495,8 +531,8 @@ impl ToolExecutionComponent {
     /// The `ToolRenderContext` flags the glue extends with state,
     /// lastComponent, invalidate, and the keybinding hints
     /// (`tool-execution.ts:122-144`). `durationMs` stays absent while
-    /// partial (absent, not null); `showImages` is false while the image
-    /// work is deferred.
+    /// partial (absent, not null); `showImages` mirrors the live setting
+    /// (`interactive-mode.ts:5153-5160`) instead of a frozen false.
     fn build_context_json(&self) -> String {
         let mut flags = serde_json::Map::new();
         flags.insert(
@@ -523,7 +559,15 @@ impl ToolExecutionComponent {
             "expanded".to_string(),
             serde_json::Value::from(self.expanded),
         );
-        flags.insert("showImages".to_string(), serde_json::Value::from(false));
+        let show_images = self
+            .image_settings
+            .lock()
+            .expect("image settings")
+            .show_images;
+        flags.insert(
+            "showImages".to_string(),
+            serde_json::Value::from(show_images),
+        );
         flags.insert(
             "isError".to_string(),
             serde_json::Value::from(self.result.as_ref().is_some_and(|result| result.is_error)),
@@ -796,5 +840,34 @@ mod tests {
         let press = MouseEvent::new(MouseEventKind::Press, 0, 2, 1, 60, 3);
         assert!(component.handle_mouse(&press).is_none());
         assert!(!component.expanded());
+    }
+
+    /// `onShowImagesChange` (`interactive-mode.ts:5153-5160`) must reach a
+    /// row that was mounted before the change: the render context's
+    /// `showImages` flag is re-read from the shared settings cell per render.
+    #[test]
+    fn show_images_flag_tracks_the_live_settings_cell() {
+        let live = Arc::new(Mutex::new(ImageSettings {
+            show_images: true,
+            ..ImageSettings::default()
+        }));
+        let component = ToolExecutionComponent::with_image_settings(
+            "read",
+            "call-1",
+            serde_json::json!({ "path": "/tmp/example.txt" }),
+            1,
+            "/tmp",
+            crate::tools::renderers::renderers_for("read"),
+            None,
+            Arc::clone(&live),
+        );
+        let show_images = || -> bool {
+            let context: serde_json::Value =
+                serde_json::from_str(&component.build_context_json()).expect("context json");
+            context["showImages"].as_bool().expect("showImages bool")
+        };
+        assert!(show_images(), "the mounted row sees showImages=true");
+        live.lock().expect("image settings").show_images = false;
+        assert!(!show_images(), "the same row sees the mid-session change");
     }
 }
