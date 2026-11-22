@@ -193,6 +193,18 @@ pub fn size_from_environment() -> TerminalSize {
     size_from_lookup(|name| std::env::var(name).ok())
 }
 
+/// `process.stdout.columns || Number(COLUMNS) || 80` (`terminal.ts:561-567`):
+/// a successful ioctl that reports zero columns or rows is just as unusable
+/// as a failing one, and must fall through to the environment/defaults.
+/// Several terminal emulators report a zero (or tiny) winsize for a freshly
+/// spawned PTY; trusting it renders a miniature frame in the top-left corner.
+pub fn size_from_ioctl_or_environment() -> TerminalSize {
+    match crossterm::terminal::size() {
+        Ok((columns, rows)) if columns > 0 && rows > 0 => TerminalSize { columns, rows },
+        _ => size_from_environment(),
+    }
+}
+
 /// `Number(text)` for the one call site pi makes it (`terminal.ts:489`, `:493`).
 ///
 /// JavaScript's `Number` is not Rust's `str::parse`: it trims surrounding
@@ -593,10 +605,7 @@ impl CrosstermTerminal {
         // `terminal.ts:485-494`: a stdout with no size (a pipe, a closed tty)
         // falls through to `COLUMNS`/`LINES` and then to 80x24, rather than
         // failing the whole terminal.
-        let size = crossterm::terminal::size().map_or_else(
-            |_| size_from_environment(),
-            |(columns, rows)| TerminalSize { columns, rows },
-        );
+        let size = size_from_ioctl_or_environment();
         Ok(Self {
             capture: FrameCapture::new(),
             responses: ResponseStore::default(),
@@ -779,12 +788,7 @@ impl Terminal for CrosstermTerminal {
     }
 
     fn refresh_size(&mut self) {
-        if let Ok(size) = crossterm::terminal::size() {
-            self.size = TerminalSize {
-                columns: size.0,
-                rows: size.1,
-            };
-        }
+        self.size = size_from_ioctl_or_environment();
     }
 
     fn override_size(&mut self, size: TerminalSize) {
