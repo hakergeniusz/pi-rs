@@ -36,15 +36,23 @@ import { createMcpToolName, mcpNamespace } from "@earendil-works/pi-mcp";
 export default function (): void {
   // QuickJS seeds Math.random() identically in each fresh runtime, so two
   // tests can otherwise pick the same temp path and collide on symlink().
+  // The exists-check alone does not save parallel tests: both can pass it
+  // before either creates the pair, so creation retries on EEXIST too.
   let file = "";
   let link = "";
   let attempt = 0;
-  do {
+  for (;;) {
     file = join(tmpdir(), `pi-ext-js-node-fixture-${Date.now()}-${Math.random()}-${attempt++}.txt`);
     link = `${file}.link`;
-  } while (existsSync(file) || existsSync(link));
-  writeFileSync(file, "fixture", "utf8");
-  symlinkSync(file, link);
+    if (existsSync(file) || existsSync(link)) continue;
+    try {
+      writeFileSync(file, "fixture", "utf8");
+      symlinkSync(file, link);
+      break;
+    } catch (error) {
+      if ((error as { code?: string } | null)?.code !== "EEXIST") throw error;
+    }
+  }
 
   const absolute = new URL("https://User:pass@Example.COM:8080/a/b?x=1#f");
   const searchUrl = new URL("http://x/?a=1&b=2");

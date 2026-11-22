@@ -23,7 +23,7 @@ use super::{
 
 /// `CLIENT_ID` (`anthropic.ts:14`, base64 in upstream source).
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-/// The encoded form in `anthropic.ts:14`, kept for the fidelity test.
+#[cfg(test)]
 const CLIENT_ID_ENCODED: &str = "OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl";
 const COPY_CODE_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
@@ -197,7 +197,7 @@ async fn login_browser(
     }
     let result = result?;
     let (code, state) = match result {
-        CallbackResult::Callback(code) => (code, generated.verifier.clone()),
+        CallbackResult::Callback(code) => (Some(code), generated.verifier.clone()),
         CallbackResult::Manual(input) => {
             let (code, state) = parse_authorization_input(&input, &generated.verifier);
             if state

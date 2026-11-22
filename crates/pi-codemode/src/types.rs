@@ -448,3 +448,11 @@ mod tests {
         assert_eq!(err.error().map_or("", |e| e.message.as_str()), "boom");
     }
 }
+
+// The VM reply sender is not `Debug`, but test helpers call `unwrap_err()` on
+// results carrying `CodemodeRun` as the Ok type; a stable label is enough.
+impl std::fmt::Debug for CodemodeRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CodemodeRun")
+    }
+}

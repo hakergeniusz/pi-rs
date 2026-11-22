@@ -24,6 +24,7 @@ use std::{
     collections::BTreeMap,
     future::Future,
     pin::Pin,
+    process::Stdio,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
@@ -33,7 +34,7 @@ use std::{
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command as TokioCommand, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command as TokioCommand},
     sync::{Mutex as AsyncMutex, oneshot},
 };
 
@@ -771,12 +772,16 @@ impl Daemon for ProcessDaemon {
     }
 
     fn kill(&self, id: u64, session: u64) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
+        // The state lock is taken here, never inside the boxed future: a
+        // `MutexGuard` is not `Send` and must not sit across the write.
+        let should_kill = {
             let state = self.inner.state.lock().expect("connection state lock");
-            if state.ready.is_some() && state.session_id == session {
+            state.ready.is_some() && state.session_id == session
+        };
+        Box::pin(async move {
+            if should_kill {
                 let mut json = JsonMap::new();
                 json.insert("mode".into(), Value::String("kill".into()));
-                drop(state);
                 let _ = write_frame(&self.inner, encode_frame(CANCEL, id, &json, &[])).await;
             }
         })

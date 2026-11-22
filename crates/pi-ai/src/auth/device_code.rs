@@ -27,7 +27,7 @@ pub const TIMEOUT_MESSAGE: &str = "Device flow timed out";
 pub const SLOW_DOWN_TIMEOUT_MESSAGE: &str = "Device flow timed out after one or more slow_down responses. This is often caused by clock drift in WSL or VM environments. Please sync or restart the VM clock and try again.";
 
 /// `OAuthDeviceCodePollResult` (`device-code.ts:11-16`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DeviceCodePollResult<T> {
     Pending,
     SlowDown { interval_seconds: Option<f64> },

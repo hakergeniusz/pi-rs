@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, channel};
 use std::thread::JoinHandle;
 
 use serde_json::Value as Json;
@@ -118,7 +118,7 @@ impl ToolExecutor for ChannelExecutor {
             if let Some(properties) = reply.properties
                 && let Ok(map) = serde_json::from_str::<serde_json::Map<String, Json>>(&properties)
             {
-                error.properties = Some(map);
+                error.properties = Some(map.into_iter().collect());
             }
             Err(error)
         }
@@ -128,10 +128,10 @@ impl ToolExecutor for ChannelExecutor {
 /// FNV-1a over the prelude bytes (`vm.ts:71-81` hashes UTF-16 code units;
 /// this prelude is ASCII so the values coincide).
 fn fnv1a(text: &str) -> u32 {
-    let mut hash = 0x811c9dc5_u32;
+    let mut hash = 0x811c_9dc5_u32;
     for byte in text.bytes() {
         hash ^= u32::from(byte);
-        hash = hash.wrapping_mul(0x01000193);
+        hash = hash.wrapping_mul(0x0100_0193);
     }
     hash
 }
@@ -361,7 +361,8 @@ impl CodemodeRun {
                     properties,
                 },
             );
-            while let Some(reply) = state.early.remove(&state.next_seq) {
+            let next_seq = state.next_seq;
+            while let Some(reply) = state.early.remove(&next_seq) {
                 if let Some(reply_now) = reply.now {
                     let mut clock = self
                         .clock
@@ -441,6 +442,10 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::Receiver;
     use std::time::Duration;
+
+    fn fresh_sandbox() -> Sandbox {
+        sandbox()
+    }
 
     fn sandbox() -> Sandbox {
         Sandbox::new(SandboxOptions::default()).expect("sandbox")
@@ -573,7 +578,7 @@ mod tests {
                 )
                 .is_err()
         );
-        let closed = sandbox();
+        let closed = fresh_sandbox();
         closed.close();
         assert_eq!(
             closed
@@ -719,7 +724,7 @@ mod tests {
         run.abort();
         assert!(run.is_finished());
         let result = run.wait();
-        assert!(result.is_err(), "{result:?}");
+        assert!(matches!(result, CodemodeResult::Err { .. }), "{result:?}");
     }
 
     #[test]

@@ -568,9 +568,8 @@ pub fn resolve_model_with(
         }
         let catalog = crate::models_state::all();
         let auth_path = crate::config::get_auth_path();
-        let supported = |model: &pi_ai::types::Model| {
-            pi_ai::providers::stream_fn_for(&model.api).is_some()
-        };
+        let supported =
+            |model: &pi_ai::types::Model| pi_ai::providers::stream_fn_for(&model.api).is_some();
         return catalog
             .iter()
             .find(|model| {

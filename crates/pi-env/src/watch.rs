@@ -105,10 +105,11 @@ pub fn parse_watch_event(json: &JsonMap) -> Option<WatchEvent> {
     let string = |key: &str| -> Option<&str> { json.get(key).and_then(Value::as_str) };
     match string("kind")? {
         "ready" => Some(WatchEvent::Ready {
+            // An absent `mode` stays absent on the ready event.
             mode: WatchMode::from_str(string("mode")),
         }),
         "change" => {
-            let mode = string("mode").map(WatchMode::from_str);
+            let mode = Some(WatchMode::from_str(string("mode")));
             let overflow = json.get("overflow").and_then(Value::as_bool) == Some(true);
             let paths = json
                 .get("paths")
@@ -333,7 +334,13 @@ impl RemoteWatcher {
         let state = self.state.clone();
         let on_change = self.on_change.clone();
         let daemon = self.daemon.clone();
-        let on_event: EventSink = Arc::new(move |event| process_event(&state, &on_change, event));
+        // `state` and `on_change` are also used by the spawned task below,
+        // so the event sink gets its own Arc handles.
+        let on_event: EventSink = {
+            let state = Arc::clone(&state);
+            let on_change = Arc::clone(&on_change);
+            Arc::new(move |event| process_event(&state, &on_change, &event))
+        };
         tokio::spawn(async move {
             let request = daemon.request(
                 "watch",

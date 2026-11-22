@@ -14,7 +14,6 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
@@ -371,7 +370,15 @@ pub async fn wait_for_callback_or_manual_input(
         message: prompt.message.clone(),
         placeholder: Some(prompt.placeholder.clone()),
     };
+    // The manual prompt must stay mounted while the callback is awaited:
+    // a user answer during the wait cancels the callback and falls through
+    // to the manual result, and a callback that yields none must still be
+    // able to await the same prompt (`callback-server.ts:160-183` — the
+    // manual promise is created before the callback wait and only aborted
+    // in the `finally`). The pinned future is polled by reference, so no
+    // select arm can take it away from the other.
     let manual = interaction.prompt_with(&manual_prompt, &manual_cancel);
+    tokio::pin!(manual);
     let callback_wait = async {
         match callback.as_mut() {
             Some(server) => server.wait().await,
@@ -379,14 +386,17 @@ pub async fn wait_for_callback_or_manual_input(
         }
     };
     tokio::select! {
+        biased;
         outcome = callback_wait => {
-            manual_cancel.cancel();
             match outcome? {
-                Some(code) => Ok(CallbackResult::Callback(code)),
+                Some(code) => {
+                    manual_cancel.cancel();
+                    Ok(CallbackResult::Callback(code))
+                }
                 None => Ok(CallbackResult::Manual(manual.await?)),
             }
         }
-        answer = manual => {
+        answer = &mut manual => {
             if let Some(token) = callback_cancel {
                 token.cancel();
             }

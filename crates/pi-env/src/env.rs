@@ -143,33 +143,37 @@ pub trait ExecutionEnv: Send + Sync {
     /// A snapshot of the working directory.
     fn cwd(&self) -> String;
     /// Resolve a path against the remote system's home and cwd.
-    fn absolute_path(
-        &self,
-        path: &str,
-        abort: &AbortSignal,
-    ) -> BoxFuture<'_, Result<String, FileError>>;
+    fn absolute_path<'a>(
+        &'a self,
+        path: &'a str,
+        abort: &'a AbortSignal,
+    ) -> BoxFuture<'a, Result<String, FileError>>;
     /// Read a UTF-8 file.
-    fn read_text_file(
-        &self,
-        path: &str,
-        abort: &AbortSignal,
-    ) -> BoxFuture<'_, Result<String, FileError>>;
+    fn read_text_file<'a>(
+        &'a self,
+        path: &'a str,
+        abort: &'a AbortSignal,
+    ) -> BoxFuture<'a, Result<String, FileError>>;
     /// Whether a file exists (a `not_found` answer becomes `false`).
-    fn exists(&self, path: &str, abort: &AbortSignal) -> BoxFuture<'_, Result<bool, FileError>>;
+    fn exists<'a>(
+        &'a self,
+        path: &'a str,
+        abort: &'a AbortSignal,
+    ) -> BoxFuture<'a, Result<bool, FileError>>;
     /// List files through the daemon.
-    fn list_files(
-        &self,
-        path: &str,
-        options: Option<&ListFilesOptions>,
-        abort: &AbortSignal,
-    ) -> BoxFuture<'_, Result<FileListing, FileError>>;
+    fn list_files<'a>(
+        &'a self,
+        path: &'a str,
+        options: Option<&'a ListFilesOptions>,
+        abort: &'a AbortSignal,
+    ) -> BoxFuture<'a, Result<FileListing, FileError>>;
     /// Run a command.
-    fn exec(
-        &self,
-        command: &Command,
-        options: Option<&ShellExecOptions>,
-        abort: &AbortSignal,
-    ) -> BoxFuture<'_, Result<ShellExecResult, ExecutionError>>;
+    fn exec<'a>(
+        &'a self,
+        command: &'a Command,
+        options: Option<&'a ShellExecOptions>,
+        abort: &'a AbortSignal,
+    ) -> BoxFuture<'a, Result<ShellExecResult, ExecutionError>>;
     /// Kill the commands this environment started.
     fn cleanup(&self) -> BoxFuture<'_, ()>;
 }
@@ -367,6 +371,9 @@ struct Handle {
     daemon: Arc<dyn Daemon>,
     id: u64,
     session: u64,
+    /// Upstream keeps the resolved path on the handle (`remote-env.ts:140-151`);
+    /// no port-side consumer reads it yet.
+    #[allow(dead_code)]
     path: String,
 }
 
@@ -377,7 +384,7 @@ impl Handle {
         json: JsonMap,
         payload: Vec<u8>,
         abort: &AbortSignal,
-    ) -> Result<Reply, crate::connection::RemoteError> {
+    ) -> Result<Reply, crate::RemoteError> {
         let mut body = json;
         body.insert("handle".into(), Value::from(self.id));
         self.daemon
@@ -394,11 +401,7 @@ impl Handle {
             .await
     }
 
-    async fn pread(
-        &self,
-        offset: Option<u64>,
-        length: u64,
-    ) -> Result<Vec<u8>, crate::connection::RemoteError> {
+    async fn pread(&self, offset: Option<u64>, length: u64) -> Result<Vec<u8>, crate::RemoteError> {
         let mut json = JsonMap::new();
         if let Some(offset) = offset {
             json.insert("offset".into(), Value::from(offset));
@@ -442,7 +445,7 @@ pub struct RemoteExecutionEnv {
     shell_path: Option<String>,
     shell_env: Option<Vec<(String, String)>>,
     watch: RemoteWatchOptions,
-    running: Mutex<Vec<(u64, u64)>>,
+    running: Arc<Mutex<Vec<(u64, u64)>>>,
 }
 
 impl std::fmt::Debug for RemoteExecutionEnv {
@@ -467,7 +470,7 @@ impl RemoteExecutionEnv {
             shell_path: options.shell_path,
             shell_env: options.shell_env,
             watch: options.watch,
-            running: Mutex::new(Vec::new()),
+            running: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -483,11 +486,7 @@ impl RemoteExecutionEnv {
         self.cwd.lock().expect("cwd lock").clone()
     }
 
-    async fn resolve(
-        &self,
-        path: &str,
-        abort: &AbortSignal,
-    ) -> Result<String, crate::connection::RemoteError> {
+    async fn resolve(&self, path: &str, abort: &AbortSignal) -> Result<String, crate::RemoteError> {
         let info = self.daemon.info(Some(abort.clone())).await?;
         let cwd = self.cwd_snapshot();
         Ok(resolve_remote_path(path, &info, &cwd))
@@ -497,7 +496,7 @@ impl RemoteExecutionEnv {
         &self,
         resolved: &str,
         mut json: JsonMap,
-    ) -> Result<(Handle, JsonMap), crate::connection::RemoteError> {
+    ) -> Result<(Handle, JsonMap), crate::RemoteError> {
         json.insert("path".into(), Value::String(resolved.to_owned()));
         let reply = self
             .daemon
@@ -593,7 +592,7 @@ impl RemoteExecutionEnv {
             .await
             .map_err(|error| to_file_error(&error, Some(&resolved)))?;
         let outcome = async {
-            if let Some(error) = reply.json.get("statError") {
+            if let Some(error) = reply.get("statError") {
                 return Err(to_file_error(
                     &RemoteError::from_fields(error.as_object().cloned().unwrap_or_default()),
                     Some(&resolved),
@@ -601,7 +600,6 @@ impl RemoteExecutionEnv {
             }
             let stat = RemoteFileInfo::from_json(
                 reply
-                    .json
                     .get("stat")
                     .and_then(Value::as_object)
                     .unwrap_or(&JsonMap::new()),
@@ -781,17 +779,17 @@ impl RemoteExecutionEnv {
         if let Some(failure) = abort_result(abort, None) {
             return failure;
         }
-        let resolved = targets
-            .iter()
-            .map(|target| {
-                Ok(WatchTarget {
-                    path: self
-                        .resolve(&target.path, abort)
-                        .map_err(|error| to_file_error(&error, None))?,
-                    ..target.clone()
-                })
-            })
-            .collect::<Result<Vec<_>, FileError>>()?;
+        let mut resolved = Vec::with_capacity(targets.len());
+        for target in targets {
+            let path = self
+                .resolve(&target.path, abort)
+                .await
+                .map_err(|error| to_file_error(&error, None))?;
+            resolved.push(WatchTarget {
+                path,
+                ..target.clone()
+            });
+        }
         if let Some(failure) = abort_result(abort, None) {
             return failure;
         }
@@ -982,41 +980,45 @@ impl ExecutionEnv for RemoteExecutionEnv {
         self.cwd_snapshot()
     }
 
-    fn absolute_path(
-        &self,
-        path: &str,
-        abort: &AbortSignal,
-    ) -> BoxFuture<'_, Result<String, FileError>> {
+    fn absolute_path<'a>(
+        &'a self,
+        path: &'a str,
+        abort: &'a AbortSignal,
+    ) -> BoxFuture<'a, Result<String, FileError>> {
         Box::pin(self.absolute_path(path, abort))
     }
 
-    fn read_text_file(
-        &self,
-        path: &str,
-        abort: &AbortSignal,
-    ) -> BoxFuture<'_, Result<String, FileError>> {
+    fn read_text_file<'a>(
+        &'a self,
+        path: &'a str,
+        abort: &'a AbortSignal,
+    ) -> BoxFuture<'a, Result<String, FileError>> {
         Box::pin(self.read_text_file(path, abort))
     }
 
-    fn exists(&self, path: &str, abort: &AbortSignal) -> BoxFuture<'_, Result<bool, FileError>> {
+    fn exists<'a>(
+        &'a self,
+        path: &'a str,
+        abort: &'a AbortSignal,
+    ) -> BoxFuture<'a, Result<bool, FileError>> {
         Box::pin(self.exists(path, abort))
     }
 
-    fn list_files(
-        &self,
-        path: &str,
-        options: Option<&ListFilesOptions>,
-        abort: &AbortSignal,
-    ) -> BoxFuture<'_, Result<FileListing, FileError>> {
+    fn list_files<'a>(
+        &'a self,
+        path: &'a str,
+        options: Option<&'a ListFilesOptions>,
+        abort: &'a AbortSignal,
+    ) -> BoxFuture<'a, Result<FileListing, FileError>> {
         Box::pin(self.list_files(path, options, abort))
     }
 
-    fn exec(
-        &self,
-        command: &Command,
-        options: Option<&ShellExecOptions>,
-        abort: &AbortSignal,
-    ) -> BoxFuture<'_, Result<ShellExecResult, ExecutionError>> {
+    fn exec<'a>(
+        &'a self,
+        command: &'a Command,
+        options: Option<&'a ShellExecOptions>,
+        abort: &'a AbortSignal,
+    ) -> BoxFuture<'a, Result<ShellExecResult, ExecutionError>> {
         Box::pin(self.exec(command, options, abort))
     }
 

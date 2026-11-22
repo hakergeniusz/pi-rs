@@ -596,7 +596,9 @@ pub struct StreamableHttpTransport {
     /// Server-initiated requests and notifications (SSE events on the GET
     /// stream and on response streams), like the stdio transport's
     /// diagnostics channel.
-    pub inbound: mpsc::Receiver<InboundMessage>,
+    /// Guarded because the host may drain it by reference
+    /// ([`crate::client::McpClient::try_recv_inbound`]).
+    pub inbound: std::sync::Mutex<mpsc::Receiver<InboundMessage>>,
 }
 
 impl StreamableHttpTransport {
@@ -651,7 +653,7 @@ impl StreamableHttpTransport {
             }),
             next_id: AtomicI64::new(0),
             get_stream_task: std::sync::Mutex::new(None),
-            inbound: receiver,
+            inbound: std::sync::Mutex::new(receiver),
         })
     }
 
@@ -1952,7 +1954,13 @@ mod tests {
             .await
             .expect("answered over SSE");
         assert_eq!(result["ok"], true);
-        let inbound = transport.inbound.recv().await.expect("notification routed");
+        let inbound = transport
+            .inbound
+            .lock()
+            .expect("inbound mutex poisoned")
+            .recv()
+            .await
+            .expect("notification routed");
         assert!(
             matches!(inbound, InboundMessage::Notification(ref notification)
                      if notification.method == "notifications/message"),
@@ -1979,7 +1987,13 @@ mod tests {
             .request("tools/list", None, Duration::from_secs(5))
             .await
             .expect("answered");
-        let inbound = transport.inbound.recv().await.expect("notification routed");
+        let inbound = transport
+            .inbound
+            .lock()
+            .expect("inbound mutex poisoned")
+            .recv()
+            .await
+            .expect("notification routed");
         assert!(
             matches!(inbound, InboundMessage::Notification(ref notification)
                      if notification.method == "notifications/tools/list_changed"),
@@ -2066,7 +2080,13 @@ mod tests {
             .await
             .expect("batched reply");
         assert_eq!(result["batched"], true);
-        let inbound = transport.inbound.recv().await.expect("notification routed");
+        let inbound = transport
+            .inbound
+            .lock()
+            .expect("inbound mutex poisoned")
+            .recv()
+            .await
+            .expect("notification routed");
         assert!(
             matches!(inbound, InboundMessage::Notification(_)),
             "{inbound:?}"
@@ -2284,10 +2304,17 @@ mod tests {
             .notify("notifications/initialized", None)
             .await
             .expect("initialized");
-        let inbound = tokio::time::timeout(Duration::from_secs(5), transport.inbound.recv())
-            .await
-            .expect("GET stream notification in time")
-            .expect("notification routed");
+        let inbound = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport
+                .inbound
+                .lock()
+                .expect("inbound mutex poisoned")
+                .recv(),
+        )
+        .await
+        .expect("GET stream notification in time")
+        .expect("notification routed");
         assert!(
             matches!(inbound, InboundMessage::Notification(ref notification)
                      if notification.method == "notifications/tools/list_changed"),

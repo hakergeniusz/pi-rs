@@ -14,14 +14,14 @@ pub mod common;
 /// Google Generative AI + Google Vertex adapters (TS `api/google-*.ts`).
 pub mod google;
 pub mod google_shared;
+/// Mistral native Chat Completions adapter (TS `api/mistral-conversations.ts`).
+pub mod mistral;
 /// OpenAI Codex (ChatGPT backend) adapter (TS `api/openai-codex-responses.ts`).
 pub mod openai_codex;
 /// OpenAI Chat Completions adapter, shared by the compatible relays.
 pub mod openai_completions;
 /// OpenAI Responses + Azure OpenAI Responses adapters (TS `api/openai-responses.ts`).
 pub mod openai_responses;
-/// Mistral native Chat Completions adapter (TS `api/mistral-conversations.ts`).
-pub mod mistral;
 /// pi's serialized assistant-message event protocol (TS `api/pi-messages.ts`).
 pub mod pi_messages;
 

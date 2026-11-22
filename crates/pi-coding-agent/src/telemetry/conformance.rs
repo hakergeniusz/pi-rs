@@ -257,7 +257,7 @@ fn links_do_not_change_parents(fixture: &TelemetryAdapterFixture) {
         },
         &mut |span| {
             span.add_link(SpanLink {
-                context: target_carrier,
+                context: target_carrier.clone(),
                 attributes: attrs(&[("reason", AttributeValue::String("late".to_string()))]),
             });
         },
@@ -422,7 +422,8 @@ fn callback_lifecycle(fixture: &TelemetryAdapterFixture) {
         });
     assert!(admitted);
     assert_eq!(calls, 1);
-    let span = find_span(&fixture.context.get_spans(), "success");
+    let spans = fixture.context.get_spans();
+    let span = find_span(&spans, "success");
     assert_eq!(span.status, SpanStatus::Ok);
     assert!(span.settled);
 }
@@ -485,7 +486,8 @@ fn recording_merges_and_orders(fixture: &TelemetryAdapterFixture) {
         },
     );
 
-    let span = find_span(&fixture.context.get_spans(), "recording");
+    let spans = fixture.context.get_spans();
+    let span = find_span(&spans, "recording");
     assert_eq!(
         span.attributes,
         attrs(&[

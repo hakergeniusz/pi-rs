@@ -21,8 +21,8 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 use crate::{
-    JsonMap,
-    connection::{AbortSignal, Daemon, Event, RequestOptions},
+    AbortSignal, JsonMap,
+    connection::{Daemon, Event, RequestOptions},
     errors::RemoteError,
 };
 
@@ -111,12 +111,13 @@ impl RemoteProcess {
         json.insert("target".into(), Value::from(self.id));
         let daemon = self.daemon.clone();
         let session = self.session;
+        let op = op.to_string();
         tokio::spawn(async move {
             // Stdin already closed, the program ended, or a lost connection:
             // `exited` reports the end (`process.ts:69-73`).
             let _ = daemon
                 .request(
-                    op,
+                    &op,
                     json,
                     RequestOptions {
                         payload,
@@ -147,7 +148,9 @@ impl RemoteProcess {
 
     /// The exit code, or the daemon's failure (`exited`, `process.ts:32`).
     pub async fn exited(&mut self) -> Result<i64, RemoteError> {
-        match self.exited.await {
+        // Awaiting by reference: the receiver stays in `self` for a second
+        // poll to observe the same end.
+        match (&mut self.exited).await {
             Ok(result) => result,
             Err(_) => Err(RemoteError::lost("pi-env connection lost")),
         }

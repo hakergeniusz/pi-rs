@@ -18,11 +18,12 @@ use super::callback::{
 use super::device_code::{
     DeviceCodePollOptions, DeviceCodePollResult, poll_oauth_device_code_flow,
 };
+use super::callback::CallbackResult;
 use super::http::{form_encode, parse_authorization_input, send};
 use super::pkce;
 use super::{
-    AuthError, AuthEvent, AuthPrompt, AuthPromptOption, CallbackResult, CancelToken,
-    EndpointConfig, FlowConfig, Interaction, OAuthCredential, now_ms,
+    AuthError, AuthEvent, AuthPrompt, AuthPromptOption, CancelToken, EndpointConfig, FlowConfig,
+    Interaction, OAuthCredential, now_ms,
 };
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -157,15 +158,14 @@ fn credentials_from_token(mut credential: OAuthCredential) -> Result<OAuthCreden
     let account_id = decode_jwt(&credential.access)
         .and_then(|payload| payload.get(JWT_CLAIM_PATH).cloned())
         .and_then(|claim| claim.get("chatgpt_account_id").cloned())
-        .and_then(Value::as_str)
+        .and_then(|claim| claim.as_str().map(str::to_string))
         .filter(|account| !account.is_empty())
-        .map(str::to_string)
         .ok_or_else(|| AuthError::Message("Failed to extract accountId from token".to_string()))?;
     credential.account_id = Some(account_id);
     Ok(credential)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct DeviceAuthInfo {
     device_auth_id: String,
     user_code: String,
@@ -293,8 +293,7 @@ async fn poll_device_auth(
                 Value::Object(object) => object.get("code").cloned(),
                 other => Some(other),
             })
-            .and_then(Value::as_str)
-            .map(str::to_string);
+            .and_then(|value| value.as_str().map(str::to_string));
         match error_code.as_deref() {
             Some("deviceauth_authorization_pending") => DeviceCodePollResult::Pending,
             Some("slow_down") => DeviceCodePollResult::SlowDown {
@@ -396,6 +395,8 @@ async fn login_browser(
         host: &config.openai_codex.callback_host,
         port: config.openai_codex.callback_port,
         path: &config.openai_codex.callback_path,
+        // The redirect URI says localhost (`openai-codex.ts:26`).
+        redirect_host: Some("localhost"),
         state: Some(&state),
         cancel: interaction.cancellation(),
         timeout: None,
@@ -417,7 +418,7 @@ async fn login_browser(
     }
     let result = result?;
     let code = match result {
-        CallbackResult::Callback(code) => code,
+        CallbackResult::Callback(code) => Some(code),
         CallbackResult::Manual(input) => {
             let (code, parsed_state) = parse_authorization_input(&input, &state);
             if parsed_state

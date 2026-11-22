@@ -19,6 +19,7 @@
 //!   serialization map from `ssh.ts:227-254` — the port is single-threaded
 //!   per host and documents the gap.
 
+use std::process::Stdio;
 use std::{
     error::Error,
     fmt::{self, Write},
@@ -29,10 +30,7 @@ use std::{
 use base64::Engine;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::{
-    io::AsyncWriteExt,
-    process::{Command as TokioCommand, Stdio},
-};
+use tokio::{io::AsyncWriteExt, process::Command as TokioCommand};
 
 use crate::{
     connection::{BoxFuture, CommandSource, ConnectionOptions, Daemon, ProcessDaemon},

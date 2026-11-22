@@ -341,12 +341,11 @@ impl Interaction {
     /// `Login cancelled` (`interaction.signal.abort()`).
     pub fn cancel(&self) {
         self.cancel.cancel();
-        for (_, sender) in self
-            .answers
-            .lock()
-            .expect("oauth answers mutex poisoned")
-            .drain()
-        {
+        // BTreeMap has no stable drain; take the whole map and reject the
+        // senders it held.
+        let answers =
+            std::mem::take(&mut *self.answers.lock().expect("oauth answers mutex poisoned"));
+        for (_, sender) in answers {
             let _ = sender.send(Err(AuthError::Cancelled));
         }
     }

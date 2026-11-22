@@ -51,7 +51,7 @@ const MAX_LOOP_ITERATIONS: usize = 100_000;
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 
 /// Everything needed to start one VM (`VmStartData` plus host limits).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VmOptions<'a> {
     /// Async-function body to evaluate.
     pub code: &'a str,

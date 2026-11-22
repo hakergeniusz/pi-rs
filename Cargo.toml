@@ -9,6 +9,7 @@ members = [
 	"crates/pi-codemode",
 	"crates/pi-coding-agent",
 	"crates/pi-ext-js",
+	"crates/pi-env",
 ]
 
 [workspace.package]

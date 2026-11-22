@@ -60,7 +60,6 @@ mod azure_config;
 #[path = "openai_responses_shared.rs"]
 mod shared;
 
-
 use std::collections::BTreeMap;
 use std::time::Duration;
 

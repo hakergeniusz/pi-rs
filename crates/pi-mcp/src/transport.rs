@@ -25,7 +25,9 @@ pub struct StdioTransport {
     outgoing: mpsc::Sender<Outgoing>,
     pending: PendingMap,
     /// Server-initiated notifications (and malformed lines, for diagnostics).
-    pub inbound: mpsc::Receiver<InboundMessage>,
+    /// Guarded because the host may drain it by reference
+    /// ([`crate::client::McpClient::try_recv_inbound`]).
+    pub inbound: std::sync::Mutex<mpsc::Receiver<InboundMessage>>,
     next_id: Arc<Mutex<i64>>,
     child: Arc<Mutex<Child>>,
     reader_task: JoinHandle<()>,
@@ -91,7 +93,7 @@ impl StdioTransport {
         Ok(Self {
             outgoing: outgoing_tx,
             pending,
-            inbound: inbound_rx,
+            inbound: std::sync::Mutex::new(inbound_rx),
             next_id: Arc::new(Mutex::new(1)),
             child: Arc::new(Mutex::new(child)),
             reader_task,

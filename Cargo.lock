@@ -1557,6 +1557,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-env"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pi-ext-js"
 version = "0.1.0"
 dependencies = [

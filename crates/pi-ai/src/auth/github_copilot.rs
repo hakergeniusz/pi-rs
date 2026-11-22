@@ -11,7 +11,7 @@
 //! picker/policy rules. Enterprise URLs are only synthesized for non-default
 //! domains; tests substitute the loopback endpoint table for `github.com`.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::CANCEL_MESSAGE;
 use super::device_code::{
@@ -25,6 +25,7 @@ use super::{
 };
 
 const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
+#[cfg(test)]
 const CLIENT_ID_ENCODED: &str = "SXYxLmI1MDdhMDhjODdlY2ZlOTg=";
 const COPILOT_API_VERSION: &str = "2026-06-01";
 const USER_AGENT: &str = "GitHubCopilotChat/0.35.0";

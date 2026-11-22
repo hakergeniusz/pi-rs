@@ -12,7 +12,6 @@ rust-version.workspace = true
 # All already resolved in the workspace lockfile; no new external crate is
 # introduced by this port (see WIRING.md).
 base64 = { workspace = true }
-dirs = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }

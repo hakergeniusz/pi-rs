@@ -237,13 +237,19 @@ pub enum RpcExtensionCommandOutcome {
 /// What upstream's `_runInputHandlers` (`:2206-2217`) did to a submission. The
 /// host owns any image transformation; the replacement text is what reaches
 /// expansion and the run.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcInputDisposition {
     /// Continue with the original text (`None`) or a host replacement.
-    #[default]
     Continue(Option<String>),
     /// An extension input handler consumed the input: `"handled"`, no run.
     Handled,
+}
+
+impl Default for RpcInputDisposition {
+    /// `Continue(None)`: the original text reaches expansion and the run.
+    fn default() -> Self {
+        Self::Continue(None)
+    }
 }
 
 /// The host-owned operations `rpc-mode.ts` delegates to `runtimeHost` and

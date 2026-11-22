@@ -388,9 +388,21 @@ impl McpClient {
     /// (upstream's notification listeners, `runtime.ts:369`, `:382-384`).
     /// The host polls this on its event loop; there is no internal timer.
     pub fn try_recv_inbound(&self) -> Option<InboundMessage> {
+        // `Receiver::try_recv` takes `&mut`, so the guarded receivers are
+        // locked for the non-async drain.
         match &self.transport {
-            ActiveTransport::Stdio(transport) => transport.inbound.try_recv().ok(),
-            ActiveTransport::Http(transport) => transport.inbound.try_recv().ok(),
+            ActiveTransport::Stdio(transport) => transport
+                .inbound
+                .lock()
+                .expect("inbound mutex poisoned")
+                .try_recv()
+                .ok(),
+            ActiveTransport::Http(transport) => transport
+                .inbound
+                .lock()
+                .expect("inbound mutex poisoned")
+                .try_recv()
+                .ok(),
         }
     }
 

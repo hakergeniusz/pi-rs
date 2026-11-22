@@ -219,7 +219,7 @@ mod tests {
         let counter = std::sync::Arc::new(AtomicUsize::new(0));
         let seen = std::sync::Arc::clone(&counter);
         {
-            let reservation = WorkerReservation::new(move || {
+            let _reservation = WorkerReservation::new(move || {
                 seen.fetch_add(1, Ordering::SeqCst);
             });
             assert_eq!(counter.load(Ordering::SeqCst), 0);
@@ -272,5 +272,12 @@ mod tests {
             assert_eq!(error.kind, CodemodeErrorKind::Sandbox);
             assert!(!error.message.is_empty());
         }
+    }
+}
+
+// The release callback is not `Debug`; tests only need a stable label.
+impl std::fmt::Debug for WorkerReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WorkerReservation")
     }
 }

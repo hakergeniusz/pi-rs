@@ -17,8 +17,8 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 use crate::{
-    JsonMap,
-    connection::{AbortSignal, Daemon, Event, RequestOptions},
+    AbortSignal, JsonMap,
+    connection::{Daemon, Event, RequestOptions},
     errors::RemoteError,
 };
 
@@ -122,12 +122,13 @@ impl RemoteTerminal {
         body.insert("target".into(), Value::from(self.id));
         let daemon = self.daemon.clone();
         let session = self.session;
+        let op = op.to_string();
         tokio::spawn(async move {
             // A terminal that ended or a lost connection: `exited` reports it
             // (`terminal.ts:84-89`).
             let _ = daemon
                 .request(
-                    op,
+                    &op,
                     body,
                     RequestOptions {
                         payload,
@@ -188,7 +189,9 @@ impl RemoteTerminal {
 
     /// The exit code, or the daemon's failure (`exited`, `terminal.ts:32`).
     pub async fn exited(&mut self) -> Result<i64, RemoteError> {
-        match self.exited.await {
+        // Awaiting by reference: the receiver stays in `self` for a second
+        // poll to observe the same end.
+        match (&mut self.exited).await {
             Ok(result) => result,
             Err(_) => Err(RemoteError::lost("pi-env connection lost")),
         }

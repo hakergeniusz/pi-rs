@@ -9842,7 +9842,7 @@ impl InteractiveMode {
             // Extension oauth providers run through the engine bridge
             // (`adaptOAuth`'s login arm, `provider-composer.ts:363-375`).
             #[cfg(feature = "ext-js")]
-            if self.start_extension_oauth_login(provider, back) {
+            if self.start_extension_oauth_login(provider, back.clone()) {
                 return;
             }
             // Built-in flows (Anthropic, OpenAI Codex, GitHub Copilot) run
@@ -9954,10 +9954,10 @@ impl InteractiveMode {
         if self.suspended_editor.is_some() {
             return;
         }
-        let events = Arc::new(Mutex::new(Vec::new()));
         self.builtin_login_prompt_id = Some(id);
         match prompt {
             pi_ai::auth::AuthPrompt::Select { message, options } => {
+                let events: Arc<Mutex<Vec<AuthSelectorEvent>>> = Arc::new(Mutex::new(Vec::new()));
                 let labels = options
                     .iter()
                     .map(|option| option.label.clone())
@@ -9980,6 +9980,7 @@ impl InteractiveMode {
                 message,
                 placeholder,
             } => {
+                let events: Arc<Mutex<Vec<LoginPromptEvent>>> = Arc::new(Mutex::new(Vec::new()));
                 let dialog =
                     LoginPromptComponent::new(message, placeholder.as_deref(), Arc::clone(&events));
                 self.builtin_login_prompt = Some(events);
@@ -10115,7 +10116,7 @@ impl InteractiveMode {
             Ok(credential) => {
                 let storage = crate::auth::AuthStorage::create(&self.auth_path);
                 match storage.modify(flow.provider_id(), |_current| Ok(Some(credential))) {
-                    Ok(()) => self.show_status(&format!(
+                    Ok(_) => self.show_status(&format!(
                         "Logged in to {}. Credentials saved to {}",
                         flow.provider_name(),
                         self.auth_path.display()

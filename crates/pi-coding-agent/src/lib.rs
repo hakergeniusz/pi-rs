@@ -40,6 +40,9 @@ pub mod config;
 pub mod crash_log;
 /// Runtime-agnostic extension host seam (runtime decision pending at the P5 gate).
 pub mod extensions;
+/// Image sniffing, resizing policy and attachment pipeline (`utils/mime.ts`,
+/// `core/tools/image-resize-core.ts`).
+pub mod images;
 /// MCP `mcp.json` discovery and loader (`extensions/mcp/config.ts`).
 pub mod mcp_config;
 /// Model reference resolution and scope patterns

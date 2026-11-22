@@ -408,9 +408,12 @@ pub(crate) fn resolve_function_calling_mode(
     if matches!(choice, Some("NONE" | "ANY")) {
         return Ok(choice);
     }
-    let use_strict = tools
-        .iter()
-        .any(|tool| resolve_json_schema_strict(tool, supports_strict).ok().flatten().unwrap_or(false));
+    let use_strict = tools.iter().any(|tool| {
+        resolve_json_schema_strict(tool, supports_strict)
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    });
     if use_strict {
         return Ok(Some("VALIDATED"));
     }

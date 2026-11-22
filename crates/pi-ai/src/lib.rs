@@ -15,6 +15,8 @@
 //! throw on request/model/runtime failures; failures are encoded as protocol
 //! events and a final assistant message with stop reason `error`/`aborted`.
 
+/// Built-in per-provider OAuth login and refresh flows (`packages/ai/src/auth/`).
+pub mod auth;
 /// The embedded model catalog: generated data, overlay, lookup.
 pub mod catalog;
 /// The tool-declared constrained-sampling config (`ConstrainedSamplingConfig`).

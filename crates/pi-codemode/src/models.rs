@@ -167,7 +167,7 @@ impl ModelInfo {
         let mut object = self.fields.clone();
         object.insert("provider".to_string(), Json::String(self.provider.clone()));
         object.insert("id".to_string(), Json::String(self.id.clone()));
-        Json::Object(object)
+        Json::Object(object.into_iter().collect())
     }
 }
 
@@ -594,7 +594,7 @@ fn model_call(
         "imageCount".to_string(),
         Json::from(u64::try_from(result.image_count).unwrap_or(u64::MAX)),
     );
-    Ok(Json::Object(object))
+    Ok(Json::Object(object.into_iter().collect()))
 }
 
 fn classify_call(

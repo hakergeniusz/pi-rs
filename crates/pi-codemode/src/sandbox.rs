@@ -515,6 +515,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CallStatus;
     use crate::types::{AbortFlag, CodemodeErrorKind, OutputItem};
     use serde_json::json;
 
