@@ -3761,6 +3761,30 @@ exports; pi-tui shims are data-shape only; no live Agent loop in
 upstream feature surface is otherwise covered; remaining differences are
 mechanism-level and documented in module docs and `docs/upstream/` notes.
 
+## 2026-11-22 — live release TUI verification
+
+Release binary rebuilt on host and exercised in tmux session `pi-rs-tui-test`
+(120×40), first with `openai-codex/gpt-6-luna` (blocked: stored token expired;
+built-in Codex OAuth login is not implemented) then with
+`nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b` (env key; both it and the
+`openrouter/...:free` variant answered `PONG` in print mode). Note: the tmux
+server had a stale `PI_CODING_AGENT_DIR=~/.config/pi`; the session is launched
+with `env -u PI_CODING_AGENT_DIR -u PI_CODING_AGENT_SESSION_DIR` so pi-rs uses
+its own XDG root.
+
+Verified live: header/footer, startup help, `/` and `@` autocomplete,
+`/hotkeys`, `/settings` (32 rows + search + TUI-mode row + overlay guard),
+`/trust`, `/resume`, `/session`, `/changelog`, `/mcp`, `/theme`, `!` via PTY,
+Ctrl+P model cycle, `/model`, Ctrl+O tool-output expansion, fullscreen and
+regular renderers, `/compact` (verbatim "Nothing to compact"), `/new`, and a
+Nemotron tool round-trip (read Cargo.toml → tool row → streamed markdown answer,
+footer usage updated). Shift+Tab produced no visible thinking-level change with
+this model (it exposes no thinking-level map).
+
+**Live bug found and fixed:** `/mcp` stayed on "Loading…" in fullscreen
+because the post-mount downcast via `HostSlot::Editor` resolves the original
+editor id; the menu is now set on the component before mounting (`6d94910`).
+
 ## Deferred items backlog (from P4 reports)
 - `unicode-normalization` dep for byte-exact NFKC (edit tool fuzzy match).
 - `serde_json` workspace feature `float_roundtrip` (exotic >17-digit literals, 1 ULP rewrites in session JSONL).
