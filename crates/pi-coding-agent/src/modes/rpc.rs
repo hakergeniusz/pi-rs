@@ -33,6 +33,17 @@
 //! disposition; a failure after it is swallowed (`:425-429`). The
 //! delivery-time `queue_update` mirrors `_handleAgentEvent`
 //! (`agent-session.ts:1181-1198`).
+//!
+//! The rest of the preflight contract (`agent-session.ts:2162-2263`) is
+//! exposed through [`RpcHost`] callbacks with inert defaults: extension
+//! command handler execution (`:2268-2292`), input handlers and their
+//! `"handled"` disposition (`:2206-2216`), skill/template expansion
+//! (`:2219-2224,2294-2323`), the no-model refusal (`:2242-2245`,
+//! `auth-guidance.ts:18-21`), and the `model_select` extension event
+//! (`:2624-2636,2644-2664,2733-2758`, `extensions/types.ts:1152-1160`).
+//! Upstream sends `model_select` only to extension listeners — never to
+//! `session.subscribe` — so the default emits it through the extension runner,
+//! not onto RPC stdout. `WIRING.md` records the host contract.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -212,6 +223,29 @@ pub struct RpcAuthCheck {
     pub using_oauth: bool,
 }
 
+/// The outcome of `_tryExecuteExtensionCommand` (`agent-session.ts:2268-2292`):
+/// upstream returns `true` both when the handler completes and when it throws
+/// (the error goes to the extension runner, not the RPC response).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcExtensionCommandOutcome {
+    /// No command of that name is registered; preflight continues.
+    NotFound,
+    /// A handler ran (or failed); the prompt is consumed.
+    Handled,
+}
+
+/// What upstream's `_runInputHandlers` (`:2206-2217`) did to a submission. The
+/// host owns any image transformation; the replacement text is what reaches
+/// expansion and the run.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RpcInputDisposition {
+    /// Continue with the original text (`None`) or a host replacement.
+    #[default]
+    Continue(Option<String>),
+    /// An extension input handler consumed the input: `"handled"`, no run.
+    Handled,
+}
+
 /// The host-owned operations `rpc-mode.ts` delegates to `runtimeHost` and
 /// `AgentSession` (`:328-345,456-463,501-507,582-650,701-732`). The port has
 /// no `AgentSessionRuntime` in RPC mode, so [`LocalRpcHost`] reconstructs the
@@ -270,6 +304,82 @@ pub trait RpcHost: Send {
     /// disposition, and no run starts. [`RpcAuthCheck::using_oauth`] selects
     /// the expired-credentials refusal over the missing-key one.
     fn check_auth(&self, runtime: &PrintRuntime, provider: &str) -> Result<RpcAuthCheck, String>;
+
+    /// `_tryExecuteExtensionCommand` (`:2268-2292`): the leading `/name` and
+    /// its args. The default only checks the command table (so a known
+    /// extension command stays `"handled"`); a full host executes the handler
+    /// here and lets it drive the session before answering.
+    fn execute_extension_command(
+        &self,
+        runtime: &mut PrintRuntime,
+        name: &str,
+        _args: &str,
+    ) -> Result<RpcExtensionCommandOutcome, String> {
+        let registered = self.get_commands(runtime)?.into_iter().any(|command| {
+            command.get("name").and_then(Value::as_str) == Some(name)
+                && command.get("source").and_then(Value::as_str) == Some("extension")
+        });
+        Ok(if registered {
+            RpcExtensionCommandOutcome::Handled
+        } else {
+            RpcExtensionCommandOutcome::NotFound
+        })
+    }
+
+    /// `_runInputHandlers` (`:2206-2216`) with `source: "rpc"`
+    /// (`rpc-mode.ts:419`). An input handler can consume the message (the
+    /// `"handled"` disposition) or rewrite its text before expansion. The
+    /// port has no RPC input-handler surface, so the default passes through.
+    #[allow(clippy::unused_self)] // an input-handler host needs the receiver
+    fn run_input_handlers(
+        &self,
+        _runtime: &mut PrintRuntime,
+        _text: &str,
+        _images: &[pi_ai::types::ImageContent],
+        _source: &str,
+    ) -> Result<RpcInputDisposition, String> {
+        Ok(RpcInputDisposition::Continue(None))
+    }
+
+    /// The skill/template expansion of `:2219-2224,2294-2323` and
+    /// `:2343-2344`. Upstream expands `/skill:name` bodies and
+    /// `promptTemplates` into the text actually sent or queued. The default
+    /// sends the original text; a full host expands with
+    /// `crate::prompt_templates::expand_prompt_template` and the skill reader.
+    #[allow(clippy::unused_self)] // a resource-owning host needs the receiver
+    fn expand_prompt(
+        &self,
+        _runtime: &PrintRuntime,
+        _text: &str,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// The `if (!this.model)` gate of `_preparePrompt` (`:2242-2245`). The
+    /// port always resolves an initial model, so the default reports one; a
+    /// host with a removable model can make the verbatim refusal reachable.
+    #[allow(clippy::unused_self)] // a model-owning host needs the receiver
+    fn has_model(&self, _runtime: &PrintRuntime) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    /// `_emitModelSelect`'s event (`:2624-2636`), built by
+    /// [`model_select_event`]. Upstream emits to extension listeners only; the
+    /// default forwards through the extension runner. A full host can also
+    /// surface it on an event bus the RPC client subscribes to.
+    fn emit_model_select(&self, runtime: &PrintRuntime, event: &Value) -> Result<(), String> {
+        emit_extension_event(runtime, event)
+    }
+
+    /// `rebindSession`'s `onError` (`rpc-mode.ts:355-357`): a handler that
+    /// throws during `_tryExecuteExtensionCommand` (`:2283-2291`) still
+    /// consumes the prompt, while the error crosses as an `extension_error`
+    /// frame. The default has no error channel; a full host forwards its
+    /// `onError` here.
+    #[allow(clippy::unused_self)] // the host owns the extension error channel
+    fn emit_extension_error(&self, _runtime: &PrintRuntime, _event: &Value) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The default [`RpcHost`] — the same seams the interactive host uses, minus
@@ -557,6 +667,36 @@ fn emit_start(runtime: &PrintRuntime, reason: &str, previous: Option<&str>) {
     }
 }
 
+/// Notification-only extension emit (`runner.ts:1103-1132`,
+/// `agent-session.ts:2630-2635`): upstream's `model_select` reaches extension
+/// listeners and nothing else. The RPC client never sees it unless an
+/// extension handler re-emits a session event.
+#[cfg(feature = "ext-js")]
+fn emit_extension_event(runtime: &PrintRuntime, event: &Value) -> Result<(), String> {
+    let Some(runner) = &runtime.extension_runner else {
+        return Ok(());
+    };
+    let event_name = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut runner = runner.lock().expect("extension runner mutex poisoned");
+    if !runner.has_handlers(&event_name) {
+        return Ok(());
+    }
+    runner.emit(event).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Headless twin: no extension listeners to notify.
+#[cfg(not(feature = "ext-js"))]
+#[allow(clippy::unnecessary_wraps)] // mirrors the ext-js twin's signature
+fn emit_extension_event(runtime: &PrintRuntime, event: &Value) -> Result<(), String> {
+    let _ = (runtime, event);
+    Ok(())
+}
+
 /// The `user_bash` interception (`interactive-mode.rs::extension_user_bash`);
 /// headless builds answer `None` — execute locally.
 #[cfg(feature = "ext-js")]
@@ -713,6 +853,38 @@ fn slash_command_name(text: &str) -> &str {
     }
 }
 
+/// The matching args parse (`:2271-2272`): everything after the first space,
+/// untrimmed — upstream hands it to the handler verbatim.
+fn slash_command_args(text: &str) -> &str {
+    match text.find(' ') {
+        Some(index) => &text[index + 1..],
+        None => "",
+    }
+}
+
+/// `modelsAreEqual` (`packages/ai/src/models.ts:1340-1345`): type, id and
+/// provider. `_emitModelSelect` (`:2629`) skips a no-op selection.
+fn models_are_equal(a: &pi_ai::types::Model, b: &pi_ai::types::Model) -> bool {
+    a.api == b.api && a.id == b.id && a.provider == b.provider
+}
+
+/// `_emitModelSelect`'s event shape (`agent-session.ts:2630-2635`,
+/// `extensions/types.ts:1155-1160`). `previousModel` is absent when undefined,
+/// as JS `JSON.stringify` would drop it.
+fn model_select_event(model: &Value, previous_model: Option<&Value>, source: &str) -> Value {
+    let mut event = serde_json::Map::new();
+    event.insert(
+        "type".to_string(),
+        Value::String("model_select".to_string()),
+    );
+    event.insert("model".to_string(), model.clone());
+    if let Some(previous) = previous_model {
+        event.insert("previousModel".to_string(), previous.clone());
+    }
+    event.insert("source".to_string(), Value::String(source.to_string()));
+    Value::Object(event)
+}
+
 /// `formatNoApiKeyFoundMessage` (`auth-guidance.ts:22-25`). The `unknown`
 /// provider id is rendered as "the selected model" upstream.
 fn format_no_api_key_message(provider: &str) -> String {
@@ -727,38 +899,98 @@ fn format_no_api_key_message(provider: &str) -> String {
     )
 }
 
+/// `formatNoModelSelectedMessage` (`auth-guidance.ts:18-21`), verbatim for the
+/// no-model branch of `_preparePrompt` (`agent-session.ts:2242-2245`).
+fn format_no_model_message() -> String {
+    let docs = crate::prompt::get_docs_path();
+    format!(
+        "No model selected.\n\nUse /login to log into a provider via OAuth or API key. See:\n  {docs}/providers.md\n  {docs}/models.md\n\nThen use /model to select a model."
+    )
+}
+
+/// An accepted prompt: its disposition plus the text actually sent to the
+/// model (after host input-handler rewriting and skill/template expansion).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptPreflight {
+    disposition: PromptDisposition,
+    text: String,
+}
+
 /// The prompt preflight upstream runs before calling `preflightResult`
 /// (`agent-session.ts:2162-2196,2202-2263`, `rpc-mode.ts:409-435`). Returns
-/// the disposition to put on the wire, or the verbatim refusal a failed
-/// preflight reports as the single `success: false` response.
+/// the disposition to put on the wire and the text to run, or the verbatim
+/// refusal a failed preflight reports as the single `success: false` response.
 ///
-/// A leading slash is resolved through the command registry: an `extension`
-/// command is upstream's immediately-executed command (`"handled"`); `prompt`
-/// and `skill` commands are input *expansions* (`:2219-2224`) and continue to
-/// the auth gate as a started run. The port has no command-handler or resource
-/// body on this seam, so expansion is a documented deviation (`WIRING.md`).
+/// Order mirrors upstream: extension-command handler (`:2171-2178`), input
+/// handlers (`:2206-2216`), skill/template expansion (`:2219-2224`), the
+/// no-model/auth gates (`:2242-2260`). Every host-bound step has an inert
+/// default, so the local host still sends the original text.
 fn prompt_preflight(
-    runtime: &PrintRuntime,
+    runtime: &mut PrintRuntime,
     host: &dyn RpcHost,
     message: &str,
-) -> Result<PromptDisposition, String> {
-    // `_tryExecuteExtensionCommand` (`:2171-2178`): only when template
+    images: &[pi_ai::types::ImageContent],
+) -> Result<PromptPreflight, String> {
+    let mut text = message.to_string();
+
+    // `_tryExecuteExtensionCommand` (`:2268-2292`): only when template
     // expansion is enabled (RPC does not disable it) and the text leads `/`.
-    if message.starts_with('/') {
-        let name = slash_command_name(message);
-        let commands = host.get_commands(runtime)?;
-        let handled = commands.iter().any(|command| {
-            command.get("name").and_then(Value::as_str) == Some(name)
-                && command.get("source").and_then(Value::as_str) == Some("extension")
-        });
-        if handled {
-            return Ok(PromptDisposition::Handled);
+    if text.starts_with('/') {
+        let name = slash_command_name(&text);
+        let args = slash_command_args(&text);
+        match host.execute_extension_command(runtime, name, args) {
+            Ok(RpcExtensionCommandOutcome::Handled) => {
+                return Ok(PromptPreflight {
+                    disposition: PromptDisposition::Handled,
+                    text,
+                });
+            }
+            Ok(RpcExtensionCommandOutcome::NotFound) => {}
+            Err(error) => {
+                // `:2283-2291`: a throwing handler still returns `true`; the
+                // error goes to the extension error channel of `rebindSession`
+                // (`rpc-mode.ts:355-357`), not to the prompt response.
+                host.emit_extension_error(
+                    runtime,
+                    &serde_json::json!({
+                        "type": "extension_error",
+                        "extensionPath": format!("command:{name}"),
+                        "event": "command",
+                        "error": error,
+                    }),
+                )?;
+                return Ok(PromptPreflight {
+                    disposition: PromptDisposition::Handled,
+                    text,
+                });
+            }
         }
     }
 
-    // `if (!this.model)` (`:2242-2245`) is unreachable: `PrintRuntime.model`
-    // is always present. The port's `set_model` also validates against the
-    // model snapshot (`rpc-mode.ts:491-499`).
+    // `_runInputHandlers` (`:2206-2217`) receives `source: "rpc"`.
+    match host.run_input_handlers(runtime, &text, images, "rpc")? {
+        RpcInputDisposition::Handled => {
+            return Ok(PromptPreflight {
+                disposition: PromptDisposition::Handled,
+                text,
+            });
+        }
+        RpcInputDisposition::Continue(Some(replacement)) => text = replacement,
+        RpcInputDisposition::Continue(None) => {}
+    }
+
+    // Skill commands and prompt templates (`:2219-2224`). The host owns both
+    // resource bodies; the default leaves the text untouched.
+    if let Some(expanded) = host.expand_prompt(runtime, &text)? {
+        text = expanded;
+    }
+
+    // `if (!this.model)` (`:2242-2245`). The port normally resolves an
+    // initial model; a host that can clear it gets the verbatim refusal.
+    if !host.has_model(runtime)? {
+        return Err(format_no_model_message());
+    }
+
     let provider = runtime.model.provider.as_str();
     let auth = host.check_auth(runtime, provider)?;
     if !auth.configured {
@@ -770,14 +1002,48 @@ fn prompt_preflight(
             format_no_api_key_message(provider)
         });
     }
-    Ok(PromptDisposition::Started)
+    Ok(PromptPreflight {
+        disposition: PromptDisposition::Started,
+        text,
+    })
+}
+
+/// The `steer`/`follow_up` preparation of `_queueUserInput`
+/// (`agent-session.ts:2325-2352`): reject extension commands, run input
+/// handlers, then expand skills/templates. `Ok(None)` means a handler consumed
+/// the input (`"handled"`); otherwise the text to enqueue is returned.
+fn prepare_queued_input(
+    runtime: &mut PrintRuntime,
+    host: &dyn RpcHost,
+    message: &str,
+    images: &[pi_ai::types::ImageContent],
+) -> Result<Option<String>, String> {
+    // `_throwIfExtensionCommand` (`:2435-2447`) uses the same command table.
+    if message.starts_with('/') {
+        let name = slash_command_name(message);
+        let is_extension = host.get_commands(runtime)?.into_iter().any(|command| {
+            command.get("name").and_then(Value::as_str) == Some(name)
+                && command.get("source").and_then(Value::as_str) == Some("extension")
+        });
+        if is_extension {
+            return Err(format!(
+                "Extension command \"/{name}\" cannot be queued. Use prompt() or execute the command when not streaming."
+            ));
+        }
+    }
+    let text = match host.run_input_handlers(runtime, message, images, "rpc")? {
+        RpcInputDisposition::Handled => return Ok(None),
+        RpcInputDisposition::Continue(Some(replacement)) => replacement,
+        RpcInputDisposition::Continue(None) => message.to_string(),
+    };
+    Ok(Some(host.expand_prompt(runtime, &text)?.unwrap_or(text)))
 }
 
 /// `session.getSessionStats()` (`agent-session.ts:4350-4402`,
 /// `SessionStats` at `:357-374`). Aggregates over *all* entries, including
 /// compacted-away history; `sessionFile`/`contextUsage` are `undefined` and
 /// therefore absent from the wire when unavailable.
-fn session_stats_json(runtime: &PrintRuntime) -> Value {
+fn session_stats_json(runtime: &PrintRuntime, has_model: bool) -> Value {
     let mut totals = UsageTotals::default();
     let mut total_messages = 0u64;
     let mut user_messages = 0u64;
@@ -859,9 +1125,11 @@ fn session_stats_json(runtime: &PrintRuntime) -> Value {
         }),
     );
     stats.insert("cost".to_string(), serde_json::json!(totals.cost));
-    let context_usage = context_usage_json(runtime);
-    if context_usage != Value::Null {
-        stats.insert("contextUsage".to_string(), context_usage);
+    if has_model {
+        let context_usage = context_usage_json(runtime);
+        if context_usage != Value::Null {
+            stats.insert("contextUsage".to_string(), context_usage);
+        }
     }
     Value::Object(stats)
 }
@@ -1644,26 +1912,26 @@ fn handle_command(
                     "Cannot read properties of undefined (reading 'startsWith')".to_string()
                 );
             };
-            let disposition = prompt_preflight(runtime, bridge.host.as_ref(), &message)?;
+            let preflight = prompt_preflight(runtime, bridge.host.as_ref(), &message, &images)?;
             write_line(
                 &out,
                 &RpcResponse::success(
                     id,
                     "prompt",
-                    Some(serde_json::json!({ "disposition": disposition.as_str() })),
+                    Some(serde_json::json!({ "disposition": preflight.disposition.as_str() })),
                 ),
             )?;
-            if disposition != PromptDisposition::Started {
-                // `"handled"` (an extension command) and `"queued"` (a host
-                // override during a run) both return before `_startRun`
-                // (`agent-session.ts:2175-2176,2238-2239`).
+            if preflight.disposition != PromptDisposition::Started {
+                // `"handled"` (an extension command or input handler) and
+                // `"queued"` (a host override during a run) both return
+                // before `_startRun` (`:2175-2176,2214-2215,2238-2239`).
                 return Ok(CommandOutcome::Replied);
             }
             let now = now_millis();
             let prompt = if images.is_empty() {
-                pi_agent::transcript::user_message(&message, now)
+                pi_agent::transcript::user_message(&preflight.text, now)
             } else {
-                pi_agent::transcript::user_message_with_images(&message, &images, now)
+                pi_agent::transcript::user_message_with_images(&preflight.text, &images, now)
             };
             // Post-preflight failures are swallowed upstream (the `.catch`
             // checks `preflightSucceeded`, `rpc-mode.ts:425-429`): the run's
@@ -1684,21 +1952,27 @@ fn handle_command(
         RpcCommand::Steer { message, images } => {
             // `session.steer` queues even while idle (`_queueUserInput`,
             // `agent-session.ts:2341-2366`); the next run drains steering
-            // first. No input handlers run in RPC mode, so the disposition
-            // is always `"queued"`.
+            // first. Input handlers can consume it (`"handled"`).
             let Some(message) = message else {
                 return Err(
                     "Cannot read properties of undefined (reading 'startsWith')".to_string()
                 );
             };
+            let Some(text) =
+                prepare_queued_input(runtime, bridge.host.as_ref(), &message, &images)?
+            else {
+                return Ok(CommandOutcome::Success(Some(
+                    serde_json::json!({ "disposition": "handled" }),
+                )));
+            };
             let now = now_millis();
-            let queued = pi_agent::transcript::user_message_with_images(&message, &images, now);
+            let queued = pi_agent::transcript::user_message_with_images(&text, &images, now);
             bridge
                 .queued_texts
                 .lock()
                 .expect("rpc queued texts")
                 .steering
-                .push(message.clone());
+                .push(text);
             bridge.queues.steer([queued]);
             emit_queue_update(&out, &bridge.queues)?;
             Ok(CommandOutcome::Success(Some(
@@ -1713,14 +1987,21 @@ fn handle_command(
                     "Cannot read properties of undefined (reading 'startsWith')".to_string()
                 );
             };
+            let Some(text) =
+                prepare_queued_input(runtime, bridge.host.as_ref(), &message, &images)?
+            else {
+                return Ok(CommandOutcome::Success(Some(
+                    serde_json::json!({ "disposition": "handled" }),
+                )));
+            };
             let now = now_millis();
-            let queued = pi_agent::transcript::user_message_with_images(&message, &images, now);
+            let queued = pi_agent::transcript::user_message_with_images(&text, &images, now);
             bridge
                 .queued_texts
                 .lock()
                 .expect("rpc queued texts")
                 .follow_up
-                .push(message.clone());
+                .push(text);
             bridge.queues.follow_up([queued]);
             emit_queue_update(&out, &bridge.queues)?;
             Ok(CommandOutcome::Success(Some(
@@ -1754,10 +2035,14 @@ fn handle_command(
             // `isCompacting` are `false`. `sessionFile`/`sessionName` are
             // `undefined` when unset, so the keys are dropped.
             let mut state = serde_json::Map::new();
-            state.insert(
-                "model".to_string(),
-                serde_json::to_value(&runtime.model).unwrap_or_default(),
-            );
+            // `session.model` is `undefined` when nothing is selected, so
+            // the key is dropped (`rpc-mode.ts:471`, `rpc-types.ts:97`).
+            if bridge.host.has_model(runtime)? {
+                state.insert(
+                    "model".to_string(),
+                    serde_json::to_value(&runtime.model).unwrap_or_default(),
+                );
+            }
             state.insert(
                 "thinkingLevel".to_string(),
                 serde_json::json!(runtime.thinking_level.as_str()),
@@ -1813,18 +2098,25 @@ fn handle_command(
                 thinking: None,
             };
             let resolved = resolve_model(Some(&pattern), None, None)?;
+            let previous = runtime.model.clone();
+            let model_data = serde_json::to_value(&resolved).unwrap_or_default();
             runtime.model = resolved.clone();
             // `session.setModel` appends the transcript record
-            // (`agent-session.ts:2665`). The per-model thinking-level switch
+            // (`agent-session.ts:2652`). The per-model thinking-level switch
             // stays deferred; the auth check is re-run per provider by the
             // prompt preflight (`prompt_preflight`, `:2247-2260`).
             runtime
                 .session
                 .append_model_change(&resolved.provider, &resolved.id)
                 .map_err(|error| error.to_string())?;
-            Ok(CommandOutcome::Success(Some(
-                serde_json::to_value(&resolved).unwrap_or_default(),
-            )))
+            // `_emitModelSelect(model, previous, "set")` (`:2663`): a no-op
+            // selection is skipped by `modelsAreEqual` (`:2629`).
+            if !models_are_equal(&previous, &resolved) {
+                let previous_data = serde_json::to_value(&previous).unwrap_or_default();
+                let event = model_select_event(&model_data, Some(&previous_data), "set");
+                bridge.host.emit_model_select(runtime, &event)?;
+            }
+            Ok(CommandOutcome::Success(Some(model_data)))
         }
         RpcCommand::GetAvailableModels => {
             // `getAvailableSnapshot` (`rpc-mode.ts:509-512`).
@@ -2086,6 +2378,7 @@ fn handle_command(
                 return Ok(CommandOutcome::Success(Some(Value::Null)));
             };
             let next = (*next).clone();
+            let previous = runtime.model.clone();
             runtime.model = next.clone();
             runtime
                 .session
@@ -2095,6 +2388,14 @@ fn handle_command(
             // settings level, which the port does not carry in `PrintRuntime`.
             let current_level = runtime.thinking_level.as_str().to_string();
             apply_thinking_level(runtime, &current_level, &out)?;
+            // `_emitModelSelect(next, current, "cycle")` (`:2756`) fires after
+            // the thinking-level switch but before the response.
+            if !models_are_equal(&previous, &next) {
+                let previous_data = serde_json::to_value(&previous).unwrap_or_default();
+                let next_data = serde_json::to_value(&next).unwrap_or_default();
+                let event = model_select_event(&next_data, Some(&previous_data), "cycle");
+                bridge.host.emit_model_select(runtime, &event)?;
+            }
             Ok(CommandOutcome::Success(Some(serde_json::json!({
                 "model": next,
                 "thinkingLevel": runtime.thinking_level.as_str(),
@@ -2128,8 +2429,12 @@ fn handle_command(
             Ok(CommandOutcome::Success(None))
         }
         RpcCommand::GetSessionStats => {
-            // `get_session_stats` (`rpc-mode.ts:614-617`).
-            Ok(CommandOutcome::Success(Some(session_stats_json(runtime))))
+            // `get_session_stats` (`rpc-mode.ts:614-617`): upstream omits
+            // `contextUsage` when no model supplies a context window.
+            let has_model = bridge.host.has_model(runtime)?;
+            Ok(CommandOutcome::Success(Some(session_stats_json(
+                runtime, has_model,
+            ))))
         }
         RpcCommand::ExportHtml { output_path } => {
             // `session.exportToHtml(outputPath)` (`rpc-mode.ts:619-622`).
@@ -3955,5 +4260,541 @@ mod tests {
             update_indices[1] < delivery,
             "the reduced queue crosses before its message_start"
         );
+    }
+
+    /// Callback calls recorded by [`StubHost`], shared with the test thread.
+    #[derive(Default)]
+    struct CallbackLog {
+        model_selects: Vec<Value>,
+        errors: Vec<Value>,
+        commands: Vec<(String, String)>,
+        expansions: Vec<String>,
+        inputs: Vec<String>,
+    }
+
+    /// A host that records every new callback and lets each test choose what
+    /// it returns. Everything else delegates to [`LocalRpcHost`].
+    struct StubHost {
+        commands: Vec<Value>,
+        outcome: RpcExtensionCommandOutcome,
+        input: RpcInputDisposition,
+        expansion: Option<String>,
+        has_model: bool,
+        handler_error: Option<String>,
+        log: Arc<Mutex<CallbackLog>>,
+    }
+
+    impl StubHost {
+        fn new(log: &Arc<Mutex<CallbackLog>>) -> Self {
+            Self {
+                commands: Vec::new(),
+                outcome: RpcExtensionCommandOutcome::NotFound,
+                input: RpcInputDisposition::Continue(None),
+                expansion: None,
+                has_model: true,
+                handler_error: None,
+                log: Arc::clone(log),
+            }
+        }
+    }
+
+    impl RpcHost for StubHost {
+        fn new_session(
+            &self,
+            runtime: &mut PrintRuntime,
+            parent: Option<&str>,
+        ) -> Result<bool, String> {
+            LocalRpcHost.new_session(runtime, parent)
+        }
+
+        fn switch_session(&self, runtime: &mut PrintRuntime, path: &str) -> Result<bool, String> {
+            LocalRpcHost.switch_session(runtime, path)
+        }
+
+        fn fork(
+            &self,
+            runtime: &mut PrintRuntime,
+            entry_id: &str,
+            position: RpcForkPosition,
+        ) -> Result<RpcForkResult, String> {
+            LocalRpcHost.fork(runtime, entry_id, position)
+        }
+
+        fn bash(
+            &self,
+            runtime: &mut PrintRuntime,
+            command: &str,
+            exclude: bool,
+            id: Option<&str>,
+        ) -> Result<Value, String> {
+            LocalRpcHost.bash(runtime, command, exclude, id)
+        }
+
+        fn get_commands(&self, _runtime: &PrintRuntime) -> Result<Vec<Value>, String> {
+            Ok(self.commands.clone())
+        }
+
+        fn check_auth(
+            &self,
+            _runtime: &PrintRuntime,
+            _provider: &str,
+        ) -> Result<RpcAuthCheck, String> {
+            Ok(RpcAuthCheck {
+                configured: true,
+                using_oauth: false,
+            })
+        }
+
+        fn execute_extension_command(
+            &self,
+            _runtime: &mut PrintRuntime,
+            name: &str,
+            args: &str,
+        ) -> Result<RpcExtensionCommandOutcome, String> {
+            self.log
+                .lock()
+                .expect("callback log")
+                .commands
+                .push((name.to_string(), args.to_string()));
+            if let Some(error) = &self.handler_error {
+                return Err(error.clone());
+            }
+            Ok(self.outcome)
+        }
+
+        fn run_input_handlers(
+            &self,
+            _runtime: &mut PrintRuntime,
+            text: &str,
+            _images: &[pi_ai::types::ImageContent],
+            source: &str,
+        ) -> Result<RpcInputDisposition, String> {
+            assert_eq!(source, "rpc", "RPC passes source: rpc (rpc-mode.ts:419)");
+            self.log
+                .lock()
+                .expect("callback log")
+                .inputs
+                .push(text.to_string());
+            Ok(self.input.clone())
+        }
+
+        fn expand_prompt(
+            &self,
+            _runtime: &PrintRuntime,
+            text: &str,
+        ) -> Result<Option<String>, String> {
+            self.log
+                .lock()
+                .expect("callback log")
+                .expansions
+                .push(text.to_string());
+            Ok(self.expansion.clone())
+        }
+
+        fn has_model(&self, _runtime: &PrintRuntime) -> Result<bool, String> {
+            Ok(self.has_model)
+        }
+
+        fn emit_model_select(&self, _runtime: &PrintRuntime, event: &Value) -> Result<(), String> {
+            self.log
+                .lock()
+                .expect("callback log")
+                .model_selects
+                .push(event.clone());
+            Ok(())
+        }
+
+        fn emit_extension_error(
+            &self,
+            _runtime: &PrintRuntime,
+            event: &Value,
+        ) -> Result<(), String> {
+            self.log
+                .lock()
+                .expect("callback log")
+                .errors
+                .push(event.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn model_select_event_shape_drops_undefined_previous() {
+        let model = json!({"id": "m", "provider": "p", "api": "a"});
+        let set = model_select_event(&model, None, "set");
+        assert_eq!(
+            set,
+            json!({"type": "model_select", "model": model.clone(), "source": "set"})
+        );
+        let previous = json!({"id": "old"});
+        let cycle = model_select_event(&model, Some(&previous), "cycle");
+        assert_eq!(
+            cycle,
+            json!({
+                "type": "model_select",
+                "model": model,
+                "previousModel": previous,
+                "source": "cycle",
+            })
+        );
+        // `_emitModelSelect` skips a no-op selection (`modelsAreEqual`).
+        let mut a = pi_ai::types::Model {
+            id: "m".to_string(),
+            provider: "p".to_string(),
+            api: "a".to_string(),
+            ..pi_ai::types::Model::default()
+        };
+        let b = a.clone();
+        assert!(models_are_equal(&a, &b));
+        a.id = "n".to_string();
+        assert!(!models_are_equal(&a, &b));
+    }
+
+    #[test]
+    fn model_select_callback_fires_on_set_and_cycle_model() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        let log = Arc::new(Mutex::new(CallbackLog::default()));
+        fixture.set_host(Box::new(StubHost::new(&log)));
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        let models = crate::models_state::all();
+        let target = models
+            .iter()
+            .find(|model| model.provider != "test")
+            .expect("an embedded catalog model");
+        fixture.write_line(&format!(
+            r#"{{"type":"set_model","id":"sm","provider":"{}","modelId":"{}"}}"#,
+            target.provider, target.id
+        ));
+        fixture.write_line(r#"{"type":"cycle_model","id":"cm"}"#);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let lines = loop {
+            let lines = fixture.output_lines();
+            if lines
+                .iter()
+                .any(|line| line.contains(r#""command":"cycle_model""#))
+            {
+                break lines;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "model responses: {lines:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        drop(fixture.writer);
+        mode.join();
+
+        let parsed: Vec<Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("line"))
+            .collect();
+        let cycle = parsed
+            .iter()
+            .find(|value| value["command"] == "cycle_model")
+            .expect("cycle response");
+        let events = log.lock().expect("callback log").model_selects.clone();
+        assert_eq!(events.len(), if cycle["data"].is_null() { 1 } else { 2 });
+        assert_eq!(events[0]["type"], "model_select");
+        assert_eq!(events[0]["source"], "set");
+        assert_eq!(events[0]["model"]["id"].as_str(), Some(target.id.as_str()));
+        assert_eq!(
+            events[0]["previousModel"]["provider"].as_str(),
+            Some("test")
+        );
+        if events.len() == 2 {
+            assert_eq!(events[1]["source"], "cycle");
+            assert_eq!(
+                events[1]["previousModel"]["id"].as_str(),
+                Some(target.id.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn no_model_branch_refuses_prompt_and_drops_state_model() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A run would panic in `NeverStream`, so this also proves none starts.
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        let log = Arc::new(Mutex::new(CallbackLog::default()));
+        let mut host = StubHost::new(&log);
+        host.has_model = false;
+        fixture.set_host(Box::new(host));
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        fixture.write_line(r#"{"type":"prompt","id":"p1","message":"hello"}"#);
+        fixture.write_line(r#"{"type":"get_state","id":"s1"}"#);
+        let lines = fixture.wait_for_output(2);
+        drop(fixture.writer);
+        mode.join();
+
+        let parsed: Vec<Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("line"))
+            .collect();
+        assert_eq!(parsed[0]["command"], "prompt");
+        assert_eq!(parsed[0]["success"], false);
+        assert_eq!(parsed[0]["error"], format_no_model_message());
+        assert!(parsed[0].get("data").is_none());
+        assert_eq!(parsed[1]["command"], "get_state");
+        assert!(
+            parsed[1]["data"].get("model").is_none(),
+            "an absent model key is dropped like JS undefined: {}",
+            parsed[1]
+        );
+    }
+
+    #[test]
+    fn expansion_callback_rewrites_prompt_and_queued_text() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime(
+            dir.path(),
+            Arc::new(TextScript {
+                calls: AtomicUsize::new(0),
+            }),
+        );
+        let log = Arc::new(Mutex::new(CallbackLog::default()));
+        let mut host = StubHost::new(&log);
+        host.expansion = Some("expanded text".to_string());
+        fixture.set_host(Box::new(host));
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+
+        fixture.write_line(r#"{"type":"steer","id":"s1","message":"/template args"}"#);
+        fixture.write_line(r#"{"type":"follow_up","id":"f1","message":"/template later"}"#);
+        let lines = fixture.wait_for_output(4);
+        assert!(
+            lines[0].contains(r#""type":"queue_update""#),
+            "the first frame is the enqueue update: {}",
+            lines[0]
+        );
+        fixture.write_line(r#"{"type":"prompt","id":"p1","message":"/template args"}"#);
+        let lines = wait_for_settle(&fixture);
+        drop(fixture.writer);
+        mode.join();
+
+        let values: Vec<Value> = lines
+            .iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert!(values.iter().any(|value| value["type"] == "queue_update"
+            && value["steering"] == json!(["expanded text"])));
+        assert!(values.iter().any(|value| value["type"] == "queue_update"
+            && value["followUp"] == json!(["expanded text"])));
+        assert!(values.iter().any(|value| value["type"] == "message_start"
+            && value["message"]["role"] == "user"
+            && value["message"]["content"][0]["text"] == "expanded text"));
+        assert_eq!(
+            log.lock().expect("callback log").expansions,
+            vec!["/template args", "/template later", "/template args"]
+        );
+    }
+
+    #[test]
+    fn input_handlers_can_consume_or_rewrite_submissions() {
+        // Consumed prompt/steer/follow-up: three `"handled"` dispositions, no
+        // run and no queue update.
+        let log = Arc::new(Mutex::new(CallbackLog::default()));
+        {
+            let mut fixture = BridgeFixture::new();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+            let mut host = StubHost::new(&log);
+            host.input = RpcInputDisposition::Handled;
+            fixture.set_host(Box::new(host));
+            let bridge = fixture.take_bridge();
+            let mode = ModeThread::start(runtime, bridge);
+            fixture.write_line(r#"{"type":"prompt","id":"p1","message":"hello"}"#);
+            fixture.write_line(r#"{"type":"steer","id":"s1","message":"hello"}"#);
+            fixture.write_line(r#"{"type":"follow_up","id":"f1","message":"hello"}"#);
+            let lines = fixture.wait_for_output(3);
+            drop(fixture.writer);
+            mode.join();
+            let parsed: Vec<Value> = lines
+                .iter()
+                .map(|line| serde_json::from_str(line).expect("line"))
+                .collect();
+            for value in &parsed {
+                assert_eq!(value["data"]["disposition"], "handled", "{value}");
+            }
+            assert_eq!(
+                log.lock().expect("log").inputs,
+                vec!["hello", "hello", "hello"]
+            );
+        }
+
+        // A rewritten prompt reaches the run with the replacement text.
+        {
+            let mut fixture = BridgeFixture::new();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let runtime = test_runtime(
+                dir.path(),
+                Arc::new(TextScript {
+                    calls: AtomicUsize::new(0),
+                }),
+            );
+            let mut host = StubHost::new(&log);
+            host.input = RpcInputDisposition::Continue(Some("rewritten".to_string()));
+            fixture.set_host(Box::new(host));
+            let bridge = fixture.take_bridge();
+            let mode = ModeThread::start(runtime, bridge);
+            fixture.write_line(r#"{"type":"prompt","id":"p2","message":"original"}"#);
+            let lines = wait_for_settle(&fixture);
+            drop(fixture.writer);
+            mode.join();
+            let values: Vec<Value> = lines
+                .iter()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            assert!(values.iter().any(|value| value["type"] == "message_start"
+                && value["message"]["role"] == "user"
+                && value["message"]["content"][0]["text"] == "rewritten"));
+        }
+    }
+
+    #[test]
+    fn extension_command_handler_outcome_guards_execution_and_errors() {
+        let log = Arc::new(Mutex::new(CallbackLog::default()));
+
+        // A host-reported handler consumes the prompt even with no registry
+        // entry: execution belongs to the host, not the default.
+        {
+            let mut fixture = BridgeFixture::new();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+            let mut host = StubHost::new(&log);
+            host.outcome = RpcExtensionCommandOutcome::Handled;
+            fixture.set_host(Box::new(host));
+            let bridge = fixture.take_bridge();
+            let mode = ModeThread::start(runtime, bridge);
+            fixture.write_line(r#"{"type":"prompt","id":"p1","message":"/deploy now"}"#);
+            let lines = fixture.wait_for_output(1);
+            drop(fixture.writer);
+            mode.join();
+            let value: Value = serde_json::from_str(&lines[0]).expect("frame");
+            assert_eq!(value["data"]["disposition"], "handled");
+            assert_eq!(
+                log.lock().expect("log").commands,
+                vec![("deploy".to_string(), "now".to_string())]
+            );
+        }
+
+        // A throwing handler still consumes and reports through `onError`.
+        {
+            let mut fixture = BridgeFixture::new();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+            let mut host = StubHost::new(&log);
+            host.outcome = RpcExtensionCommandOutcome::Handled;
+            host.handler_error = Some("boom".to_string());
+            fixture.set_host(Box::new(host));
+            let bridge = fixture.take_bridge();
+            let mode = ModeThread::start(runtime, bridge);
+            fixture.write_line(r#"{"type":"prompt","id":"p2","message":"/deploy now"}"#);
+            let lines = fixture.wait_for_output(1);
+            drop(fixture.writer);
+            mode.join();
+            let value: Value = serde_json::from_str(&lines[0]).expect("frame");
+            assert_eq!(value["data"]["disposition"], "handled");
+            // The host owns the `onError` sink (`rpc-mode.ts:355-357`); the
+            // shape it receives is the verbatim extension_error frame.
+            let errors = log.lock().expect("log").errors.clone();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0]["type"], "extension_error");
+            assert_eq!(errors[0]["extensionPath"], "command:deploy");
+            assert_eq!(errors[0]["event"], "command");
+            assert_eq!(errors[0]["error"], "boom");
+        }
+
+        // NotFound falls through to a run even when the name is registered:
+        // it is the host's call whether a handler actually ran.
+        {
+            let mut fixture = BridgeFixture::new();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let runtime = test_runtime(
+                dir.path(),
+                Arc::new(TextScript {
+                    calls: AtomicUsize::new(0),
+                }),
+            );
+            let mut host = StubHost::new(&log);
+            host.commands = vec![json!({"name": "deploy", "source": "extension"})];
+            fixture.set_host(Box::new(host));
+            let bridge = fixture.take_bridge();
+            let mode = ModeThread::start(runtime, bridge);
+            fixture.write_line(r#"{"type":"prompt","id":"p3","message":"/deploy now"}"#);
+            let lines = wait_for_settle(&fixture);
+            drop(fixture.writer);
+            mode.join();
+            let values: Vec<Value> = lines
+                .iter()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            let response = values
+                .iter()
+                .find(|value| value["command"] == "prompt")
+                .expect("prompt response");
+            assert_eq!(response["data"]["disposition"], "started");
+            assert!(values.iter().any(|value| value["type"] == "agent_settled"));
+        }
+    }
+
+    #[test]
+    fn queued_texts_mirror_removes_one_delivery_at_a_time() {
+        let mut mirror = QueuedTexts::default();
+        mirror.steering.push("one".to_string());
+        mirror.steering.push("two".to_string());
+        mirror.follow_up.push("later".to_string());
+        assert!(mirror.take_delivered("two"));
+        assert_eq!(mirror.steering, vec!["one"]);
+        assert!(mirror.take_delivered("later"));
+        assert!(
+            !mirror.take_delivered("later"),
+            "a second delivery has no matching queue text"
+        );
+        let AgentEvent::QueueUpdate {
+            steering,
+            follow_up,
+        } = mirror.as_event()
+        else {
+            panic!("the mirror is a queue_update");
+        };
+        assert_eq!(steering, vec!["one"]);
+        assert!(follow_up.is_empty());
+    }
+
+    #[test]
+    fn steer_rejects_extension_commands_verbatim() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        let log = Arc::new(Mutex::new(CallbackLog::default()));
+        let mut host = StubHost::new(&log);
+        host.commands = vec![json!({"name": "deploy", "source": "extension"})];
+        fixture.set_host(Box::new(host));
+        let bridge = fixture.take_bridge();
+        let mode = ModeThread::start(runtime, bridge);
+        fixture.write_line(r#"{"type":"steer","id":"s1","message":"/deploy now"}"#);
+        fixture.write_line(r#"{"type":"follow_up","id":"f1","message":"/deploy now"}"#);
+        let lines = fixture.wait_for_output(2);
+        drop(fixture.writer);
+        mode.join();
+        let parsed: Vec<Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("line"))
+            .collect();
+        for value in &parsed {
+            assert_eq!(value["success"], false);
+            assert_eq!(
+                value["error"],
+                "Extension command \"/deploy\" cannot be queued. Use prompt() or execute the command when not streaming."
+            );
+        }
     }
 }
