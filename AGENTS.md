@@ -194,8 +194,9 @@ Still open (genuine mechanism tails or deliberate scope decisions):
    wasm `Stats`/`HMAC`/URL shims are unported and codemode tools stay
    synchronous. `blockImages` is still snapshotted once at startup in print/JSON
    (interactive/RPC re-read per call); clipboard-image paste needs a host hook.
-   Telemetry's real transports are opt-in library capabilities — the binary
-   still builds the inert default at this base. MCP stderr uses a temp-file
+   Telemetry's real transports are installed at startup via
+   `install_from_env_with_settings` (`bac3519`), still gated so no socket opens
+   by default. MCP stderr uses a temp-file
    sink; `StartupWait` is one-shot (late connects survive via a per-server
    queue). Session-delta types are library surfaces with no host emission call
    site yet. `pi-env` ticks/PTY/SSH onboarding are host-driven by design.
