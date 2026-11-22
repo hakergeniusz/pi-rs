@@ -1,5 +1,124 @@
 # Handoff: Pi in Rust (`pi-rs`)
 
+> **CURRENT SNAPSHOT — 2026-11-22.** Read this section first; the dated
+> P0–P7 history below is retained for provenance only and contains stale
+> "main = …" / "checkout on wip/…" notes. The authoritative status is here,
+> in `AGENTS.md`, and in `docs/GAP-STATUS.md`. Repo:
+> `/home/hakergeniusz/Projects/pi-rs`, branch `main`, clean and pushed.
+> Remote: `github.com/hakergeniusz/pi-rs` (private). Ground truth: upstream
+> pi 1.5.2 at `/home/hakergeniusz/tmp-11-18/pi-152` (re-clone if gone:
+> `gh repo clone earendil-works/pi /tmp/pi`). **Never read real pi data roots
+> (`~/.config/pi`, `~/.local/state/pi`, legacy `~/.pi`) — credentials and chat
+> history live there. All fixtures are synthetic.**
+
+## Goal
+Rewrite upstream pi (TypeScript coding-agent harness, ~236K LOC) in Rust with
+**1:1 behavioral and on-disk fidelity** (session JSONL v3, print/JSON/RPC
+schemas, `.pi/` layout). One deliberate deviation: user-level roots are XDG
+(`~/.config/pi-rs`, `~/.local/share/pi-rs`) so the port never touches a real
+TypeScript pi install. Phases P0–P7 plus the E0–E4 extension arc are landed.
+
+## Current Progress
+- **`main` at `e19b45f`**, clean, pushed; latest CI run `45041019432` =
+  **success** (fmt, clippy, test, msrv, audit, release, no-default-features).
+- **Full gate: 2646 passed, 0 failed, 3 ignored.** Snapshot build cache at
+  `.build-cache/host-target.tar.zst` (zstd -5, ~531 MB, verified with
+  `zstd -t`).
+- All *fixable* upstream gaps are closed. A 10-agent fleet closed the gap wave
+  (env host, image backend, telemetry transports, MCP ticks, interactive/RPC
+  tails, OAuth fidelity, codemode transports, E4 shims, session deltas), then
+  a read-only audit found five dead mechanisms, fixed in a second wave:
+  telemetry recorder+flush, real RPC abort, typed OAuth errors + Copilot base
+  URL, tool-result image transformer + session-delta call sites, opt-in
+  codemode thread-worker transport.
+- **Terminal-exit noise fixed and verified live in tmux** (`3cb7659`,
+  `e19b45f`): the OSC/DA1 theme query is now issued after raw mode is on,
+  pending stdin is drained like upstream's `drainInput(1000, 50)`, and the
+  resume hint starts on a cleared fresh line. Verified for Ctrl+D, Ctrl+C
+  (two presses — expected), `/quit`, and fullscreen exit.
+- Easter egg (`/arminsayshi`, 3D logo, header logo click) is landed and
+  verified; **not an open gap**.
+
+### Build / test recipe (memory-safe, offline, low-TBW)
+```sh
+cd /home/hakergeniusz/Projects/pi-rs
+TMPDIR=/var/tmp PI_CACHE_DIR=/var/tmp/opencode/pi-rs-cache \
+  PI_TARGET_DIR=/var/tmp/opencode/pt/ca JOBS=2 \
+  sh scripts/host-build.sh gate
+```
+`/tmp` is user-quota-blocked (files get created but writes fail) — use
+`/var/tmp` for logs, worktrees and TMPDIR. Logs go to `/var/tmp/*.log`, never
+`/tmp/opencode`. Debug binary: `/var/tmp/opencode/pt/ca/debug/pi`. Run with
+`env -u PI_CODING_AGENT_DIR -u PI_CODING_AGENT_SESSION_DIR` to avoid stale
+host overrides. The interactive TUI needs a real PTY (tmux works):
+`tmux new-session -d -s test -x 120 -y 40` → `send-keys` → `capture-pane -p -e`.
+
+## What Worked
+- **Fleet with strict, disjoint file ownership**, each agent allowed targeted
+  `cargo check`/tests against 3 shared, disk-backed target dirs; coordinator
+  cherry-picked and ran the serial authoritative gate. Verify ownership
+  before launching — one overlap (print_mode.rs) had to be corrected mid-run.
+- **Read-only audit agent after the fleet**: it found five "defined but never
+  called" mechanisms that per-slice reports had claimed as done. Always audit
+  reachability, not just compilation.
+- **Reproduce terminal bugs in tmux and capture with `-e`** (escape-visible),
+  plus a Python PTY proxy / `script` to distinguish app output from terminal
+  echo. That isolated the DA1 reply to *when* the query was emitted.
+- **Fail-first then fix**: a workspace `check` before clippy before tests
+  surfaced compile errors in batches cheaply; clippy also compiles test code.
+- Sleep-free polling and `nice -n 19` + low `JOBS` kept the shared box usable.
+- Restoring cancelled agents' uncommitted worktree edits directly (commit in
+  the worktree, then cherry-pick) after the server restart lost 8 sessions.
+
+## What Didn't Work (do not repeat)
+- **Shared process-wide current-thread tokio runtime** (`runtime.rs`) made
+  parallel tests flake (telemetry loopback, RPC abort). Fixed with a
+  **thread-local** runtime — do not revert to a `OnceLock` global.
+- **Latent infinite loop in E4 `require` folding**: the `+` arm set the match
+  but never advanced its cursor; a quoted-literal fast path also misread
+  `"a" + "b"` as one literal. Fixed; the guard that skips folding when the
+  source has no `require(` also prevents stalls on ESM-only modules.
+- **Issuing the DA1 theme query during mode construction** (before raw mode)
+  echoes `ESC[?1;2;4c` into the scrollback; `\r\n` alone did not clear the
+  preserved footer row — needed `\x1b[2K` too.
+- **Ten agents sharing `JOBS=1` caches** serialized cargo forever; send a
+  convergence instruction ("one check, then commit") so agents stop looping.
+- `/tmp` build artifacts exhausted the tmpfs quota; old `target/` (16 GB) was
+  trashed. Never build with default `CARGO_TARGET_DIR` on this box.
+- `cargo clippy --workspace --all-targets --offline …` fails because the
+  script already passes `--offline` — don't pass it twice.
+- Do **not** edit `~/.zshrc` (user will fix stale `PI_CODING_AGENT_*` vars).
+
+## Next Steps
+1. **Only if asked** — the remaining mechanism tails in `AGENTS.md`:
+   - RPC execution still serialized behind the FIFO turnstile (receives are
+     concurrent; abort is real); signal handling / graceful shutdown open.
+   - Dynamic/computed `require` specifiers unsupported; unserved `pi-ai`
+     subpaths and type-only exports.
+   - True Node `worker_threads`/Cloudflare/wasm transports remain typed
+     stubs; wasm `Stats`/`HMAC`/URL shims unported; codemode tools sync.
+   - `blockImages` snapshotted once at startup in print/JSON; clipboard-image
+     paste needs a host hook; session-delta types have no host emission call
+     site (some wired in interactive); MCP stderr uses a temp-file sink.
+   - `pi-env` ticks/PTY/SSH onboarding are host-driven by design.
+2. **Out of scope / policy — do not "fix" without explicit user approval:**
+   `chord`, `pi-durable`, `evals`, `apps/p2`; `/share` and `/bug` (Radius
+   upload policy); macOS release assets (need a hosted runner).
+3. For any new work: create worktrees under `/var/tmp/opencode/wt-<name>`
+   (`git worktree add -b task/<name> …`), run the gate recipe above, commit
+   with conventional message + `Assisted-by: OpenCode (hy4-flash-free)`,
+   push, then `gh run watch` the *latest* run id (the list can return a stale
+   id right after a push — re-query after a few seconds).
+4. Keep docs current: `HANDOFF.md` (this file), `AGENTS.md`, `README.md`,
+   `docs/GAP-STATUS.md`. No full 1:1 parity is claimed; differences are
+   mechanism-level and documented in module `//!` docs.
+
+---
+
+## Historical detail (P0–P7, superseded by the snapshot above)
+
+# Handoff: Pi in Rust (`pi-rs`)
+
 > Written 2026-11-11, updated same day after gate attempts. Repo: `/home/hakergeniusz/Projects/pi-rs` on `acer`.
 > **GitHub: https://github.com/hakergeniusz/pi-rs (private)**, remote `origin` (ssh). **`main` = P0–P5-part-1 + codex adapter + interactive TUI (parts 1+2a+2b fullscreen) + XDG paths; E2E PROVEN LIVE** — `pi -p` smoke test PASSED 2026-11-14 (PONG / read-tool round-trip ALBATROSS / JSON event mode) with the openai-codex stored OAuth credential and default model `openai-codex/gpt-6-luna`; required (1) a new `openai-codex-responses` adapter in pi-ai (`8efb00b`) and (2) the agent loop driven on a process-wide tokio runtime (`4c4d62c`, was futures::executor::block_on → "no reactor running"). — landing fast-forwarded `39b22ad..37782d1` on 2026-11-14; first landing CI failed only because ubuntu-latest ships **neither rg nor fd** (12 grep tests: `which("rg")` failed) → fixed in ci.yml (`8c6d178`, installs `ripgrep` + `fd-find`); CI run `43578686739` on `8c6d178` = **ok**. Interactive TUI landed `27769a9..500302b` + part 2a `8ae806d` on 2026-11-14 (see P6 sections). `wip/p4-pre-gate` == `main`; local checkout is ON `wip/p4-pre-gate`.
 > ALL development happens on `acer` (per user). Reference checkout: **`/tmp/pi`** on `acer` (re-cloned 2026-11-15 @ 1.5.2; tmpfs — re-clone if gone: `gh repo clone earendil-works/pi /tmp/pi`).
