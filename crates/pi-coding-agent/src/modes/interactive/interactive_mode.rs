@@ -16514,9 +16514,21 @@ export default function (pi) {
         let events = mode.editor_events.lock().expect("editor events").clone();
         assert!(events.contains(&EditorEventOut::Action(AppAction::FollowUp)));
 
-        mode.pump();
-        mode.tui.render_now(false);
-        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        // Queue rows arrive on the worker; under CI load one pump is not
+        // always enough. Poll the rendered frame with a bounded deadline.
+        let mut frame = String::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            mode.pump();
+            mode.tui.render_now(false);
+            frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+            if frame.contains("Steering: steered mid-run")
+                && frame.contains("Follow-up: follow-up mid-run")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(frame.contains("Steering: steered mid-run"), "{frame}");
         assert!(frame.contains("Follow-up: follow-up mid-run"), "{frame}");
 
