@@ -1,0 +1,45 @@
+[package]
+name = "pi-native-ext"
+description = "Native Rust extension ABI and loader for pi-rs (additive capability; upstream pi has no native extension host)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pi_native_ext"
+path = "src/lib.rs"
+
+[dependencies]
+libloading = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# This crate owns the only `unsafe` in the native-extension stack: dynamic
+# loading goes through `libloading`'s FFI. It is confined to `src/loader.rs`,
+# where every unsafe operation carries a `SAFETY` comment. The host crate
+# (`pi-coding-agent`) keeps its `#![forbid(unsafe_code)]` and uses only the
+# safe API here. We therefore cannot inherit the workspace's
+# `unsafe_code = "forbid"` lint, but we do inherit the rest of its quality bar.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+large_enum_variant = "allow"

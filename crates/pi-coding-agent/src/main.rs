@@ -28,6 +28,7 @@ use pi_coding_agent::modes::print_mode::{
     thinking_level_from_str,
 };
 use pi_coding_agent::modes::rpc::run_rpc_mode;
+use pi_coding_agent::native_ext::NativeExtensions;
 use pi_coding_agent::output_guard::{restore_stdout, take_over_stdout};
 use pi_coding_agent::session::store::{NewSessionOptions, SessionManager};
 use pi_coding_agent::telemetry::host::{
@@ -431,6 +432,15 @@ fn build_runtime_with_ui(
         }
         return Err(message);
     }
+
+    // Native Rust extensions (additive pi-rs capability; upstream pi has no
+    // native host). Loaded from `PI_NATIVE_EXTENSIONS` and `<cwd>/.pi/native/`,
+    // inert when neither is configured. A bad ABI aborts startup with the
+    // extension name. `on_session_start` is the hook fired during assembly;
+    // the other hooks are exposed on `NativeExtensions` for host callers.
+    let native_extensions = NativeExtensions::load(cwd)?;
+    let _ = native_extensions.on_session_start(extension_mode, cwd_string);
+
     // Composed model catalog: models.json ⊕ extension providers ⊕ virtual
     // models (`model-runtime.ts`; consumers read `models_state`).
     #[cfg(feature = "ext-js")]
@@ -657,11 +667,20 @@ fn build_runtime_with_ui(
     // extension tools append after the builtins, like the upstream
     // registry order).
     let builtin_available = ToolRegistry::all().definitions().to_vec();
-    let selected = select_tools(args, &builtin_available, extensions.host.tool_definitions())?;
-    let executor = extensions.host.executor(&selected, cwd_string);
+    let mut extension_tools = extensions.host.tool_definitions().to_vec();
+    native_extensions.register_tools(&mut extension_tools);
+    let selected = select_tools(args, &builtin_available, &extension_tools)?;
+    let executor =
+        native_extensions.wrap_executor(extensions.host.executor(&selected, cwd_string), &selected);
 
-    // System prompt.
-    let system_prompt = system_prompt_for(args, cwd_string, &agent_dir, project_trusted)?;
+    // System prompt. Native `transform_prompt` subscribers chain over it, like
+    // the JS host's `transformContext` hook, before the first model call.
+    let system_prompt = native_extensions.transform_prompt(&system_prompt_for(
+        args,
+        cwd_string,
+        &agent_dir,
+        project_trusted,
+    )?);
 
     // Thinking level (`createAgentSession`, `core/sdk.ts:253-278`): the
     // `--thinking` flag wins; else a resumed session restores its recorded

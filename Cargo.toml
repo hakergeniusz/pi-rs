@@ -10,6 +10,8 @@ members = [
 	"crates/pi-coding-agent",
 	"crates/pi-ext-js",
 	"crates/pi-env",
+	"crates/pi-native-ext",
+	"crates/pi-native-ext/sample-extension",
 ]
 
 [workspace.package]
@@ -76,6 +78,11 @@ pi-ext-js = { path = "crates/pi-ext-js", version = "0.1.1" }
 
 # extensions host (E0 spike)
 rquickjs = { version = "0.14", features = ["loader", "parallel"] }
+
+# Native extension host (additive pi-rs capability; upstream pi has no Rust
+# extension ABI). Pinned to the offline-cached release.
+libloading = "=0.8.9"
+pi-native-ext = { path = "crates/pi-native-ext", version = "0.1.1" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

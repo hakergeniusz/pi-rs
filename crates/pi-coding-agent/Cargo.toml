@@ -21,6 +21,10 @@ pi-agent = { workspace = true }
 pi-ai = { workspace = true }
 pi-codemode = { workspace = true }
 pi-mcp = { workspace = true }
+# Native Rust extension host (additive pi-rs capability; upstream has none).
+# The host loader uses only the crate's safe API, so `#![forbid(unsafe_code)]`
+# in lib.rs still holds; all FFI is confined to pi-native-ext.
+pi-native-ext = { workspace = true }
 # Direct path so the workspace root's dependency table stays untouched; the
 # crate is already a workspace member. `pi remote` is its host consumer.
 pi-env = { path = "../pi-env" }

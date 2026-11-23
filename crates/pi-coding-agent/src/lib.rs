@@ -57,6 +57,9 @@ pub mod models_config;
 pub mod models_state;
 /// Print, JSON-event, RPC, and interactive modes.
 pub mod modes;
+/// Native Rust extension host loader (additive pi-rs capability; upstream pi
+/// has no native extension host). See the module docs for the C ABI boundary.
+pub mod native_ext;
 /// OAuth and provider-auth composition (E2 slice 6c): auth methods per
 /// provider, login/logout option surfaces (`core/provider-composer.ts` +
 /// `auth/resolve.ts` halves).
