@@ -15,9 +15,14 @@ use pi_ai::providers;
 
 use pi_ai::types::ImageContent;
 use pi_coding_agent::changelog::ChangelogEntry;
-use pi_coding_agent::cli::args::{Args, DiagnosticKind, Mode, parse_args, print_help};
+use pi_coding_agent::cli::args::{
+    Args, DiagnosticKind, ExtensionFlagInfo, Mode, parse_args, print_help,
+};
 use pi_coding_agent::cli::file_processor::process_file_arguments;
 use pi_coding_agent::cli::project_trust::{DefaultProjectTrust, ProjectTrustStore};
+use pi_coding_agent::cli::session::{
+    StartupSessionError, resolve_startup_session, validate_fork_flags, validate_session_id_flags,
+};
 use pi_coding_agent::config;
 use pi_coding_agent::config::settings::{SettingsManager, SettingsManagerCreateOptions};
 use pi_coding_agent::extensions;
@@ -30,7 +35,7 @@ use pi_coding_agent::modes::print_mode::{
 use pi_coding_agent::modes::rpc::run_rpc_mode;
 use pi_coding_agent::native_ext::NativeExtensions;
 use pi_coding_agent::output_guard::{restore_stdout, take_over_stdout};
-use pi_coding_agent::session::store::{NewSessionOptions, SessionManager};
+use pi_coding_agent::session::store::SessionManager;
 use pi_coding_agent::telemetry::host::{
     ChangelogPingDecision, HostTelemetry, LAST_CHANGELOG_VERSION_SETTING, SETTING_OTLP_ENDPOINT,
     changelog_ping_decision, install_from_env_with_settings,
@@ -44,9 +49,23 @@ use pi_coding_agent::tools::index::ToolRegistry;
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
 
+    // `pi auth <command>` routes before argument parsing (`main.ts:622`,
+    // `runAuthCommand` `:171-262`). An `auth` word must never become the
+    // first prompt message.
+    if let Some(code) = pi_coding_agent::cli::auth_command::handle_auth_command(&raw) {
+        std::process::exit(code);
+    }
+
     // Package subcommands route before mode startup (`main.ts:648` —
     // `pi install|remove|uninstall|list|update`), like `runAuthCommand`.
     if let Some(code) = pi_coding_agent::cli::package_command::handle_package_command(&raw) {
+        std::process::exit(code);
+    }
+
+    // `pi config` routes next (`main.ts:661`, `handleConfigCommand`). The
+    // resource TUI itself is not ported; the handler emits an honest message
+    // with the files it would edit rather than falling through to a prompt.
+    if let Some(code) = pi_coding_agent::cli::config_command::handle_config_command(&raw) {
         std::process::exit(code);
     }
 
@@ -99,24 +118,35 @@ fn main() {
 
     let args = parse_args(&raw);
 
-    let errors: Vec<&_> = args
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.kind == DiagnosticKind::Error)
-        .collect();
-    if !errors.is_empty() {
-        for error in errors {
-            eprintln!("{}", error.message);
-        }
-        std::process::exit(2);
+    // `main.ts:671-679`: every diagnostic is reported with its `Error:` /
+    // `Warning:` prefix, and any error exits 1. Warnings (notably an invalid
+    // `--thinking` level) are surfaced but do not abort startup.
+    let mut has_error = false;
+    for diagnostic in &args.diagnostics {
+        let prefix = if diagnostic.kind == DiagnosticKind::Error {
+            "Error"
+        } else {
+            "Warning"
+        };
+        eprintln!("{prefix}: {}", diagnostic.message);
+        has_error |= diagnostic.kind == DiagnosticKind::Error;
+    }
+    if has_error {
+        std::process::exit(1);
     }
 
+    // `main.ts:683-685` prints the bare `VERSION` (the coding-agent package
+    // version). The port prints its own package version, and keeps that
+    // version visible in `--help` too.
     if args.version {
-        println!("{} {}", config::APP_NAME, env!("CARGO_PKG_VERSION"));
+        println!("{}", env!("CARGO_PKG_VERSION"));
         return;
     }
     if args.help {
-        print_help();
+        print_help(&collect_extension_flags(
+            &args,
+            &std::env::current_dir().unwrap_or_default(),
+        ));
         return;
     }
     // `--export <file> [output]` (`main.ts:688-703`): export a session file
@@ -141,16 +171,11 @@ fn main() {
         return;
     }
 
-    if args.resume || args.fork.is_some() {
-        eprintln!("pi-rs: --resume/--fork are not implemented yet (phase P5/P6)");
-        std::process::exit(2);
-    }
-
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let cwd_string = cwd.to_string_lossy().to_string();
 
     if let Some(search) = &args.list_models {
-        list_models(search.as_deref());
+        pi_coding_agent::cli::list_models::print_models(search.as_deref());
         return;
     }
 
@@ -168,6 +193,34 @@ fn main() {
         take_over_stdout();
     }
 
+    // `main.ts:708-711`: @file arguments never reach RPC mode. Checked here,
+    // before a `--fork` can create a session file.
+    if app_mode == AppMode::Rpc && !args.file_args.is_empty() {
+        eprintln!("Error: @file arguments are not supported in RPC mode");
+        std::process::exit(1);
+    }
+
+    // `main.ts:713-714` (validateForkFlags / validateSessionIdFlags).
+    for result in [validate_fork_flags(&args), validate_session_id_flags(&args)] {
+        if let Err(message) = result {
+            eprintln!("Error: {message}");
+            std::process::exit(1);
+        }
+    }
+
+    // `main.ts:401-499` (`createSessionManager`): --resume/--fork/--session/
+    // --continue/--session-id all resolve to one session manager shared by
+    // every mode. This is where the old "not implemented" bail-out lived.
+    let session_dir = args.session_dir.as_deref().map(PathBuf::from);
+    let session = match resolve_startup_session(&args, &cwd, session_dir.as_deref()) {
+        Ok(session) => session,
+        Err(StartupSessionError::Error(message)) => {
+            eprintln!("Error: {message}");
+            std::process::exit(1);
+        }
+        Err(StartupSessionError::Cancelled) => std::process::exit(0),
+    };
+
     // Read piped stdin content (if any) - skip for RPC mode which uses stdin
     // for JSON-RPC (`main.ts:960-968`); content present while interactive
     // flips the mode to print.
@@ -181,10 +234,10 @@ fn main() {
     }
 
     let outcome = match app_mode {
-        AppMode::Rpc => run_rpc(&args, &cwd, &cwd_string),
-        AppMode::Json => run_json(&args, &cwd, &cwd_string, stdin_content.as_deref()),
-        AppMode::Print => run_print(&args, &cwd, &cwd_string, stdin_content.as_deref()),
-        AppMode::Interactive => run_interactive(&args, &cwd, &cwd_string),
+        AppMode::Rpc => run_rpc(&args, &cwd, &cwd_string, session),
+        AppMode::Json => run_json(&args, &cwd, &cwd_string, stdin_content.as_deref(), session),
+        AppMode::Print => run_print(&args, &cwd, &cwd_string, stdin_content.as_deref(), session),
+        AppMode::Interactive => run_interactive(&args, &cwd, &cwd_string, session),
     };
     match outcome {
         Ok(code) => std::process::exit(code),
@@ -249,18 +302,50 @@ fn read_piped_stdin_from(reader: &mut impl std::io::Read) -> Option<String> {
     }
 }
 
-/// `--list-models [search]`: catalog listing with substring filter. The fuzzy
-/// search of upstream `cli/list-models.ts` lands in P5.
-fn list_models(search: Option<&str>) {
-    let search = search.unwrap_or("");
-    for provider in pi_coding_agent::models_state::providers() {
-        for model in pi_coding_agent::models_state::models_for(&provider) {
-            let full = format!("{provider}/{}", model.id);
-            if search.is_empty() || full.contains(search) || model.id.contains(search) {
-                println!("{full}\t{}", model.name);
-            }
+/// The extension flags a loaded host registered, for `--help`
+/// (`main.ts:941-944`). Upstream loads the host before printing help so the
+/// `Extension CLI Flags:` section lists real registrations; the port does the
+/// same, and stays empty when the engine is disabled or loading fails.
+fn collect_extension_flags(args: &Args, cwd: &std::path::Path) -> Vec<ExtensionFlagInfo> {
+    #[cfg(feature = "ext-js")]
+    {
+        let agent_dir = config::get_agent_dir();
+        let trust_store = ProjectTrustStore::new(&agent_dir);
+        let settings = SettingsManager::create(
+            cwd,
+            &agent_dir,
+            SettingsManagerCreateOptions {
+                project_trusted: None,
+            },
+        );
+        let default_trust = startup_default_project_trust(&settings);
+        if let Ok((loaded, _)) = extensions::load(
+            args,
+            cwd,
+            &agent_dir,
+            &trust_store,
+            default_trust,
+            &settings,
+            "tui",
+            None,
+        ) && let Some(runner) = loaded.host.runner()
+        {
+            return runner
+                .lock()
+                .expect("extension runner mutex poisoned")
+                .flags()
+                .into_iter()
+                .map(|flag| ExtensionFlagInfo {
+                    name: flag.name,
+                    description: flag.description,
+                    kind: flag.kind,
+                })
+                .collect();
         }
     }
+    #[cfg(not(feature = "ext-js"))]
+    let _ = (args, cwd);
+    Vec::new()
 }
 
 /// Upstream creates a settings manager before trust is resolved
@@ -350,8 +435,9 @@ fn build_runtime(
     cwd: &std::path::Path,
     cwd_string: &str,
     mode: &str,
+    session: SessionManager,
 ) -> Result<(PrintRuntime, HostTelemetry, bool), String> {
-    build_runtime_with_ui(args, cwd, cwd_string, mode, ModeUi::default())
+    build_runtime_with_ui(args, cwd, cwd_string, mode, ModeUi::default(), session)
 }
 
 /// The runtime assembly with an optional UI surface. `ui` binds before
@@ -365,6 +451,7 @@ fn build_runtime_with_ui(
     cwd_string: &str,
     mode: &str,
     ui: ModeUi,
+    session: SessionManager,
 ) -> Result<(PrintRuntime, HostTelemetry, bool), String> {
     let agent_dir = config::get_agent_dir();
     let trust_store = ProjectTrustStore::new(&agent_dir);
@@ -581,27 +668,9 @@ fn build_runtime_with_ui(
             base
         };
 
-    // Session: --no-session is ephemeral, --continue resumes the most recent
-    // session for this cwd, --session opens by path, --session-id reuses or
-    // creates, otherwise create.
-    let session_dir = args.session_dir.as_deref().map(PathBuf::from);
-    let session = if args.no_session {
-        SessionManager::in_memory(cwd, &NewSessionOptions::default(), Vec::new())
-    } else if args.r#continue {
-        SessionManager::continue_recent(cwd, session_dir.as_deref())
-    } else if let Some(path) = &args.session {
-        SessionManager::open(&PathBuf::from(path), session_dir.as_deref(), None)
-    } else if let Some(id) = &args.session_id {
-        match SessionManager::find_by_id(cwd, id, session_dir.as_deref()) {
-            Some(path) => SessionManager::open(&path, session_dir.as_deref(), None),
-            None => {
-                SessionManager::create(cwd, session_dir.as_deref(), &NewSessionOptions::default())
-            }
-        }
-    } else {
-        SessionManager::create(cwd, session_dir.as_deref(), &NewSessionOptions::default())
-    }
-    .map_err(|error| error.to_string())?;
+    // The session was resolved once at startup (`createSessionManager`,
+    // `main.ts:401-499`), before piped stdin was read. It already carries
+    // --resume/--fork/--continue/--session/--session-id semantics.
 
     // Restore facts (`createAgentSession`, `core/sdk.ts:195-198`): whether the
     // resumed session carries messages, and the level its branch recorded
@@ -786,9 +855,10 @@ fn run_print(
     cwd: &std::path::Path,
     cwd_string: &str,
     stdin_content: Option<&str>,
+    session: SessionManager,
 ) -> Result<i32, String> {
     let (mut runtime, host_telemetry, block_images) =
-        build_runtime(args, cwd, cwd_string, "print")?;
+        build_runtime(args, cwd, cwd_string, "print", session)?;
     host_telemetry.record_run("print");
     let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd, stdin_content)?;
     let options = PrintModeOptions {
@@ -807,7 +877,12 @@ fn run_print(
 
 /// Interactive mode: the chat TUI. Initial `@file`/message arguments ride
 /// along like upstream's `initialMessage` (P6 part 2).
-fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
+fn run_interactive(
+    args: &Args,
+    cwd: &std::path::Path,
+    cwd_string: &str,
+    session: SessionManager,
+) -> Result<i32, String> {
     // The interactive `ctx.ui` bridge (E3 slice 6a): built before
     // extensions load so a dialog can open during `session_start`
     // (`createExtensionUIContext`, `interactive-mode.ts:2763-2830`; the
@@ -823,10 +898,11 @@ fn run_interactive(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Resu
         cwd_string,
         "interactive",
         Some(Arc::clone(&extension_ui) as Arc<dyn pi_ext_js::UiSink>),
+        session,
     )?;
     #[cfg(not(feature = "ext-js"))]
     let (mut runtime, host_telemetry, _block_images) =
-        build_runtime(args, cwd, cwd_string, "interactive")?;
+        build_runtime(args, cwd, cwd_string, "interactive", session)?;
     host_telemetry.record_run("interactive");
     // The trust ladder resolved once in build_runtime — extensions may have
     // decided through the `project_trust` hook.
@@ -876,8 +952,10 @@ fn run_json(
     cwd: &std::path::Path,
     cwd_string: &str,
     stdin_content: Option<&str>,
+    session: SessionManager,
 ) -> Result<i32, String> {
-    let (mut runtime, host_telemetry, block_images) = build_runtime(args, cwd, cwd_string, "json")?;
+    let (mut runtime, host_telemetry, block_images) =
+        build_runtime(args, cwd, cwd_string, "json", session)?;
     host_telemetry.record_run("json");
     let (initial, images, follow_ups) = resolve_prompt_messages(args, cwd, stdin_content)?;
     let options = PrintModeOptions {
@@ -893,11 +971,14 @@ fn run_json(
     outcome
 }
 
-fn run_rpc(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, String> {
-    if !args.file_args.is_empty() {
-        // `main.ts:708-711`.
-        return Err("Error: @file arguments are not supported in RPC mode".to_string());
-    }
+fn run_rpc(
+    args: &Args,
+    cwd: &std::path::Path,
+    cwd_string: &str,
+    session: SessionManager,
+) -> Result<i32, String> {
+    // The @file guard runs in main() before the session is resolved
+    // (`main.ts:708-711`).
     // The bridge owns stdin/stdout for the run: the reader thread routes
     // `extension_ui_response` lines to pending dialogs while the loop is
     // inside a command (upstream routes both through the same stdin
@@ -907,10 +988,17 @@ fn run_rpc(args: &Args, cwd: &std::path::Path, cwd_string: &str) -> Result<i32, 
         Box::new(pi_coding_agent::modes::rpc::RpcStdout::new()),
     );
     #[cfg(feature = "ext-js")]
-    let (mut runtime, host_telemetry, block_images) =
-        build_runtime_with_ui(args, cwd, cwd_string, "rpc", Some(Arc::clone(&bridge.sink)))?;
+    let (mut runtime, host_telemetry, block_images) = build_runtime_with_ui(
+        args,
+        cwd,
+        cwd_string,
+        "rpc",
+        Some(Arc::clone(&bridge.sink)),
+        session,
+    )?;
     #[cfg(not(feature = "ext-js"))]
-    let (mut runtime, host_telemetry, block_images) = build_runtime(args, cwd, cwd_string, "rpc")?;
+    let (mut runtime, host_telemetry, block_images) =
+        build_runtime(args, cwd, cwd_string, "rpc", session)?;
     host_telemetry.record_run("rpc");
     let outcome = run_rpc_mode(&mut runtime, &mut bridge, block_images);
     host_telemetry.flush_and_shutdown();

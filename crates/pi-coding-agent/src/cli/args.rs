@@ -33,6 +33,17 @@ pub enum DiagnosticKind {
     Error,
 }
 
+/// One registered extension flag (`ExtensionFlag` in
+/// `core/extensions/types.ts`), collected from the loaded host for the
+/// `Extension CLI Flags:` section of `--help` (`args.ts:273-283`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionFlagInfo {
+    pub name: String,
+    pub description: String,
+    /// `"boolean"` or `"string"`.
+    pub kind: String,
+}
+
 /// Parsed CLI arguments (`Args`, `args.ts:13-59`).
 ///
 /// Fields stay `None`/empty exactly where upstream leaves them undefined;
@@ -427,12 +438,19 @@ pub fn parse_args(input: &[String]) -> Args {
     result
 }
 
-/// `printHelp` (`args.ts:273-480`), minus chalk styling and the extension
-/// flag section (extensions land in P5).
-pub fn print_help() {
+/// `printHelp` (`args.ts:270-480`), minus chalk styling. The extension flag
+/// section, Examples and Environment Variables follow upstream; paths and
+/// variable descriptions are adjusted for pi-rs's XDG roots.
+pub fn print_help(extension_flags: &[ExtensionFlagInfo]) {
     println!(
         "{} - AI coding assistant with read, bash, edit, write tools",
         crate::config::APP_NAME
+    );
+    // Keep the binary's own version discoverable: upstream's `--version`
+    // prints only the package version (`main.ts:683-685`).
+    println!(
+        "pi-rs {} (upstream parity target: @earendil-works/pi-coding-agent 1.5.2)",
+        env!("CARGO_PKG_VERSION")
     );
     println!();
     println!("Usage:");
@@ -572,59 +590,215 @@ pub fn print_help() {
     println!("  --version, -v                  Show version number");
     println!();
     println!("Extensions can register additional flags (e.g., --plan from plan-mode extension).");
+    if !extension_flags.is_empty() {
+        println!();
+        println!("Extension CLI Flags:");
+        for flag in extension_flags {
+            let value = if flag.kind == "string" {
+                " <value>"
+            } else {
+                ""
+            };
+            let description = if flag.description.is_empty() {
+                format!("Registered by {}", flag.name)
+            } else {
+                flag.description.clone()
+            };
+            println!(
+                "  {:<28} {}",
+                format!("--{}{}", flag.name, value),
+                description
+            );
+        }
+    }
     println!();
     println!("Examples:");
-    println!("  # Print a provider API key for an external client");
-    println!(
-        "  {} auth print-api-key --provider openai",
-        crate::config::APP_NAME
+    let example = |description: &str, command: String| {
+        println!("  # {description}");
+        println!("  {command}");
+        println!();
+    };
+    let pi = crate::config::APP_NAME;
+    example(
+        "Print a provider API key for an external client",
+        format!("{pi} auth print-api-key --provider openai"),
     );
-    println!();
-    println!("  # Non-interactive mode (process and exit)");
-    println!(
-        "  {} -p \"List all .ts files in src/\"",
-        crate::config::APP_NAME
+    example(
+        "Print an OAuth bearer token for an external client (refreshes if expired)",
+        format!("{pi} auth print-bearer-token --provider openai-codex"),
     );
-    println!();
-    println!("  # Prompt beginning with a dash");
-    println!(
-        "  {} -p -- \"- Summarize these points\"",
-        crate::config::APP_NAME
+    example("Interactive mode", pi.to_string());
+    example(
+        "Interactive mode with initial prompt",
+        format!("{pi} \"List all .ts files in src/\""),
     );
-    println!();
-    println!("  # Use different model");
-    println!(
-        "  {} --provider openai --model gpt-4o-mini \"Help me refactor this code\"",
-        crate::config::APP_NAME
+    example(
+        "Include files in initial message",
+        format!("{pi} @prompt.md @image.png \"What color is the sky?\""),
     );
-    println!();
-    println!("  # Use model with provider prefix (no --provider needed)");
-    println!(
-        "  {} --model openai/gpt-4o \"Help me refactor this code\"",
-        crate::config::APP_NAME
+    example(
+        "Non-interactive mode (process and exit)",
+        format!("{pi} -p \"List all .ts files in src/\""),
     );
-    println!();
-    println!("  # Use model with thinking level shorthand");
-    println!(
-        "  {} --model sonnet:high \"Solve this complex problem\"",
-        crate::config::APP_NAME
+    example(
+        "Prompt beginning with a dash",
+        format!("{pi} -p -- \"- Summarize these points\""),
     );
-    println!();
-    println!("  # Read-only mode (no file modifications possible)");
-    println!(
-        "  {} --tools read,grep,find,ls -p \"Review the code in src/\"",
-        crate::config::APP_NAME
+    example(
+        "Multiple messages (interactive)",
+        format!("{pi} \"Read package.json\" \"What dependencies do we have?\""),
     );
+    example(
+        "Continue previous session",
+        format!("{pi} --continue \"What did we discuss?\""),
+    );
+    example(
+        "Start a named session",
+        format!("{pi} --name \"Refactor auth module\""),
+    );
+    example(
+        "Use different model",
+        format!("{pi} --provider openai --model gpt-4o-mini \"Help me refactor this code\""),
+    );
+    example(
+        "Use model with provider prefix (no --provider needed)",
+        format!("{pi} --model openai/gpt-4o \"Help me refactor this code\""),
+    );
+    example(
+        "Use model with thinking level shorthand",
+        format!("{pi} --model sonnet:high \"Solve this complex problem\""),
+    );
+    example(
+        "Limit model cycling to specific models",
+        format!("{pi} --models claude-sonnet,claude-haiku,gpt-4o"),
+    );
+    example(
+        "Limit to a specific provider with glob pattern",
+        format!("{pi} --models \"github-copilot/*\""),
+    );
+    example(
+        "Cycle models with fixed thinking levels",
+        format!("{pi} --models sonnet:high,haiku:low"),
+    );
+    example(
+        "Start with a specific thinking level",
+        format!("{pi} --thinking high \"Solve this complex problem\""),
+    );
+    example(
+        "Read-only mode (no file modifications possible)",
+        format!("{pi} --tools read,grep,find,ls -p \"Review the code in src/\""),
+    );
+    example(
+        "Add codemode to the default tools",
+        format!("{pi} --tools +codemode"),
+    );
+    example(
+        "Codemode with only the tools of one MCP server",
+        format!("{pi} --tools read,bash,codemode,'mcp__radius__*'"),
+    );
+    example(
+        "Disable one tool while keeping the rest available",
+        format!("{pi} --exclude-tools ask_question"),
+    );
+    example(
+        "Export a session file to HTML",
+        format!(
+            "{pi} --export ~/{}/agent/sessions/--path--/session.jsonl",
+            crate::config::CONFIG_DIR_NAME
+        ),
+    );
+    println!("  {pi} --export session.jsonl output.html");
     println!();
     println!("Environment Variables:");
-    println!("  ANTHROPIC_AUTH_TOKEN             - Anthropic bearer auth token");
-    println!("  ANTHROPIC_API_KEY                - Anthropic Claude API key");
-    println!("  ANTHROPIC_OAUTH_TOKEN            - Anthropic OAuth token (alternative to API key)");
-    println!("  OPENAI_API_KEY                   - OpenAI GPT API key");
-    println!("  GEMINI_API_KEY                   - Google Gemini API key");
-    println!("  GROQ_API_KEY                     - Groq API key");
-    println!("  DEEPSEEK_API_KEY                 - DeepSeek API key");
-    println!("  OPENROUTER_API_KEY               - OpenRouter API key");
+    for (name, description) in [
+        ("ANTHROPIC_AUTH_TOKEN", "Anthropic bearer auth token"),
+        ("ANTHROPIC_API_KEY", "Anthropic Claude API key"),
+        (
+            "ANTHROPIC_OAUTH_TOKEN",
+            "Anthropic OAuth token (alternative to API key)",
+        ),
+        ("ANT_LING_API_KEY", "Ant Ling API key"),
+        ("OPENAI_API_KEY", "OpenAI GPT API key"),
+        ("AZURE_OPENAI_API_KEY", "Azure OpenAI API key"),
+        (
+            "AZURE_OPENAI_BASE_URL",
+            "Azure OpenAI/Cognitive Services base URL",
+        ),
+        (
+            "AZURE_OPENAI_RESOURCE_NAME",
+            "Azure OpenAI resource name (alternative to base URL)",
+        ),
+        (
+            "AZURE_OPENAI_API_VERSION",
+            "Azure OpenAI API version (default: v1)",
+        ),
+        (
+            "AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
+            "Azure OpenAI model=deployment map",
+        ),
+        ("DEEPSEEK_API_KEY", "DeepSeek API key"),
+        ("NVIDIA_API_KEY", "NVIDIA NIM API key"),
+        ("GEMINI_API_KEY", "Google Gemini API key"),
+        ("GROQ_API_KEY", "Groq API key"),
+        ("CEREBRAS_API_KEY", "Cerebras API key"),
+        ("XAI_API_KEY", "xAI Grok API key"),
+        ("FIREWORKS_API_KEY", "Fireworks API key"),
+        ("TOGETHER_API_KEY", "Together AI API key"),
+        ("BASETEN_API_KEY", "Baseten API key"),
+        ("OPENROUTER_API_KEY", "OpenRouter API key"),
+        ("AI_GATEWAY_API_KEY", "Vercel AI Gateway API key"),
+        ("ZAI_API_KEY", "ZAI Coding Plan API key (Global)"),
+        ("ZAI_CODING_CN_API_KEY", "ZAI Coding Plan API key (China)"),
+        ("MISTRAL_API_KEY", "Mistral API key"),
+        ("MINIMAX_API_KEY", "MiniMax API key"),
+        ("MOONSHOT_API_KEY", "Moonshot AI API key"),
+        ("OPENCODE_API_KEY", "OpenCode Zen/OpenCode Go API key"),
+        ("KIMI_API_KEY", "Kimi For Coding API key"),
+        ("META_API_KEY", "Meta Model API key"),
+        (
+            "CLOUDFLARE_API_KEY",
+            "Cloudflare API token (Workers AI and AI Gateway)",
+        ),
+        (
+            "CLOUDFLARE_ACCOUNT_ID",
+            "Cloudflare account id (required for both)",
+        ),
+        (
+            "CLOUDFLARE_GATEWAY_ID",
+            "Cloudflare AI Gateway slug (required for AI Gateway)",
+        ),
+        (
+            "QWEN_TOKEN_PLAN_API_KEY",
+            "Qwen Token Plan API key (international)",
+        ),
+        (
+            "QWEN_TOKEN_PLAN_CN_API_KEY",
+            "Qwen Token Plan API key (China)",
+        ),
+        ("XIAOMI_API_KEY", "Xiaomi MiMo API key"),
+        (
+            "XIAOMI_TOKEN_PLAN_CN_API_KEY",
+            "Xiaomi MiMo Token Plan API key (China)",
+        ),
+        (
+            "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+            "Xiaomi MiMo Token Plan API key (Amsterdam)",
+        ),
+        (
+            "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+            "Xiaomi MiMo Token Plan API key (Singapore)",
+        ),
+        ("AWS_PROFILE", "AWS profile for Amazon Bedrock"),
+        ("AWS_ACCESS_KEY_ID", "AWS access key for Amazon Bedrock"),
+        ("AWS_SECRET_ACCESS_KEY", "AWS secret key for Amazon Bedrock"),
+        ("AWS_BEARER_TOKEN_BEDROCK", "Bedrock API key (bearer token)"),
+        (
+            "AWS_REGION",
+            "AWS region for Amazon Bedrock (e.g., us-east-1)",
+        ),
+    ] {
+        println!("  {name:<32} - {description}");
+    }
     println!(
         "  {:<32} - Agent dir override: all state under one dir (default: XDG roots like ~/.config/{})",
         crate::config::ENV_AGENT_DIR,
@@ -635,7 +809,20 @@ pub fn print_help() {
         crate::config::ENV_SESSION_DIR
     );
     println!(
-        "  PI_OFFLINE                       - Disable startup network operations when set to 1/true/yes"
+        "  {:<32} - Override package directory (for Nix/Guix store paths)",
+        "PI_PACKAGE_DIR"
+    );
+    println!(
+        "  {:<32} - Disable startup network operations when set to 1/true/yes",
+        "PI_OFFLINE"
+    );
+    println!(
+        "  {:<32} - Override install telemetry when set to 1/true/yes or 0/false/no",
+        "PI_TELEMETRY"
+    );
+    println!(
+        "  {:<32} - pi-rs OTLP endpoint for the opt-in telemetry exporter",
+        "PI_RS_OTLP_ENDPOINT"
     );
     println!();
     println!("Built-in Tool Names:");
