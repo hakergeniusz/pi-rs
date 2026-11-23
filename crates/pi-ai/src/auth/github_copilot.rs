@@ -470,6 +470,8 @@ async fn refresh_access_token(
         account_id: None,
         enterprise_url: enterprise_domain.map(str::to_string),
         available_model_ids: Vec::new(),
+        client_id: None,
+        scopes: Vec::new(),
     })
 }
 
@@ -644,6 +646,28 @@ mod tests {
         config.github_copilot.device_user_code_url = server.url("/usercode");
         config.github_copilot.device_token_url = server.url("/access-token");
         config
+    }
+
+    /// `getUrls` (`github-copilot.ts:53-63`) derives the token endpoint from
+    /// the domain for *all* domains; github.com resolves to api.github.com.
+    #[test]
+    fn get_urls_uses_the_github_api_domain_for_the_token_endpoint() {
+        let config = FlowConfig::default();
+        let (device_code, access_token, token) = get_urls("github.com", &config.github_copilot);
+        assert_eq!(device_code, "https://github.com/login/device/code");
+        assert_eq!(access_token, "https://github.com/login/oauth/access_token");
+        assert_eq!(token, "https://api.github.com/copilot_internal/v2/token");
+        let (device_code, access_token, token) =
+            get_urls("ghe.company.com", &config.github_copilot);
+        assert_eq!(device_code, "https://ghe.company.com/login/device/code");
+        assert_eq!(
+            access_token,
+            "https://ghe.company.com/login/oauth/access_token"
+        );
+        assert_eq!(
+            token,
+            "https://api.ghe.company.com/copilot_internal/v2/token"
+        );
     }
 
     #[test]

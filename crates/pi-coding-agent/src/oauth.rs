@@ -47,12 +47,13 @@
 //!   `AuthSelectorProvider` (`:10-20`), `formatAuthSelectorProviderType`
 //!   (`:23-27`), `formatAuthSelectorProviderStatus` (`:30-49`).
 //!
-//! The per-provider OAuth *flows* for Anthropic, OpenAI Codex and GitHub
-//! Copilot (PKCE/device-code/callback-server implementations in
-//! `packages/ai/src/auth/oauth/{anthropic,openai-codex,github-copilot}.ts`)
-//! live in `pi_ai::auth` and are driven by [`BuiltinLoginFlow`] here. The
-//! remaining flows (kimi-coding, meta, xai, openrouter, radius) still report
-//! the honest upstream-shaped error. This module also ports the composition
+//! The per-provider OAuth *flows* for Anthropic, OpenAI Codex, GitHub
+//! Copilot, ChatGPT, Kimi Code, Meta, xAI and OpenRouter (the PKCE /
+//! device-code / callback-server implementations in
+//! `packages/ai/src/auth/oauth/*.ts`) live in `pi_ai::auth` and are driven by
+//! [`BuiltinLoginFlow`] here. Radius still reports the honest error: its flow
+//! needs a configured pi-messages gateway that this port does not create.
+//! This module also ports the composition
 //! surface: which auth methods a provider exposes, their display metadata,
 //! the login/logout option lists, and the request-time resolution rules the
 //! wire ladder applies
@@ -381,14 +382,26 @@ fn builtin_oauth(provider_id: &str) -> Option<OAuthAuthInfo> {
         "anthropic" => ("Anthropic (Claude Pro/Max)", true, None),
         // github-copilot.ts:31
         "github-copilot" => ("GitHub Copilot", true, None),
-        // kimi-coding.ts:14-16
-        "kimi-coding" => ("Kimi Code (subscription)", true, None),
-        // meta.ts:14-16
-        "meta" => ("Meta (Muse subscription)", true, None),
-        // openai.ts:16-18
-        "openai" => ("OpenAI (ChatGPT subscription)", true, None),
-        // xai.ts:14-16
-        "xai" => ("xAI (Grok/X subscription)", true, None),
+        // kimi-coding.ts:14-17
+        "kimi-coding" => (
+            "Kimi Code (subscription)",
+            true,
+            Some("Sign in with Kimi Code"),
+        ),
+        // meta.ts:14-17
+        "meta" => ("Meta (Muse subscription)", true, Some("Sign in with Meta")),
+        // openai.ts:16-19
+        "openai" => (
+            "OpenAI (ChatGPT subscription)",
+            true,
+            Some("Sign in with ChatGPT"),
+        ),
+        // xai.ts:14-17
+        "xai" => (
+            "xAI (Grok/X subscription)",
+            true,
+            Some("Sign in with SuperGrok or X Premium"),
+        ),
         // openrouter.ts:69-73
         "openrouter" => ("OpenRouter OAuth", false, Some("Sign in with OpenRouter")),
         // openai-codex.ts:13-16
@@ -579,8 +592,12 @@ pub fn provider_auth_status(
     // The ambient env vars (`envApiKeyAuth.resolve`'s loop,
     // `helpers.ts:21-29`): the first set variable is the source label.
     for variable in crate::modes::print_mode::env_key_candidates(provider_id) {
+        // `defaultProviderAuthContext().env` only accepts a value whose
+        // `trim()` is non-empty (`auth/context.ts:27`); whitespace-only env
+        // vars are treated as unset. The original (untrimmed) value is what
+        // the credential carries.
         if let Ok(value) = std::env::var(variable)
-            && !value.is_empty()
+            && !value.trim().is_empty()
         {
             return Some(AuthStatus {
                 configured: true,
@@ -1062,6 +1079,14 @@ fn credential_from_pi(credential: pi_ai::auth::OAuthCredential) -> crate::auth::
             serde_json::json!(credential.available_model_ids),
         );
     }
+    // OpenAI ChatGPT's dynamic client id and granted scopes must survive a
+    // refresh round-trip (`openai-chatgpt.ts:208-223`).
+    if let Some(client_id) = credential.client_id {
+        unknown.insert("clientId".to_string(), serde_json::json!(client_id));
+    }
+    if !credential.scopes.is_empty() {
+        unknown.insert("scopes".to_string(), serde_json::json!(credential.scopes));
+    }
     crate::auth::Credential::Oauth {
         access: credential.access,
         refresh: credential.refresh,
@@ -1124,6 +1149,17 @@ fn stored_oauth_to_pi(
                     .collect()
             })
             .unwrap_or_default(),
+        client_id: string("clientId"),
+        scopes: unknown
+            .get("scopes")
+            .and_then(serde_json::Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -1138,6 +1174,11 @@ fn pi_credential_extra(
             "enterpriseUrl".to_string(),
             serde_json::json!(enterprise_url),
         );
+    }
+    // OpenAI ChatGPT's refresh grant needs the dynamically issued client id
+    // (`openai-chatgpt.ts:208-212`).
+    if let Some(client_id) = &credential.client_id {
+        extra.insert("clientId".to_string(), serde_json::json!(client_id));
     }
     extra
 }
@@ -1437,6 +1478,24 @@ mod tests {
                 assert_eq!(oauth.login_label, Some("Sign in with OpenRouter"));
             }
             other @ AuthMethod::ApiKey(_) => panic!("expected oauth, got {other:?}"),
+        }
+    }
+
+    /// The verbatim `loginLabel` values from `providers/*.ts` that the auth
+    /// type selector uses instead of the generic "Sign in with an account".
+    #[test]
+    fn builtin_oauth_login_labels_match_upstream() {
+        for (provider, label) in [
+            ("openai", "Sign in with ChatGPT"),
+            ("kimi-coding", "Sign in with Kimi Code"),
+            ("meta", "Sign in with Meta"),
+            ("xai", "Sign in with SuperGrok or X Premium"),
+        ] {
+            let methods = provider_auth_methods(provider, None, None);
+            match methods.first().expect("oauth first") {
+                AuthMethod::OAuth(oauth) => assert_eq!(oauth.login_label, Some(label)),
+                other @ AuthMethod::ApiKey(_) => panic!("expected oauth, got {other:?}"),
+            }
         }
     }
 
@@ -1976,6 +2035,8 @@ mod tests {
             account_id: Some("acct".to_string()),
             enterprise_url: Some("ghe.company.com".to_string()),
             available_model_ids: vec!["gpt-5".to_string()],
+            client_id: None,
+            scopes: Vec::new(),
         });
         let value = serde_json::to_value(&credential).expect("credential json");
         assert_eq!(

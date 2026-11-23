@@ -69,7 +69,11 @@ pub fn state_hex() -> String {
         })
 }
 
-fn random_bytes(length: usize) -> Vec<u8> {
+/// Raw random bytes from the same source `generatePKCE` uses. Exposed for the
+/// flows that need a nonce/state or a UUID (`openai-chatgpt.ts:49-51`,
+/// `openrouter.ts:120`'s `crypto.randomUUID()`).
+#[must_use]
+pub fn random_bytes(length: usize) -> Vec<u8> {
     if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
         let mut bytes = vec![0_u8; length];
         if file.read_exact(&mut bytes).is_ok() {
@@ -91,6 +95,33 @@ fn random_bytes(length: usize) -> Vec<u8> {
     }
     bytes.truncate(length);
     bytes
+}
+
+/// `crypto.randomUUID()` (used by `openrouter.ts:120` for the callback path).
+#[must_use]
+pub fn uuid_v4() -> String {
+    let mut bytes = random_bytes(16);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
 }
 
 #[cfg(test)]

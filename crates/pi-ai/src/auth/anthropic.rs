@@ -109,6 +109,8 @@ async fn exchange_authorization_code(
         account_id: None,
         enterprise_url: None,
         available_model_ids: Vec::new(),
+        client_id: None,
+        scopes: Vec::new(),
     })
 }
 
@@ -145,6 +147,7 @@ fn start_callback(
         state: Some(verifier),
         cancel: cancel.clone(),
         timeout: None,
+        return_query: false,
     };
     CallbackServer::start(&options(endpoints.callback_port))
         .or_else(|_| CallbackServer::start(&options(0)))
@@ -349,6 +352,8 @@ pub async fn refresh(
         account_id: None,
         enterprise_url: None,
         available_model_ids: Vec::new(),
+        client_id: None,
+        scopes: Vec::new(),
     })
 }
 

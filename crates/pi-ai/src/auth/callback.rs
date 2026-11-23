@@ -31,6 +31,10 @@ pub struct CallbackOptions<'a> {
     pub state: Option<&'a str>,
     pub cancel: CancelToken,
     pub timeout: Option<Duration>,
+    /// `OpenAI` `ChatGPT`'s callback carries an issued `client_id` alongside the
+    /// code (`openai-chatgpt.ts:53-62`); when set, `wait()` yields the whole
+    /// query string instead of just `code`.
+    pub return_query: bool,
 }
 
 /// The browser callback plus the manual-code alternative
@@ -82,6 +86,7 @@ impl CallbackServer {
         let path = options.path.to_string();
         let state = options.state.map(str::to_string);
         let cancel = options.cancel.clone();
+        let return_query = options.return_query;
         let timeout = options.timeout.unwrap_or(Duration::from_mins(15));
         std::thread::spawn(move || {
             serve(
@@ -91,6 +96,7 @@ impl CallbackServer {
                 state.as_deref(),
                 &cancel,
                 timeout,
+                return_query,
                 sender,
             );
         });
@@ -151,6 +157,7 @@ enum CallbackStep {
     Finish(Result<Option<String>, AuthError>),
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors the callback server's inputs; split when extending
 fn serve(
     listener: &TcpListener,
     provider_name: &str,
@@ -158,6 +165,7 @@ fn serve(
     state: Option<&str>,
     cancel: &CancelToken,
     timeout: Duration,
+    return_query: bool,
     sender: oneshot::Sender<Result<Option<String>, AuthError>>,
 ) {
     if let Err(error) = listener.set_nonblocking(true) {
@@ -173,7 +181,7 @@ fn serve(
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let (status, page, step) =
-                    handle_connection(&mut stream, provider_name, path, state);
+                    handle_connection(&mut stream, provider_name, path, state, return_query);
                 write_response(&mut stream, status, &page);
                 if let CallbackStep::Finish(result) = step {
                     let _ = sender.send(result);
@@ -202,6 +210,7 @@ fn handle_connection(
     provider_name: &str,
     path: &str,
     expected_state: Option<&str>,
+    return_query: bool,
 ) -> (u16, String, CallbackStep) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut buffer = Vec::with_capacity(1024);
@@ -235,7 +244,14 @@ fn handle_connection(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or("/");
-    handle_request(method, target, provider_name, path, expected_state)
+    handle_request(
+        method,
+        target,
+        provider_name,
+        path,
+        expected_state,
+        return_query,
+    )
 }
 
 fn handle_request(
@@ -244,6 +260,7 @@ fn handle_request(
     provider_name: &str,
     path: &str,
     expected_state: Option<&str>,
+    return_query: bool,
 ) -> (u16, String, CallbackStep) {
     if method != "GET" || target.split('?').next().is_none_or(|value| value != path) {
         return (
@@ -282,12 +299,19 @@ fn handle_request(
             CallbackStep::Continue,
         );
     };
+    let value = if return_query {
+        target
+            .split_once('?')
+            .map_or(String::new(), |(_, query)| query.to_string())
+    } else {
+        code.clone()
+    };
     (
         200,
         oauth_success_html(&format!(
             "Signed in to {provider_name}. You may now close this page."
         )),
-        CallbackStep::Finish(Ok(Some(code.clone()))),
+        CallbackStep::Finish(Ok(Some(value))),
     )
 }
 
@@ -432,6 +456,7 @@ mod tests {
             state,
             cancel: CancelToken::new(),
             timeout: Some(timeout),
+            return_query: false,
         })
         .expect("callback server")
     }

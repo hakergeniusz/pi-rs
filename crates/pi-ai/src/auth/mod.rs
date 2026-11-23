@@ -23,6 +23,12 @@
 //!   `toAuth` proxy base URL (`:494-500`); `getGitHubCopilotBaseUrl`'s
 //!   token-proxy / enterprise fallback (`:70-88`) is exposed through
 //!   [`base_url_for_wire_credential`] so the wire path can carry it.
+//! - `oauth/kimi-coding.ts` — device authorization, bounded refresh (`:15-278`).
+//! - `oauth/meta.ts` — device flow plus Muse Code key mint (`:20-197`).
+//! - `oauth/xai.ts` — device flow and skew-adjusted refresh (`:8-239`).
+//! - `oauth/openrouter.ts` — ephemeral-callback PKCE key exchange (`:19-169`).
+//! - `oauth/openai-chatgpt.ts` — dynamic-client PKCE with the issued client id
+//!   and direct-token scope (`:16-309`).
 //!
 //! Deviations (see `WIRING.md` at the worktree root):
 //! - The app-owned interaction callbacks become the concrete
@@ -38,6 +44,9 @@
 //! - The callback server runs on `std::net` inside a blocking task rather than
 //!   Node's `http.createServer`; the route, `state`, error and code handling,
 //!   status codes and error strings mirror upstream exactly.
+//! - OpenAI ChatGPT's `LoginOptions.getDeviceId()` is supplied through
+//!   [`FlowConfig::openai_chatgpt_device_id`]; with no host settings manager a
+//!   UUID v4 is synthesized per login instead of reusing a stable host id.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,9 +62,14 @@ pub mod callback;
 pub mod device_code;
 pub mod github_copilot;
 pub mod http;
+pub mod kimi_coding;
+pub mod meta;
+pub mod openai_chatgpt;
 pub mod openai_codex;
+pub mod openrouter;
 pub mod pkce;
 pub mod trusted_url;
+pub mod xai;
 
 /// `CANCEL_MESSAGE` (`device-code.ts:1`).
 pub const CANCEL_MESSAGE: &str = "Login cancelled";
@@ -77,6 +91,14 @@ pub struct OAuthCredential {
     pub enterprise_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_model_ids: Vec<String>,
+    /// `OpenAI` `ChatGPT`'s dynamically issued client id (`openai-chatgpt.ts:178`).
+    /// Required by its refresh grant (`:208-223`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// `OpenAI` `ChatGPT`'s granted scopes, kept for the `chatgpt.tokens.use.direct`
+    /// contract (`:169-181`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
 }
 
 impl OAuthCredential {
@@ -100,6 +122,12 @@ impl OAuthCredential {
                 "availableModelIds".to_string(),
                 json!(self.available_model_ids),
             );
+        }
+        if let Some(client_id) = &self.client_id {
+            object.insert("clientId".to_string(), json!(client_id));
+        }
+        if !self.scopes.is_empty() {
+            object.insert("scopes".to_string(), json!(self.scopes));
         }
         Value::Object(object)
     }
@@ -415,6 +443,15 @@ pub struct FlowConfig {
     pub anthropic: EndpointConfig,
     pub openai_codex: EndpointConfig,
     pub github_copilot: EndpointConfig,
+    pub kimi_coding: EndpointConfig,
+    pub meta: EndpointConfig,
+    pub xai: EndpointConfig,
+    pub openrouter: EndpointConfig,
+    pub openai_chatgpt: EndpointConfig,
+    /// Upstream's `LoginOptions.getDeviceId()` (`interactive-mode.ts:6538`).
+    /// The port has no settings-manager device id, so a UUID is synthesized
+    /// per login when this is `None` (documented deviation).
+    pub openai_chatgpt_device_id: Option<String>,
 }
 
 impl Default for FlowConfig {
@@ -444,7 +481,11 @@ impl Default for FlowConfig {
             github_copilot: EndpointConfig {
                 device_user_code_url: "https://github.com/login/device/code".to_string(),
                 device_token_url: "https://github.com/login/oauth/access_token".to_string(),
-                token_url: "https://api.githubcopilot.com/copilot_internal/v2/token".to_string(),
+                // `github-copilot.ts:53-63` derives `https://api.${domain}` for
+                // every domain, including github.com. `api.githubcopilot.com`
+                // is the *inference* base URL (`identity.test.ts:179`), not
+                // the token endpoint.
+                token_url: "https://api.github.com/copilot_internal/v2/token".to_string(),
                 // Upstream's `fetchWithRateLimitRetry` budget for Copilot
                 // (`maxRetries: 2, maxElapsedMs: 5000`), applied to the token
                 // and catalogue fetches (`github-copilot.ts:180, 396-400`).
@@ -454,15 +495,67 @@ impl Default for FlowConfig {
                 },
                 ..EndpointConfig::default()
             },
+            // kimi-coding.ts:15-19,59-60,135
+            kimi_coding: EndpointConfig {
+                device_user_code_url: "https://auth.kimi.com/api/oauth/device_authorization"
+                    .to_string(),
+                device_token_url: "https://auth.kimi.com/api/oauth/token".to_string(),
+                ..EndpointConfig::default()
+            },
+            // meta.ts:21-25
+            meta: EndpointConfig {
+                device_user_code_url: "https://auth.meta.com/oidc/device/authorization/"
+                    .to_string(),
+                device_token_url: "https://auth.meta.com/oidc/device/token/".to_string(),
+                token_url: "https://api.meta.ai/muse-code/key".to_string(),
+                ..EndpointConfig::default()
+            },
+            // xai.ts:8-11
+            xai: EndpointConfig {
+                device_user_code_url: "https://auth.x.ai/oauth2/device/code".to_string(),
+                device_token_url: "https://auth.x.ai/oauth2/token".to_string(),
+                ..EndpointConfig::default()
+            },
+            // openrouter.ts:19-24 (the callback path gets a random suffix).
+            openrouter: EndpointConfig {
+                authorize_url: "https://openrouter.ai/auth".to_string(),
+                token_url: "https://openrouter.ai/api/v1/auth/keys".to_string(),
+                callback_host: "127.0.0.1".to_string(),
+                callback_port: 0,
+                callback_path: "/oauth/callback".to_string(),
+                ..EndpointConfig::default()
+            },
+            // openai-chatgpt.ts:19-25
+            openai_chatgpt: EndpointConfig {
+                authorize_url: "https://auth.openai.com/api/accounts/authorize".to_string(),
+                token_url: "https://auth.openai.com/api/accounts/oauth/token".to_string(),
+                callback_host: "127.0.0.1".to_string(),
+                callback_port: 1455,
+                callback_path: "/auth/callback".to_string(),
+                ..EndpointConfig::default()
+            },
+            openai_chatgpt_device_id: None,
         }
     }
 }
 
 /// The provider ids whose built-in flows are ported
-/// (`auth/oauth/{anthropic,openai-codex,github-copilot}.ts`).
+/// (`auth/oauth/{anthropic,openai-codex,github-copilot,openai-chatgpt,
+/// kimi-coding,meta,xai,openrouter}.ts`). Radius stays out: its flow needs a
+/// configured pi-messages gateway that this port does not create.
 #[must_use]
 pub fn is_builtin_oauth_provider(provider_id: &str) -> bool {
-    matches!(provider_id, "anthropic" | "openai-codex" | "github-copilot")
+    matches!(
+        provider_id,
+        "anthropic"
+            | "openai-codex"
+            | "github-copilot"
+            | "kimi-coding"
+            | "meta"
+            | "xai"
+            | "openrouter"
+            | "openai"
+    )
 }
 
 /// `OAuthAuth.login` for a built-in provider.
@@ -479,6 +572,11 @@ pub async fn login(
         "anthropic" => anthropic::login(interaction, config).await,
         "openai-codex" => openai_codex::login(interaction, config).await,
         "github-copilot" => github_copilot::login(interaction, config).await,
+        "kimi-coding" => kimi_coding::login(interaction, config).await,
+        "meta" => meta::login(interaction, config).await,
+        "xai" => xai::login(interaction, config).await,
+        "openrouter" => openrouter::login(interaction, config).await,
+        "openai" => openai_chatgpt::login(interaction, config).await,
         other => Err(AuthError::Message(format!(
             "Unknown OAuth provider: {other}"
         ))),
@@ -506,6 +604,14 @@ pub async fn refresh(
                 .and_then(Value::as_str)
                 .and_then(http::normalize_domain);
             github_copilot::refresh(refresh_token, domain.as_deref(), cancel, config).await
+        }
+        "kimi-coding" => kimi_coding::refresh(refresh_token, cancel, config).await,
+        "meta" => meta::refresh(refresh_token, cancel, config).await,
+        "xai" => xai::refresh(refresh_token, cancel, config).await,
+        "openrouter" => Ok(openrouter::refresh(refresh_token)),
+        "openai" => {
+            let client_id = extra.get("clientId").and_then(Value::as_str);
+            openai_chatgpt::refresh(client_id, refresh_token, cancel, config).await
         }
         other => Err(AuthError::Message(format!(
             "Unknown OAuth provider: {other}"
@@ -556,6 +662,8 @@ pub fn base_url_for_wire_credential(
             account_id: None,
             enterprise_url: enterprise_url.map(str::to_string),
             available_model_ids: Vec::new(),
+            client_id: None,
+            scopes: Vec::new(),
         },
     )
     .1
@@ -597,6 +705,8 @@ mod tests {
             account_id: Some("acct".to_string()),
             enterprise_url: None,
             available_model_ids: vec!["gpt-5".to_string()],
+            client_id: None,
+            scopes: Vec::new(),
         };
         assert_eq!(
             credential.to_value(),
@@ -611,13 +721,39 @@ mod tests {
         );
     }
 
+    /// `github-copilot.ts:53-63` always derives the token URL from the domain;
+    /// for github.com that is `https://api.github.com/...`, not the
+    /// `api.githubcopilot.com` inference host (`identity.test.ts:179`).
+    #[test]
+    fn github_copilot_token_endpoint_is_the_github_api_domain() {
+        let config = FlowConfig::default();
+        assert_eq!(
+            config.github_copilot.token_url,
+            "https://api.github.com/copilot_internal/v2/token"
+        );
+        // The inference base URL is a separate derivation and stays intact.
+        assert_eq!(
+            base_url_for_wire_token(
+                "github-copilot",
+                "tid=1;proxy-ep=proxy.individual.githubcopilot.com;"
+            ),
+            Some("https://api.individual.githubcopilot.com".to_string())
+        );
+    }
+
     #[test]
     fn builtin_provider_dispatch_is_exact() {
         assert!(is_builtin_oauth_provider("anthropic"));
         assert!(is_builtin_oauth_provider("openai-codex"));
         assert!(is_builtin_oauth_provider("github-copilot"));
+        assert!(is_builtin_oauth_provider("kimi-coding"));
+        assert!(is_builtin_oauth_provider("meta"));
+        assert!(is_builtin_oauth_provider("xai"));
+        assert!(is_builtin_oauth_provider("openrouter"));
+        assert!(is_builtin_oauth_provider("openai"));
+        // Radius needs a configured pi-messages gateway, which the port does
+        // not create; its row still reports the honest error.
         assert!(!is_builtin_oauth_provider("radius"));
-        assert!(!is_builtin_oauth_provider("openrouter"));
     }
 
     #[test]
@@ -629,6 +765,8 @@ mod tests {
             account_id: None,
             enterprise_url: None,
             available_model_ids: Vec::new(),
+            client_id: None,
+            scopes: Vec::new(),
         };
         assert_eq!(to_auth("anthropic", &credential), ("tok".to_string(), None));
         assert_eq!(

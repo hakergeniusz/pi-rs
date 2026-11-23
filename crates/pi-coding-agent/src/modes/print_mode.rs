@@ -995,7 +995,10 @@ fn resolve_wire_credential_checked_with(
     }
     for variable in env_key_candidates(provider) {
         if let Ok(value) = std::env::var(variable) {
-            if value.is_empty() {
+            // `defaultProviderAuthContext().env` treats a whitespace-only
+            // value as unset (`auth/context.ts:27`); the credential itself
+            // keeps the original, untrimmed value.
+            if value.trim().is_empty() {
                 continue;
             }
             // `ANTHROPIC_AUTH_TOKEN` rides as a custom Bearer header, ahead

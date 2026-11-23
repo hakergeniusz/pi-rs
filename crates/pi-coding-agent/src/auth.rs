@@ -14,7 +14,8 @@
 //! directory (`:68-73`), written as `JSON.stringify(data, null, 2)`, and
 //! guarded by a lock (pi takes `proper-lockfile`; this port creates the
 //! `<path>.lock` directory the same library would, with the same 10-attempt /
-//! 20 ms retry the sync path uses, `:81-96`).
+//! 20 ms retry the sync path uses, `:81-96`, plus the 30 s stale-lock window
+//! the async path passes as `stale`, `:118-157`).
 //!
 //! Deviations: the revision-keyed read-state cache and its reload coalescing
 //! (`:331-345`, `:403-441`) are an async-IO optimization and are not ported —
@@ -375,9 +376,23 @@ struct FileLock {
     path: PathBuf,
 }
 
+/// The `stale` window `proper-lockfile` is given by both lock paths
+/// (`auth-storage.ts:122,134`: `const staleMs = 30_000`). A lock directory
+/// older than this was left behind by a crashed holder and is reclaimed.
+const LOCK_STALE: Duration = Duration::from_secs(30);
+
+/// `lockfile`'s stale check: the lock directory's mtime compared with now.
+fn lock_is_stale(modified: std::time::SystemTime, now: std::time::SystemTime) -> bool {
+    now.duration_since(modified)
+        .is_ok_and(|age| age >= LOCK_STALE)
+}
+
 impl FileLock {
     /// `acquireLockSyncWithRetry` (`auth-storage.ts:81-96`): up to 10 attempts
-    /// with a 20 ms delay between them.
+    /// with a 20 ms delay between them, plus the stale-window reclaim the
+    /// async path installs via `lockfile.lock(..., { stale: 30_000 })`
+    /// (`:118-157`). Without the reclaim a crashed process's `<auth>.lock`
+    /// directory would block every later operation for as long as it lives.
     fn acquire(path: &Path) -> AuthResult<FileLock> {
         const MAX_ATTEMPTS: usize = 10;
         let lock_path = PathBuf::from(format!("{}.lock", path.to_string_lossy()));
@@ -386,6 +401,16 @@ impl FileLock {
             match std::fs::create_dir(&lock_path) {
                 Ok(()) => return Ok(FileLock { path: lock_path }),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Reclaim an abandoned lock before falling back to the
+                    // 10x/20 ms sync retry, matching the stale option's
+                    // observable effect on this lock directory.
+                    if std::fs::metadata(&lock_path)
+                        .and_then(|metadata| metadata.modified())
+                        .is_ok_and(|modified| lock_is_stale(modified, std::time::SystemTime::now()))
+                        && std::fs::remove_dir(&lock_path).is_ok()
+                    {
+                        continue;
+                    }
                     last_error = Some(error);
                     if attempt != MAX_ATTEMPTS {
                         std::thread::sleep(Duration::from_millis(20));
@@ -1022,6 +1047,14 @@ mod tests {
             read_stored_credential("anthropic", &dir.path().join("missing.json")),
             None
         );
+    }
+
+    #[test]
+    fn stale_lock_window_is_thirty_seconds() {
+        let modified = std::time::SystemTime::now();
+        assert!(!lock_is_stale(modified, modified + Duration::from_secs(29)));
+        assert!(lock_is_stale(modified, modified + Duration::from_secs(30)));
+        assert!(lock_is_stale(modified, modified + Duration::from_secs(60)));
     }
 
     #[test]

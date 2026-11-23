@@ -66,6 +66,8 @@ fn read_token_response(
         account_id: None,
         enterprise_url: None,
         available_model_ids: Vec::new(),
+        client_id: None,
+        scopes: Vec::new(),
     })
 }
 
@@ -400,6 +402,7 @@ async fn login_browser(
         state: Some(&state),
         cancel: interaction.cancellation(),
         timeout: None,
+        return_query: false,
     })
     .ok();
     interaction.notify(AuthEvent::AuthUrl {
@@ -558,6 +561,8 @@ mod tests {
             account_id: None,
             enterprise_url: None,
             available_model_ids: Vec::new(),
+            client_id: None,
+            scopes: Vec::new(),
         })
         .expect("credential");
         assert_eq!(credential.account_id.as_deref(), Some("acct-1"));
@@ -569,6 +574,8 @@ mod tests {
                 account_id: None,
                 enterprise_url: None,
                 available_model_ids: Vec::new(),
+                client_id: None,
+                scopes: Vec::new(),
             })
             .unwrap_err()
             .to_string(),
