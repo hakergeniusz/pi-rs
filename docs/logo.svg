@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="300" viewBox="0 0 128 128" role="img" aria-label="pi-rs logo">
+  <title>pi-rs logo</title>
+  <!-- The pi pixel mark, from upstream pi-logo.ts (pinned 1.5.2):
+       coral coral coral .
+       blue  .     coral .
+       blue  blue  .     yellow
+       blue  .     .     yellow
+       Brand colours: coral #e48a7a, blue #4f8eb3, yellow #eab65d.
+       Transparent background so it reads on GitHub's light and dark themes. -->
+  <g fill-rule="evenodd">
+    <!-- row 0 -->
+    <rect x="6"  y="6"  width="26" height="26" rx="3" fill="#e48a7a"/>
+    <rect x="36" y="6"  width="26" height="26" rx="3" fill="#e48a7a"/>
+    <rect x="66" y="6"  width="26" height="26" rx="3" fill="#e48a7a"/>
+    <!-- row 1 -->
+    <rect x="6"  y="36" width="26" height="26" rx="3" fill="#4f8eb3"/>
+    <rect x="66" y="36" width="26" height="26" rx="3" fill="#e48a7a"/>
+    <!-- row 2 -->
+    <rect x="6"  y="66" width="26" height="26" rx="3" fill="#4f8eb3"/>
+    <rect x="36" y="66" width="26" height="26" rx="3" fill="#4f8eb3"/>
+    <rect x="96" y="66" width="26" height="26" rx="3" fill="#eab65d"/>
+    <!-- row 3 -->
+    <rect x="6"  y="96" width="26" height="26" rx="3" fill="#4f8eb3"/>
+    <rect x="96" y="96" width="26" height="26" rx="3" fill="#eab65d"/>
+  </g>
+</svg>

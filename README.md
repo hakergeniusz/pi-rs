@@ -10,10 +10,10 @@
 > extensible agent harness. **Almost 1:1** behavioural and on-disk parity with
 > pi 1.5.2, with native Rust extensions on top.
 
-```
-▀▀█  v0.1.1
-█▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
-```
+<p align="center"><img src="docs/logo.svg" alt="pi-rs logo" width="300"></p>
+
+> **Why pi-rs?** Keep your pi 1.5.2 sessions and extensions, gain native Rust
+> plugins, and never touch an existing upstream `~/.pi` install.
 
 ---
 
@@ -43,7 +43,7 @@ The repo is public, so no token is required.
 
 ### Windows
 
-Download `pi-windows-x86_64` from the
+Download `pi-windows-x86_64.exe` from the
 [latest release](https://github.com/hakergeniusz/pi-rs/releases/latest), rename
 it to `pi-rs.exe`, and put it on your `PATH`. A PowerShell installer is not
 published yet.
@@ -64,13 +64,13 @@ There is no pi-rs package on npm today. The upstream
 
 ## 🪟 Platform support
 
-| Platform | Asset | Notes |
-|---|---|---|
-| Linux x86-64 | `pi-linux-x86_64` | primary parity target |
-| Linux aarch64 | `pi-linux-aarch64` | |
-| macOS x86-64 | `pi-darwin-x86_64` | Intel runners |
-| macOS aarch64 | `pi-darwin-aarch64` | Apple Silicon |
-| Windows x86-64 | `pi-windows-x86_64` | `.exe` asset, extensionless on the release |
+| Platform       | Asset                   | Notes                       |
+| -------------- | ----------------------- | --------------------------- |
+| Linux x86-64   | `pi-linux-x86_64`       | primary parity target       |
+| Linux aarch64  | `pi-linux-aarch64`      |                             |
+| macOS x86-64   | `pi-darwin-x86_64`      | Intel runners               |
+| macOS aarch64  | `pi-darwin-aarch64`     | Apple Silicon               |
+| Windows x86-64 | `pi-windows-x86_64.exe` | executable asset on release |
 
 All five are built and checksum-verified by the tag workflow. Source-level
 platform gates live in the crates; see
@@ -108,11 +108,11 @@ Measured on the operator's box; indicative, not a benchmark suite.
 
 ![Startup and memory comparison: pi-rs ~342 ms / 32 MiB, upstream pi ~65 ms / 41 MiB](docs/bench.svg)
 
-| | pi-rs (release) | pi-rs (debug) | upstream pi (Node 0.12.26) |
-|---|---:|---:|---:|
-| First TUI frame | ~342 ms | ~694 ms | ~65 ms |
-| Resident set size | ~32 MiB | ~40 MiB | ~41 MiB |
-| Binary | 26 MB, stripped | debug build | Node runtime |
+| Metric            | pi-rs (release) | pi-rs (debug) | upstream pi (Node 0.12.26) |
+| ----------------- | --------------: | ------------: | -------------------------: |
+| First TUI frame   | ~342 ms         | ~694 ms       | ~65 ms                     |
+| Resident set size | ~32 MiB         | ~40 MiB       | ~41 MiB                    |
+| Binary            | 26 MB, stripped | debug build   | Node runtime               |
 
 pi-rs uses about **24% less memory** but starts roughly **5x slower**. Node
 benefits from a warm V8 startup; pi-rs spends its first few hundred milliseconds
@@ -144,12 +144,12 @@ Inside the TUI: `/` commands, `@file` fuzzy search, `!`/`!!` bash mode,
 pi-rs follows the [XDG Base Directory spec](https://specifications.freedesktop.org/basedir-spec/latest/)
 under a `pi-rs` leaf:
 
-| Role | Default | Contents |
-|---|---|---|
-| config | `~/.config/pi-rs` | `settings.json`, `auth.json`, `models.json`, themes, prompts, tools, skills, trust |
-| data | `~/.local/share/pi-rs` | `sessions/` |
-| cache | `~/.cache/pi-rs` | managed binaries (`fd`, `rg`) |
-| state | `~/.local/state/pi-rs` | debug log |
+| Role   | Default                | Contents                                                                           |
+| ------ | ---------------------- | ---------------------------------------------------------------------------------- |
+| config | `~/.config/pi-rs`      | `settings.json`, `auth.json`, `models.json`, themes, prompts, tools, skills, trust |
+| data   | `~/.local/share/pi-rs` | `sessions/`                                                                        |
+| cache  | `~/.cache/pi-rs`       | managed binaries (`fd`, `rg`)                                                      |
+| state  | `~/.local/state/pi-rs` | debug log                                                                          |
 
 Each root honours its `XDG_*` variable when absolute. `PI_CODING_AGENT_DIR`
 collapses every role into one upstream-style directory. Project-local `.pi/`
@@ -196,6 +196,8 @@ Deferred from core scope: `chord`, `pi-durable`, `evals`, `apps/p2`.
   harness this port follows (MIT), including its logo, sessions and CLI surface.
 - The Rust ecosystem crates that make the port possible, notably `rquickjs`,
   `crossterm`, `reqwest` and `oxc`.
+
+---
 
 ## 📄 License
 
