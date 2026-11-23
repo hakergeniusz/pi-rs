@@ -2,9 +2,9 @@
 # Host-side build workflow for pi-rs (replaces the retired podman containers).
 #
 # Keeps the low-TBW contract from the old RAM container: cargo artifacts and
-# test caches live on the host tmpfs (/tmp/opencode), and only an explicit
-# `snapshot` writes a single compressed archive to the workspace's
-# .build-cache dir. The cargo registry stays read-only/offline.
+# test caches live under /var/cache/zstd5 (disk-backed, not the /tmp tmpfs),
+# and only an explicit `snapshot` writes a single compressed archive to the
+# workspace's .build-cache dir. The cargo registry stays read-only/offline.
 #
 # Usage:
 #   sh scripts/host-build.sh check [-p crate]

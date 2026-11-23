@@ -113,9 +113,10 @@ under the repo or `/tmp`.
   trailer naming the assistant (ZCode sessions use
   `Assisted-by: ZCode (GLM-5.3-Flash)`).
 - Push after every commit, then check CI (`gh run list` / `gh run view`).
-- Remote: `github.com/hakergeniusz/pi-rs` (**private**). Never commit
+- Remote: `github.com/hakergeniusz/pi-rs` (**public**). Never commit
   secrets or files ≥ 25 MB.
-- Version discipline: workspace `0.1.0-alpha.x`.
+- Version discipline: workspace `0.1.1`, tagged `v0.1.1`; patch bumps keep the
+  tag and Cargo version in lockstep.
 
 ## Code conventions
 
@@ -133,8 +134,11 @@ under the repo or `/tmp`.
 
 `HANDOFF.md` has the dated details; `README.md` the user summary;
 [`docs/GAP-STATUS.md`](docs/GAP-STATUS.md) the upstream↔port coverage matrix.
-**v0.1.0 is tagged and released** (Linux x86_64/aarch64 assets + checksums).
-Builds are host-side (`scripts/host-build.sh`); podman was removed.
+**v0.1.1 is tagged and released**: ten assets across five targets (Linux
+x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64 `.exe`) plus checksums;
+npm wrapper `@hakergeniusz/pi-rs@0.1.2`. Latest CI: run `45222553829`
+(green, 2026-11-23) on `45c3302`. Builds are host-side
+(`scripts/host-build.sh`); podman was removed.
 
 Landed through the 2026-11-22 gap wave (integration `16f0946`): the full
 extensions arc E0→E3 plus the E4 items (CJS interop, per-path `/reload` unload,
@@ -168,8 +172,10 @@ gained Copilot's 429 back-off and enterprise base URL; codemode got real local
 thread/client transports; and E4 gained `URL.canParse`, ancestor `node_modules`
 resolution and statically-foldable `require(expr)`. A post-audit fix wave made
 telemetry end-to-end live, real RPC abort cancellation, the typed OAuth error
-and Copilot base URL reachable, real tool-result image conversion, session
-delta host call sites, and an opt-in codemode thread-worker transport. The
+and Copilot base URL reachable, real tool-result image conversion,
+`SessionListProgress` consumption in the interactive session selector and
+`ReadonlySessionManager` in `session/cwd.rs`, and an opt-in codemode
+thread-worker transport. The
 sync tokio runtime is thread-local (removes parallel-test flakes) and the
 E4 `require` fold was repaired. Final gate: 2646 passed, 0 failed, 3 ignored;
 CI all jobs green.
@@ -188,9 +194,12 @@ Still open (genuine mechanism tails or deliberate scope decisions):
    `install_from_env_with_settings` (`bac3519`), still gated so no socket opens
    by default. MCP stderr uses a temp-file
    sink; `StartupWait` is one-shot (late connects survive via a per-server
-   queue). Session-delta types are library surfaces with no host emission call
-   site yet. `pi-env` ticks/PTY/SSH onboarding are host-driven by design.
+   queue). Session deltas are partly wired: `SessionListProgress` is consumed
+   by the interactive session selector and `ReadonlySessionManager` by
+   `session/cwd.rs`; live `bash_execution_update` emission is still
+   library-only. `pi-env` ticks/PTY/SSH onboarding are host-driven by design.
 3. Out of scope: `chord`, `pi-durable`, `evals`, `apps/p2`. `/share` and `/bug`
-   stay omitted (Radius upload policy); macOS release assets await a runner.
+   stay omitted (Radius upload policy). All five release targets publish from
+   the tag workflow.
    No full 1:1 parity is claimed — remaining differences are mechanism-level
    and documented in module docs and [`docs/GAP-STATUS.md`](docs/GAP-STATUS.md).

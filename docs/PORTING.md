@@ -84,10 +84,13 @@ manager), `extensions/` (loader entry), `modes/` (`interactive/`, `rpc/`,
 Established translations. Use these; add new entries here when you invent a
 pattern, so the next agent doesn't rediscover it.
 
-- **Timers / `setInterval`** → host-driven time. The interactive loop's
-  `pump` (~25 ms cadence) is the only clock; animation frames derive from
-  elapsed time. State crossing into components travels as
-  `Arc<AtomicU16>`/`Arc<AtomicBool>` (rows, exit flags) refreshed/polled by
+- **Timers / `setInterval`** → `pi-tui`'s `ui_loop` timers: `set_timeout` /
+  `set_interval` return a `TimerId` and dispatch `Send` callbacks on one
+  dedicated timer thread (`clear_timer` cancels), sleeping on a `Condvar` so
+  no host polling is needed. Callbacks request a frame through
+  `TuiRenderWaker`. The interactive `pump` (~25 ms cadence) still drives
+  animation frames from elapsed time; state crossing into components travels
+  as `Arc<AtomicU16>`/`Arc<AtomicBool>` (rows, exit flags) refreshed/polled by
   `pump`.
 - **Callbacks that would borrow the mode** (re-entrancy during dispatch) →
   queue into `Arc<Mutex<Vec<T>>>` set as a boxed callback; `pump` drains with
@@ -170,7 +173,9 @@ slice that introduced them. The headline ones:
 - **XDG directory roots** (`~/.config/pi-rs`, …) instead of `~/.pi` — the
   one product-level deviation; `PI_CODING_AGENT_DIR` still collapses roles
   into one directory exactly like upstream.
-- **No timers**: the host-driven pump replaces `setInterval` everywhere.
+- **Timers run on a dedicated thread**: `pi-tui`'s `ui_loop` provides
+  `set_timeout`/`set_interval`/`clear_timer` with autonomous due-timer dispatch
+  and a `TuiRenderWaker`; only the render/paint path stays host-driven.
 - **rg download fallback** (upstream downloads a binary; we apt-install in
   CI and document the deviation).
 - **`pi auth login` is not ported**; the ported error hint mentions it.

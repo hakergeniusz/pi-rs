@@ -1,11 +1,11 @@
 # Handoff: Pi in Rust (`pi-rs`)
 
-> **CURRENT SNAPSHOT — 2026-11-22.** Read this section first; the dated
+> **CURRENT SNAPSHOT — 2026-11-23.** Read this section first; the dated
 > P0–P7 history below is retained for provenance only and contains stale
 > "main = …" / "checkout on wip/…" notes. The authoritative status is here,
 > in `AGENTS.md`, and in `docs/GAP-STATUS.md`. Repo:
 > `/home/hakergeniusz/Projects/pi-rs`, branch `main`, clean and pushed.
-> Remote: `github.com/hakergeniusz/pi-rs` (private). Ground truth: upstream
+> Remote: `github.com/hakergeniusz/pi-rs` (public). Ground truth: upstream
 > pi 1.5.2 at `/home/hakergeniusz/tmp-11-18/pi-152` (re-clone if gone:
 > `gh repo clone earendil-works/pi /tmp/pi`). **Never read real pi data roots
 > (`~/.config/pi`, `~/.local/state/pi`, legacy `~/.pi`) — credentials and chat
@@ -19,9 +19,12 @@ schemas, `.pi/` layout). One deliberate deviation: user-level roots are XDG
 TypeScript pi install. Phases P0–P7 plus the E0–E4 extension arc are landed.
 
 ## Current Progress
-- **`main` at `e19b45f`**, clean, pushed; latest CI run `45041019432` =
-  **success** (fmt, clippy, test, msrv, audit, release, no-default-features).
-- **Full gate: 2646 passed, 0 failed, 3 ignored.** Snapshot build cache at
+- **`main` tip `877a9c7`**, worktree HEAD `45c3302` (2026-11-23,
+  "feat(tui): add autonomous timers for the 3D egg"), clean and pushed; latest
+  CI run `45222553829` = **success** on `45c3302`
+  (fmt, clippy, test, msrv, audit, release, no-default-features).
+- **Full gate: 2646 passed, 0 failed, 3 ignored** at the audit wave; the
+  current `45c3302` CI run is green. Snapshot build cache at
   `.build-cache/host-target.tar.zst` (zstd -5, ~531 MB, verified with
   `zstd -t`).
 - All *fixable* upstream gaps are closed. A 10-agent fleet closed the gap wave
@@ -29,8 +32,9 @@ TypeScript pi install. Phases P0–P7 plus the E0–E4 extension arc are landed.
   tails, OAuth fidelity, codemode transports, E4 shims, session deltas), then
   a read-only audit found five dead mechanisms, fixed in a second wave:
   telemetry recorder+flush, real RPC abort, typed OAuth errors + Copilot base
-  URL, tool-result image transformer + session-delta call sites, opt-in
-  codemode thread-worker transport.
+  URL, tool-result image transformer, `SessionListProgress` consumption in
+  the interactive session selector and `ReadonlySessionManager` in
+  `session/cwd.rs`, plus an opt-in codemode thread-worker transport.
 - **Terminal-exit noise fixed and verified live in tmux** (`3cb7659`,
   `e19b45f`): the OSC/DA1 theme query is now issued after raw mode is on,
   pending stdin is drained like upstream's `drainInput(1000, 50)`, and the
@@ -42,8 +46,7 @@ TypeScript pi install. Phases P0–P7 plus the E0–E4 extension arc are landed.
 ### Build / test recipe (memory-safe, offline, low-TBW)
 ```sh
 cd /home/hakergeniusz/Projects/pi-rs
-TMPDIR=/var/tmp PI_CACHE_DIR=/var/tmp/opencode/pi-rs-cache \
-  PI_CACHE_DIR=/var/cache/zstd5/cache \
+TMPDIR=/var/tmp PI_CACHE_DIR=/var/cache/zstd5/cache \
   PI_TARGET_DIR=/var/cache/zstd5/cargo-target JOBS=2 \
   sh scripts/host-build.sh gate
 ```
@@ -109,8 +112,9 @@ host overrides. The interactive TUI needs a real PTY (tmux works):
    - True Node `worker_threads`/Cloudflare/wasm transports remain typed
      stubs; wasm `Stats`/`HMAC`/URL shims unported; codemode tools sync.
    - `blockImages` snapshotted once at startup in print/JSON; clipboard-image
-     paste needs a host hook; session-delta types have no host emission call
-     site (some wired in interactive); MCP stderr uses a temp-file sink.
+     paste needs a host hook; live `bash_execution_update` emission is still
+     library-only (`SessionListProgress` and `ReadonlySessionManager` have
+     host consumers); MCP stderr uses a temp-file sink.
    - `pi-env` ticks/PTY/SSH onboarding are host-driven by design.
 2. **Out of scope / policy — do not "fix" without explicit user approval:**
    `chord`, `pi-durable`, `evals`, `apps/p2`; `/share` and `/bug` (Radius

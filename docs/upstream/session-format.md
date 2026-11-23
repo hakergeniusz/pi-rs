@@ -6,9 +6,9 @@
 > `~/.local/share/pi-rs/` for sessions; the binary is still `pi`, but it is the
 > Rust build installed from the checksummed release assets / `scripts/install.sh`,
 > not npm. See the repository `README.md` (“Paths”) for the full table.
-> Sessions are JSONL v3 and byte-compatible with upstream golden fixtures;
-> exotic >17-digit float literals may still be rewritten (serde_json
-> `float_roundtrip` gap). Session files live under the XDG data root.
+> Sessions are JSONL v3 and byte-compatible with upstream golden fixtures,
+> including exotic >17-digit float literals (serde_json's `float_roundtrip`
+> feature is enabled). Session files live under the XDG data root.
 
 
 Sessions are stored as JSONL (JSON Lines) files. Each line is a JSON object with a `type` field. Session entries form a tree structure via `id`/`parentId` fields, enabling in-place branching without creating new files.
