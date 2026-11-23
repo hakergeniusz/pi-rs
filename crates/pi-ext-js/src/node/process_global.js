@@ -224,3 +224,54 @@ function structuredCloneValue(value, seen = new Map()) {
 }
 
 if (globalThis.structuredClone === undefined) globalThis.structuredClone = structuredCloneValue;
+
+// The GLUE bootstrap installs only `Intl.Segmenter`; extensions also use
+// `Intl.NumberFormat` at module top level (pi-sol-pi/src/sol-pi/tui.ts:14).
+// QuickJS-NG ships no ICU, so provide the decimal/percent/currency subset the
+// real-world sweep needs: grouping, digit limits and `resolvedOptions`.
+// A future ICU-backed host can replace this without touching extensions.
+if (globalThis.Intl === undefined) globalThis.Intl = {};
+if (globalThis.Intl.NumberFormat === undefined) {
+  globalThis.Intl.NumberFormat = class NumberFormat {
+    constructor(locales, options = {}) {
+      const locale = typeof locales === "string"
+        ? locales
+        : Array.isArray(locales) ? locales[0] : undefined;
+      this.locale = locale || "en-US";
+      this.options = options;
+      this.style = options.style ?? "decimal";
+      this.currency = options.currency;
+      this.maximumFractionDigits = options.maximumFractionDigits
+        ?? (this.style === "currency" ? 2 : 3);
+      this.minimumFractionDigits = options.minimumFractionDigits ?? 0;
+    }
+
+    format(value) {
+      let number = Number(value);
+      if (!Number.isFinite(number)) number = 0;
+      if (this.style === "percent") number *= 100;
+      const digits = Math.max(0, Math.min(20,
+        Math.max(this.minimumFractionDigits, this.maximumFractionDigits)));
+      const [integer, fraction] = number.toFixed(digits).split(".");
+      const grouped = integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+      let formatted = fraction ? `${grouped}.${fraction}` : grouped;
+      if (this.style === "percent") formatted += "%";
+      if (this.style === "currency" && this.currency) formatted = `${this.currency}${formatted}`;
+      return formatted;
+    }
+
+    formatToParts(value) {
+      return [{ type: "integer", value: this.format(value) }];
+    }
+
+    resolvedOptions() {
+      return {
+        locale: this.locale,
+        style: this.style,
+        maximumFractionDigits: this.maximumFractionDigits,
+        minimumFractionDigits: this.minimumFractionDigits,
+        ...(this.currency ? { currency: this.currency } : {}),
+      };
+    }
+  };
+}

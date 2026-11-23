@@ -144,6 +144,40 @@ export function mkdirSync(path, options) {
   return recursive ? String(path) : undefined;
 }
 
+// Node validates `mode` as a non-negative integer; strings are octal
+// (`chmodSync(path, "755") === chmodSync(path, 0o755)`). The host op receives
+// a decimal string so the Rust side stays a pure integer check.
+function modeOf(mode) {
+  if (typeof mode === "string") {
+    if (!/^[0-7]+$/.test(mode)) {
+      throw new TypeError("The \"mode\" argument must be an integer or an octal string");
+    }
+    return String(parseInt(mode, 8));
+  }
+  if (typeof mode !== "number" || !Number.isInteger(mode) || mode < 0) {
+    throw new TypeError("The \"mode\" argument must be a non-negative integer");
+  }
+  return String(mode);
+}
+
+// `chmodSync` maps to real Unix permissions in the host op; on non-Unix
+// platforms it is a documented no-op (the host has no portable mode seam).
+export function chmodSync(path, mode) {
+  unwrap(
+    ops.nodeFsChmodSync(String(path), modeOf(mode)),
+    "chmod",
+    String(path),
+  );
+}
+
+// `mkdtempSync(prefix)` appends Node's six random alphanumerics under the
+// given prefix and returns the created directory. The optional `encoding`
+// ("buffer") is honoured the same way `readFileSync` honours it.
+export function mkdtempSync(prefix, options) {
+  const created = unwrap(ops.nodeFsMkdtempSync(String(prefix)), "mkdtemp", String(prefix));
+  return encodingOf(options) === "buffer" ? Buffer.from(created) : created;
+}
+
 export function renameSync(oldPath, newPath) {
   unwrap(
     ops.nodeFsRenameSync(String(oldPath), String(newPath)),
@@ -284,7 +318,22 @@ export function realpath(path) {
   return Promise.resolve().then(() => realpathSync(path));
 }
 
-export const constants = { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1 };
+export const constants = {
+  F_OK: 0,
+  R_OK: 4,
+  W_OK: 2,
+  X_OK: 1,
+  // POSIX open flags (Linux values); `openSync` accepts these numerically.
+  O_RDONLY: 0,
+  O_WRONLY: 1,
+  O_RDWR: 2,
+  O_CREAT: 64,
+  O_EXCL: 128,
+  O_NOCTTY: 256,
+  O_TRUNC: 512,
+  O_APPEND: 1024,
+  O_NOFOLLOW: 131072,
+};
 
 export default {
   Stats,
@@ -297,6 +346,8 @@ export default {
   statSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
+  chmodSync,
   renameSync,
   unlinkSync,
   rmSync,

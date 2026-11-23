@@ -1,7 +1,10 @@
 // `node:crypto` — the hash and UUID surface used by the bundled MCP OAuth
 // flow (`extensions/mcp/oauth.ts:13`, `packages/mcp/src/naming.ts:6`). The
 // digest itself is computed by the host's sha2 dependency; the JS half
-// only implements Node's chainable Hash object.
+// only implements Node's chainable Hash object. The asymmetric functions
+// pi-zed-models imports (`generateKeyPairSync`, `privateDecrypt`,
+// `createPublicKey`) are shape-only stubs: the host has no RSA backend, so
+// they exist for the ESM linker but throw when called.
 
 import { Buffer } from "node:buffer";
 
@@ -98,13 +101,56 @@ export function randomBytes(size) {
 
 export const getHashes = () => ["sha256", "sha512"];
 
+// The embedded host has no RSA backend (no `rsa` dependency in the lockfile
+// and no HSM seam), so the asymmetric surface pi-zed-models imports for its
+// browser OAuth flow is shaped for the linker and throws an explicit error
+// when called. `stream`-style stubs elsewhere in the host use the same
+// "export exists, call is unavailable" policy.
+function rsaUnavailable(name) {
+  throw new Error(`node:crypto.${name} is not available in the extensions host (no RSA backend)`);
+}
+
+export function generateKeyPairSync() {
+  rsaUnavailable("generateKeyPairSync");
+}
+
+export function privateDecrypt() {
+  rsaUnavailable("privateDecrypt");
+}
+
+export function publicDecrypt() {
+  rsaUnavailable("publicDecrypt");
+}
+
+export function createPublicKey() {
+  rsaUnavailable("createPublicKey");
+}
+
+export function createPrivateKey() {
+  rsaUnavailable("createPrivateKey");
+}
+
 export const constants = {
   defaultEncoding: "buffer",
+  RSA_PKCS1_PADDING: 1,
+  RSA_SSLV23_PADDING: 2,
+  RSA_NO_PADDING: 3,
+  RSA_PKCS1_OAEP_PADDING: 4,
+  RSA_X931_PADDING: 5,
+  RSA_PKCS1_PSS_PADDING: 6,
+  RSA_PKCS1_PSS_SALTLEN_DIGEST: -1,
+  RSA_PKCS1_PSS_SALTLEN_MAX_SIGN: -2,
+  RSA_PKCS1_PSS_SALTLEN_AUTO: -3,
 };
 
 export default {
   createHash,
   createHmac,
+  generateKeyPairSync,
+  privateDecrypt,
+  publicDecrypt,
+  createPublicKey,
+  createPrivateKey,
   randomUUID,
   randomBytes,
   getHashes,

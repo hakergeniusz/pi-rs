@@ -353,6 +353,20 @@ impl JsHost {
         // without importing `node:process`. `node:process` re-exports this
         // same object (see `node/process_global.js`).
         ctx.with(|ctx| ctx.eval::<(), _>(crate::resolver::node::process_global_source()))?;
+        // Install the WHATWG `URL`/`URLSearchParams` globals at bootstrap:
+        // extensions reference `new URL(import.meta.url)` at module top level
+        // without importing `node:url` (pi-subagents-ported/index.ts:94).
+        // Evaluating the shim here runs its `globalThis.URL ??=` guards; a
+        // later `import "node:url"` reuses those already-installed globals.
+        ctx.with(|ctx| -> Result<(), JsHostError> {
+            let source = crate::resolver::virtual_module_source("node:url")
+                .expect("the node:url shim is always available");
+            let declared = rquickjs::Module::declare(ctx.clone(), "virtual:node:url", source)
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            let (module, _promise) = declared.eval().map_err(|err| Self::js_error(&ctx, err))?;
+            let _namespace = module.namespace()?;
+            Ok(())
+        })?;
         Ok(Self { ctx, rt, core })
     }
 
@@ -1106,10 +1120,22 @@ impl JsHost {
                     {
                         return Ok(Err(Self::js_error(&ctx, err)));
                     }
-                    let (module, _promise) = match declaration.eval() {
+                    let (module, promise) = match declaration.eval() {
                         Ok(evaluated) => evaluated,
                         Err(err) => return Ok(Err(Self::js_error(&ctx, err))),
                     };
+                    // QuickJS reports a failed module *evaluation* through
+                    // the returned promise, not as a thrown exception from
+                    // `eval()`. Ignoring it let a top-level throw (for
+                    // example `URL is not defined`) slip through and the
+                    // factory below ran against a half-evaluated module,
+                    // surfacing a misleading TDZ error instead. Surface the
+                    // real rejection to the caller.
+                    if matches!(promise.state(), rquickjs::promise::PromiseState::Rejected)
+                        && let Some(Err(err)) = promise.result::<Value>()
+                    {
+                        return Ok(Err(Self::js_error(&ctx, err)));
+                    }
                     let namespace = module.namespace()?;
                     let factory: Option<Function> = namespace.get("default")?;
                     let Some(factory) = factory else {
@@ -2450,6 +2476,148 @@ mod tests {
             host.eval_for_tests("typeof console.error").expect("eval"),
             "function"
         );
+    }
+
+    #[test]
+    fn url_global_is_available_without_importing_node_url() {
+        // Regression: `pi-subagents-ported/index.ts:94` evaluates
+        // `path.dirname(new URL(import.meta.url).pathname)` at module top
+        // level without importing `node:url`. Before the bootstrap fix the
+        // top-level throw was swallowed by the eval promise and the factory
+        // ran against a half-evaluated module, producing "Semaphore is not
+        // initialized" instead of loading.
+        let dir = std::env::temp_dir().join(format!("pi-ext-js-url-global-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let entry = dir.join("main.ts");
+        std::fs::write(
+            &entry,
+            r#"import * as path from "node:path";
+const EXT_DIR = path.dirname(new URL(import.meta.url).pathname);
+export default function () {
+  (globalThis as Record<string, unknown>).__extDir = EXT_DIR;
+  (globalThis as Record<string, unknown>).__urlType = typeof URL;
+}
+"#,
+        )
+        .expect("write");
+        let host = host();
+        let index = host
+            .begin_extension(&entry.to_string_lossy())
+            .expect("begin");
+        host.load_extension_module(index, &entry.to_string_lossy(), None)
+            .expect("URL global must exist at module top level");
+        assert_eq!(
+            host.eval_for_tests("globalThis.__extDir").expect("eval"),
+            dir.to_string_lossy()
+        );
+        assert_eq!(
+            host.eval_for_tests("globalThis.__urlType").expect("eval"),
+            "function"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_world_shim_exports_resolve() {
+        // Every export below was a link-time blocker for one of the four
+        // real-world extensions; keep them together so a future shim edit
+        // cannot silently break a load again.
+        let dir = std::env::temp_dir().join(format!("pi-ext-js-exports-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let entry = dir.join("main.ts");
+        std::fs::write(
+            &entry,
+            r#"import { mkdtempSync, chmodSync, constants as fsConstants } from "node:fs";
+import { open, FileHandle } from "node:fs/promises";
+import http from "node:http";
+import { generateKeyPairSync, privateDecrypt, createPublicKey, constants as cryptoConstants } from "node:crypto";
+import { complete } from "@earendil-works/pi-ai/compat";
+import { estimateTokens, findCutPoint, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
+export default function () {
+  (globalThis as Record<string, unknown>).__shims = {
+    mkdtemp: typeof mkdtempSync,
+    chmod: typeof chmodSync,
+    open: typeof open,
+    handle: typeof FileHandle,
+    listen: typeof http.createServer,
+    keygen: typeof generateKeyPairSync,
+    decrypt: typeof privateDecrypt,
+    pubkey: typeof createPublicKey,
+    oaep: cryptoConstants.RSA_PKCS1_OAEP_PADDING,
+    createFlag: fsConstants.O_CREAT,
+    complete: typeof complete,
+    estimate: typeof estimateTokens,
+    cut: typeof findCutPoint,
+    project: typeof sessionEntryToContextMessages,
+  };
+}
+"#,
+        )
+        .expect("write");
+        let host = host();
+        let index = host
+            .begin_extension(&entry.to_string_lossy())
+            .expect("begin");
+        host.load_extension_module(index, &entry.to_string_lossy(), None)
+            .expect("all real-world shim exports resolve");
+        let out = host
+            .eval_for_tests("JSON.stringify(globalThis.__shims)")
+            .expect("eval");
+        let value: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(value["mkdtemp"], json!("function"));
+        assert_eq!(value["chmod"], json!("function"));
+        assert_eq!(value["open"], json!("function"));
+        assert_eq!(value["handle"], json!("function"));
+        assert_eq!(value["listen"], json!("function"));
+        assert_eq!(value["keygen"], json!("function"));
+        assert_eq!(value["decrypt"], json!("function"));
+        assert_eq!(value["pubkey"], json!("function"));
+        assert_eq!(value["oaep"], json!(4));
+        assert_eq!(value["createFlag"], json!(64));
+        assert_eq!(value["complete"], json!("function"));
+        assert_eq!(value["estimate"], json!("function"));
+        assert_eq!(value["cut"], json!("function"));
+        assert_eq!(value["project"], json!("function"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn intl_number_format_subset_is_installed() {
+        let host = host();
+        assert_eq!(
+            host.eval_for_tests(
+                "new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(1234567.89)"
+            )
+            .expect("eval"),
+            "1,234,568"
+        );
+        assert_eq!(
+            host.eval_for_tests(
+                "new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 0 }).format(0.125)"
+            )
+            .expect("eval"),
+            "13%"
+        );
+    }
+
+    #[test]
+    fn module_evaluation_rejection_is_surfaced() {
+        // A top-level throw must reach the caller as the load error; before
+        // the eval-promise check this was swallowed and the loader reported a
+        // later TDZ error from the factory instead.
+        let host = host();
+        let index = host
+            .begin_extension("<test-eval-rejection>")
+            .expect("begin");
+        let err = host
+            .load_extension_module(
+                index,
+                "<test-eval-rejection>",
+                Some("throw new Error(\"top level boom\");\nexport default function () {}\n"),
+            )
+            .expect_err("module evaluation must reject");
+        assert!(err.to_string().contains("top level boom"), "{err}");
+        assert!(!err.to_string().contains("not initialized"), "{err}");
     }
 
     #[test]

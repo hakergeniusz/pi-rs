@@ -180,6 +180,15 @@ export const openAIResponsesApi = () => ({
 export function builtinProviders() {
   return [];
 }
+
+/** `complete` (compat.ts:269): one-shot completion over `stream`. The
+ *  embedded host's `stream` is the documented "not available" stub, so the
+ *  export exists for extension linkers but a call still fails explicitly
+ *  instead of pretending to reach a model. */
+export async function complete(model, context, options) {
+  const s = stream(model, context, options);
+  return s.result();
+}
 "#;
 
 pub const PI_TUI_PATCH: &str = r#"
@@ -730,6 +739,159 @@ export class SettingsManager {
   getShellCommandPrefix() {
     return getSettings()?.shell?.commandPrefix ?? getSettings()?.shellCommandPrefix ?? undefined;
   }
+}
+
+// --- compaction helpers ----------------------------------------------------
+// Upstream: core/compaction/compaction.ts:276-500 and
+// core/session-manager.ts:439-461. pi-sol-pi's online-context-compact uses
+// all three at runtime; the embedded host stores sessions as JSON, so the
+// pure projection/estimation functions port directly.
+
+const __ESTIMATED_IMAGE_CHARS = 4800;
+
+function __estimateTextAndImageContentChars(content) {
+  if (typeof content === "string") return content.length;
+  let chars = 0;
+  for (const block of content ?? []) {
+    if (block.type === "text" && block.text) chars += block.text.length;
+    else if (block.type === "image") chars += __ESTIMATED_IMAGE_CHARS;
+  }
+  return chars;
+}
+
+/** `estimateTokens` (compaction.ts:298): chars/4, conservative overestimate. */
+export function estimateTokens(message) {
+  let chars = 0;
+  switch (message.role) {
+    case "system":
+      chars = __estimateTextAndImageContentChars(message.content);
+      for (const section of Object.values(message.sections ?? {})) {
+        if (section) chars += section.length;
+      }
+      if (message.toolsAdded) chars += JSON.stringify(message.toolsAdded).length;
+      return Math.ceil(chars / 4);
+    case "user":
+      return Math.ceil(__estimateTextAndImageContentChars(message.content) / 4);
+    case "assistant":
+      for (const block of message.content ?? []) {
+        if (block.type === "text") chars += block.text.length;
+        else if (block.type === "thinking") chars += block.thinking.length;
+        else if (block.type === "toolCall") chars += block.name.length + JSON.stringify(block.arguments).length;
+      }
+      return Math.ceil(chars / 4);
+    case "custom":
+    case "toolResult":
+      return Math.ceil(__estimateTextAndImageContentChars(message.content) / 4);
+    case "bashExecution":
+      chars = message.command.length + message.output.length;
+      return Math.ceil(chars / 4);
+    case "branchSummary":
+    case "compactionSummary":
+      return Math.ceil(message.summary.length / 4);
+  }
+  return 0;
+}
+
+/** `sessionEntryToContextMessages` (session-manager.ts:439). */
+export function sessionEntryToContextMessages(entry) {
+  if (entry.type === "message") {
+    const message = entry.message;
+    if (message.role === "system" && message.content == null) return [{ ...message, content: "" }];
+    if (
+      (message.role === "user" || message.role === "assistant" || message.role === "toolResult") &&
+      message.content == null
+    ) {
+      return [{ ...message, content: [] }];
+    }
+    return [message];
+  }
+  if (entry.type === "custom_message") {
+    return [{
+      role: "custom",
+      customType: entry.customType,
+      content: entry.content ?? [],
+      display: entry.display,
+      details: entry.details,
+      timestamp: entry.timestamp,
+    }];
+  }
+  if (entry.type === "branch_summary" && entry.summary) {
+    return [{ role: "branchSummary", summary: entry.summary, fromId: entry.fromId, timestamp: entry.timestamp }];
+  }
+  if (entry.type === "compaction") {
+    const summary = {
+      role: "compactionSummary",
+      summary: entry.summary,
+      tokensBefore: entry.tokensBefore,
+      timestamp: entry.timestamp,
+    };
+    return entry.systemMessage ? [entry.systemMessage, summary] : [summary];
+  }
+  return [];
+}
+
+function __isCutPointMessage(message) {
+  return ["user", "assistant", "bashExecution", "custom", "branchSummary", "compactionSummary"].includes(message.role);
+}
+
+function __isTurnStartMessage(message) {
+  return ["user", "bashExecution", "custom", "branchSummary", "compactionSummary"].includes(message.role);
+}
+
+function __isTurnStartEntry(entry) {
+  if (entry.type === "compaction") return false;
+  return sessionEntryToContextMessages(entry).some(__isTurnStartMessage);
+}
+
+function __findValidCutPoints(entries, startIndex, endIndex) {
+  const points = [];
+  for (let i = startIndex; i < endIndex; i++) {
+    const entry = entries[i];
+    if (entry.type === "compaction") continue;
+    if (sessionEntryToContextMessages(entry).some(__isCutPointMessage)) points.push(i);
+  }
+  return points;
+}
+
+function __findTurnStartIndex(entries, entryIndex, startIndex) {
+  for (let i = entryIndex; i >= startIndex; i--) {
+    if (__isTurnStartEntry(entries[i])) return i;
+  }
+  return -1;
+}
+
+/** `findCutPoint` (compaction.ts:446): newest-first token budget walk. */
+export function findCutPoint(entries, startIndex, endIndex, keepRecentTokens) {
+  const cutPoints = __findValidCutPoints(entries, startIndex, endIndex);
+  if (cutPoints.length === 0) {
+    return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
+  }
+  let accumulatedTokens = 0;
+  let cutIndex = cutPoints[0];
+  for (let i = endIndex - 1; i >= startIndex; i--) {
+    const messageTokens = sessionEntryToContextMessages(entries[i]).reduce(
+      (sum, message) => sum + estimateTokens(message),
+      0,
+    );
+    if (messageTokens === 0) continue;
+    accumulatedTokens += messageTokens;
+    if (accumulatedTokens >= keepRecentTokens) {
+      cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
+      break;
+    }
+  }
+  while (cutIndex > startIndex) {
+    const previous = entries[cutIndex - 1];
+    if (previous.type === "compaction" || sessionEntryToContextMessages(previous).length > 0) break;
+    cutIndex--;
+  }
+  const startsTurn = __isTurnStartEntry(entries[cutIndex]);
+  const turnStartIndex = startsTurn ? -1 : __findTurnStartIndex(entries, cutIndex, startIndex);
+  return {
+    firstKeptEntryIndex: cutIndex,
+    turnStartIndex,
+    isSplitTurn: !startsTurn && turnStartIndex !== -1,
+  };
 }
 "#;
 

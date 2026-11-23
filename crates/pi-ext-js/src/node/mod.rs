@@ -21,6 +21,18 @@
 //!   remaining calls an extension commonly reaches for. The sweep also
 //!   surfaced `execFile` (`pi-guardrails/index.ts:49,567`) and `fs.openSync`
 //!   (`pi-cord/src/{chat,lock}.ts`), so those are served by the same ops.
+//!   `fs.mkdtempSync` (`pi-sol-pi/src/sol-pi/runtime-paths.ts:26`) and
+//!   `fs.chmodSync` (`pi-ssh/src/session.ts:434`) are served there too: the
+//!   former creates a unique directory with Node's six-character suffix, the
+//!   latter maps to real Unix permissions and is a documented no-op elsewhere.
+//!   `fs/promises.open` and its `FileHandle` (`pi-sol-pi`'s observation pack)
+//!   wrap the same opaque fd table; numeric POSIX flags are accepted alongside
+//!   the string forms.
+//! - `node:http` — resolution-only shim for `pi-zed-models/src/browser-auth.ts`,
+//!   which imports `http.createServer` for an OAuth redirect listener. The
+//!   host has no socket seam, so the module resolves and exposes the Node
+//!   shape but its calls throw an explicit unsupported error (documented in
+//!   `http.js`).
 //!
 //! The global `process` object is installed once at engine creation by
 //! [`process_global_source`] (`process_global.js`), because third-party
@@ -30,7 +42,8 @@
 //! object. It mirrors Node's shape but never exits the host or delivers
 //! signals; all lifecycle calls are inert by design. The same bootstrap
 //! also installs `structuredClone` (used at load time by
-//! `pi-guardrails/index.ts:166`), since `QuickJS` ships no clone primitive.
+//! `pi-guardrails/index.ts:166`) and an `Intl.NumberFormat` subset (used by
+//! `pi-sol-pi/src/sol-pi/tui.ts:14`), since `QuickJS` ships neither.
 //!
 //! Host packages get real in-process surfaces where the port has state:
 //! `@earendil-works/pi-coding-agent` reads settings, session metadata and
@@ -56,11 +69,16 @@
 //!   used by upstream's `web-url.ts:9` and `extensions/mcp/tools.ts:161`,
 //! - `node:fs` → `fs.Stats` / `fs.lstatSync` (symlinks are *not* followed),
 //! - `node:crypto` → `crypto.createHmac` (RFC 2104 / FIPS 198-1, SHA-256 and
-//!   SHA-512 block sizes),
+//!   SHA-512 block sizes). The asymmetric calls `pi-zed-models` imports are
+//!   shape-only stubs (no RSA backend in the host); their padding constants
+//!   are real Node values,
 //! - `node:process` → `process.env` key rules and the string-valued
 //!   `cwd`/`platform`/`arch`/`version` properties.
 //! - `node:module` → `createRequire` resolving through the host's own
 //!   resolver/loader (`loader.ts:42,78-89`, `loader.ts:571-602`).
+//! - `node:http` → only the module shape is portable here; without a socket
+//!   seam the shim resolves but its `createServer`/`request`/`get` calls throw
+//!   an explicit unsupported error (a deliberate, documented scope limit).
 //!
 //! The fd handle behind `fs.openSync` is deliberately minimal: positive
 //! integer fds index a process-lifetime table in this module, flags `r`,
@@ -105,6 +123,7 @@ pub const NODE_BUILTINS: &[&str] = &[
     "node:child_process",
     "node:crypto",
     "node:fs",
+    "node:http",
     "node:module",
     "node:fs/promises",
     "node:os",
@@ -131,6 +150,7 @@ pub(crate) fn source(specifier: &str) -> Option<&'static str> {
         "node:crypto" => include_str!("hash.js"),
         "node:fs" => include_str!("fs.js"),
         "node:fs/promises" => include_str!("fs_promises.js"),
+        "node:http" => include_str!("http.js"),
         "node:module" => include_str!("module.js"),
         "node:os" => include_str!("os.js"),
         "node:path" => include_str!("path.js"),
@@ -172,6 +192,80 @@ fn io_error(error: &std::io::Error) -> Json {
         },
     };
     serde_json::json!({ "error": error.to_string(), "code": code })
+}
+
+/// Alphabet Node samples from for the six random characters appended by
+/// `fs.mkdtempSync` (`[a-zA-Z0-9]`).
+const MKDTEMP_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/// Six random alphanumerics, sourced from `/dev/urandom` with the same
+/// time-derived fallback `random_uuid` uses when that device is absent.
+fn random_suffix(length: usize) -> String {
+    let mut bytes = vec![0_u8; length];
+    let mut source = std::fs::File::open("/dev/urandom");
+    let filled = source
+        .as_mut()
+        .ok()
+        .and_then(|file| file.read_exact(&mut bytes).ok());
+    if filled.is_none() {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos() as u64);
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = (seed >> ((index % 8) * 8)) as u8;
+        }
+    }
+    bytes
+        .into_iter()
+        .map(|byte| MKDTEMP_ALPHABET[usize::from(byte) % MKDTEMP_ALPHABET.len()] as char)
+        .collect()
+}
+
+/// `fs.mkdtempSync(prefix)`: append six random characters to `prefix` and
+/// create the directory, retrying on `EEXIST` the way Node does. Returns the
+/// created path as a string (the shim wraps it when an encoding is asked for).
+fn mkdtemp_sync(prefix: &str) -> Result<String, Json> {
+    for _ in 0..100 {
+        let candidate = format!("{prefix}{}", random_suffix(6));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(io_error(&error)),
+        }
+    }
+    Err(serde_json::json!({
+        "error": "could not create a unique temporary directory",
+        "code": "EEXIST",
+    }))
+}
+
+/// Parses the decimal mode string produced by the `node:fs` shim after its
+/// own number/octal-string validation. The host only applies the value,
+/// mirroring Node's `fs.chmodSync` acceptance of any non-negative integer.
+fn parse_chmod_mode(text: &str) -> Result<u32, String> {
+    match text.parse::<u32>() {
+        Ok(mode) => Ok(mode),
+        Err(error) => Err(format!("invalid mode: {error}")),
+    }
+}
+
+/// Applies `fs.chmodSync(path, mode)`. On Unix this maps to the real
+/// `PermissionsExt::from_mode` so the SSH extension's `chmodSync(dir, 0o700)`
+/// is enforced. On other platforms the call is a documented no-op: the host
+/// has no portable mode abstraction, matching `fs.openSync`'s `mode` handling.
+fn chmod_sync(path: &str, text: &str) -> Result<(), Json> {
+    let mode = parse_chmod_mode(text)
+        .map_err(|message| serde_json::json!({ "error": message, "code": "EINVAL" }))?;
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|error| io_error(&error))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
 }
 
 /// One `fs.openSync` handle. The fd is an opaque host id (not an OS fd):
@@ -227,6 +321,42 @@ fn open_fd(path: &str, flags: &str) -> Result<i32, Json> {
         }
         "ax" | "xa" => {
             options.write(true).create_new(true).append(true);
+        }
+        other if other.parse::<u32>().is_ok() => {
+            // Node also accepts the numeric POSIX flags exposed on
+            // `fs.constants` (pi-sol-pi uses O_RDONLY | O_NOFOLLOW etc.).
+            // `O_NOFOLLOW` has no `OpenOptions` equivalent and is ignored;
+            // the host's file abstraction does not resolve symlinks here.
+            let bits = other.parse::<u32>().unwrap_or(0);
+            match bits & 0o7 {
+                0 => {
+                    options.read(true);
+                }
+                1 => {
+                    options.write(true);
+                }
+                2 => {
+                    options.read(true).write(true);
+                }
+                _ => {
+                    return Err(serde_json::json!({
+                        "error": format!("Unknown file open flag: {other}"),
+                        "code": "EINVAL"
+                    }));
+                }
+            }
+            if bits & 0o100 != 0 {
+                options.create(true);
+            }
+            if bits & 0o200 != 0 {
+                options.create_new(true);
+            }
+            if bits & 0o1000 != 0 {
+                options.truncate(true);
+            }
+            if bits & 0o2000 != 0 {
+                options.append(true);
+            }
         }
         other => {
             return Err(serde_json::json!({
@@ -947,6 +1077,20 @@ pub(crate) fn install_ops<'js>(
             }
         }
     });
+    op!("nodeFsMkdtempSync", _core, |prefix: String| -> String {
+        match mkdtemp_sync(&prefix) {
+            Ok(path) => ok(Json::String(path)),
+            Err(error) => serde_json::to_string(&error).unwrap_or_else(|_| fail("io error", "EIO")),
+        }
+    });
+    op!("nodeFsChmodSync", _core, |path: String,
+                                   mode: String|
+     -> String {
+        match chmod_sync(&path, &mode) {
+            Ok(()) => ok(Json::Null),
+            Err(error) => serde_json::to_string(&error).unwrap_or_else(|_| fail("io error", "EIO")),
+        }
+    });
     op!("nodeFsRenameSync", _core, |from: String,
                                     to: String|
      -> String {
@@ -1257,6 +1401,58 @@ mod tests {
     }
 
     #[test]
+    fn mkdtemp_sync_creates_a_unique_directory_under_the_prefix() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let prefix = format!("{}/sol-pi-", directory.path().display());
+        let first = mkdtemp_sync(&prefix).expect("first mkdtemp");
+        let second = mkdtemp_sync(&prefix).expect("second mkdtemp");
+        assert_ne!(first, second);
+        assert!(first.starts_with(&prefix));
+        assert_eq!(first.len(), prefix.len() + 6);
+        assert!(
+            first[prefix.len()..]
+                .chars()
+                .all(|c| MKDTEMP_ALPHABET.contains(&(c as u8)))
+        );
+        assert!(std::path::Path::new(&first).is_dir());
+        assert!(std::path::Path::new(&second).is_dir());
+
+        let missing = format!("{}/missing-", directory.path().display());
+        let error = mkdtemp_sync(&format!("{missing}/child-")).unwrap_err();
+        assert_eq!(error["code"], "ENOENT");
+    }
+
+    #[test]
+    fn chmod_mode_parsing_and_unix_permissions() {
+        assert_eq!(parse_chmod_mode("493").expect("decimal"), 0o755);
+        assert_eq!(parse_chmod_mode("0").expect("zero"), 0);
+        assert!(parse_chmod_mode("-1").is_err());
+        assert!(parse_chmod_mode("abc").is_err());
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("secret");
+        std::fs::write(&path, b"x").expect("write");
+        #[cfg(unix)]
+        {
+            chmod_sync(path.to_str().expect("utf8 path"), "448").expect("chmod");
+            let permissions = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(permissions & 0o777, 0o700);
+        }
+        #[cfg(not(unix))]
+        {
+            chmod_sync(path.to_str().expect("utf8 path"), "448").expect("chmod no-op");
+        }
+        #[cfg(unix)]
+        {
+            let error = chmod_sync("/definitely/missing", "448").unwrap_err();
+            assert_eq!(error["code"], "ENOENT");
+        }
+    }
+
+    #[test]
     fn fd_helpers_round_trip_bytes_and_reject_closed_handles() {
         let directory = tempfile::tempdir().expect("temp dir");
         let path = directory.path().join("fd.bin");
@@ -1270,6 +1466,16 @@ mod tests {
         assert_eq!(read_fd(fd, 1, 0).unwrap_err()["code"], "EBADF");
         assert_eq!(open_fd(&path, "wx").unwrap_err()["code"], "EEXIST");
         assert_eq!(open_fd(&path, "bad-flag").unwrap_err()["code"], "EINVAL");
+
+        // Numeric POSIX flags (the values exported on `fs.constants`).
+        let numeric = directory.path().join("numeric.bin");
+        let numeric = numeric.to_string_lossy().into_owned();
+        let numeric_fd = open_fd(&numeric, "65").expect("O_WRONLY | O_CREAT");
+        close_fd(numeric_fd).expect("close");
+        assert_eq!(std::fs::read(&numeric).expect("read"), b"");
+        assert_eq!(open_fd(&numeric, "193").unwrap_err()["code"], "EEXIST");
+        let read_fd_handle = open_fd(&numeric, "131072").expect("O_RDONLY | O_NOFOLLOW");
+        close_fd(read_fd_handle).expect("close");
     }
 
     #[test]
