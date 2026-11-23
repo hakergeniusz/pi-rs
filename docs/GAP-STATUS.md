@@ -35,7 +35,7 @@ Legend:
 | `pi-mcp` — startup wait, `list_changed`, result `_meta` | `pi-ext-js::mcp_manager`, `pi-mcp::types`, `pi-coding-agent::extensions` | Partial | background connects + per-server readiness queue survives the one-shot `StartupWait` bound; non-blocking `try_drain_notifications` + `list_changed` tool re-registration; host `mcp_tick` driven from the interactive pump and per RPC command; result `_meta`/`annotations` preserved. Remaining: stderr still captured via a temp-file sink, the blocking `poll_notifications` form is kept for barrier hosts |
 | `pi-codemode` | `pi-codemode` | Partial | inline VM, deterministic runs, `models.*`, grammar hook; local real transports (`ThreadWorkerTransport`, `RemoteCodemodeTransport`, `serve_remote`, `InProcessRemote`) plus worker admission; true Node `worker_threads`/Cloudflare/wasm compilation remain typed stubs (API compat) |
 | `pi-env` | `crates/pi-env` + `pi-coding-agent::remote_env` | Ported | all nine upstream modules, 46 fake-backend tests; host-wired as `pi remote` (`remote_env.rs`): daemon transport, `ExecutionEnv`, host-driven ticks, PTY input on the process Tokio runtime, explicit SSH host-key onboarding |
-| `pi-coding-agent` — session deltas | `session/{bash_execution,readonly}.rs`, `session/store.rs` | Partial | `SessionListProgress` is consumed by the interactive session selector and `ReadonlySessionManager` by `session/cwd.rs`; live `bash_execution_update` emission is still library-only |
+| `pi-coding-agent` — session deltas | `session/{bash_execution,readonly}.rs`, `session/store.rs` | Partial | `SessionListProgress` is consumed by the interactive session selector and `ReadonlySessionManager` by `session/cwd.rs`; `bash_execution_update` is emitted on the interactive extension event stream; persisting accumulated deltas into the session store is not wired |
 | extensions runtime | `pi-ext-js` | Partial | E0–E3 landed; E4 static CJS, `/reload` unload, `node:*` and host packages, `URL.canParse`, ancestor `node_modules` resolution (scoped packages, exports targets, main/index) and statically-foldable `require(expr)` landed; genuinely dynamic/computed specifiers still resolve to the missing-module error, plus a few unserved `pi-ai` subpaths and type-only exports |
 | package manager (npm/git/local arms) | `pi-coding-agent::package_manager` | Ported | npm registry work delegated to `npm`/`pnpm`/`bun` |
 
@@ -71,7 +71,7 @@ deliberate scope decision, not a claim of full 1:1 parity.
   `poll_notifications` form is retained for hosts that need a barrier.
 - **Session deltas are partly wired:** `SessionListProgress` is consumed by the
   interactive session selector and `ReadonlySessionManager` by `session/cwd.rs`;
-  live `bash_execution_update` emission is still library-only.
+  `bash_execution_update` is emitted on the interactive extension event stream; persisting accumulated deltas into the session store is not wired.
 - **`pi-env` is host-driven by design:** `pi remote` consumes the crate, but
   keepalive/watch ticks, PTY input on the process Tokio runtime and SSH
   host-key onboarding require the host to drive them (no internal timers).

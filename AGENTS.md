@@ -196,8 +196,9 @@ Still open (genuine mechanism tails or deliberate scope decisions):
    sink; `StartupWait` is one-shot (late connects survive via a per-server
    queue). Session deltas are partly wired: `SessionListProgress` is consumed
    by the interactive session selector and `ReadonlySessionManager` by
-   `session/cwd.rs`; live `bash_execution_update` emission is still
-   library-only. `pi-env` ticks/PTY/SSH onboarding are host-driven by design.
+   `session/cwd.rs`; `bash_execution_update` is emitted on the interactive
+   extension event stream, but persisting accumulated deltas into the session
+   store is not wired. `pi-env` ticks/PTY/SSH onboarding are host-driven by design.
 3. Out of scope: `chord`, `pi-durable`, `evals`, `apps/p2`. `/share` and `/bug`
    stay omitted (Radius upload policy). All five release targets publish from
    the tag workflow.
