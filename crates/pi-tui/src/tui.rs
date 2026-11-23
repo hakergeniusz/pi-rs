@@ -15,8 +15,16 @@
 //!   but no component emits them yet; that lands with the alt-screen renderer.
 //! * The terminal-colour and cell-size protocols are exposed as query methods
 //!   rather than pushed by the host: [`Tui::query_terminal_colors`],
-//!   [`Tui::query_cell_size`]. Replies are consumed by
-//!   [`Tui::consume_terminal_response`].
+//!   [`Tui::query_terminal_colors_with`], [`Tui::query_cell_size`]. Replies are
+//!   consumed by [`Tui::consume_terminal_response`].
+//!
+//! * pi's `queryTerminalColors` returns a promise the caller awaits
+//!   (`tui.ts:1470-1493`); yannelli's port takes a result callback plus an
+//!   `onLateReply` callback. [`Tui::query_terminal_colors_with`] is the port's
+//!   callback shape: the result callback fires once, when the DA1 fence - or a
+//!   short self-owned deadline - settles the query, while the late callback
+//!   stays armed for replies after it. [`Tui::query_terminal_colors`] keeps the
+//!   original drain-based API for the theme controller.
 //!
 //! pi's colour-scheme listeners live in a `Set`
 //! (`onTerminalColorSchemeChange`, `tui.ts:943-948`), which dedupes an
@@ -29,6 +37,7 @@
 
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::ansi::{
     SEGMENT_RESET, normalize_terminal_output, strip_terminal_sequences, visible_width,
@@ -352,6 +361,11 @@ pub struct TerminalColors {
     pub palette: Option<[RgbColor; TERMINAL_PALETTE_SIZE]>,
 }
 
+/// The continuation of a colour query that a caller awaits: pi's promise
+/// (`tui.ts:1477-1484`), yannelli's `ColorsCallback`. Called exactly once, with
+/// the colours collected when the query settles.
+pub type TerminalColorsResultCallback = Box<dyn FnOnce(TerminalColors) + Send>;
+
 /// One in-flight colour query. `tui.ts:1475-1487`.
 struct PendingTerminalColorQuery {
     palette: [Option<RgbColor>; TERMINAL_PALETTE_SIZE],
@@ -371,6 +385,12 @@ struct PendingTerminalColorQuery {
     /// query, so a late reply reaches the query that asked for it and not
     /// whichever one happens to be first.
     late_sink: Option<Box<dyn FnMut(TerminalColors) + Send>>,
+    /// The awaited result's continuation, called once when this query settles.
+    /// `None` for the drain-only API. `tui.ts:1477-1484`.
+    result_sink: Option<TerminalColorsResultCallback>,
+    /// A self-owned deadline for callback queries whose caller cannot supply a
+    /// host clock. `None` means the host services [`Self::deadline_ms`] instead.
+    own_deadline: Option<std::time::Instant>,
 }
 
 /// pi's `PendingTerminalColorQuery.deliver`. `tui.ts:154-157`.
@@ -1822,6 +1842,41 @@ impl Tui {
             deadline_ms: timeout_ms,
             delivery: TerminalColorDelivery::Resolve,
             late_sink: on_late_reply,
+            result_sink: None,
+            own_deadline: None,
+        });
+        self.terminal.write(&terminal_color_query())
+    }
+
+    /// The callback shape of pi's await (`queryTerminalColors`,
+    /// `tui.ts:478-484`, `:1470-1493`; yannelli's `query_terminal_colors` in
+    /// `easter_egg_3d/mod.rs`): `on_result` is the promise's `resolve` and fires
+    /// once, when the DA1 fence or the deadline settles the query. The optional
+    /// `on_late_reply` is armed at the deadline, as in `query_terminal_colors`.
+    ///
+    /// `timeout_ms` is an owned deadline here: a caller that cannot hand the
+    /// host's clock to [`Tui::service_terminal_queries`] (the egg is one, since
+    /// it starts long after the theme controller's clock) still gets its
+    /// result after the budget. The host must keep polling input or servicing
+    /// queries; both paths check the deadline. The host-driven queue still
+    /// receives the same colours, so both APIs can coexist on one Tui.
+    pub fn query_terminal_colors_with(
+        &mut self,
+        timeout_ms: u64,
+        on_result: Option<TerminalColorsResultCallback>,
+        on_late_reply: Option<Box<dyn FnMut(TerminalColors) + Send>>,
+    ) -> io::Result<()> {
+        self.pending_color_queries.push(PendingTerminalColorQuery {
+            palette: [None; TERMINAL_PALETTE_SIZE],
+            foreground: None,
+            background: None,
+            replied: vec![false; TERMINAL_COLOR_REPLY_COUNT],
+            replied_count: 0,
+            deadline_ms: u64::MAX,
+            delivery: TerminalColorDelivery::Resolve,
+            late_sink: on_late_reply,
+            result_sink: on_result,
+            own_deadline: Some(std::time::Instant::now() + Duration::from_millis(timeout_ms)),
         });
         self.terminal.write(&terminal_color_query())
     }
@@ -1847,6 +1902,9 @@ impl Tui {
     /// [`crate::terminal::Terminal::poll_response`] so query replies reach the
     /// state machine.
     pub fn poll_terminal_response(&mut self) -> bool {
+        // A callback query owns its deadline; a host that only polls replies
+        // still needs it to settle on time.
+        let _ = self.settle_terminal_queries(None);
         match self.terminal.poll_response() {
             Some(response) => {
                 self.consume_terminal_response(&response);
@@ -1937,6 +1995,9 @@ impl Tui {
             TerminalColorDelivery::Resolve => {
                 query.delivery = TerminalColorDelivery::Done;
                 self.terminal_color_results.push(colors);
+                if let Some(sink) = query.result_sink.take() {
+                    sink(colors);
+                }
             }
             TerminalColorDelivery::Late => {
                 query.delivery = TerminalColorDelivery::Done;
@@ -1972,19 +2033,33 @@ impl Tui {
     /// that already completed is not settled twice — pi clears its timer in
     /// `completeTerminalColorQuery` (`tui.ts:1164`).
     pub fn service_terminal_queries(&mut self, now_ms: u64) -> Vec<TerminalColors> {
+        self.settle_terminal_queries(Some(now_ms))
+    }
+
+    /// The deadline arm shared by [`Self::service_terminal_queries`] and
+    /// [`Self::poll_terminal_response`]. `now_ms` is `None` when only the
+    /// self-owned deadlines of callback queries can be checked.
+    fn settle_terminal_queries(&mut self, now_ms: Option<u64>) -> Vec<TerminalColors> {
+        let now = std::time::Instant::now();
         let expired: Vec<usize> = self
             .pending_color_queries
             .iter()
             .enumerate()
             .filter(|(_, query)| {
-                query.delivery == TerminalColorDelivery::Resolve && now_ms >= query.deadline_ms
+                if query.delivery != TerminalColorDelivery::Resolve {
+                    return false;
+                }
+                match query.own_deadline {
+                    Some(deadline) => now >= deadline,
+                    None => now_ms.is_some_and(|value| value >= query.deadline_ms),
+                }
             })
             .map(|(index, _)| index)
             .collect();
         let mut settled = Vec::with_capacity(expired.len());
         for index in expired {
             let query = &mut self.pending_color_queries[index];
-            // `query.deliver = onLateReply; resolve(...)` — the swap first, and
+            // `query.deliver = onLateReply; resolve(...)` - the swap first, and
             // an absent `onLateReply` leaves `deliver` undefined.
             query.delivery = if query.late_sink.is_some() {
                 TerminalColorDelivery::Late
@@ -1993,6 +2068,9 @@ impl Tui {
             };
             let colors = Self::terminal_color_query_result(query);
             self.terminal_color_results.push(colors);
+            if let Some(sink) = query.result_sink.take() {
+                sink(colors);
+            }
             settled.push(colors);
         }
         settled
@@ -3818,6 +3896,68 @@ mod tests {
             late.palette.expect("full palette")[0],
             RgbColor { r: 1, g: 2, b: 3 }
         );
+    }
+
+    /// yannelli's callback query: the result continuation fires once, with the
+    /// colours the DA1 fence gathered, before the deadline.
+    #[test]
+    fn a_callback_query_delivers_colours_on_the_fence() {
+        let (mut tui, _capture) = query_tui();
+        let delivered = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&delivered);
+        tui.query_terminal_colors_with(
+            100,
+            Some(Box::new(move |colors| {
+                *sink.lock().expect("sink") = Some(colors);
+            })),
+            None,
+        )
+        .unwrap();
+        assert!(
+            delivered.lock().expect("sink").is_none(),
+            "the promise is not resolved before the fence"
+        );
+        tui.consume_terminal_response("\x1b]10;#ffffff\x07");
+        tui.consume_terminal_response("\x1b]11;#000000\x07");
+        tui.consume_terminal_response("\x1b[?62;c");
+        let colors = (*delivered.lock().expect("sink")).expect("result callback");
+        assert_eq!(
+            colors.foreground,
+            Some(RgbColor {
+                r: 255,
+                g: 255,
+                b: 255
+            })
+        );
+        assert_eq!(colors.background, Some(RgbColor { r: 0, g: 0, b: 0 }));
+        assert_eq!(
+            tui.take_terminal_colors(),
+            Some(colors),
+            "the drain still sees it"
+        );
+    }
+
+    /// The self-owned deadline settles a callback query even when the host
+    /// never supplies a clock (`service_terminal_queries(0)` below would not
+    /// expire it). A zero budget makes the timeout deterministic in a test.
+    #[test]
+    fn a_callback_query_falls_back_when_the_deadline_fires() {
+        let (mut tui, _capture) = query_tui();
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&delivered);
+        tui.query_terminal_colors_with(
+            0,
+            Some(Box::new(move |colors| {
+                sink.lock().expect("sink").push(colors);
+            })),
+            None,
+        )
+        .unwrap();
+        assert_eq!(tui.service_terminal_queries(0).len(), 1);
+        let colors = delivered.lock().expect("sink").clone();
+        assert_eq!(colors.len(), 1, "the continuation fires exactly once");
+        assert_eq!(colors[0], TerminalColors::default(), "nothing arrived");
+        assert_eq!(tui.service_terminal_queries(u64::MAX).len(), 0, "not twice");
     }
 
     #[test]

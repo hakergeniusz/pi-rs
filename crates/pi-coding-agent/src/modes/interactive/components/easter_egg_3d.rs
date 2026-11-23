@@ -22,9 +22,18 @@
 //!   `tui.requestRender()`. This port now has a small autonomous timer
 //!   ([`pi_tui::ui_loop`]) that requests renders through the TUI's waker;
 //!   the host pump and its atomics remain as a fallback for other hosts.
-//! - Upstream awaits a fresh `queryTerminalColors` before fading; the port
-//!   reads the colors the startup query already reported (the same terminal
-//!   defaults, without the async round-trip).
+//! - Upstream awaits a fresh `queryTerminalColors` (100 ms budget) before
+//!   fading (`easter-egg-3d.ts:849-857`). The port issues the same query with
+//!   [`pi_tui::tui::Tui::query_terminal_colors_with`] and a result callback,
+//!   like yannelli's `easter_egg_3d/mod.rs`. Because this host's `play*` API
+//!   must return an `EasterEggHandle` with a real `OverlayId` synchronously,
+//!   the overlay mounts at once with a small placeholder; the animation itself
+//!   is built when the callback delivers colours (or, as a documented fallback
+//!   for hosts that never service queries, after the deadline). The placeholder
+//!   shows the captured screen meanwhile, as upstream does while it awaits.
+//! - The dark/light fallback reads the active theme's `appearance()`
+//!   (`theme.ts:249-253`), not the terminal appearance: a light theme on a dark
+//!   terminal still falls back to white when no OSC report exists.
 //! - The frame timer ports both of upstream's stop guards
 //!   (`easter-egg-3d.ts:908-912`): it finishes once `exitProgress() >= 1`
 //!   or a full second passes without a render. The host-dropped-overlay
@@ -35,13 +44,17 @@ use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use pi_tui::ansi::truncate_to_width;
 use pi_tui::color::{background_ansi, color_to_rgb, foreground_ansi, indexed_color, rgb_color};
 use pi_tui::component::Component;
 use pi_tui::keybindings::{self, action};
 use pi_tui::mouse::{MouseEvent, MouseEventKind, MouseEventResult};
 use pi_tui::oklab::Rgb;
+use pi_tui::terminal_colors::{RgbColor as ReportedRgb, TERMINAL_COLOR_QUERY_TIMEOUT_MS};
 use pi_tui::theme::{ThemeAppearance, ThemeColor};
-use pi_tui::tui::{OverlayAnchor, OverlayId, OverlayOptions, SizeValue, Tui};
+use pi_tui::tui::{
+    OverlayAnchor, OverlayId, OverlayOptions, SizeValue, TerminalColors as ReportedColors, Tui,
+};
 use pi_tui::ui_loop::{self, TuiRenderWaker};
 
 use super::super::theme;
@@ -2014,6 +2027,137 @@ impl Emitter<'_> {
     }
 }
 
+/// The reported colour as the animation's `[r, g, b]` triple.
+fn reported_rgb(rgb: ReportedRgb) -> [f64; 3] {
+    [f64::from(rgb.r), f64::from(rgb.g), f64::from(rgb.b)]
+}
+
+/// Upstream's `toRgbTuple` fallback chain (`easter-egg-3d.ts:853-856`): a
+/// reported default wins, otherwise the theme's `text` token for the
+/// foreground and black/white from the theme's appearance for the background.
+fn resolve_egg_colors(
+    reported: ReportedColors,
+    dark: bool,
+    fallback_foreground: [f64; 3],
+) -> ([f64; 3], [f64; 3]) {
+    (
+        reported
+            .foreground
+            .map_or(fallback_foreground, reported_rgb),
+        reported
+            .background
+            .map_or(if dark { [0.0; 3] } else { [255.0; 3] }, reported_rgb),
+    )
+}
+
+/// The placeholder mounted while the fresh colour query is in flight. It holds
+/// everything the animation needs and builds the animation in the result
+/// callback's wake-up frame, so the animation's clock starts when the colours
+/// arrive, just as upstream's does after its `await`.
+struct PendingEasterEgg3d {
+    screen: Mutex<Vec<String>>,
+    model: Mutex<Option<Model>>,
+    rows: Arc<AtomicU16>,
+    done: Arc<AtomicBool>,
+    waker: TuiRenderWaker,
+    /// Written by the query's result callback; read on the next render.
+    reported: Arc<Mutex<Option<ReportedColors>>>,
+    started: Instant,
+    dark: bool,
+    fallback_foreground: [f64; 3],
+    animation: Mutex<Option<EasterEgg3dAnimation>>,
+}
+
+impl PendingEasterEgg3d {
+    fn build_animation(&self) -> EasterEgg3dAnimation {
+        let reported = (*self.reported.lock().expect("egg colour report")).unwrap_or_default();
+        let colors = resolve_egg_colors(reported, self.dark, self.fallback_foreground);
+        let screen = self.screen.lock().expect("egg screen").clone();
+        let model = self
+            .model
+            .lock()
+            .expect("egg model")
+            .take()
+            .expect("the animation is built once");
+        EasterEgg3dAnimation::with_render_waker(
+            screen,
+            model,
+            colors,
+            Arc::clone(&self.rows),
+            Arc::clone(&self.done),
+            self.waker.clone(),
+        )
+    }
+
+    /// `None` means the colours have not arrived yet and the budget has not
+    /// expired: keep showing the captured screen, as upstream does while it
+    /// awaits the query.
+    fn ensure_animation(&self) -> bool {
+        let mut animation = self.animation.lock().expect("egg animation");
+        if animation.is_some() {
+            return true;
+        }
+        let reported = self.reported.lock().expect("egg colour report");
+        let ready = reported.is_some()
+            || self.started.elapsed() >= Duration::from_millis(TERMINAL_COLOR_QUERY_TIMEOUT_MS);
+        drop(reported);
+        if !ready {
+            return false;
+        }
+        *animation = Some(self.build_animation());
+        true
+    }
+
+    fn animation_mut(&mut self) -> &mut EasterEgg3dAnimation {
+        if self.animation.get_mut().expect("egg animation").is_none() {
+            let built = self.build_animation();
+            *self.animation.get_mut().expect("egg animation") = Some(built);
+        }
+        self.animation
+            .get_mut()
+            .expect("egg animation")
+            .as_mut()
+            .expect("egg animation")
+    }
+
+    fn placeholder(&self, width: usize) -> Vec<String> {
+        let height = usize::from(self.rows.load(Ordering::SeqCst)).max(1);
+        self.screen
+            .lock()
+            .expect("egg screen")
+            .iter()
+            .take(height)
+            .map(|line| truncate_to_width(line, width, "", false))
+            .collect()
+    }
+}
+
+impl Component for PendingEasterEgg3d {
+    fn render(&self, width: usize) -> Vec<String> {
+        if !self.ensure_animation() {
+            return self.placeholder(width);
+        }
+        let animation = self.animation.lock().expect("egg animation");
+        animation.as_ref().expect("egg animation").render(width)
+    }
+
+    fn handle_input(&mut self, data: &str) -> Option<pi_tui::component::ComponentMutation> {
+        self.animation_mut().handle_input(data)
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent) -> Option<MouseEventResult> {
+        self.animation_mut().handle_mouse(event)
+    }
+
+    fn invalidate(&mut self) {
+        // Only a mounted animation has cached state; before it exists the
+        // placeholder re-reads the captured screen on every frame.
+        if self.animation.get_mut().expect("egg animation").is_some() {
+            self.animation_mut().invalidate();
+        }
+    }
+}
+
 /// Show the animation as a fullscreen overlay until it is dismissed. The
 /// overlay takes focus and mouse input and returns focus when hidden, so the
 /// rest of the UI keeps running underneath untouched (`playEasterEgg3d`).
@@ -2021,22 +2165,15 @@ impl Emitter<'_> {
 /// The caller has already checked the fullscreen guard (upstream's
 /// `tui instanceof TuiAltScreen`) and captured the screen.
 pub fn play_easter_egg_3d(tui: &mut Tui, screen: Vec<String>, egg: EasterEgg3d) -> EasterEggHandle {
-    // Fading needs the terminal's actual default colors; the theme only
-    // knows its own. The startup query reported them; fall back like
-    // upstream when it did not.
-    let reported = theme::terminal_colors();
-    let dark = theme::terminal_appearance() == ThemeAppearance::Dark;
+    // The theme tells us which background the egg is designed for; the
+    // terminal's own appearance can disagree (theme.ts:249-253).
+    let active = theme::theme();
+    let dark = active.appearance() == ThemeAppearance::Dark;
     let tint = |token: ThemeColor| -> [f64; 3] {
-        let rgb = color_to_rgb(theme::theme().fg_color(token));
+        let rgb = color_to_rgb(active.fg_color(token));
         [rgb.r, rgb.g, rgb.b]
     };
-    let foreground = reported
-        .foreground
-        .map_or_else(|| tint(ThemeColor::Text), |rgb| [rgb.r, rgb.g, rgb.b]);
-    let background = reported.background.map_or_else(
-        || if dark { [0.0, 0.0, 0.0] } else { [255.0; 3] },
-        |rgb| [rgb.r, rgb.g, rgb.b],
-    );
+    let fallback_foreground = tint(ThemeColor::Text);
     let model = match egg {
         EasterEgg3d::Armin => armin_model(tint(ThemeColor::Accent)),
         EasterEgg3d::PiLogo { column, row } => pi_logo_model(Some((column, row))),
@@ -2048,16 +2185,35 @@ pub fn play_easter_egg_3d(tui: &mut Tui, screen: Vec<String>, egg: EasterEgg3d) 
             .unwrap_or_default(),
     ));
     let done = Arc::new(AtomicBool::new(false));
-    let animation = EasterEgg3dAnimation::with_render_waker(
-        screen,
-        model,
-        (foreground, background),
-        Arc::clone(&rows),
-        Arc::clone(&done),
-        tui.render_waker(),
+    let waker = tui.render_waker();
+    let reported = Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&reported);
+    let sink_waker = waker.clone();
+    let on_colors = move |colors: ReportedColors| {
+        *sink.lock().expect("egg colour report") = Some(colors);
+        sink_waker.request_render();
+    };
+    // The fresh query, not the one the theme controller issued at startup:
+    // the terminal's defaults may have changed, and upstream asks again here.
+    let _ = tui.query_terminal_colors_with(
+        TERMINAL_COLOR_QUERY_TIMEOUT_MS,
+        Some(Box::new(on_colors)),
+        None,
     );
+    let pending = PendingEasterEgg3d {
+        screen: Mutex::new(screen),
+        model: Mutex::new(Some(model)),
+        rows: Arc::clone(&rows),
+        done: Arc::clone(&done),
+        waker,
+        reported,
+        started: Instant::now(),
+        dark,
+        fallback_foreground,
+        animation: Mutex::new(None),
+    };
     let overlay = tui.show_overlay(
-        Box::new(animation),
+        Box::new(pending),
         Some(OverlayOptions {
             anchor: OverlayAnchor::TopLeft,
             width: Some(SizeValue::Percent(100.0)),
@@ -2529,5 +2685,94 @@ mod tests {
         }
         assert_eq!(cells[0][5].text, " ", "outside stays blank too");
         assert!(cells[0][5].delay > 0.0, "dust delays are assigned");
+    }
+
+    fn pending_egg(
+        reported: Option<ReportedColors>,
+        dark: bool,
+        expired: bool,
+    ) -> PendingEasterEgg3d {
+        let started = if expired {
+            Instant::now()
+                .checked_sub(Duration::from_millis(TERMINAL_COLOR_QUERY_TIMEOUT_MS + 1))
+                .expect("backdate")
+        } else {
+            Instant::now()
+        };
+        PendingEasterEgg3d {
+            screen: Mutex::new(vec!["hello world".to_string()]),
+            model: Mutex::new(Some(logo_model())),
+            rows: Arc::new(AtomicU16::new(10)),
+            done: Arc::new(AtomicBool::new(false)),
+            waker: TuiRenderWaker::default(),
+            reported: Arc::new(Mutex::new(reported)),
+            started,
+            dark,
+            fallback_foreground: [9.0; 3],
+            animation: Mutex::new(None),
+        }
+    }
+
+    /// Upstream awaits a fresh query (`easter-egg-3d.ts:849-852`): starting the
+    /// egg must write OSC 10/11 plus the DA1 fence, not reuse the boot report.
+    #[test]
+    fn starting_the_egg_issues_a_fresh_colour_query() {
+        let terminal = pi_tui::terminal::CaptureTerminal::new();
+        let capture = terminal.capture();
+        let mut tui = Tui::new(Box::new(terminal));
+        let handle = play_easter_egg_3d(&mut tui, vec!["hello".to_string()], EasterEgg3d::Armin);
+        let output = capture.output();
+        assert!(output.contains("\x1b]10;?\x07"), "default foreground query");
+        assert!(output.contains("\x1b]11;?\x07"), "default background query");
+        assert!(output.contains("\x1b[c"), "DA1 fence");
+        assert!(
+            tui.has_overlay(),
+            "the placeholder overlays the captured screen"
+        );
+        drop(handle);
+    }
+
+    /// The callback's report is what the animation is built from: both
+    /// defaults win over the theme fallback (`easter-egg-3d.ts:853-856`).
+    #[test]
+    fn callback_colours_build_the_animation() {
+        let reported = ReportedColors {
+            foreground: Some(ReportedRgb { r: 1, g: 2, b: 3 }),
+            background: Some(ReportedRgb { r: 4, g: 5, b: 6 }),
+            palette: None,
+        };
+        let pending = pending_egg(Some(reported), true, false);
+        assert!(pending.ensure_animation(), "the callback armed the colours");
+        let animation = pending.animation.lock().expect("animation");
+        let animation = animation.as_ref().expect("built animation");
+        assert_eq!(animation.foreground, [1.0, 2.0, 3.0]);
+        assert_eq!(animation.background, [4.0, 5.0, 6.0]);
+    }
+
+    /// With no report the fallback comes from the theme's own appearance, not
+    /// from the terminal: a light theme on a dark terminal still falls back to
+    /// white (theme.ts:249-253). The deadline is the synchronous fallback for
+    /// hosts that never service the query.
+    #[test]
+    fn timeout_uses_the_theme_appearance_fallback() {
+        assert_eq!(
+            resolve_egg_colors(ReportedColors::default(), false, [7.0; 3]),
+            ([7.0; 3], [255.0; 3]),
+            "light theme"
+        );
+        assert_eq!(
+            resolve_egg_colors(ReportedColors::default(), true, [7.0; 3]),
+            ([7.0; 3], [0.0; 3]),
+            "dark theme"
+        );
+        let pending = pending_egg(None, false, true);
+        assert!(
+            pending.ensure_animation(),
+            "the deadline released the fallback"
+        );
+        let animation = pending.animation.lock().expect("animation");
+        let animation = animation.as_ref().expect("built animation");
+        assert_eq!(animation.foreground, [9.0; 3], "the theme's text token");
+        assert_eq!(animation.background, [255.0; 3], "a light theme's white");
     }
 }

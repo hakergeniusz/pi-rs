@@ -5,9 +5,17 @@
 //! `packages/tui/src/tui.ts:160-172` (the query bytes), `:960-970`
 //! (`queryCellSize`), `:1122-1200` (the three consumers).
 //!
-//! Parsing lives here; the orchestration — when to emit, when to give up, how
-//! to hand late replies to the caller — lives in [`crate::tui::Tui`], because
+//! Parsing lives here; the orchestration - when to emit, when to give up, how
+//! to hand late replies to the caller - lives in [`crate::tui::Tui`], because
 //! this crate owns no timer: the timeout is a deadline the host services.
+//!
+//! The easter egg's fresh query uses [`TERMINAL_COLOR_QUERY_TIMEOUT_MS`]
+//! (`easter-egg-3d.ts:849-857`), the one caller that asks for a short deadline
+//! at the moment it starts rather than at terminal startup.
+
+/// The egg's fresh-query budget: `await tui.queryTerminalColors({ timeoutMs:
+/// 100 })`, `easter-egg-3d.ts:849-852`.
+pub const TERMINAL_COLOR_QUERY_TIMEOUT_MS: u64 = 100;
 
 /// `TERMINAL_PALETTE_SIZE`, `tui.ts:160`.
 pub const TERMINAL_PALETTE_SIZE: usize = 16;
