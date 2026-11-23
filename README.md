@@ -10,7 +10,7 @@
 > extensible agent harness. **Almost 1:1** behavioural and on-disk parity with
 > pi 1.5.2, with native Rust extensions on top.
 
-<p align="center"><img src="docs/logo.svg" alt="pi-rs logo" width="300"></p>
+<p align="center"><img src="docs/logo.svg" alt="pi-rs logo" width="180"></p>
 
 > **Why pi-rs?** Keep your pi 1.5.2 sessions and extensions, gain native Rust
 > plugins, and never touch an existing upstream `~/.pi` install.
@@ -22,7 +22,7 @@
 ### Linux & macOS
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh | sh
+curl -fsSL https://hakergeniusz.github.io/pi-rs/install.sh | sh
 ```
 
 Works in `sh`, `bash` or `zsh`. The one-liner downloads the release asset,
@@ -33,12 +33,12 @@ an upstream TypeScript `pi` binary.
 Prefer reviewing before running? Download the script first:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh
+curl -fsSLO https://hakergeniusz.github.io/pi-rs/install.sh
 sh ./install.sh --help
 sh ./install.sh v0.1.1
 ```
 
-Options: `--prefix DIR`, `--force`, `--sudo`, and an optional release `TAG`.
+Options: `--prefix DIR`, `--sudo`, `--no-update`, and an optional release `TAG`. Re-running the installer updates an existing install by default.
 The repo is public, so no token is required.
 
 ### Windows
@@ -46,7 +46,7 @@ The repo is public, so no token is required.
 PowerShell one-liner (per-user, no admin):
 
 ```powershell
-irm https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.ps1 | iex
+irm https://hakergeniusz.github.io/pi-rs/install.ps1 | iex
 ```
 
 It downloads `pi-windows-x86_64.exe`, verifies its SHA-256, and installs

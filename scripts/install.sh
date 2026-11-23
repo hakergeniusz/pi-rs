@@ -3,16 +3,16 @@
 #
 # QUICK START (one-liner; works when piped into sh, bash or zsh on Linux/macOS):
 #
-#   curl -fsSL https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh | sh
+#   curl -fsSL https://hakergeniusz.github.io/pi-rs/install.sh | sh
 #
 #   # Options still work when piped; use `-s --` so `sh` does not eat them:
-#   curl -fsSL https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh \
-#     | sh -s -- --prefix "$HOME/bin" --force
+#   curl -fsSL https://hakergeniusz.github.io/pi-rs/install.sh \
+#     | sh -s -- --prefix "$HOME/bin"
 #
 # SAFER ALTERNATIVE (recommended): download the script first, read it, then run
 # it. No bytes fetched from the network are fed directly to a shell:
 #
-#   curl -fsSLO https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh
+#   curl -fsSLO https://hakergeniusz.github.io/pi-rs/install.sh
 #   sh ./install.sh                       # latest -> ~/.local/bin/pi-rs
 #   sh ./install.sh --prefix "$HOME/bin"  # custom prefix
 #
@@ -37,7 +37,7 @@ REPO="hakergeniusz/pi-rs"
 ASSET_PREFIX="pi"
 BINARY="pi-rs"
 API_BASE="https://api.github.com/repos/${REPO}"
-INSTALL_URL="https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh"
+INSTALL_URL="https://hakergeniusz.github.io/pi-rs/install.sh"
 ONE_LINER="curl -fsSL ${INSTALL_URL} | sh"
 
 # Defaults; each can be overridden (see usage()).
@@ -50,7 +50,7 @@ fi
 TAG="${PI_VERSION:-latest}"
 TOKEN="${GITHUB_TOKEN:-${PI_GITHUB_TOKEN:-}}"
 USE_SUDO=0
-FORCE=0
+FORCE=1  # update/overwrite an existing install by default
 
 die() {
   printf 'install.sh: error: %s\n' "$*" >&2
@@ -69,7 +69,8 @@ Options:
   -p, --prefix DIR    Install into DIR (default: \$PI_INSTALL_DIR or ~/.local/bin).
       --prefix=DIR    Same, in a single argument.
       --sudo          Use sudo for the mkdir/cp/chmod/mv steps (opt-in only).
-      --force         Replace an existing \$PREFIX/$BINARY (default: refuse).
+      --force         Accepted for compatibility (overwrite is the default).
+      --no-update     Refuse to replace an existing \$PREFIX/$BINARY.
   [TAG]               Release tag to install, e.g. v0.1.0 (default: \$PI_VERSION
                       or "latest").
 
@@ -83,10 +84,10 @@ Environment:
 
 Piped one-liner (sh, bash or zsh; Linux and macOS):
   ${ONE_LINER}
-  # Pass options with: ... | sh -s -- --prefix DIR --force
+  # Pass options with: ... | sh -s -- --prefix DIR
 
 Safer alternative (download, review, then run - no network bytes piped to a shell):
-  curl -fsSLO https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh
+  curl -fsSLO https://hakergeniusz.github.io/pi-rs/install.sh
   sh ./install.sh
 
 Downloaded release assets are checksum-verified before installation. Only the
@@ -112,6 +113,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     --sudo) USE_SUDO=1; shift ;;
     --force) FORCE=1; shift ;;
+    --no-update) FORCE=0; shift ;;
     --) shift; break ;;
     -*) die "unknown option: $1 (try --help)" ;;
     *) TAG=$1; shift ;;
@@ -301,7 +303,7 @@ printf 'install.sh: checksum OK (%s)\n' "$actual"
 
 # ---------------------------------------------------------------- install
 if [ -e "${PREFIX}/${BINARY}" ] && [ "$FORCE" -ne 1 ]; then
-  die "${PREFIX}/${BINARY} already exists; pass --force to replace it, or choose another --prefix"
+  die "${PREFIX}/${BINARY} already exists (--no-update was passed); choose another --prefix"
 fi
 
 if [ "$USE_SUDO" -eq 1 ]; then
@@ -337,6 +339,6 @@ Next steps:
   3. Sessions/config live under XDG roots (defaults: ~/.config/pi-rs,
      ~/.local/share/pi-rs). See README.md -> Paths for details.
 
-To replace a future release: curl -fsSL ${INSTALL_URL} | sh -s -- --force
+To update to a future release: curl -fsSL ${INSTALL_URL} | sh
 To uninstall: remove ${target}
 EOF

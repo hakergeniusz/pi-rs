@@ -197,7 +197,7 @@ outside the prefix (apart from a cleaned-up `TMPDIR` scratch dir), and uses
 `scripts/install.ps1` supports the one-liner:
 
 ```powershell
-irm https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.ps1 | iex
+irm https://hakergeniusz.github.io/pi-rs/install.ps1 | iex
 ```
 
 It detects an x86-64 host (clear error otherwise), downloads
@@ -216,7 +216,7 @@ The repo is public, so no token is needed. Download the script as a *file*
 (the piped one-liner is also supported):
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh
+curl -fsSLO https://hakergeniusz.github.io/pi-rs/install.sh
 sh ./install.sh --help                    # options/usage
 sh ./install.sh --version                 # installer version
 DEST=$(mktemp -d)
@@ -226,7 +226,7 @@ sh ./install.sh --prefix "$DEST" v0.1.0
 ```
 
 Expected: a `checksum OK` line, then the install path and next steps. Re-run
-with `--force` to replace an existing install in the same prefix. To check the
+to update an existing install in the same prefix (overwrite is the default; `--no-update` refuses). To check the
 checksum independently of the installer:
 
 ```sh
@@ -240,7 +240,7 @@ The Windows installer can be verified the same way, downloading the script as
 a file first so it can be read before running:
 
 ```powershell
-irm https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.ps1 -OutFile install.ps1
+irm https://hakergeniusz.github.io/pi-rs/install.ps1 -OutFile install.ps1
 $DEST = Join-Path $env:TEMP 'pi-rs-install-test'
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Prefix $DEST -Version v0.1.1
 & (Join-Path $DEST 'pi-rs.exe') --version    # must report 0.1.1
