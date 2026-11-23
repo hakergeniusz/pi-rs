@@ -77,7 +77,7 @@ The `release` job (lines 94–113) currently:
    symbols` (matching the thin-LTO + stripped `[profile.release]` in
    `Cargo.toml`);
 3. runs `cargo build --release`;
-4. uploads `target/release/pi` as the **CI artifact** `pi-linux-x86_64`.
+4. uploads `target/release/pi` as the **CI artifact** `pi-linux-x86_64`. The installer copies it to `~/.local/bin/pi-rs` so it never collides with an upstream TypeScript `pi` install.
 
 That job is a per-push *build smoke test*, not a release publisher. It does
 **not** create a GitHub Release, has no checksum generation, and builds only

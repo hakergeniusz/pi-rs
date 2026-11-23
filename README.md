@@ -57,7 +57,7 @@ sh ./install.sh --help
 sh ./install.sh v0.1.1
 ```
 
-The binary lands at `~/.local/bin/pi` by default; override with `--prefix DIR`
+The binary lands at `~/.local/bin/pi-rs` by default; override with `--prefix DIR`
 (or `PI_INSTALL_DIR`). Each download is SHA-256 verified before install. No
 `curl | sh`, no writes outside the prefix, and `sudo` only with `--sudo`. Use
 `--force` to replace an existing install.
@@ -160,7 +160,7 @@ decoupled from Rust internals.
 | `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, UI dialogs over protocol, `user_bash`, context transforms, RPC dialog subprotocol, virtual-model routing, extension keyboard shortcuts + markdown transformers + entry/message/tool renderers and components over the handle bridge, interactive `ctx.ui.custom` + the dialog stack + overlay handles, OSC 7501 program status + `ctx.ui.setStatus`/setTitle, the small `ctx.ui` surfaces (widgets, footer/header factories, working-status family, editor text ops, toolsExpanded, onTerminalInput), autocomplete wrappers (`addAutocompleteProvider` chain + trigger union), the editor component (`setEditorComponent`/`getEditorComponent` - the delegate editor slot + the status row), the `ctx.ui` themes API (`theme`/`getAllThemes`/`getTheme`/`setTheme` - the engine-side sync half, `themeChanged` crossings for the mode-side visuals + persistence, RPC/headless stubs verbatim) (`tool-search` exit gate green; E3 TUI bridging complete) |
 | `pi-codemode` | `@earendil-works/pi-codemode` | inline VM, deterministic runs, `models.*` globals, grammar-constrained sampling hook, real local thread/client transports; true Node/Workers/wasm transports remain typed stubs |
 | `pi-env` | `@earendil-works/pi-env` | daemon frame transport, remote env/files/process/PTY/watch, SSH; host-wired as `pi remote` (ticks/PTY/SSH onboarding are host-driven) |
-| `pi-coding-agent` (`pi` binary) | `@earendil-works/pi-coding-agent` | CLI, print/JSON/RPC/interactive modes, session store, tools, auth, images and telemetry modules |
+| `pi-coding-agent` (`pi-rs` binary) | `@earendil-works/pi-coding-agent` | CLI, print/JSON/RPC/interactive modes, session store, tools, auth, images and telemetry modules |
 
 Deferred (not in the core scope): `chord`, `pi-durable`, `evals`, `apps/p2`.
 `/share` and `/bug` are omitted by policy (Radius upload).

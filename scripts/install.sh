@@ -13,7 +13,7 @@
 # it. No bytes fetched from the network are fed directly to a shell:
 #
 #   curl -fsSLO https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh
-#   sh ./install.sh                       # latest -> ~/.local/bin/pi
+#   sh ./install.sh                       # latest -> ~/.local/bin/pi-rs
 #   sh ./install.sh --prefix "$HOME/bin"  # custom prefix
 #
 # Portability rules (this single file is the whole installer; no siblings):
@@ -34,7 +34,8 @@ set -eu
 
 INSTALLER_VERSION="0.2.0"
 REPO="hakergeniusz/pi-rs"
-BINARY="pi"
+ASSET_PREFIX="pi"
+BINARY="pi-rs"
 API_BASE="https://api.github.com/repos/${REPO}"
 INSTALL_URL="https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh"
 ONE_LINER="curl -fsSL ${INSTALL_URL} | sh"
@@ -133,7 +134,7 @@ case "$machine" in
   *) die "unsupported CPU architecture: $machine (expected x86_64 or aarch64)" ;;
 esac
 
-asset="${BINARY}-${os}-${arch}"
+asset="${ASSET_PREFIX}-${os}-${arch}"
 checksum_asset="${asset}.sha256"
 
 # ------------------------------------------------------------------ tooling
