@@ -8,11 +8,14 @@
 //! block. `frame` adds a read-only cell grid so offline tests can assert
 //! what the terminal would show.
 //!
-//! Nothing in this crate owns a thread or a timer. Hosts drive frames with
-//! [`tui::Tui::request_render`] / [`tui::Tui::render_now`], spinner frames
-//! with [`components::loader::Loader::tick`], wheel acceleration with
+//! Hosts drive frames with [`tui::Tui::request_render`] /
+//! [`tui::Tui::render_now`], spinner frames with
+//! [`components::loader::Loader::tick`], wheel acceleration with
 //! [`wheel_scroll::WheelScrollAccelerator::next`], and input timeouts with
-//! [`stdin_buffer::StdinBuffer::pending_timeout_ms`].
+//! [`stdin_buffer::StdinBuffer::pending_timeout_ms`]. The one exception is
+//! [`ui_loop`]: a small timer thread that requests renders through a
+//! thread-safe [`ui_loop::TuiRenderWaker`], for animations whose frames must
+//! advance without input.
 //!
 //! Mouse handling lives in [`mouse`] and [`wheel_scroll`]; the terminal query
 //! protocol (OSC 10/11/4, CSI ?997, cell size) is driven from
@@ -68,6 +71,8 @@ pub mod theme;
 pub mod tui;
 /// The alt-screen (fullscreen) renderer with overlays.
 pub mod tui_alt_screen;
+/// Autonomous timers and the cross-thread render waker.
+pub mod ui_loop;
 /// Undo/redo stack for the editor.
 pub mod undo_stack;
 /// Wheel-event acceleration for scrolling.

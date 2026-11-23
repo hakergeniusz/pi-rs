@@ -19,10 +19,9 @@
 //!
 //! Deviations from upstream, all host-shape driven:
 //! - Upstream drives frames with a `setInterval` and calls
-//!   `tui.requestRender()`; this port has no timers — the interactive loop
-//!   renders every pass, so the animation computes its pose from elapsed
-//!   time and the terminal's row count arrives through a cell the host
-//!   refreshes each pass (as fresh as upstream's 30fps read).
+//!   `tui.requestRender()`. This port now has a small autonomous timer
+//!   ([`pi_tui::ui_loop`]) that requests renders through the TUI's waker;
+//!   the host pump and its atomics remain as a fallback for other hosts.
 //! - Upstream awaits a fresh `queryTerminalColors` before fading; the port
 //!   reads the colors the startup query already reported (the same terminal
 //!   defaults, without the async round-trip).
@@ -33,7 +32,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pi_tui::color::{background_ansi, color_to_rgb, foreground_ansi, indexed_color, rgb_color};
 use pi_tui::component::Component;
@@ -42,6 +41,7 @@ use pi_tui::mouse::{MouseEvent, MouseEventKind, MouseEventResult};
 use pi_tui::oklab::Rgb;
 use pi_tui::theme::{ThemeAppearance, ThemeColor};
 use pi_tui::tui::{OverlayAnchor, OverlayId, OverlayOptions, SizeValue, Tui};
+use pi_tui::ui_loop::{self, TuiRenderWaker};
 
 use super::super::theme;
 use super::armin::{ARMIN_HEIGHT, ARMIN_WIDTH, is_armin_pixel};
@@ -81,6 +81,8 @@ const WAVE_JITTER: f64 = 0.12;
 const DISSOLVE_END: f64 = FLY_START + WAVE_SPREAD + WAVE_JITTER + DUST_DURATION;
 const BACKGROUND_FADE: f64 = 0.5;
 const EXIT_DURATION: f64 = 1.1;
+/// Upstream's `FRAME_MS` (30 fps); the timer requests one render per beat.
+const FRAME_MS: u64 = 33;
 // A faint starfield fades in behind the logo once the screen has dissolved.
 const STARS_START: f64 = 2.5;
 const STARS_FADE: f64 = 2.0;
@@ -1209,6 +1211,10 @@ pub struct EasterEgg3dAnimation {
     done: Arc<AtomicBool>,
     start: Instant,
     inner: Mutex<Inner>,
+    /// The frame timer, cancelled on finish or when the overlay is dropped.
+    timer: Mutex<Option<ui_loop::TimerId>>,
+    /// Cleared on finish so a tick already in flight cannot request a frame.
+    alive: Arc<AtomicBool>,
 }
 
 /// What the host keeps to drive a playing easter egg.
@@ -1245,7 +1251,31 @@ impl EasterEgg3dAnimation {
                 cells: Vec::new(),
                 ansi_cache: HashMap::new(),
             }),
+            timer: Mutex::new(None),
+            alive: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Like [`Self::new`], but also drives frames with a 33 ms timer that
+    /// requests renders through `waker` (upstream's `setInterval`). Hosts
+    /// without a waker keep the pump-driven fallback.
+    fn with_render_waker(
+        screen: Vec<String>,
+        model: Model,
+        colors: ([f64; 3], [f64; 3]),
+        rows: Arc<AtomicU16>,
+        done: Arc<AtomicBool>,
+        waker: TuiRenderWaker,
+    ) -> Self {
+        let animation = Self::new(screen, model, colors, rows, done);
+        let alive = Arc::clone(&animation.alive);
+        let id = ui_loop::set_interval(Duration::from_millis(FRAME_MS), move || {
+            if alive.load(Ordering::SeqCst) {
+                waker.request_render();
+            }
+        });
+        *animation.timer.lock().expect("frame timer") = Some(id);
+        animation
     }
 
     /// Play the exit animation. A second call skips it (`close`).
@@ -1268,9 +1298,20 @@ impl EasterEgg3dAnimation {
         });
     }
 
+    /// Stop the frame timer. Safe to call while the animation state is
+    /// locked: it uses a separate mutex.
+    fn stop_timer(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        let id = self.timer.lock().expect("frame timer").take();
+        if let Some(id) = id {
+            ui_loop::clear_timer(id);
+        }
+    }
+
     /// The exit completed: tell the host to hide the overlay (upstream's
     /// `finish` clears the interval and calls `onDone`).
     fn finish(&self) {
+        self.stop_timer();
         self.done.store(true, Ordering::SeqCst);
     }
 
@@ -1507,6 +1548,14 @@ impl EasterEgg3dAnimation {
             }
         }
         cells
+    }
+}
+
+impl Drop for EasterEgg3dAnimation {
+    fn drop(&mut self) {
+        // The overlay can be removed without playing the exit; never let the
+        // timer outlive the animation.
+        self.stop_timer();
     }
 }
 
@@ -1935,12 +1984,13 @@ pub fn play_easter_egg_3d(tui: &mut Tui, screen: Vec<String>, egg: EasterEgg3d) 
             .unwrap_or_default(),
     ));
     let done = Arc::new(AtomicBool::new(false));
-    let animation = EasterEgg3dAnimation::new(
+    let animation = EasterEgg3dAnimation::with_render_waker(
         screen,
         model,
         (foreground, background),
         Arc::clone(&rows),
         Arc::clone(&done),
+        tui.render_waker(),
     );
     let overlay = tui.show_overlay(
         Box::new(animation),
@@ -2152,6 +2202,49 @@ mod tests {
             ),
             done,
         )
+    }
+
+    fn test_animation_with_waker(waker: TuiRenderWaker) -> (EasterEgg3dAnimation, Arc<AtomicBool>) {
+        let screen: Vec<String> = vec!["hello world".to_string(), "second line".to_string()];
+        let done = Arc::new(AtomicBool::new(false));
+        let rows = Arc::new(AtomicU16::new(10));
+        (
+            EasterEgg3dAnimation::with_render_waker(
+                screen,
+                pi_logo_model(Some((0, 0))),
+                ([255.0; 3], [0.0; 3]),
+                rows,
+                Arc::clone(&done),
+                waker,
+            ),
+            done,
+        )
+    }
+
+    #[test]
+    fn frame_timer_requests_renders_until_finish() {
+        let mut tui = Tui::new(Box::new(pi_tui::terminal::CaptureTerminal::new()));
+        let (animation, done) = test_animation_with_waker(tui.render_waker());
+        assert!(!tui.render_requested());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            tui.render_requested(),
+            "the 33 ms timer flags a frame on the TUI"
+        );
+        tui.render_now(false);
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            tui.render_requested(),
+            "the interval keeps requesting frames"
+        );
+        animation.finish();
+        assert!(done.load(Ordering::SeqCst));
+        // Let a tick already in flight settle before clearing the flag.
+        std::thread::sleep(Duration::from_millis(80));
+        tui.render_now(false);
+        assert!(!tui.render_requested());
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!tui.render_requested(), "finish cancels the timer");
     }
 
     #[test]

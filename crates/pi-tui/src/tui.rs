@@ -6,10 +6,11 @@
 //!
 //! Deliberate deviations, all of them mechanical:
 //!
-//! * No timers. pi schedules a frame with `setTimeout`; here
-//!   [`Tui::request_render`] sets a flag and the host calls
-//!   [`Tui::render_now`]. The terminal-colour query works the same way: the
-//!   caller passes the host clock to [`Tui::service_terminal_queries`].
+//! * pi schedules a frame with `setTimeout`; here [`Tui::request_render`]
+//!   sets a flag and the host calls [`Tui::render_now`]. The flag is a
+//!   [`crate::ui_loop::TuiRenderWaker`], so [`crate::ui_loop`] timers can
+//!   request frames from their own thread. The terminal-colour query still
+//!   uses the host clock via [`Tui::service_terminal_queries`].
 //! * Kitty image lines are recognised ([`crate::terminal_image::is_image_line`])
 //!   but no component emits them yet; that lands with the alt-screen renderer.
 //! * The terminal-colour and cell-size protocols are exposed as query methods
@@ -427,7 +428,8 @@ pub struct Tui {
     max_lines_rendered: usize,
     previous_viewport_top: i64,
     full_redraw_count: usize,
-    render_requested: bool,
+    /// Pending-frame flag, shared with [`crate::ui_loop`] timer callbacks.
+    render_requested: crate::ui_loop::TuiRenderWaker,
     /// A pending request that bypasses the 16 ms floor, set by
     /// [`Tui::request_immediate_render`]. `tui.ts:517`.
     ///
@@ -602,7 +604,7 @@ impl Tui {
             max_lines_rendered: 0,
             previous_viewport_top: 0,
             full_redraw_count: 0,
-            render_requested: false,
+            render_requested: crate::ui_loop::TuiRenderWaker::default(),
             immediate_render: false,
             color_scheme_notifications: false,
             last_render_at: None,
@@ -814,7 +816,13 @@ impl Tui {
     /// out [`Tui::MIN_RENDER_INTERVAL`], so a stream of deltas becomes one
     /// frame a terminal can show.
     pub fn request_render(&mut self) {
-        self.render_requested = true;
+        self.render_requested.request_render();
+    }
+
+    /// A cloneable, thread-safe handle to this TUI's pending-frame flag, for
+    /// timers and other threads that need to request a frame ([`crate::ui_loop`]).
+    pub fn render_waker(&self) -> crate::ui_loop::TuiRenderWaker {
+        self.render_requested.clone()
     }
 
     /// `requestImmediateRender`, `tui.ts:1001-1017`. Keyboard input is
@@ -822,7 +830,7 @@ impl Tui {
     /// `setTimeout(0)` can take a full 16 ms tick on Windows, and renders on
     /// the next tick instead. This cancels the floor for the pending request.
     pub fn request_immediate_render(&mut self) {
-        self.render_requested = true;
+        self.render_requested.request_render();
         self.immediate_render = true;
     }
 
@@ -840,7 +848,7 @@ impl Tui {
 
     /// Whether a frame is waiting; the host drives it via [`Tui::render_due_at`].
     pub fn render_requested(&self) -> bool {
-        self.render_requested
+        self.render_requested.render_requested()
     }
 
     /// `tui.ts:916-929`.
@@ -2493,7 +2501,7 @@ impl Tui {
         if force {
             self.reset_render_state();
         }
-        self.render_requested = false;
+        self.render_requested.take();
         // `tui.ts:986` clears the immediate flag too: a frame that went out
         // re-arms the floor for whatever is requested next.
         self.immediate_render = false;
@@ -2520,7 +2528,7 @@ impl Tui {
     /// that is not owed. pi answers the same question with a `setTimeout`; a
     /// host that has its own clock - a `select!` arm, a test - asks here.
     pub fn render_due_at(&self) -> Option<std::time::Instant> {
-        if self.stopped || !self.render_requested {
+        if self.stopped || !self.render_requested.render_requested() {
             return None;
         }
         // `requestImmediateRender` cancels the pending timer, so the request
