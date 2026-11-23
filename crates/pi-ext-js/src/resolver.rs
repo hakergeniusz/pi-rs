@@ -139,6 +139,19 @@ pub fn resolve_relative(base_dir: &Path, specifier: &str) -> Option<PathBuf> {
             return Some(with_suffix);
         }
     }
+    // TypeScript's NodeNext convention writes `./api.js` in source but ships
+    // `api.ts` in the repo. Upstream's jiti resolves that pair; do the same so
+    // extensions like `pi-zed-models` (which import `./src/api.js`) load.
+    let typescript = match candidate.extension().and_then(|ext| ext.to_str()) {
+        Some("js") => Some(candidate.with_extension("ts")),
+        Some("mjs") => Some(candidate.with_extension("mts")),
+        _ => None,
+    };
+    if let Some(typescript) = typescript
+        && typescript.is_file()
+    {
+        return Some(typescript);
+    }
     for index in ["index.ts", "index.js"] {
         let index_path = candidate.join(index);
         if index_path.is_file() {
@@ -678,7 +691,10 @@ impl rquickjs::loader::Loader for ExtensionLoader {
         _attributes: Option<rquickjs::loader::ImportAttributes<'js>>,
     ) -> JsResult<Module<'js, rquickjs::module::Declared>> {
         if let Some(specifier) = name.strip_prefix("virtual:") {
-            if let Some(source) = virtual_module_source(specifier) {
+            // The host-package patches are part of the module an importing
+            // extension sees: `composed_source` appends the E4 extension-
+            // surface exports to the base shim served by `virtual_module_source`.
+            if let Some(source) = crate::hostpkg::composed_source(specifier) {
                 return Module::declare(ctx.clone(), name, source);
             }
             return Err(rquickjs::Error::Unknown);
@@ -812,6 +828,28 @@ mod tests {
             Some(package.join("raw/extra.js"))
         );
         assert_eq!(resolve_bare(dir.path(), "exported/missing"), None);
+    }
+
+    #[test]
+    fn relative_js_specifier_resolves_to_typescript_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &dir.path().join("api.ts"),
+            "export const tag: string = \"ts\";\n",
+        );
+        write(
+            &dir.path().join("scene.mts"),
+            "export const tag: string = \"mts\";\n",
+        );
+        assert_eq!(
+            resolve_relative(dir.path(), "./api.js"),
+            Some(dir.path().join("api.ts"))
+        );
+        assert_eq!(
+            resolve_relative(dir.path(), "./scene.mjs"),
+            Some(dir.path().join("scene.mts"))
+        );
+        assert_eq!(resolve_relative(dir.path(), "./missing.js"), None);
     }
 
     #[test]
