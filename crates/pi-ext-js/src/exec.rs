@@ -324,8 +324,8 @@ mod tests {
     fn spawn_failure_is_a_failed_execution() {
         let result = run("nonexistent-command-e1", &[], &serde_json::json!({}));
         assert_eq!(result["code"], 1);
-        assert!(result["stdout"].as_str().expect("stdout").is_empty());
-        assert!(!result["stderr"].as_str().expect("stderr").is_empty());
+        assert_eq!(result["stdout"].as_str().expect("stdout"), "");
+        assert_ne!(result["stderr"].as_str().expect("stderr"), "");
     }
 
     #[cfg(unix)]
