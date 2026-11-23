@@ -61,6 +61,9 @@ pub use sign_in::{
 pub use store::{
     MCP_AUTH_FILE_NAME, McpOAuthCredentialStore, ServerOAuthStore, default_store_path, store_keys,
 };
+/// Re-exported so a host that drives the two sign-in halves needs no direct
+/// `tokio-util` dependency of its own.
+pub use tokio_util::sync::CancellationToken;
 pub use types::{
     AuthorizationServerMetadata, OAuthChallenge, OAuthClientInformationFull, OAuthClientMetadata,
     OAuthDiscoveryState, OAuthProtectedResourceMetadata, OAuthServerInfo, OAuthTokens,

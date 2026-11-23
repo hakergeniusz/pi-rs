@@ -13,7 +13,8 @@ use tokio::task::JoinHandle;
 
 use crate::error::McpError;
 use crate::types::{
-    InboundMessage, JsonRpcId, JsonRpcNotification, JsonRpcRequest, JsonRpcVersion, classify_line,
+    InboundMessage, JsonRpcId, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    JsonRpcVersion, classify_line,
 };
 
 /// Awaiting responses: id -> one-shot reply channel. Keyed by [`JsonRpcId`] so
@@ -38,6 +39,8 @@ pub struct StdioTransport {
 enum Outgoing {
     Request(JsonRpcRequest),
     Notification(JsonRpcNotification),
+    /// A reply to a server-initiated request (`roots/list`, `ping`).
+    Response(JsonRpcResponse),
     /// Tear the transport down: kill the child.
     Close,
 }
@@ -178,6 +181,18 @@ impl StdioTransport {
             .map_err(|_| McpError::ConnectionClosed("writer task gone".to_string()))
     }
 
+    /// Replies to a request the server sent (upstream's `requestHandlers`
+    /// in `client.ts:176-182`, `:510-520`).
+    ///
+    /// # Errors
+    /// When the writer task is gone.
+    pub async fn respond(&self, response: JsonRpcResponse) -> Result<(), McpError> {
+        self.outgoing
+            .send(Outgoing::Response(response))
+            .await
+            .map_err(|_| McpError::ConnectionClosed("writer task gone".to_string()))
+    }
+
     /// Kills the server and joins the tasks. Draining `inbound` afterwards
     /// still yields any lines the reader saw before shutdown.
     ///
@@ -253,6 +268,7 @@ async fn writer_loop(mut stdin: ChildStdin, mut outgoing: mpsc::Receiver<Outgoin
         let line = match &outgoing {
             Outgoing::Request(request) => serde_json::to_string(request),
             Outgoing::Notification(notification) => serde_json::to_string(notification),
+            Outgoing::Response(response) => serde_json::to_string(response),
             Outgoing::Close => break,
         };
         let Ok(line) = line else { break };

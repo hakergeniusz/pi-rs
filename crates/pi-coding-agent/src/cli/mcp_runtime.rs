@@ -3,16 +3,32 @@
 //! [`McpRuntime`] trait to the real `pi-mcp` client for connection/tool
 //! listing and to the `mcp-auth.json` store for credential removal.
 //!
-//! Deviations: the OAuth sign-in flow (`signInMcpServer`) is not driven from
-//! the CLI — it stays interactive-mode work — so [`CliMcpRuntime::sign_in`]
-//! returns a typed failure. Header/env `!cmd` config values resolve through
+//! [`CliMcpRuntime::sign_in`] drives the two sign-in halves directly
+//! (`extensions/mcp/oauth.ts:207-250`, `cli.ts:627-656`): a loopback callback
+//! server, `start_mcp_sign_in` (refresh or browser URL), and
+//! `complete_mcp_sign_in` after the redirect. A `needs-auth` connect result
+//! is produced by the CLI itself for HTTP servers with an auth challenge;
+//! the interactive `/mcp` selector needs the same state from its own host
+//! seam (see the report to the caller).
+//!
+//! Deviations: the pasted-redirect-URL arm (`promptForRedirectUrl`) is not
+//! wired, because the pi-mcp prompt callback needs a `'static` future while
+//! this runtime's prompt is a borrowed `FnMut`; browser loopback works.
+//! Header/env `!cmd` config values resolve through
 //! [`crate::auth::resolve_config_value`]; a failed resolution is reported as
 //! a failed connection rather than aborting the whole `list` command.
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
+use pi_mcp::oauth::{
+    CancellationToken, ListenForLoopbackSignInOptions, MCP_AUTH_FILE_NAME, McpOAuthCredentialStore,
+    McpOAuthServerStore, McpOAuthSettings, McpSignInOptions, McpSignInStart, OAuthError,
+    WaitForLoopbackSignInOptions, complete_mcp_sign_in, listen_for_loopback_sign_in,
+    start_mcp_sign_in, wait_for_loopback_sign_in,
+};
 use pi_mcp::{McpClient, McpError, McpServerConfig, McpTransportConfig};
 use serde_json::Value as Json;
 
@@ -21,6 +37,15 @@ use super::mcp_command::{ConnectionSnapshot, McpRuntime, McpServerEntry, SignInE
 /// Wall-clock ceiling for a CLI connection handshake and `tools/list`
 /// (`runtime.ts:212-214` uses `(config.timeout ?? 60) * 1000`).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cancellation vs. failure, as `cli.ts:641-647` distinguishes them.
+fn sign_in_error(error: &McpError) -> SignInError {
+    if matches!(error, McpError::OAuth(OAuthError::SignInCancelled)) {
+        SignInError::Cancelled
+    } else {
+        SignInError::Failed(error.to_string())
+    }
+}
 
 /// The real runtime used by `pi mcp` in the binary.
 #[derive(Debug, Default, Clone, Copy)]
@@ -141,7 +166,7 @@ impl McpRuntime for CliMcpRuntime {
                     }
                 },
                 Err(error) => {
-                    result.state = if matches!(error, McpError::AuthRequired { .. }) {
+                    result.state = if error.needs_auth() {
                         "needs-auth".to_string()
                     } else {
                         "failed".to_string()
@@ -167,18 +192,101 @@ impl McpRuntime for CliMcpRuntime {
 
     fn sign_in(
         &self,
-        _name: &str,
-        _url: &str,
-        _timeout_ms: u64,
-        _show_authorization_url: &mut dyn FnMut(&str),
+        name: &str,
+        url: &str,
+        timeout_ms: u64,
+        show_authorization_url: &mut dyn FnMut(&str),
         _prompt_redirect_url: &mut dyn FnMut() -> Option<String>,
     ) -> Result<usize, SignInError> {
-        // Interactive-mode work: the CLI has no event loop to drive the
-        // loopback callback / browser flow. Keep the typed failure so the
-        // command prints a truthful message instead of hanging.
-        Err(SignInError::Failed(
-            "MCP sign-in is only available in interactive mode (`pi` then `/mcp`)".to_string(),
-        ))
+        // `signInMcpServer` (oauth.ts:207-250) plus the reconnect and tool
+        // count of `cli.ts:627-656`. The CLI has no TUI event loop, but the
+        // loopback callback and the two sign-in halves are plain async work
+        // the CLI's tokio runtime can drive.
+        crate::runtime::block_on(async {
+            let agent_dir = crate::config::get_agent_dir();
+            let credentials =
+                McpOAuthCredentialStore::with_path(agent_dir.join(MCP_AUTH_FILE_NAME));
+            let store: Arc<dyn McpOAuthServerStore> = Arc::new(
+                credentials
+                    .for_server(name, url)
+                    .map_err(|error| sign_in_error(&error))?,
+            );
+            let settings = McpOAuthSettings::default();
+            let callback = listen_for_loopback_sign_in(ListenForLoopbackSignInOptions {
+                server_url: url,
+                store: store.clone(),
+                settings: &settings,
+                client_metadata_documents: None,
+                render_page: None,
+            })
+            .await
+            .map_err(|error| sign_in_error(&error))?;
+
+            // `AbortSignal.timeout(timeoutMs)` (cli.ts:639): one timer bounds
+            // every half of the flow, including the browser wait.
+            let signal = CancellationToken::new();
+            let timer_signal = signal.clone();
+            let timer = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+                timer_signal.cancel();
+            });
+            let options = McpSignInOptions {
+                server_url: url.to_string(),
+                store: store.clone(),
+                settings,
+                client_name: "pi".to_string(),
+                client_metadata_documents: None,
+                redirect_url: callback.redirect_url.clone(),
+                challenge: None,
+                signal: Some(signal.clone()),
+            };
+            let outcome = async {
+                match start_mcp_sign_in(&options)
+                    .await
+                    .map_err(|error| sign_in_error(&error))?
+                {
+                    McpSignInStart::Authorized => Ok(()),
+                    McpSignInStart::Redirect(authorization) => {
+                        show_authorization_url(&authorization.authorization_url);
+                        let response = wait_for_loopback_sign_in(WaitForLoopbackSignInOptions {
+                            callback: callback.callback,
+                            authorization: authorization.clone(),
+                            prompt_for_redirect_url: None,
+                            signal: Some(signal.clone()),
+                        })
+                        .await
+                        .map_err(|error| sign_in_error(&error))?;
+                        complete_mcp_sign_in(&options, &authorization, &response)
+                            .await
+                            .map_err(|error| sign_in_error(&error))
+                    }
+                }
+            }
+            .await;
+            timer.abort();
+            outcome?;
+
+            // The reconnect (`cli.ts:649-656`): the command reports the
+            // tool count, so open one fresh client against the same URL.
+            let spawn = McpServerConfig {
+                name: name.to_string(),
+                transport: McpTransportConfig::Http {
+                    url: url.to_string(),
+                    headers: HashMap::new(),
+                },
+            };
+            let client = McpClient::connect_with_timeout(&spawn, CONNECT_TIMEOUT)
+                .await
+                .map_err(|error| sign_in_error(&error))?;
+            let tools = client
+                .tools_list_with_timeout(CONNECT_TIMEOUT)
+                .await
+                .map_err(|error| sign_in_error(&error))?
+                .tools
+                .len();
+            let _ = client.shutdown().await;
+            Ok(tools)
+        })
     }
 }
 

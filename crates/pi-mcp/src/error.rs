@@ -61,6 +61,17 @@ pub enum McpError {
     OAuth(#[from] OAuthError),
 }
 
+impl McpError {
+    /// Whether this failure means the user must sign in
+    /// (`needsSignIn`, `extensions/mcp/runtime.ts:320-322`): a 401/insufficient
+    /// -scope challenge or an OAuth flow that needs user interaction.
+    #[must_use]
+    pub fn needs_auth(&self) -> bool {
+        matches!(self, Self::AuthRequired { .. })
+            || matches!(self, Self::OAuth(OAuthError::AuthorizationRequired))
+    }
+}
+
 /// `Clone` so concurrent requests joining one in-flight OAuth refresh all
 /// see the same failure (upstream: every waiter of the shared promise gets
 /// the same error object). `std::io::Error` is not `Clone`, so the two

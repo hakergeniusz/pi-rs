@@ -60,16 +60,27 @@
 //!   the top-level `_meta` is dropped. Tool-name `*`-patterns are matched
 //!   with [`pi_mcp::types::tool_name_pattern_matches`], the faithful port of
 //!   `core/mcp-servers.ts:17-34`.
+//! * Server log messages (`extensions/mcp/log.ts:1-69`, `runtime.ts:370`):
+//!   `notifications/message` is formatted as an `[server]` line and appended
+//!   to `<agent-dir>/mcp.log`, with the 5 MiB rotation of `log.ts:10,50-54`.
+//!   The same lines are published as [`McpLogEvent`]s for a host UI.
+//! * Progress and cancellation relay (`tools.ts:281-286`, `client.ts:404-410`,
+//!   `:525-530`, `:562-572`): tool calls carry `_meta.progressToken`, and
+//!   `notifications/progress` / `notifications/cancelled` are published as
+//!   typed [`McpNotificationEvent`]s. Server-initiated `roots/list` and
+//!   `ping` requests are answered from the worker (`client.ts:176-182`).
+//! * The `needs-auth` report state (`runtime.ts:59`, `:320-330`) and
+//!   [`McpManager::reconnect`] for the post-sign-in retry (`cli.ts:649-656`).
 //!
-//! Not in this slice (recorded open): OAuth/`needs-auth` (`oauth.ts` and
-//! the HTTP arm's sign-in flow), resources (`resources.ts`), and the
-//! `/mcp` manager UI (`ui.ts`).
+//! Not in this slice (recorded open): the pasted-redirect-URL arm of the
+//! interactive sign-in UI (`ui.ts:177-234`) and the `/mcp` selector's own
+//! event handling (`ui.ts`), which live outside this module's host seam.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{TryRecvError, channel};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value as Json, json};
 
@@ -77,7 +88,10 @@ use pi_mcp::auth_provider::AuthProvider;
 use pi_mcp::oauth::auth_provider::{McpAuthProvider, McpAuthProviderOptions};
 use pi_mcp::oauth::{MCP_AUTH_FILE_NAME, McpOAuthCredentialStore, McpOAuthSettings};
 use pi_mcp::resources::READ_MCP_RESOURCE_TOOL;
-use pi_mcp::types::{ContentBlock, InboundMessage};
+use pi_mcp::types::{
+    ContentBlock, InboundMessage, JsonRpcId, LoggingMessageParams, Root, ServerNotification,
+    parse_server_notification,
+};
 use pi_mcp::{CallToolResult, McpClient, McpError, McpServerConfig, McpTool, McpTransportConfig};
 
 /// Upstream's per-connection default timeout (`DEFAULT_TIMEOUT_SECONDS`,
@@ -105,6 +119,10 @@ const STDERR_TAIL_CHARS: usize = 2_000;
 /// Env key carrying the stdio stderr sink path into the child process (a
 /// port implementation detail; upstream reads `StdioTransport.stderr`).
 const STDERR_PATH_ENV: &str = "PI_MCP_STDERR_PATH";
+/// File the host writes `notifications/message` lines to (`log.ts:3`).
+const MCP_LOG_FILE_NAME: &str = "mcp.log";
+/// Rotation threshold of `mcp.log` (`MAX_LOG_BYTES`, `log.ts:10`).
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 /// One configured server's connection state in the worker.
 ///
@@ -193,6 +211,13 @@ enum Request {
     DrainNotifications {
         reply: std::sync::mpsc::Sender<()>,
     },
+    /// Retry one server after its OAuth sign-in saved new credentials
+    /// (`connection.reconnect()`, `cli.ts:649-656`). Reuses the stored spawn
+    /// config and publishes the outcome to the readiness queue.
+    Reconnect {
+        name: String,
+        reply: std::sync::mpsc::Sender<Result<ConnectOutcome, String>>,
+    },
     ShutdownAll,
 }
 
@@ -215,6 +240,84 @@ pub struct ConnectOutcome {
     pub instructions: Option<String>,
     /// `capabilities.resources.is_some()` (`runtime.ts:393`).
     pub has_resources: bool,
+}
+
+/// One formatted `notifications/message` line, ready for the host UI and for
+/// `mcp.log` (`log.ts:26-32`). `text` includes the timestamp and trailing
+/// newline, exactly as upstream appends it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpLogEvent {
+    pub server: String,
+    pub level: String,
+    pub logger: Option<String>,
+    pub text: String,
+}
+
+/// One `notifications/progress` from a tool call (`tools.ts:280-286`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpProgressEvent {
+    pub server: String,
+    /// The tool whose `_meta.progressToken` correlated this notification.
+    pub tool: Option<String>,
+    pub progress_token: JsonRpcId,
+    pub progress: f64,
+    pub total: Option<f64>,
+    pub message: Option<String>,
+}
+
+/// One server-initiated `notifications/cancelled` (`client.ts:526`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpCancellationEvent {
+    pub server: String,
+    pub request_id: JsonRpcId,
+    pub reason: Option<String>,
+}
+
+/// A server-initiated notification the host may want to show: a log line, a
+/// tool's progress update, or a cancellation. Published into the manager's
+/// shared queue by the notification drain.
+#[derive(Debug, Clone, PartialEq)]
+pub enum McpNotificationEvent {
+    Log(McpLogEvent),
+    Progress(McpProgressEvent),
+    Cancelled(McpCancellationEvent),
+}
+
+/// The connection state a host report shows (`runtime.ts:59`,
+/// `index.ts:232-250`). `NeedsAuth` is the state upstream sets when an
+/// `McpAuthRequiredError` (or an OAuth step-up) reaches `withClient`
+/// (`runtime.ts:320-330`, `:412-416`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpConnectionState {
+    Connected,
+    NeedsAuth,
+    Failed,
+    Disabled,
+}
+
+impl McpConnectionState {
+    /// The string form used by `ConnectionSnapshot.state` and the CLI's JSON
+    /// report (`mcp_command.rs:87-92`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::NeedsAuth => "needs-auth",
+            Self::Failed => "failed",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+/// Classifies one connect error for a host report (`needsSignIn`,
+/// `runtime.ts:320-322`).
+#[must_use]
+pub fn connection_state_for_error(error: &McpError) -> McpConnectionState {
+    if error.needs_auth() {
+        McpConnectionState::NeedsAuth
+    } else {
+        McpConnectionState::Failed
+    }
 }
 
 /// One background connection's outcome, keyed by server name. The manager
@@ -246,6 +349,15 @@ pub struct McpManager {
     /// blocking on the next tick. The changes themselves live in
     /// `tool_changes`; an ack only means "this drain ran".
     pending_drains: Arc<Mutex<Vec<std::sync::mpsc::Receiver<()>>>>,
+    /// Log/progress/cancellation notifications published by the worker's
+    /// drain and taken by the host's MCP tick (`log.ts:43`, `tools.ts:281`).
+    notification_events: Arc<Mutex<Vec<McpNotificationEvent>>>,
+    /// Server names whose last connect failed with `needs-auth`
+    /// (`runtime.ts:328`), drained by the host's `/mcp` report builder.
+    needs_auth: Arc<Mutex<Vec<String>>>,
+    /// `_meta.progressToken` -> (server, tool), so a progress notification
+    /// arriving after the call returns still names its tool.
+    progress_tools: Arc<Mutex<HashMap<JsonRpcId, (String, String)>>>,
 }
 
 impl McpManager {
@@ -263,6 +375,9 @@ impl McpManager {
                     self.timeouts.clone(),
                     self.tool_changes.clone(),
                     self.settled_connects.clone(),
+                    self.notification_events.clone(),
+                    self.needs_auth.clone(),
+                    self.progress_tools.clone(),
                     self.auth_dir.clone(),
                 ))
             })
@@ -370,6 +485,82 @@ impl McpManager {
                 .lock()
                 .expect("mcp tool changes mutex poisoned"),
         )
+    }
+
+    /// Every server-initiated notification accumulated since the last drain.
+    pub fn take_notification_events(&self) -> Vec<McpNotificationEvent> {
+        std::mem::take(
+            &mut *self
+                .notification_events
+                .lock()
+                .expect("mcp notification events mutex poisoned"),
+        )
+    }
+
+    /// Just the `notifications/message` lines, keeping progress and
+    /// cancellation events for a later drain.
+    pub fn take_log_events(&self) -> Vec<McpLogEvent> {
+        let mut events = self
+            .notification_events
+            .lock()
+            .expect("mcp notification events mutex poisoned");
+        let mut logs = Vec::new();
+        events.retain(|event| {
+            if let McpNotificationEvent::Log(log) = event {
+                logs.push(log.clone());
+                false
+            } else {
+                true
+            }
+        });
+        logs
+    }
+
+    /// Just the `notifications/progress` updates, keeping the other events.
+    pub fn take_progress_events(&self) -> Vec<McpProgressEvent> {
+        let mut events = self
+            .notification_events
+            .lock()
+            .expect("mcp notification events mutex poisoned");
+        let mut progress = Vec::new();
+        events.retain(|event| {
+            if let McpNotificationEvent::Progress(item) = event {
+                progress.push(item.clone());
+                false
+            } else {
+                true
+            }
+        });
+        progress
+    }
+
+    /// Servers that last failed with `needs-auth` since the host last
+    /// drained them (`runtime.ts:328`, `cli.ts:579`).
+    pub fn take_needs_auth(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .needs_auth
+                .lock()
+                .expect("mcp needs auth mutex poisoned"),
+        )
+    }
+
+    /// Retry one server after its sign-in saved credentials
+    /// (`connection.reconnect()`, `cli.ts:649-656`). The outcome is also
+    /// published to [`Self::take_settled_connects`] so the host registers
+    /// the server's tools on its next tick.
+    pub fn reconnect(&self, name: &str) -> Result<ConnectOutcome, String> {
+        let window = self.reply_window(name, config_default_window());
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.sender()
+            .send(Request::Reconnect {
+                name: name.to_string(),
+                reply,
+            })
+            .map_err(|_| "MCP manager is not running".to_string())?;
+        reply_rx
+            .recv_timeout(window)
+            .unwrap_or_else(|_| Err("MCP manager did not answer in time".to_string()))
     }
 
     /// The reply window for `server`: its configured timeout (twice over,
@@ -854,6 +1045,9 @@ fn spawn_worker(
     timeouts: Arc<Mutex<HashMap<String, Duration>>>,
     tool_changes: Arc<Mutex<Vec<ToolChange>>>,
     settled_connects: Arc<Mutex<SettledConnects>>,
+    notification_events: Arc<Mutex<Vec<McpNotificationEvent>>>,
+    needs_auth: Arc<Mutex<Vec<String>>>,
+    progress_tools: Arc<Mutex<HashMap<JsonRpcId, (String, String)>>>,
     auth_dir: Option<std::path::PathBuf>,
 ) -> tokio::sync::mpsc::UnboundedSender<Request> {
     // A tokio request channel lets the worker `block_on(recv())`: its
@@ -869,6 +1063,9 @@ fn spawn_worker(
                 &timeouts,
                 &tool_changes,
                 &settled_connects,
+                &notification_events,
+                &needs_auth,
+                &progress_tools,
                 auth_dir.as_deref(),
             );
         })
@@ -880,17 +1077,24 @@ fn spawn_worker(
 /// manager handles drop, the channel closes and remaining clients shut
 /// down (their transports kill the children).
 #[allow(clippy::too_many_lines)] // mirrors upstream's single worker loop; split when extending
+#[allow(clippy::too_many_arguments)] // one shared queue per notification class; split when extending
 fn worker_loop(
     receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Request>,
     timeouts: &Arc<Mutex<HashMap<String, Duration>>>,
     tool_changes: &Arc<Mutex<Vec<ToolChange>>>,
     settled_connects: &Arc<Mutex<SettledConnects>>,
+    notification_events: &Arc<Mutex<Vec<McpNotificationEvent>>>,
+    needs_auth: &Arc<Mutex<Vec<String>>>,
+    progress_tools: &Arc<Mutex<HashMap<JsonRpcId, (String, String)>>>,
     auth_dir: Option<&std::path::Path>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build MCP manager runtime");
+    // Upstream writes every server log message to `<agent-dir>/mcp.log`
+    // (`log.ts:43-60`); no agent dir means the events still reach the host.
+    let mut server_log = auth_dir.map(|dir| McpServerLog::new(dir.join(MCP_LOG_FILE_NAME)));
     let mut servers: HashMap<String, ServerEntry> = HashMap::new();
     while let Some(request) = runtime.block_on(receiver.recv()) {
         // Notifications are an explicit host-tick event now
@@ -913,6 +1117,7 @@ fn worker_loop(
                             &name,
                             &spawn,
                             timeout,
+                            needs_auth,
                             auth_dir,
                         ) {
                             Ok(outcome) => Ok(outcome),
@@ -960,7 +1165,16 @@ fn worker_loop(
                 args,
                 reply,
             } => {
-                let outcome = call_tool_on(&runtime, &mut servers, &server, &tool, args, auth_dir);
+                let outcome = call_tool_on(
+                    &runtime,
+                    &mut servers,
+                    &server,
+                    &tool,
+                    args,
+                    needs_auth,
+                    progress_tools,
+                    auth_dir,
+                );
                 let _ = reply.send(outcome);
             }
             Request::ListResourcePage {
@@ -972,6 +1186,7 @@ fn worker_loop(
                     &runtime,
                     &mut servers,
                     &server,
+                    needs_auth,
                     auth_dir,
                     |client, timeout| {
                         let page = runtime
@@ -986,6 +1201,7 @@ fn worker_loop(
                     &runtime,
                     &mut servers,
                     &server,
+                    needs_auth,
                     auth_dir,
                     |client, timeout| {
                         let items = runtime.block_on(client.resources_list(timeout))?;
@@ -1003,6 +1219,7 @@ fn worker_loop(
                     &runtime,
                     &mut servers,
                     &server,
+                    needs_auth,
                     auth_dir,
                     |client, timeout| {
                         let page = runtime.block_on(
@@ -1018,6 +1235,7 @@ fn worker_loop(
                     &runtime,
                     &mut servers,
                     &server,
+                    needs_auth,
                     auth_dir,
                     |client, timeout| {
                         let items = runtime.block_on(client.resources_templates_list(timeout))?;
@@ -1031,6 +1249,7 @@ fn worker_loop(
                     &runtime,
                     &mut servers,
                     &server,
+                    needs_auth,
                     auth_dir,
                     |client, timeout| {
                         let result = runtime.block_on(client.resource_read(&uri, timeout))?;
@@ -1063,12 +1282,59 @@ fn worker_loop(
                 let _ = reply.send(names);
             }
             Request::DrainNotifications { reply } => {
-                // The try_recv loop in `collect_tool_changes` is the port's
-                // notification listener (`runtime.ts:382-384`): it never
-                // blocks, and the changes are published to the shared queue
-                // before the ack is sent.
-                collect_tool_changes(&runtime, &mut servers, tool_changes);
+                // The try_recv loop in `drain_server_notifications` is the
+                // port's notification listener (`runtime.ts:382-384`): it
+                // never blocks, and the changes/events are published to the
+                // shared queues before the ack is sent.
+                drain_server_notifications(
+                    &runtime,
+                    &mut servers,
+                    tool_changes,
+                    notification_events,
+                    progress_tools,
+                    server_log.as_mut(),
+                );
                 let _ = reply.send(());
+            }
+            Request::Reconnect { name, reply } => {
+                let reconnect = match servers.get(&name).map(|entry| &entry.state) {
+                    Some(
+                        ServerState::Connected { spawn, timeout, .. }
+                        | ServerState::Failed { spawn, timeout, .. },
+                    ) => Some((spawn.clone(), *timeout)),
+                    None => None,
+                };
+                let outcome = match reconnect {
+                    Some((spawn, timeout)) => {
+                        let result = connect_with_retries(
+                            &runtime,
+                            &mut servers,
+                            &name,
+                            &spawn,
+                            timeout,
+                            needs_auth,
+                            auth_dir,
+                        )
+                        .map_err(|error| error.to_string());
+                        if result.is_ok() {
+                            timeouts
+                                .lock()
+                                .expect("mcp timeouts mutex poisoned")
+                                .insert(name.clone(), timeout);
+                        }
+                        result
+                    }
+                    None => Err(format!("MCP server \"{name}\" is not connected")),
+                };
+                let published = match &outcome {
+                    Ok(value) => Ok(value.clone()),
+                    Err(error) => Err(error.clone()),
+                };
+                settled_connects
+                    .lock()
+                    .expect("mcp settled connects mutex poisoned")
+                    .push((name, published));
+                let _ = reply.send(outcome);
             }
             Request::ShutdownAll => {
                 shutdown_all(&runtime, &mut servers);
@@ -1099,13 +1365,19 @@ fn failed_error_text(servers: &HashMap<String, ServerEntry>, name: &str, fallbac
         .unwrap_or_else(|| fallback.to_string())
 }
 
-/// Drains server-initiated messages and re-lists tools on
-/// `notifications/tools/list_changed` (`runtime.ts:382-384`, `:432-442`),
-/// publishing the results for the host to re-register.
-fn collect_tool_changes(
+/// Drains server-initiated messages: answers `roots/list` / `ping`, appends
+/// `notifications/message` to `mcp.log` and publishes it to the host,
+/// forwards progress and cancellation as typed events, and re-lists tools on
+/// `notifications/tools/list_changed` (`runtime.ts:382-384`, `:432-442`,
+/// `log.ts:43-60`, `tools.ts:280-286`, `client.ts:525-530`).
+#[allow(clippy::too_many_lines)] // mirrors the four upstream listeners; split when extending
+fn drain_server_notifications(
     runtime: &tokio::runtime::Runtime,
     servers: &mut HashMap<String, ServerEntry>,
     tool_changes: &Arc<Mutex<Vec<ToolChange>>>,
+    notification_events: &Arc<Mutex<Vec<McpNotificationEvent>>>,
+    progress_tools: &Arc<Mutex<HashMap<JsonRpcId, (String, String)>>>,
+    mut server_log: Option<&mut McpServerLog>,
 ) {
     let names: Vec<String> = servers
         .iter()
@@ -1115,18 +1387,57 @@ fn collect_tool_changes(
             };
             let mut changed = false;
             while let Some(message) = client.try_recv_inbound() {
-                if let InboundMessage::Notification(notification) = &message
-                    && notification.method == "notifications/tools/list_changed"
-                {
-                    changed = true;
+                match message {
+                    InboundMessage::Request(request) => {
+                        // `client.ts:176-182` serves `ping` and `roots/list`.
+                        let _ = runtime.block_on(client.respond_to_request(&request));
+                    }
+                    InboundMessage::Notification(notification) => {
+                        match parse_server_notification(&notification) {
+                            ServerNotification::ToolsListChanged => changed = true,
+                            ServerNotification::Message(params) => {
+                                let event = mcp_log_event(name, &params);
+                                if let Some(log) = server_log.as_deref_mut() {
+                                    log.write(&event);
+                                }
+                                notification_events
+                                    .lock()
+                                    .expect("mcp notification events mutex poisoned")
+                                    .push(McpNotificationEvent::Log(event));
+                            }
+                            ServerNotification::Progress(progress) => {
+                                let tool = progress_tools
+                                    .lock()
+                                    .expect("mcp progress tools mutex poisoned")
+                                    .get(&progress.progress_token)
+                                    .map(|(_, tool)| tool.clone());
+                                notification_events
+                                    .lock()
+                                    .expect("mcp notification events mutex poisoned")
+                                    .push(McpNotificationEvent::Progress(McpProgressEvent {
+                                        server: name.clone(),
+                                        tool,
+                                        progress_token: progress.progress_token,
+                                        progress: progress.progress,
+                                        total: progress.total,
+                                        message: progress.message,
+                                    }));
+                            }
+                            ServerNotification::Cancelled(cancelled) => {
+                                notification_events
+                                    .lock()
+                                    .expect("mcp notification events mutex poisoned")
+                                    .push(McpNotificationEvent::Cancelled(McpCancellationEvent {
+                                        server: name.clone(),
+                                        request_id: cancelled.request_id,
+                                        reason: cancelled.reason,
+                                    }));
+                            }
+                            ServerNotification::Other(_) => {}
+                        }
+                    }
+                    _ => {}
                 }
-                // `notifications/message` is still discarded here. Upstream
-                // forwards it to the `mcp.log` file in the agent directory
-                // (`extensions/mcp/log.ts:1-69`, `:43-60`), but the MCP worker
-                // has no log-event host seam: the only log sink in this crate
-                // is the JS host's `ui_log` (engine.rs:313), out of this
-                // module's reach. Wiring it needs a host op or log event in
-                // runner.rs/glue.rs (outside this slice's ownership).
             }
             changed.then(|| name.clone())
         })
@@ -1177,6 +1488,121 @@ fn collect_tool_changes(
     }
 }
 
+/// `formatMcpLogMessage` (`log.ts:26-32`): one `[server]` line with an
+/// optional logger, a default `info` level, and continuation lines indented
+/// by four spaces. The timestamp is generated at format time so the appended
+/// bytes are identical to upstream's `now.toISOString()` line.
+fn mcp_log_event(server: &str, params: &LoggingMessageParams) -> McpLogEvent {
+    let level = params
+        .level
+        .as_deref()
+        .filter(|level| !level.is_empty())
+        .unwrap_or("info");
+    let logger = params
+        .logger
+        .as_deref()
+        .filter(|logger| !logger.is_empty())
+        .map(|logger| format!(" {logger}:"));
+    let data = match &params.data {
+        Json::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    let text = data.replace("\r\n", "\n").replace('\n', "\n    ");
+    let line = format!(
+        "{} [{}] {}{} {}\n",
+        iso_timestamp(SystemTime::now()),
+        server,
+        level,
+        logger.unwrap_or_default(),
+        text
+    );
+    McpLogEvent {
+        server: server.to_string(),
+        level: level.to_string(),
+        logger: params.logger.clone(),
+        text: line,
+    }
+}
+
+/// `Date.toISOString()` in UTC, to millisecond precision. `chrono` is not a
+/// dependency of this crate, so the civil date comes from a day count.
+fn iso_timestamp(now: SystemTime) -> String {
+    let elapsed = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seconds = elapsed.as_secs();
+    let millis = elapsed.subsec_millis();
+    let days = (seconds / 86_400) as i64;
+    let within = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        within / 3_600,
+        (within % 3_600) / 60,
+        within % 60
+    )
+}
+
+/// Howard Hinnant's days-from-civil inverse; day 0 is 1970-01-01.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// The host's `mcp.log` writer (`McpServerLog`, `log.ts:35-68`). The size is
+/// cached after the first write, like upstream's `size` field, and rotation
+/// is best effort across processes: another writer may have rotated already.
+struct McpServerLog {
+    path: std::path::PathBuf,
+    size: Option<u64>,
+}
+
+impl McpServerLog {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path, size: None }
+    }
+
+    fn write(&mut self, event: &McpLogEvent) {
+        use std::io::Write as _;
+        if self.size.is_none() {
+            if let Some(parent) = self.path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            self.size = Some(self.current_size());
+        }
+        if self.size.is_some_and(|size| size > MAX_LOG_BYTES) {
+            if self.current_size() > MAX_LOG_BYTES {
+                let mut rotated = self.path.clone().into_os_string();
+                rotated.push(".1");
+                let _ = std::fs::rename(&self.path, std::path::PathBuf::from(rotated));
+            }
+            self.size = Some(self.current_size());
+        }
+        let bytes = event.text.as_bytes();
+        if std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .and_then(|mut file| file.write_all(bytes))
+            .is_ok()
+            && let Some(size) = self.size.as_mut()
+        {
+            *size += bytes.len() as u64;
+        }
+    }
+
+    fn current_size(&self) -> u64 {
+        std::fs::metadata(&self.path).map_or(0, |metadata| metadata.len())
+    }
+}
+
 /// The last `STDERR_TAIL_CHARS` characters of a failed stdio server's
 /// stderr (`sliceTail(transport.stderr.trim(), STDERR_TAIL_CHARS)`,
 /// `runtime.ts:403`). The UTF-16 code-unit boundary from upstream's
@@ -1220,6 +1646,7 @@ fn connect_with_retries(
     name: &str,
     spawn: &McpServerConfig,
     timeout: Duration,
+    needs_auth: &Arc<Mutex<Vec<String>>>,
     auth_dir: Option<&std::path::Path>,
 ) -> Result<ConnectOutcome, McpError> {
     let retries: &[u64] = match spawn.transport {
@@ -1227,7 +1654,15 @@ fn connect_with_retries(
         McpTransportConfig::Stdio { .. } => &[],
     };
     for attempt in 0.. {
-        match connect_with_spawn(runtime, servers, name, spawn.clone(), timeout, auth_dir) {
+        match connect_with_spawn(
+            runtime,
+            servers,
+            name,
+            spawn.clone(),
+            timeout,
+            needs_auth,
+            auth_dir,
+        ) {
             Ok(outcome) => return Ok(outcome),
             Err(error) => {
                 let Some(delay_ms) = retries.get(attempt) else {
@@ -1293,11 +1728,15 @@ fn connect_with_spawn(
     name: &str,
     spawn: McpServerConfig,
     timeout: Duration,
+    needs_auth: &Arc<Mutex<Vec<String>>>,
     auth_dir: Option<&std::path::Path>,
 ) -> Result<ConnectOutcome, McpError> {
     let auth = auth_dir.and_then(|dir| http_auth_provider(name, &spawn, dir));
+    // Upstream hands the session cwd to the client as one root
+    // (`runtime.ts:363`); for stdio servers the spawn config carries it.
+    let roots = roots_for_spawn(&spawn);
     let attempt = runtime.block_on(async {
-        let client = McpClient::connect_with_auth(&spawn, auth, timeout).await?;
+        let client = McpClient::connect_with_auth_and_roots(&spawn, auth, roots, timeout).await?;
         // Servers without the tools capability (prompts or resources only)
         // do not answer tools/list (`runtime.ts:387-388`).
         let tools = if client.capabilities.tools.is_some() {
@@ -1310,7 +1749,9 @@ fn connect_with_spawn(
             .map(mcp_tool_definition_json)
             .collect::<Vec<_>>();
         let has_resources = client.capabilities.resources.is_some();
-        let instructions = client.instructions.clone();
+        // `this.instructions = client.instructions?.trim() || undefined`
+        // (`runtime.ts:391`).
+        let instructions = trim_instructions(client.instructions.as_deref());
         Ok::<_, McpError>((client, tools, has_resources, instructions))
     });
     let (client, tools, has_resources, instructions) = match attempt {
@@ -1324,6 +1765,12 @@ fn connect_with_spawn(
                 _ => error.to_string(),
             };
             clear_stderr_sink(&spawn);
+            if connection_state_for_error(&error) == McpConnectionState::NeedsAuth {
+                needs_auth
+                    .lock()
+                    .expect("mcp needs auth mutex poisoned")
+                    .push(name.to_string());
+            }
             servers.insert(
                 name.to_string(),
                 ServerEntry {
@@ -1362,6 +1809,55 @@ fn connect_with_spawn(
     })
 }
 
+/// `client.instructions?.trim() || undefined` (`runtime.ts:391`): blank
+/// instructions never reach the host report or the tool registry.
+fn trim_instructions(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+/// The single root a connection advertises (`runtime.ts:363`): the spawn
+/// config's cwd as a `file://` URL, named after its last path component.
+/// HTTP configs carry no cwd, so they declare no roots.
+fn roots_for_spawn(spawn: &McpServerConfig) -> Vec<Root> {
+    let McpTransportConfig::Stdio { working_dir, .. } = &spawn.transport else {
+        return Vec::new();
+    };
+    let Some(cwd) = working_dir else {
+        return Vec::new();
+    };
+    let path = cwd.to_string_lossy();
+    let name = cwd
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty());
+    vec![Root {
+        uri: file_url(&path),
+        name,
+    }]
+}
+
+/// `pathToFileURL(cwd).href` for the common path shapes: a leading slash for
+/// unix paths, `file:///` for absolute ones, and percent escapes for the
+/// characters a URL cannot carry literally.
+fn file_url(path: &str) -> String {
+    use std::fmt::Write as _;
+    let mut url = String::from("file://");
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'.' | b'_' | b'~' | b':' => {
+                url.push(byte as char);
+            }
+            _ => {
+                let _ = write!(url, "%{byte:02X}");
+            }
+        }
+    }
+    url
+}
+
 /// Drops one entry, killing a connected process.
 fn drop_entry(
     runtime: &tokio::runtime::Runtime,
@@ -1393,6 +1889,7 @@ fn resource_reply(
     runtime: &tokio::runtime::Runtime,
     servers: &mut HashMap<String, ServerEntry>,
     server: &str,
+    needs_auth: &Arc<Mutex<Vec<String>>>,
     auth_dir: Option<&std::path::Path>,
     op: impl FnOnce(&McpClient, Duration) -> Result<Json, McpError>,
 ) -> Result<Json, String> {
@@ -1402,7 +1899,9 @@ fn resource_reply(
         None => return Err(format!("MCP server \"{server}\" is not connected")),
     };
     if let Some((spawn, timeout)) = reconnect
-        && let Err(error) = connect_with_spawn(runtime, servers, server, spawn, timeout, auth_dir)
+        && let Err(error) = connect_with_spawn(
+            runtime, servers, server, spawn, timeout, needs_auth, auth_dir,
+        )
     {
         // Same stderr-augmented `connectFailed` text as the other
         // reconnect paths (`runtime.ts:411-420`).
@@ -1420,12 +1919,15 @@ fn resource_reply(
     op(client, *timeout).map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_arguments)] // the two notification queues and auth dir are all per-call
 fn call_tool_on(
     runtime: &tokio::runtime::Runtime,
     servers: &mut HashMap<String, ServerEntry>,
     server: &str,
     tool: &str,
     args: Json,
+    needs_auth: &Arc<Mutex<Vec<String>>>,
+    progress_tools: &Arc<Mutex<HashMap<JsonRpcId, (String, String)>>>,
     auth_dir: Option<&std::path::Path>,
 ) -> Result<Json, String> {
     // `!current` and disabled both answer the disabled error
@@ -1441,7 +1943,10 @@ fn call_tool_on(
     if let Some((spawn, timeout)) = reconnect {
         // Lazy reconnect: the next call opens a fresh connection
         // (`withClient` → `getClient` → `open`, `runtime.ts:280-303`).
-        if connect_with_spawn(runtime, servers, server, spawn, timeout, auth_dir).is_err()
+        if connect_with_spawn(
+            runtime, servers, server, spawn, timeout, needs_auth, auth_dir,
+        )
+        .is_err()
             && let ServerState::Failed { error, .. } = &servers[server].state
         {
             // `connectFailed`'s error text (`runtime.ts:419`).
@@ -1479,7 +1984,25 @@ fn call_tool_on(
         else {
             return Err(format!("MCP server \"{server}\" is disabled."));
         };
-        let result = runtime.block_on(client.tools_call(tool, arguments.clone(), *timeout));
+        // Upstream attaches `onProgress` to the tool call to push `onUpdate`
+        // (`tools.ts:280-286`); the port correlates typed progress events by
+        // `_meta.progressToken` and publishes them to the host drain.
+        let token = client.allocate_progress_token();
+        {
+            let mut tokens = progress_tools
+                .lock()
+                .expect("mcp progress tools mutex poisoned");
+            if tokens.len() > 1024 {
+                tokens.clear();
+            }
+            tokens.insert(token.clone(), (server.to_string(), tool.to_string()));
+        }
+        let result = runtime.block_on(client.tools_call_with_progress(
+            tool,
+            arguments.clone(),
+            &token,
+            *timeout,
+        ));
         match result {
             Ok(result) => return Ok(convert_mcp_result(server, tool, &result)),
             Err(McpError::SessionExpired { .. }) if session_retry => {
@@ -1496,13 +2019,23 @@ fn call_tool_on(
                         return Err(format!("MCP server \"{server}\" is disabled."));
                     }
                 };
-                if let Err(error) =
-                    connect_with_spawn(runtime, servers, server, spawn, timeout, auth_dir)
-                {
+                if let Err(error) = connect_with_spawn(
+                    runtime, servers, server, spawn, timeout, needs_auth, auth_dir,
+                ) {
                     return Err(failed_error_text(servers, server, &error.to_string()));
                 }
             }
-            Err(error) => return Err(error.to_string()),
+            Err(error) => {
+                // `withClient` marks the server `needs-auth` when a call
+                // fails with an auth challenge (`runtime.ts:296-300`).
+                if connection_state_for_error(&error) == McpConnectionState::NeedsAuth {
+                    needs_auth
+                        .lock()
+                        .expect("mcp needs auth mutex poisoned")
+                        .push(server.to_string());
+                }
+                return Err(error.to_string());
+            }
         }
     }
 }
@@ -3041,5 +3574,149 @@ done
         let result = manager.call_tool("synth", "echo", json!({"text": "hi"}));
         assert_eq!(result["result"]["content"][0]["text"], "echo-ok");
         manager.shutdown_all();
+    }
+
+    /// Synthetic server that emits a log, a progress and a cancellation
+    /// notification before answering a tool call (`log.ts`, `tools.ts:281`).
+    #[cfg(test)]
+    const NOTIFYING_SERVER_SCRIPT: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"notify","version":"1.0.0"},"instructions":"  Padded instructions.  \\n"}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"warning","logger":"db","data":"line one\\nline two"}}\n'
+      printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":1,"progress":2,"total":4,"message":"half"}}\n'
+      printf '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":99,"reason":"user"}}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}],"structuredContent":{"ok":true}}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    fn write_notifying_server(directory: &std::path::Path) -> std::path::PathBuf {
+        let path = directory.join("notify-server.sh");
+        std::fs::write(&path, NOTIFYING_SERVER_SCRIPT).expect("write fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fixture");
+        }
+        path
+    }
+
+    #[test]
+    fn log_progress_and_cancellation_notifications_are_forwarded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = write_notifying_server(dir.path());
+        let config = json!({"command": script.to_string_lossy(), "timeout": 5});
+        let mut manager = McpManager::default();
+        manager.set_auth_dir(dir.path().to_path_buf());
+        let outcome = manager
+            .connect("notify", &config, dir.path().to_str().expect("cwd"))
+            .expect("connect");
+        // Upstream trims `client.instructions` (`runtime.ts:391`).
+        assert_eq!(
+            outcome.instructions.as_deref(),
+            Some("Padded instructions.")
+        );
+        let result = manager.call_tool("notify", "echo", json!({}));
+        assert_eq!(result["result"]["content"][0]["text"], "ok");
+        manager.poll_notifications();
+
+        let events = manager.take_notification_events();
+        let log = events.iter().find_map(|event| match event {
+            McpNotificationEvent::Log(log) => Some(log),
+            _ => None,
+        });
+        let log = log.expect("log event");
+        assert_eq!(log.server, "notify");
+        assert_eq!(log.level, "warning");
+        assert_eq!(log.logger.as_deref(), Some("db"));
+        assert!(
+            log.text
+                .contains("[notify] warning db: line one\n    line two")
+        );
+        assert!(log.text.ends_with('\n'));
+
+        let progress = events.iter().find_map(|event| match event {
+            McpNotificationEvent::Progress(progress) => Some(progress),
+            _ => None,
+        });
+        let progress = progress.expect("progress event");
+        assert_eq!(progress.server, "notify");
+        assert_eq!(progress.tool.as_deref(), Some("echo"));
+        assert_eq!(progress.progress_token, JsonRpcId::Number(1));
+        assert_eq!(progress.progress, 2.0);
+        assert_eq!(progress.total, Some(4.0));
+        assert_eq!(progress.message.as_deref(), Some("half"));
+
+        let cancelled = events.iter().find_map(|event| match event {
+            McpNotificationEvent::Cancelled(cancelled) => Some(cancelled),
+            _ => None,
+        });
+        let cancelled = cancelled.expect("cancellation event");
+        assert_eq!(cancelled.request_id, JsonRpcId::Number(99));
+        assert_eq!(cancelled.reason.as_deref(), Some("user"));
+
+        // The same line is appended to `mcp.log` (log.ts:43-60).
+        let written = std::fs::read_to_string(dir.path().join(MCP_LOG_FILE_NAME)).expect("mcp.log");
+        assert_eq!(written, log.text);
+        manager.shutdown_all();
+    }
+
+    #[test]
+    fn needs_auth_state_classifies_auth_failures() {
+        let auth = McpError::AuthRequired {
+            www_authenticate: None,
+            body: String::new(),
+        };
+        assert_eq!(
+            connection_state_for_error(&auth),
+            McpConnectionState::NeedsAuth
+        );
+        assert_eq!(McpConnectionState::NeedsAuth.as_str(), "needs-auth");
+        assert!(auth.needs_auth());
+        let network = McpError::Network("offline".to_string());
+        assert_eq!(
+            connection_state_for_error(&network),
+            McpConnectionState::Failed
+        );
+        assert!(!network.needs_auth());
+    }
+
+    #[test]
+    fn instructions_trim_and_roots_follow_upstream_shapes() {
+        assert_eq!(
+            trim_instructions(Some("  Padded. \n")),
+            Some("Padded.".to_string())
+        );
+        assert_eq!(trim_instructions(Some("  \n\t")), None);
+        assert_eq!(trim_instructions(None), None);
+
+        let spawn = McpServerConfig {
+            name: "synth".to_string(),
+            transport: McpTransportConfig::Stdio {
+                command: "srv".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                working_dir: Some(std::path::PathBuf::from("/home/pi/my project")),
+            },
+        };
+        let roots = roots_for_spawn(&spawn);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].uri, "file:///home/pi/my%20project");
+        assert_eq!(roots[0].name.as_deref(), Some("my project"));
+        let http = McpServerConfig {
+            name: "web".to_string(),
+            transport: McpTransportConfig::Http {
+                url: "http://x".to_string(),
+                headers: HashMap::new(),
+            },
+        };
+        assert_eq!(roots_for_spawn(&http), Vec::<Root>::new());
     }
 }

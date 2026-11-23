@@ -6,9 +6,15 @@
 //! (`extensions/mcp/runtime.ts:369`, `:382-384`). [`McpClient::try_recv_inbound`]
 //! lets the host drain them without a background task; the host re-lists
 //! tools on `notifications/tools/list_changed`.
+//! [`McpClient::drain_server_notifications`] is the typed form, forwarding
+//! log messages, progress and cancellation (`client.ts:525-530`,
+//! `tools.ts:281-286`, `log.ts:43-60`). Server-initiated `ping` and
+//! `roots/list` requests get replies through [`McpClient::respond_to_request`]
+//! (`client.ts:176-182`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -23,7 +29,9 @@ use crate::resources::{
 use crate::transport::{SpawnOptions, StdioTransport};
 use crate::types::{
     CallToolParams, CallToolResult, ClientCapabilities, Implementation, InboundMessage,
-    InitializeParams, InitializeResult, ToolsListResult,
+    InitializeParams, InitializeResult, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
+    JsonRpcVersion, Root, RootsCapability, ServerNotification, ToolsListResult,
+    json_rpc_error_codes, parse_server_notification,
 };
 
 /// How to reach one MCP server (`mcp-servers.json` entry shape): a stdio
@@ -134,6 +142,14 @@ impl ActiveTransport {
         }
     }
 
+    /// Replies to a server-initiated request (`roots/list`, `ping`).
+    async fn respond(&self, response: JsonRpcResponse) -> Result<(), McpError> {
+        match self {
+            Self::Stdio(transport) => transport.respond(response).await,
+            Self::Http(transport) => transport.respond(response).await,
+        }
+    }
+
     async fn shutdown(self) -> Result<(), McpError> {
         match self {
             Self::Stdio(transport) => transport.shutdown().await,
@@ -149,6 +165,12 @@ pub struct McpClient {
     pub capabilities: crate::types::ServerCapabilities,
     /// Server instructions from `initialize` (`InitializeResult.instructions`).
     pub instructions: Option<String>,
+    /// The roots served to the server through `roots/list`
+    /// (`runtime.ts:363`, `client.ts:177-181`).
+    pub roots: Vec<Root>,
+    /// Source of `_meta.progressToken` values for tool calls
+    /// (`client.ts:404-410`).
+    progress_tokens: AtomicU64,
 }
 
 impl McpClient {
@@ -189,8 +211,24 @@ impl McpClient {
         auth: Option<Arc<dyn AuthProvider>>,
         timeout: Duration,
     ) -> Result<Self, McpError> {
+        Self::connect_with_auth_and_roots(config, auth, Vec::new(), timeout).await
+    }
+
+    /// [`McpClient::connect_with_auth`] with the roots the host serves
+    /// through `roots/list` (upstream's `client.ts:177-181`, `:217-218`,
+    /// fed the session cwd at `runtime.ts:363`).
+    ///
+    /// # Errors
+    /// Spawn failures, handshake errors, or a protocol version the server
+    /// refuses.
+    pub async fn connect_with_auth_and_roots(
+        config: &McpServerConfig,
+        auth: Option<Arc<dyn AuthProvider>>,
+        roots: Vec<Root>,
+        timeout: Duration,
+    ) -> Result<Self, McpError> {
         let transport = ActiveTransport::build_with_auth(&config.transport, auth)?;
-        match handshake(&transport, timeout).await {
+        match handshake(&transport, timeout, &roots).await {
             Ok(initialized) => {
                 // The negotiated version rides `MCP-Protocol-Version` on
                 // HTTP servers (`client.ts:242`, `streamable-http.ts:281`).
@@ -201,6 +239,8 @@ impl McpClient {
                     capabilities: initialized.capabilities,
                     instructions: initialized.instructions,
                     transport,
+                    roots,
+                    progress_tokens: AtomicU64::new(1),
                 })
             }
             Err(error) => {
@@ -247,6 +287,52 @@ impl McpClient {
         let params = CallToolParams {
             name: name.to_string(),
             arguments,
+            meta: None,
+        };
+        let result = self
+            .transport
+            .request(
+                "tools/call",
+                Some(serde_json::to_value(params).map_err(|error| serde_error(&error))?),
+                timeout,
+            )
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|error| McpError::Malformed(format!("bad tools/call result: {error}")))
+    }
+
+    /// Allocates a token for one call's `notifications/progress` stream
+    /// (`client.ts:404-410` uses the request id; a monotonic client token is
+    /// equally unique on the wire and survives request-id rewrites by HTTP
+    /// transports).
+    #[must_use]
+    pub fn allocate_progress_token(&self) -> JsonRpcId {
+        JsonRpcId::Number(
+            i64::try_from(self.progress_tokens.fetch_add(1, Ordering::Relaxed)).unwrap_or(i64::MAX),
+        )
+    }
+
+    /// Calls one tool asking the server for progress notifications via
+    /// `_meta.progressToken` (`client.ts:404-410`, `tools.ts:280-286`). The
+    /// notifications themselves are delivered by
+    /// [`Self::drain_server_notifications`].
+    ///
+    /// # Errors
+    /// Transport failures; protocol-level tool errors come back as
+    /// [`CallToolResult::is_error`].
+    pub async fn tools_call_with_progress(
+        &self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+        progress_token: &JsonRpcId,
+        timeout: Duration,
+    ) -> Result<CallToolResult, McpError> {
+        // `_meta` is a sibling of `arguments` on the request params, as
+        // upstream builds it (`client.ts:407-409`).
+        let params = CallToolParams {
+            name: name.to_string(),
+            arguments,
+            meta: Some(json!({ "progressToken": progress_token })),
         };
         let result = self
             .transport
@@ -406,6 +492,77 @@ impl McpClient {
         }
     }
 
+    /// Drains every queued server-initiated notification as a typed value
+    /// (`client.ts:525-530` and the notification listeners of
+    /// `runtime.ts:369`, `:382-384`). Non-blocking like
+    /// [`Self::try_recv_inbound`]; malformed lines are skipped.
+    #[must_use]
+    pub fn drain_server_notifications(&self) -> Vec<ServerNotification> {
+        let mut output = Vec::new();
+        while let Some(message) = self.try_recv_inbound() {
+            if let InboundMessage::Notification(notification) = message {
+                output.push(parse_server_notification(&notification));
+            }
+        }
+        output
+    }
+
+    /// Sends `notifications/cancelled` for one of our in-flight requests
+    /// (`client.ts:562-572`, `cancelPending`). Reason is optional, as in the
+    /// spec (`protocol/types.ts:59-62`).
+    ///
+    /// # Errors
+    /// Transport failures.
+    pub async fn notify_cancelled(
+        &self,
+        request_id: &JsonRpcId,
+        reason: Option<&str>,
+    ) -> Result<(), McpError> {
+        let mut params = json!({ "requestId": request_id });
+        if let Some(reason) = reason {
+            params["reason"] = json!(reason);
+        }
+        self.transport
+            .notify("notifications/cancelled", Some(params))
+            .await
+    }
+
+    /// Replies to a server-initiated request. `ping` always answers `{}`;
+    /// `roots/list` answers with the roots this client was connected with;
+    /// anything else gets `-32601` (`client.ts:176-182`, `:510-520`).
+    ///
+    /// # Errors
+    /// Transport failures.
+    pub async fn respond_to_request(&self, request: &JsonRpcRequest) -> Result<(), McpError> {
+        let result = match request.method.as_str() {
+            "ping" => json!({}),
+            "roots/list" => json!({ "roots": self.roots }),
+            _ => {
+                return self
+                    .transport
+                    .respond(JsonRpcResponse {
+                        jsonrpc: JsonRpcVersion,
+                        id: request.id.clone(),
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: json_rpc_error_codes::METHOD_NOT_FOUND,
+                            message: format!("Method not found: {}", request.method),
+                            data: None,
+                        }),
+                    })
+                    .await;
+            }
+        };
+        self.transport
+            .respond(JsonRpcResponse {
+                jsonrpc: JsonRpcVersion,
+                id: request.id.clone(),
+                result: Some(result),
+                error: None,
+            })
+            .await
+    }
+
     /// Protocol liveness probe.
     ///
     /// # Errors
@@ -435,11 +592,17 @@ impl McpClient {
 async fn handshake(
     transport: &ActiveTransport,
     timeout: Duration,
+    roots: &[Root],
 ) -> Result<InitializeResult, McpError> {
     transport.start()?;
+    // `client.ts:217-218`: supplying roots declares the `roots` capability
+    // even when the caller passed an empty capability object.
+    let capabilities = ClientCapabilities {
+        roots: (!roots.is_empty()).then(RootsCapability::default),
+    };
     let params = InitializeParams {
         protocol_version: crate::PROTOCOL_VERSION.to_string(),
-        capabilities: ClientCapabilities::default(),
+        capabilities,
         client_info: Implementation {
             name: crate::CLIENT_NAME.to_string(),
             version: Some(crate::CLIENT_VERSION.to_string()),

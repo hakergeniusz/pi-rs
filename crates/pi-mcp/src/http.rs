@@ -924,6 +924,32 @@ impl StreamableHttpTransport {
         Ok(())
     }
 
+    /// Replies to a server-initiated request (`roots/list`, `ping`) over the
+    /// same POST channel notifications use (`client.ts:510-520`).
+    ///
+    /// # Errors
+    /// On HTTP failures.
+    pub async fn respond(&self, response: JsonRpcResponse) -> Result<(), McpError> {
+        self.assert_open()?;
+        let body = serde_json::to_vec(&response).map_err(|error| {
+            McpError::Malformed(format!("request serialization failed: {error}"))
+        })?;
+        let response = self
+            .shared
+            .fetch_with_auth(
+                Method::POST,
+                &[
+                    ("accept", POST_ACCEPT.to_string()),
+                    ("content-type", "application/json".to_string()),
+                ],
+                Some(body),
+            )
+            .await?;
+        let response = self.shared.check_response(response).await?;
+        self.shared.capture_session(&response);
+        Ok(())
+    }
+
     /// Opens the server-to-client stream once
     /// (`startGetStream`, `streamable-http.ts:480-484`).
     fn start_get_stream(&self) {

@@ -10,9 +10,16 @@
 //! so the host can forward them (upstream `extensions/mcp/tools.ts:228-232`,
 //! `:237-273`). Preserving them here is what lets `convertMcpResult` return
 //! the whole `CallToolResult` minus the top-level `_meta`.
+//!
+//! Server-initiated messages are typed too: `Root`/`RootsCapability`
+//! (`protocol/types.ts:18-28`), `ProgressNotification` /
+//! `CancelledNotification` (`:52-62`, dispatched in `client.ts:525-530`), and
+//! the `notifications/message` params the host's MCP log writes
+//! (`extensions/mcp/log.ts:26-32`). [`parse_server_notification`] is the
+//! single classifier the host drains use.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// A JSON-RPC id: `string | number` (upstream `JsonRpcId`,
 /// `protocol/jsonrpc.ts:1`, `:89-91`). Integers stay on the wire as numbers so
@@ -137,6 +144,116 @@ pub enum InboundMessage {
     Malformed(String),
 }
 
+/// A root the client advertises and serves through `roots/list`
+/// (`protocol/types.ts:18-21`; upstream passes the session cwd as one root,
+/// `extensions/mcp/runtime.ts:363`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Root {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// The `roots` part of `ClientCapabilities` (`protocol/types.ts:25`). An
+/// empty `{}` (rather than an omitted field) is what tells the server that
+/// `roots/list` is handled (`client.ts:217-218`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RootsCapability {
+    #[serde(
+        default,
+        rename = "listChanged",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub list_changed: Option<bool>,
+}
+
+/// `notifications/progress` params (`protocol/types.ts:52-57`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProgressNotification {
+    #[serde(rename = "progressToken")]
+    pub progress_token: JsonRpcId,
+    pub progress: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// `notifications/cancelled` params (`protocol/types.ts:59-62`): a server
+/// cancelling one of the client's in-flight requests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelledNotification {
+    #[serde(rename = "requestId")]
+    pub request_id: JsonRpcId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Params of `notifications/message` (MCP logging), as consumed by
+/// `formatMcpLogMessage` (`extensions/mcp/log.ts:16-32`). A scalar `data`
+/// arrives as `params` directly upstream; [`parse_server_notification`]
+/// wraps it before decoding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LoggingMessageParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logger: Option<String>,
+    pub data: Value,
+}
+
+/// A typed server-initiated notification (`client.ts:525-530` dispatches
+/// progress and cancellation before the generic notification listeners).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerNotification {
+    /// `notifications/tools/list_changed` (`runtime.ts:382-384`).
+    ToolsListChanged,
+    /// `notifications/message`, for the MCP log (`log.ts:43-60`).
+    Message(LoggingMessageParams),
+    /// `notifications/progress`, for a tool's `onUpdate` (`tools.ts:281-286`).
+    Progress(ProgressNotification),
+    /// `notifications/cancelled` from the server (`client.ts:526`).
+    Cancelled(CancelledNotification),
+    /// Any other server notification, kept by method name for the host.
+    Other(String),
+}
+
+/// Classifies one inbound notification (`handleNotification`,
+/// `client.ts:525-530`; `log.ts:43` for `notifications/message`).
+#[must_use]
+pub fn parse_server_notification(notification: &JsonRpcNotification) -> ServerNotification {
+    let params = notification.params.clone().unwrap_or(Value::Null);
+    match notification.method.as_str() {
+        "notifications/tools/list_changed" => ServerNotification::ToolsListChanged,
+        "notifications/message" => {
+            let value = if params.is_object() {
+                params
+            } else {
+                json!({ "data": params })
+            };
+            serde_json::from_value(value).map_or_else(
+                |_| {
+                    ServerNotification::Message(LoggingMessageParams {
+                        level: None,
+                        logger: None,
+                        data: Value::Null,
+                    })
+                },
+                ServerNotification::Message,
+            )
+        }
+        "notifications/progress" => serde_json::from_value(params).map_or_else(
+            |_| ServerNotification::Other(notification.method.clone()),
+            ServerNotification::Progress,
+        ),
+        "notifications/cancelled" => serde_json::from_value(params).map_or_else(
+            |_| ServerNotification::Other(notification.method.clone()),
+            ServerNotification::Cancelled,
+        ),
+        _ => ServerNotification::Other(notification.method.clone()),
+    }
+}
+
 /// JSON-RPC error codes (`JSON_RPC_ERROR_CODES`, upstream
 /// `protocol/jsonrpc.ts:37-43`).
 pub mod json_rpc_error_codes {
@@ -197,10 +314,15 @@ pub struct InitializeParams {
     pub client_info: Implementation,
 }
 
-/// The capabilities the client declares in `initialize`. The port declares
-/// none.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct ClientCapabilities {}
+/// The capabilities the client declares in `initialize`
+/// (`protocol/types.ts:23-28`). The port declares `roots` when the host
+/// supplies roots (upstream does so for every connection, `runtime.ts:363`);
+/// the other optional capabilities stay absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roots: Option<RootsCapability>,
+}
 
 /// `implementation` info block (name + version).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -287,12 +409,16 @@ pub struct ToolsListResult {
     pub next_cursor: Option<String>,
 }
 
-/// `tools/call` params.
+/// `tools/call` params. `_meta.progressToken` is how upstream asks for
+/// progress notifications (`client.ts:404-410`); the port keeps it on the
+/// params so a call can be correlated with its progress events.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CallToolParams {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments: Option<Value>,
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 /// `tools/call` result: content blocks plus the protocol-level error flag.
@@ -467,7 +593,6 @@ fn literal_at(part: &[char], chars: &[char], start: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn classifies_response_request_notification_and_garbage() {
@@ -620,5 +745,87 @@ mod tests {
         // Non-star patterns still behave as exact matches.
         assert!(tool_name_pattern_matches("echo", "echo"));
         assert!(!tool_name_pattern_matches("echo", "echo2"));
+    }
+
+    #[test]
+    fn client_capabilities_declare_roots_only_when_supplied() {
+        assert_eq!(
+            serde_json::to_value(ClientCapabilities::default()).unwrap(),
+            json!({})
+        );
+        let capabilities = ClientCapabilities {
+            roots: Some(RootsCapability::default()),
+        };
+        assert_eq!(
+            serde_json::to_value(capabilities).unwrap(),
+            json!({ "roots": {} })
+        );
+        let root = Root {
+            uri: "file:///home/pi".to_string(),
+            name: Some("pi".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(root).unwrap(),
+            json!({ "uri": "file:///home/pi", "name": "pi" })
+        );
+    }
+
+    #[test]
+    fn server_notifications_decode_typed_and_keep_unknown_methods() {
+        let notification = |method: &str, params: Value| JsonRpcNotification {
+            jsonrpc: JsonRpcVersion,
+            method: method.to_string(),
+            params: Some(params),
+        };
+        assert_eq!(
+            parse_server_notification(&notification("notifications/tools/list_changed", json!({}))),
+            ServerNotification::ToolsListChanged
+        );
+        assert_eq!(
+            parse_server_notification(&notification(
+                "notifications/message",
+                json!({"level": "warning", "logger": "db", "data": "hello\nworld"})
+            )),
+            ServerNotification::Message(LoggingMessageParams {
+                level: Some("warning".to_string()),
+                logger: Some("db".to_string()),
+                data: json!("hello\nworld"),
+            })
+        );
+        // A scalar `data` is wrapped exactly as log.ts:27 does.
+        assert_eq!(
+            parse_server_notification(&notification("notifications/message", json!(7))),
+            ServerNotification::Message(LoggingMessageParams {
+                level: None,
+                logger: None,
+                data: json!(7),
+            })
+        );
+        assert_eq!(
+            parse_server_notification(&notification(
+                "notifications/progress",
+                json!({"progressToken": 3, "progress": 2, "total": 4, "message": "half"})
+            )),
+            ServerNotification::Progress(ProgressNotification {
+                progress_token: JsonRpcId::Number(3),
+                progress: 2.0,
+                total: Some(4.0),
+                message: Some("half".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_server_notification(&notification(
+                "notifications/cancelled",
+                json!({"requestId": "req-1", "reason": "user"})
+            )),
+            ServerNotification::Cancelled(CancelledNotification {
+                request_id: JsonRpcId::String("req-1".to_string()),
+                reason: Some("user".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_server_notification(&notification("notifications/other", json!({}))),
+            ServerNotification::Other("notifications/other".to_string())
+        );
     }
 }
