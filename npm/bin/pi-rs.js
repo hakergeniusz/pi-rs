@@ -10,14 +10,22 @@ const path = require('path');
 const exe = path.join(__dirname, process.platform === 'win32' ? 'pi-rs.exe' : 'pi-rs');
 
 if (!fs.existsSync(exe)) {
-  console.error(
-    'pi-rs: the native binary is missing.\n' +
-      'Reinstall to download it again:\n' +
-      '  npm install -g pi-rs\n' +
-      '  bun install -g pi-rs\n' +
-      'If the download was blocked, check your network / proxy settings and retry.'
-  );
-  process.exit(1);
+  // Some npm versions gate postinstall scripts (npm 11 `install-scripts`).
+  // Self-heal by running our own vetted installer before giving up.
+  console.error('pi-rs: native binary missing; downloading it now...');
+  const install = spawnSync(process.execPath, [path.join(__dirname, '..', 'install.js')], {
+    stdio: 'inherit',
+  });
+  if (install.status !== 0 || !fs.existsSync(exe)) {
+    console.error(
+      'pi-rs: could not download the native binary.\n' +
+        'Reinstall with:\n' +
+        '  npm install -g @hakergeniusz/pi-rs\n' +
+        '  bun install -g @hakergeniusz/pi-rs\n' +
+        'If the download was blocked, check your network / proxy settings and retry.'
+    );
+    process.exit(1);
+  }
 }
 
 const result = spawnSync(exe, process.argv.slice(2), { stdio: 'inherit' });

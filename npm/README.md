@@ -1,21 +1,21 @@
-# pi-rs (npm wrapper)
+# @hakergeniusz/pi-rs (npm wrapper)
 
-Native-binary wrapper for [pi-rs](https://github.com/hakergeniusz/pi-rs), a Rust
+Native-binary wrapper for [@hakergeniusz/pi-rs](https://github.com/hakergeniusz/@hakergeniusz/pi-rs), a Rust
 rewrite of the `pi` coding agent. On install it fetches the release binary for
 your platform and verifies its SHA-256 checksum before writing it into `bin/`.
 
 ## Install
 
 ```sh
-npx pi-rs --help
-npm install -g pi-rs
-bun install -g pi-rs
+npx @hakergeniusz/pi-rs --help
+npm install -g @hakergeniusz/pi-rs
+bun install -g @hakergeniusz/pi-rs
 ```
 
 Then run it:
 
 ```sh
-pi-rs --help
+@hakergeniusz/pi-rs --help
 ```
 
 ## Notes

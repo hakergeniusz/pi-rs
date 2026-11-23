@@ -54,22 +54,23 @@ It downloads `pi-windows-x86_64.exe`, verifies its SHA-256, and installs
 asset from the [latest release](https://github.com/hakergeniusz/pi-rs/releases/latest)
 and put it on your `PATH`.
 
-### npm / Bun (package ready, publishing pending)
+### npm / Bun
 
-The wrapper package lives in [`npm/`](npm/) and is validated with
-`npm pack --dry-run`. Once published, these will work:
+The wrapper source lives in [`npm/`](npm/). It is live on npm as
+`@hakergeniusz/pi-rs` (v0.1.2):
 
 ```sh
-npx pi-rs
-bunx pi-rs
-npm install -g pi-rs
-bun install -g pi-rs
+npx @hakergeniusz/pi-rs
+bunx @hakergeniusz/pi-rs
+npm install -g @hakergeniusz/pi-rs
+bun install -g @hakergeniusz/pi-rs
 ```
 
 It downloads the matching release binary and verifies its SHA-256 during
-postinstall; set `PI_RS_SKIP_DOWNLOAD=1` to skip the download during local
-development. The npm package is not published yet. The upstream
-`@earendil-works/pi-coding-agent` package is a different program.
+postinstall. If your npm gates install scripts, the launcher downloads it on
+first run instead. Set `PI_RS_SKIP_DOWNLOAD=1` to skip the download during local
+development. The upstream `@earendil-works/pi-coding-agent` package is a
+different program.
 
 ---
 

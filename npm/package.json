@@ -1,6 +1,6 @@
 {
-  "name": "pi-rs",
-  "version": "0.1.1",
+  "name": "@hakergeniusz/pi-rs",
+  "version": "0.1.2",
   "description": "Native binary wrapper for pi-rs, a Rust rewrite of the pi coding agent",
   "bin": {
     "pi-rs": "./bin/pi-rs.js"
