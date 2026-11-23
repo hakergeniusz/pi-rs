@@ -1602,9 +1602,28 @@ fn wrap_stdio_stderr(command: String, args: Vec<String>) -> (String, Vec<String>
     (command, args)
 }
 
+/// The home directory used by [`expand_home`]. Unix keeps `HOME` verbatim;
+/// native Windows also accepts `USERPROFILE` (Git Bash sets both, plain
+/// `cmd.exe` usually only the latter).
+fn home_env() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME").unwrap_or_default()
+    }
+}
+
 /// `expandHome` (`runtime.ts:92-98`): `~` and `~/…` name the home directory.
+///
+/// Unix uses `HOME`; native Windows falls back to `USERPROFILE` when `HOME` is
+/// absent. The pure expansion semantics are otherwise identical.
 fn expand_home(value: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_env();
     if value == "~" {
         return home;
     }
@@ -1674,6 +1693,22 @@ fn resolve_template(parts: &[Part]) -> Option<String> {
     Some(resolved)
 }
 
+/// The default shell for `!...` config values, mirroring Node's
+/// `child_process.exec` default shell: `/bin/sh -c` on Unix (including
+/// macOS) and `cmd.exe /C` on Windows. Other targets get `/bin/sh` as a
+/// documented placeholder; they cannot spawn a shell but the call still
+/// fails cleanly as a `None` result.
+fn config_value_shell() -> (&'static str, &'static str) {
+    #[cfg(windows)]
+    {
+        ("cmd.exe", "/C")
+    }
+    #[cfg(not(windows))]
+    {
+        ("/bin/sh", "-c")
+    }
+}
+
 /// `executeCommand` (`resolve-config-value.ts:180-201` default-shell arm):
 /// trimmed stdout of the shell command, `None` on failure, or on the 10 s
 /// cap (the child is killed, like `spawnSync`'s `timeout`).
@@ -1686,8 +1721,9 @@ fn execute_command_value(command: &str) -> Option<String> {
     if let Some(cached) = cached {
         return cached;
     }
-    let mut child = std::process::Command::new("/bin/sh")
-        .arg("-c")
+    let (shell, flag) = config_value_shell();
+    let mut child = std::process::Command::new(shell)
+        .arg(flag)
         .arg(command)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1749,7 +1785,19 @@ fn kill_process(pid: u32) {
     let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
 }
 
-#[cfg(not(unix))]
+/// Windows uses `taskkill /F /T` (force, including descendants), the OS
+/// equivalent of SIGKILL for a process group. No-op on targets without either
+/// mechanism so the 10 s cap still reports a timeout rather than hanging.
+#[cfg(windows)]
+fn kill_process(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F", "/T"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
 fn kill_process(pid: u32) {
     let _ = pid;
 }
@@ -2344,7 +2392,7 @@ mod tests {
 
     #[test]
     fn expand_home_replaces_tilde() {
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = home_env();
         if home.is_empty() {
             return;
         }

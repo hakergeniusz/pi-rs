@@ -315,8 +315,14 @@ fn execute_command(command_config: &str) -> Option<String> {
 
 fn execute_command_uncached(command_config: &str) -> Option<String> {
     let command = &command_config[1..]; // TS: `commandConfig.slice(1)`
-    let mut child = std::process::Command::new("/bin/sh")
-        .arg("-c")
+    // Node's `child_process.exec` default shell: `/bin/sh -c` on Unix,
+    // `cmd.exe /C` on native Windows. The env-value semantics are identical.
+    #[cfg(windows)]
+    let (shell, flag): (&str, &str) = ("cmd.exe", "/C");
+    #[cfg(not(windows))]
+    let (shell, flag): (&str, &str) = ("/bin/sh", "-c");
+    let mut child = std::process::Command::new(shell)
+        .arg(flag)
         .arg(command)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

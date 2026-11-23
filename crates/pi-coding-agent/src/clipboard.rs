@@ -8,6 +8,14 @@
 //!   `pbcopy` / `clip` — upstream's own fallback commands.
 //! - The read half (`readClipboardText` / `readClipboardFilePaths`) lands
 //!   with the paste-file/image feature that consumes it.
+//!
+//! # Platform gate
+//!
+//! Upstream runs clipboard helpers with `cwd: "/"`. That is a valid absolute
+//! root on Unix; native Windows needs a rooted path with a drive prefix, so
+//! `clipboard_cwd` uses `%SystemRoot%` (falling back to `C:\`) there. Every
+//! other behaviour, including the `pbcopy`/`clip`/OSC 52 route order, is
+//! unchanged.
 
 use std::io::{Read as _, Write as _};
 use std::time::{Duration, Instant};
@@ -40,6 +48,25 @@ fn env_is(name: &str, expected: &str) -> bool {
     std::env::var(name).is_ok_and(|value| value == expected)
 }
 
+/// The absolute cwd upstream uses for clipboard helpers (`cwd: "/"`).
+///
+/// Unix keeps `/` verbatim. Windows does not accept a bare `/` as a process
+/// cwd, so `%SystemRoot%` (the real Windows directory) is used, with `C:\` as
+/// the fallback when the variable is absent.
+fn clipboard_cwd() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            return std::path::PathBuf::from(root);
+        }
+        std::path::PathBuf::from(r"C:\")
+    }
+    #[cfg(not(windows))]
+    {
+        std::path::PathBuf::from("/")
+    }
+}
+
 /// `runClipboardCommand` (`clipboard-command.ts:12-57`): spawn an external
 /// clipboard tool from `/`, detached on POSIX (so a daemonizing writer leaves
 /// pi's process group and suspend does not stop it, #11179) and hidden on
@@ -54,7 +81,7 @@ pub fn run_clipboard_command(
 ) -> Option<Vec<u8>> {
     let mut cmd = std::process::Command::new(command);
     cmd.args(args)
-        .current_dir("/")
+        .current_dir(clipboard_cwd())
         .stdin(std::process::Stdio::piped())
         .stdout(if options.input.is_none() {
             std::process::Stdio::piped()

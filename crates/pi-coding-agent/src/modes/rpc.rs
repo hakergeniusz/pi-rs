@@ -784,12 +784,22 @@ fn extension_user_bash(
 /// `bash-executor.ts:137-180`), reduced to the synchronous shape the port
 /// uses everywhere outside the PTY slice (P7). The result is the verbatim
 /// `BashResult` object (`rpc-types.ts:193`).
+///
+/// Unix keeps the original `bash -c` spawn verbatim. Native Windows shares
+/// the agent bash tool's documented Git Bash discovery instead of assuming a
+/// `bash` executable on `PATH` (docs/upstream/windows.md).
 fn local_bash(
     command: &str,
     session: &crate::session::store::SessionManager,
 ) -> Result<Value, String> {
-    let output = std::process::Command::new("bash")
-        .arg("-c")
+    #[cfg(unix)]
+    let (shell, shell_args): (String, Vec<String>) = ("bash".to_string(), vec!["-c".to_string()]);
+    #[cfg(windows)]
+    let (shell, shell_args) = crate::tools::bash::shell_config(None).map_err(|error| error.0)?;
+    #[cfg(not(any(unix, windows)))]
+    let (shell, shell_args): (String, Vec<String>) = ("sh".to_string(), vec!["-c".to_string()]);
+    let output = std::process::Command::new(shell)
+        .args(shell_args)
         .arg(command)
         .current_dir(session.get_cwd())
         .output()

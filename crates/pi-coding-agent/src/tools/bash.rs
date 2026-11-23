@@ -29,6 +29,18 @@
 //! seam (`bash-executor.ts:20-148`); this module stays on upstream's pipe path
 //! for the agent tool. It is declared here with `#[path]` so the new file does
 //! not need an edit to `tools/mod.rs`.
+//!
+//! # Platform gate
+//!
+//! Upstream keeps `bash -c` on every platform. On Unix this port resolves
+//! `/bin/bash`, then `bash` on `PATH`, then `sh`, exactly as before. On native
+//! Windows it follows the documented resolution order instead (docs/upstream/
+//! `shell-aliases.md`, `windows.md`): the configured `shellPath`, Git Bash at
+//! `%ProgramFiles%/Git/bin/bash.exe`, then `%ProgramFiles(x86)%/...`, then
+//! `bash.exe` on `PATH`. A missing shell is a clear tool error rather than a
+//! silent spawn failure. Process-tree kill uses `taskkill` on Windows and the
+//! original `/bin/kill` process-group signal on Unix; the direct child is
+//! always killed too.
 
 /// PTY execution for the interactive `!` command (`bash-executor.ts:20-148`).
 #[path = "bash_pty.rs"]
@@ -88,25 +100,60 @@ fn format_number(value: f64) -> String {
     }
 }
 
-/// pi's `getShellConfig` (`utils/shell.ts:108-118`), Unix branch: the
-/// configured `shellPath` if there is one (error when missing), else
-/// `/bin/bash`, then `bash` on `PATH`, then `sh`. The args are always `["-c"]`
-/// — pi never passes `-l`. The Windows branch ships with the skipped
-/// `powershell` variant.
-fn shell_config(custom: Option<&str>) -> Result<(String, Vec<String>), ToolError> {
+/// pi's `getShellConfig` (`utils/shell.ts:108-118`): the configured
+/// `shellPath` if there is one (error when missing), then the platform's
+/// default shell. The args are always `["-c"]`; pi never passes `-l`.
+///
+/// Unix (including macOS) keeps the verbatim `/bin/bash` → `bash` → `sh`
+/// chain. Native Windows follows upstream's documented Git Bash order
+/// (`docs/upstream/windows.md`, `docs/upstream/shell-aliases.md`):
+/// `%ProgramFiles%/Git/bin/bash.exe`, `%ProgramFiles(x86)%/Git/bin/bash.exe`,
+/// then `bash.exe` on `PATH`. The optional `powershell` tool is out of scope
+/// for pi-rs (documented in HANDOFF.md); this function only resolves Bash.
+pub(crate) fn shell_config(custom: Option<&str>) -> Result<(String, Vec<String>), ToolError> {
     if let Some(path) = custom {
         if Path::new(path).exists() {
             return Ok((path.to_string(), vec!["-c".to_string()]));
         }
         return Err(ToolError(format!("Custom shell path not found: {path}")));
     }
-    if Path::new("/bin/bash").exists() {
-        return Ok(("/bin/bash".to_string(), vec!["-c".to_string()]));
+    #[cfg(unix)]
+    {
+        if Path::new("/bin/bash").exists() {
+            return Ok(("/bin/bash".to_string(), vec!["-c".to_string()]));
+        }
+        if which("bash").is_some() {
+            return Ok(("bash".to_string(), vec!["-c".to_string()]));
+        }
+        Ok(("sh".to_string(), vec!["-c".to_string()]))
     }
-    if which("bash").is_some() {
-        return Ok(("bash".to_string(), vec!["-c".to_string()]));
+    #[cfg(windows)]
+    {
+        let candidates = [
+            std::env::var_os("ProgramFiles").map(|root| Path::new(&root).join("Git/bin/bash.exe")),
+            std::env::var_os("ProgramFiles(x86)")
+                .map(|root| Path::new(&root).join("Git/bin/bash.exe")),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            if candidate.is_file() {
+                return Ok((
+                    candidate.to_string_lossy().into_owned(),
+                    vec!["-c".to_string()],
+                ));
+            }
+        }
+        if let Some(path) = which("bash.exe").or_else(|| which("bash")) {
+            return Ok((path.to_string_lossy().into_owned(), vec!["-c".to_string()]));
+        }
+        Err(ToolError(
+            "Bash not found: install Git for Windows, put bash.exe on PATH, or set shellPath"
+                .to_string(),
+        ))
     }
-    Ok(("sh".to_string(), vec!["-c".to_string()]))
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(("sh".to_string(), vec!["-c".to_string()]))
+    }
 }
 
 /// A PATH lookup, the job pi's `findExecutableOnPath` does for shell
@@ -445,6 +492,16 @@ fn kill_tree(child: &mut Child) {
             .stderr(Stdio::null())
             .status();
     }
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        // `taskkill /T` walks descendants, the Windows equivalent of the
+        // Unix process-group signal above.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F", "/T"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     let _ = child.start_kill();
 }
 
@@ -496,10 +553,17 @@ mod tests {
     }
 
     #[test]
-    fn shell_config_prefers_bin_bash_then_sh() {
-        let (shell, args) = shell_config(None).expect("a shell");
-        assert!(matches!(shell.as_str(), "/bin/bash" | "bash" | "sh"));
-        assert_eq!(args, vec!["-c".to_string()], "pi never passes -l");
+    fn shell_config_prefers_platform_bash_then_sh() {
+        if let Ok((shell, args)) = shell_config(None) {
+            #[cfg(unix)]
+            assert!(matches!(shell.as_str(), "/bin/bash" | "bash" | "sh"));
+            #[cfg(windows)]
+            assert!(
+                shell.to_lowercase().ends_with("bash.exe")
+                    || shell.to_lowercase().ends_with("bash")
+            );
+            assert_eq!(args, vec!["-c".to_string()], "pi never passes -l");
+        }
         let error = shell_config(Some("/no/such/shell-xyz")).unwrap_err();
         assert_eq!(error.0, "Custom shell path not found: /no/such/shell-xyz");
     }

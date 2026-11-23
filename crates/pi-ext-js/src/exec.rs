@@ -14,10 +14,21 @@
 //! E1 differences: abort signals do not cross the engine boundary yet (E1
 //! runs host actions synchronously), so the `signal` option is accepted
 //! and ignored — recorded in HANDOFF.md.
+//!
+//! # Platform gate
+//!
+//! Unix (including macOS) keeps the exact upstream semantics: `nix` delivers
+//! SIGTERM/SIGKILL and `std::os::unix::process::ExitStatusExt` supplies the
+//! `128 + signal` exit code. Windows has neither primitive in `std`, so it
+//! uses `taskkill` (the standard OS equivalent) and falls back to exit code 1
+//! when a process dies without a code. Other targets get no-op signalling;
+//! their exit code convention still matches upstream's "missing code is a
+//! failure" rule. No Unix behaviour changes.
 
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -154,9 +165,7 @@ pub fn exec(
 
     // A signal-killed command has no exit code; use the shell convention
     // (exec.ts:151-153). A truncated result must never read as success.
-    let mut code = status
-        .code()
-        .unwrap_or_else(|| status.signal().map_or(1, |signal| 128 + signal));
+    let mut code = status_exit_code(status);
     if truncated && code == 0 {
         code = 1;
     }
@@ -174,6 +183,23 @@ fn exec_error(message: &str) -> serde_json::Value {
     serde_json::json!({ "execError": message })
 }
 
+/// The upstream `128 + signal` convention for a signal-terminated child
+/// (`exec.ts:151-153`). Only Unix exposes a signal on [`ExitStatus`]; Windows
+/// and other targets have no signal concept, so a code-less exit is the
+/// generic failure upstream uses for the same case.
+fn status_exit_code(status: ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        status
+            .code()
+            .unwrap_or_else(|| status.signal().map_or(1, |signal| 128 + signal))
+    }
+    #[cfg(not(unix))]
+    {
+        status.code().unwrap_or(1)
+    }
+}
+
 /// Shared output-cap accounting (`takeWithinCap`, `exec.ts:105-117`): the
 /// combined byte count, and whether the cap was hit (readers stop and
 /// close their pipes once it is).
@@ -185,6 +211,7 @@ struct CapState {
 /// Sends one signal to the spawned pid. The child may have exited between
 /// the check and the signal; that race is harmless (upstream guards with
 /// `proc.killed` for the same reason), and ESRCH is ignored.
+#[cfg(unix)]
 fn send_signal(pid: u32, signal: i32) {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
@@ -192,6 +219,28 @@ fn send_signal(pid: u32, signal: i32) {
         return;
     };
     let _ = kill(Pid::from_raw(pid as i32), signal);
+}
+
+/// Windows equivalent of [`send_signal`]. `taskkill` is the OS-level process
+/// terminator: without `/F` it asks a console process to stop (the closest
+/// analogue to SIGTERM), with `/F` it kills immediately (SIGKILL). `/T`
+/// includes descendants, matching upstream's process-tree termination.
+/// A race with the child's own exit just makes `taskkill` fail harmlessly.
+#[cfg(windows)]
+fn send_signal(pid: u32, signal: i32) {
+    let mut command = std::process::Command::new("taskkill");
+    command.arg("/PID").arg(pid.to_string()).arg("/T");
+    if signal == 9 {
+        command.arg("/F");
+    }
+    let _ = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
+}
+
+/// No signal primitive on other targets (for example wasm): the timeout and
+/// output-cap paths still mark the result `killed`, but cannot stop a child.
+#[cfg(not(any(unix, windows)))]
+fn send_signal(pid: u32, signal: i32) {
+    let _ = (pid, signal);
 }
 
 fn spawn_reader(
@@ -253,11 +302,15 @@ mod tests {
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>(),
-            "/tmp",
+            &std::env::temp_dir().to_string_lossy(),
             options,
         )
     }
 
+    /// The `/bin/*` fixtures below exist on Unix (including macOS). Windows
+    /// gets its own `cmd.exe` fixture further down; the spawn-failure case
+    /// runs on every target.
+    #[cfg(unix)]
     #[test]
     fn captures_stdout_and_exit_code() {
         let result = run("/bin/sh", &["-c", "echo hello"], &serde_json::json!({}));
@@ -269,16 +322,13 @@ mod tests {
 
     #[test]
     fn spawn_failure_is_a_failed_execution() {
-        let result = run("/nonexistent-command-e1", &[], &serde_json::json!({}));
+        let result = run("nonexistent-command-e1", &[], &serde_json::json!({}));
         assert_eq!(result["code"], 1);
-        assert!(
-            result["stderr"]
-                .as_str()
-                .expect("stderr")
-                .contains("No such file")
-        );
+        assert!(result["stdout"].as_str().expect("stdout").is_empty());
+        assert!(!result["stderr"].as_str().expect("stderr").is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn max_buffer_overflow_truncates_and_fails() {
         let result = run(
@@ -292,6 +342,7 @@ mod tests {
         assert_ne!(result["code"], 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn invalid_max_buffer_is_a_range_error() {
         let result = run(
@@ -307,6 +358,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn timeout_kills_the_command() {
         // Spawn the binary directly: `sh -c "sleep 30"` is unsafe here —
@@ -322,6 +374,32 @@ mod tests {
         );
         assert_eq!(result["killed"], true);
         assert_eq!(result["code"], 143);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// Windows smoke test for the same capture path, using the OS shell
+    /// instead of the Unix `/bin/*` fixtures.
+    #[cfg(windows)]
+    #[test]
+    fn windows_captures_stdout_and_exit_code() {
+        let result = run("cmd.exe", &["/C", "echo hello"], &serde_json::json!({}));
+        assert_eq!(result["stdout"].as_str().expect("stdout").trim(), "hello");
+        assert_eq!(result["code"], 0);
+        assert_eq!(result["truncated"], false);
+        assert_eq!(result["killed"], false);
+    }
+
+    /// The taskkill branch must report a killed command on timeout.
+    #[cfg(windows)]
+    #[test]
+    fn windows_timeout_kills_the_command() {
+        let started = Instant::now();
+        let result = run(
+            "cmd.exe",
+            &["/C", "ping -n 30 127.0.0.1 >nul"],
+            &serde_json::json!({ "timeout": 100 }),
+        );
+        assert_eq!(result["killed"], true);
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

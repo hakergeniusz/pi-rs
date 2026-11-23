@@ -45,6 +45,12 @@
 //!   SHA-512 block sizes),
 //! - `node:process` → `process.env` key rules and the string-valued
 //!   `cwd`/`platform`/`arch`/`version` properties.
+//!
+//! Platform note: native Windows has no `/dev/urandom`, so `random_uuid`
+//! takes the time-derived fallback. A `getrandom` swap needs a Cargo.lock
+//! change and is tracked separately by the platform-portability audit
+//! (NEEDS-DEP). The filesystem and path shims have explicit Windows branches
+//! (`symlink_file`/`symlink_dir`, `mode = 0`), so no Unix API leaks here.
 
 use std::fmt::Write as _;
 use std::io::Read as _;

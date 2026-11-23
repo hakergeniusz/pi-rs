@@ -15,11 +15,23 @@
 //! while keeping the agent-tool seam in [`super::execute`] on the original
 //! pipe path. See `WIRING.md` for the host hooks and the termios deviation.
 //!
-//! The pseudo-terminal itself comes from `script(1)` (util-linux): it forks a
-//! child under `forkpty`, so the command sees a real tty, and it forwards
-//! stdin, `\x03` (Ctrl-C), and signals to that child. Using the helper keeps
-//! this crate `#![forbid(unsafe_code)]` — `openpty`/`grantpt`/`forkpty` are all
-//! raw FFI otherwise — and avoids a new dependency.
+//! The pseudo-terminal itself comes from `script(1)`: it forks a child under
+//! `forkpty`, so the command sees a real tty, and it forwards stdin, `\x03`
+//! (Ctrl-C), and signals to that child. Using the helper keeps this crate
+//! `#![forbid(unsafe_code)]` — `openpty`/`grantpt`/`forkpty` are all raw FFI
+//! otherwise — and avoids a new dependency.
+//!
+//! # Platform gate
+//!
+//! Linux uses util-linux's `script -q -e -c <command> /dev/null`. macOS ships
+//! BSD `script`, which takes the command as trailing arguments and has no
+//! `-e`/`-c` flags, so its branch passes `script -q /dev/null <shell> -c
+//! <command>` instead; the exit code is then whatever `script` reports
+//! (documented deviation, needs CI validation on a macOS runner). Native
+//! Windows has no `script(1)` and no safe std PTY primitive, so [`run`]
+//! returns a clear "use the agent bash tool" error there; the interactive
+//! `!` seam remains functional through [`super::execute`]. Hard kills use
+//! `/bin/kill` on Unix and `taskkill` on Windows.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -124,17 +136,7 @@ impl BashPtyControl {
         let Some(pid) = pid else {
             return;
         };
-        // A negative pid addresses the process group (`bash.ts:127`'s
-        // `detached` + `killProcessTree`). `kill(1)` is used instead of a
-        // `killpg` FFI because the crate forbids unsafe code.
-        for target in [format!("-{pid}"), pid.to_string()] {
-            let _ = Command::new("/bin/kill")
-                .arg("-KILL")
-                .arg(target)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
+        kill_pid(pid);
     }
 
     /// Forward raw host bytes (arrow keys, `q`, …) into the pty so the
@@ -160,6 +162,34 @@ impl Clone for BashPtyControl {
     }
 }
 
+/// Hard-kill one pid (and its descendants) without unsafe FFI.
+///
+/// Unix sends SIGKILL to the negative pid first (the process group, matching
+/// `bash.ts:127`'s `detached` + `killProcessTree`) and then to the pid itself.
+/// Windows uses `taskkill /F /T`, the OS equivalent. Other targets no-op: the
+/// cancellation flag still ends the reader loop and reports a cancelled run.
+fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    for target in [format!("-{pid}"), pid.to_string()] {
+        let _ = Command::new("/bin/kill")
+            .arg("-KILL")
+            .arg(target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F", "/T"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
+}
+
 /// The command and working directory for one pty run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BashPtyRequest {
@@ -167,9 +197,54 @@ pub struct BashPtyRequest {
     pub cwd: PathBuf,
 }
 
+/// The argument vector for the `script(1)` helper on this platform.
+///
+/// util-linux (Linux and other non-macOS Unix) takes one `-c` string plus a
+/// throwaway typescript file. BSD `script` (macOS) has no `-c`/`-e` and takes
+/// the command as trailing arguments after the file, so the same inner
+/// command is handed to `/bin/sh -c` explicitly. Non-Unix targets return an
+/// empty vector; [`run`] rejects them before spawning.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn script_args(inner: String) -> Vec<String> {
+    vec![
+        "-q".to_string(),
+        "-e".to_string(),
+        "-c".to_string(),
+        inner,
+        "/dev/null".to_string(),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn script_args(inner: String) -> Vec<String> {
+    vec![
+        "-q".to_string(),
+        "/dev/null".to_string(),
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        inner,
+    ]
+}
+
+#[cfg(not(unix))]
+fn script_args(inner: String) -> Vec<String> {
+    let _ = inner;
+    Vec::new()
+}
+
 /// Start a command under a pseudo-terminal. Output arrives on
 /// [`BashPtyRun::events`]; the caller must drain it until `Done`.
+///
+/// The feature is Unix-only: native Windows has neither `script(1)` nor a
+/// safe std PTY primitive, so it returns the documented error and callers
+/// fall back to the pipe-based agent bash tool.
 pub fn run(request: BashPtyRequest) -> Result<BashPtyRun, String> {
+    if cfg!(not(unix)) {
+        return Err(
+            "PTY bash requires a Unix pseudo-terminal (`script(1)`); use the agent bash tool on this platform"
+                .to_string(),
+        );
+    }
     if !request.cwd.exists() {
         return Err(format!(
             "Working directory does not exist: {}\nCannot execute bash commands.",
@@ -178,14 +253,15 @@ pub fn run(request: BashPtyRequest) -> Result<BashPtyRun, String> {
     }
     let Some(script) = which("script") else {
         return Err(
-            "PTY bash requires `script(1)` (util-linux); install util-linux or use the agent bash tool"
+            "PTY bash requires `script(1)` (util-linux on Linux, BSD script on macOS); install it or use the agent bash tool"
                 .to_string(),
         );
     };
     let shell = shell_path();
-    // `script -c` runs its argument under `/bin/sh -c`; `exec` keeps the
-    // shell in the pty's foreground group so `^C` reaches the job directly.
+    // `exec` keeps the shell in the pty's foreground group so `^C` reaches
+    // the job directly, on both script(1) dialects.
     let inner = format!("exec {shell} -c {}", shell_quote(&request.command));
+    let script_args = script_args(inner);
     let cancel = Arc::new(AtomicBool::new(false));
     let finished = Arc::new(AtomicBool::new(false));
     let control = BashPtyControl::new(Arc::clone(&cancel), Arc::clone(&finished));
@@ -195,7 +271,7 @@ pub fn run(request: BashPtyRequest) -> Result<BashPtyRun, String> {
     let thread = std::thread::Builder::new()
         .name("bash-pty".to_string())
         .spawn(move || {
-            let result = worker(&script, &inner, &request.cwd, &shared, &cancel, &tx);
+            let result = worker(&script, &script_args, &request.cwd, &shared, &cancel, &tx);
             finished.store(true, Ordering::SeqCst);
             let _ = tx.send(BashPtyEvent::Done(result));
         })
@@ -213,18 +289,14 @@ pub fn run(request: BashPtyRequest) -> Result<BashPtyRun, String> {
 /// output produced so far is still returned (`bash-executor.ts:121-130`).
 fn worker(
     script: &Path,
-    inner: &str,
+    script_args: &[String],
     cwd: &Path,
     control: &BashPtyControl,
     cancel: &Arc<AtomicBool>,
     tx: &std::sync::mpsc::Sender<BashPtyEvent>,
 ) -> BashPtyResult {
     let mut child = match Command::new(script)
-        .arg("-q")
-        .arg("-e")
-        .arg("-c")
-        .arg(inner)
-        .arg("/dev/null")
+        .args(script_args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

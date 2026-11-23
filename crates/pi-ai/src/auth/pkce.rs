@@ -7,6 +7,12 @@
 //! Deviations: Web Crypto is the `sha2` crate plus `base64`, and randomness
 //! is read from `/dev/urandom` (a time/pid SHA-256 stream is the fallback on
 //! systems without it) because the port has no `rand` dependency.
+//!
+//! Platform note: native Windows has no `/dev/urandom`, so it always takes
+//! that time/pid fallback. It is adequate for a one-shot PKCE verifier but
+//! weaker than an OS CSPRNG; moving it to `getrandom` needs a Cargo.lock
+//! change and is therefore tracked separately by the platform-portability
+//! audit (NEEDS-DEP). No Unix behaviour changes.
 
 use std::fmt::Write;
 use std::io::Read;
