@@ -367,6 +367,18 @@ impl JsHost {
             let _namespace = module.namespace()?;
             Ok(())
         })?;
+        // Same bootstrap for `node:util`: its shim installs the global
+        // `TextEncoder`/`TextDecoder` that extensions use at module top level
+        // without importing the module (pi-result-cap/result-cap.ts).
+        ctx.with(|ctx| -> Result<(), JsHostError> {
+            let source = crate::resolver::virtual_module_source("node:util")
+                .expect("the node:util shim is always available");
+            let declared = rquickjs::Module::declare(ctx.clone(), "virtual:node:util", source)
+                .map_err(|err| Self::js_error(&ctx, err))?;
+            let (module, _promise) = declared.eval().map_err(|err| Self::js_error(&ctx, err))?;
+            let _namespace = module.namespace()?;
+            Ok(())
+        })?;
         Ok(Self { ctx, rt, core })
     }
 
