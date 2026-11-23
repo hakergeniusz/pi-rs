@@ -135,7 +135,14 @@ impl Component for BuiltInHeader {
             return None;
         }
         let callback = self.on_logo_click.as_mut()?;
-        callback(event.screen_x - event.x + 1, event.screen_y - event.y);
+        // Upstream's `screenX - x + 1` (`interactive-mode.ts:272`) folds its
+        // one padding column into the literal. Generalize it to this
+        // component's padding so a zero-padded header lifts the logo off the
+        // clicked cell instead of one column to its right.
+        callback(
+            event.screen_x - event.x + self.padding_x as i64,
+            event.screen_y - event.y,
+        );
         Some(MouseEventResult::handled())
     }
 
@@ -190,12 +197,13 @@ mod tests {
             sink.lock().expect("hits").push((column, row));
         })));
         // A click on the logo's bottom line, with the screen position offset
-        // from the local one: the callback gets the logo's screen cell.
+        // from the local one: the callback gets the logo's screen cell. With
+        // zero padding the origin is `screen_x - x` (no upstream +1).
         let mut click = MouseEvent::new(MouseEventKind::Click, 0, 2, 1, 40, 2);
         click.screen_x = 10;
         click.screen_y = 5;
         header.handle_mouse(&click).expect("handled");
-        assert_eq!(hits.lock().expect("hits").as_slice(), &[(9, 4)]);
+        assert_eq!(hits.lock().expect("hits").as_slice(), &[(8, 4)]);
         // Outside the logo cells: untouched.
         let outside = MouseEvent::new(MouseEventKind::Click, 0, 7, 1, 40, 2);
         assert!(header.handle_mouse(&outside).is_none());
@@ -204,5 +212,23 @@ mod tests {
         let mut bare = BuiltInHeader::new("c".to_string(), "e".to_string(), false, 0, 0);
         let click = MouseEvent::new(MouseEventKind::Click, 0, 2, 1, 40, 2);
         assert!(bare.handle_mouse(&click).is_none());
+    }
+
+    /// With upstream's single padding column the origin reduces to its
+    /// literal `screenX - x + 1` (`interactive-mode.ts:272`).
+    #[test]
+    fn padded_logo_origin_matches_upstream() {
+        let mut header =
+            BuiltInHeader::new("compact".to_string(), "expanded".to_string(), false, 1, 0);
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&hits);
+        header.set_on_logo_click(Some(Box::new(move |column, row| {
+            sink.lock().expect("hits").push((column, row));
+        })));
+        let mut click = MouseEvent::new(MouseEventKind::Click, 0, 1, 0, 40, 2);
+        click.screen_x = 11;
+        click.screen_y = 5;
+        header.handle_mouse(&click).expect("handled");
+        assert_eq!(hits.lock().expect("hits").as_slice(), &[(11, 5)]);
     }
 }

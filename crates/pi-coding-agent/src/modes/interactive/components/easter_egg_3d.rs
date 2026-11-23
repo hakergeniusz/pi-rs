@@ -25,9 +25,10 @@
 //! - Upstream awaits a fresh `queryTerminalColors` before fading; the port
 //!   reads the colors the startup query already reported (the same terminal
 //!   defaults, without the async round-trip).
-//! - Upstream's animation stops itself when it goes a second without being
-//!   rendered (pi hides overlays on exit); the port's host drops the
-//!   overlay, so the check has no equivalent to port.
+//! - The frame timer ports both of upstream's stop guards
+//!   (`easter-egg-3d.ts:908-912`): it finishes once `exitProgress() >= 1`
+//!   or a full second passes without a render. The host-dropped-overlay
+//!   signal (`alive`) is kept as an extra guard.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -81,8 +82,8 @@ const WAVE_JITTER: f64 = 0.12;
 const DISSOLVE_END: f64 = FLY_START + WAVE_SPREAD + WAVE_JITTER + DUST_DURATION;
 const BACKGROUND_FADE: f64 = 0.5;
 const EXIT_DURATION: f64 = 1.1;
-/// Upstream's `FRAME_MS` (30 fps); the timer requests one render per beat.
-const FRAME_MS: u64 = 33;
+/// Upstream's `FRAME_MS` (`easter-egg-3d.ts:221`, `math.rs:25`): 30 fps.
+const FRAME_MS: f64 = 1000.0 / 30.0;
 // A faint starfield fades in behind the logo once the screen has dissolved.
 const STARS_START: f64 = 2.5;
 const STARS_FADE: f64 = 2.0;
@@ -391,7 +392,10 @@ fn parse_screen(
                                     2 => 4,
                                     _ => 1,
                                 };
-                                let taken: Vec<u32> = codes[i + 1..i + 1 + count]
+                                // JS `slice` clamps its end to the array length, so a truncated
+                                // `38;2;...` must not panic (`easter-egg-3d.ts:337`).
+                                let end = (i + 1 + count).min(codes.len());
+                                let taken: Vec<u32> = codes[i + 1..end]
                                     .iter()
                                     .filter_map(|part| part.parse::<u32>().ok())
                                     .collect();
@@ -1210,9 +1214,14 @@ pub struct EasterEgg3dAnimation {
     /// Set once the exit animation completes; the host hides the overlay.
     done: Arc<AtomicBool>,
     start: Instant,
-    inner: Mutex<Inner>,
+    /// Shared with the timer callback so it can read the exit timeline.
+    inner: Arc<Mutex<Inner>>,
     /// The frame timer, cancelled on finish or when the overlay is dropped.
-    timer: Mutex<Option<ui_loop::TimerId>>,
+    /// Shared so the callback can clear itself on a stop guard.
+    timer: Arc<Mutex<Option<ui_loop::TimerId>>>,
+    /// Last time `render` ran; upstream's `:880,954` `lastRender` (ms). Shared
+    /// with the timer callback for the one-second-idle stop guard.
+    last_render: Arc<Mutex<Instant>>,
     /// Cleared on finish so a tick already in flight cannot request a frame.
     alive: Arc<AtomicBool>,
 }
@@ -1241,7 +1250,7 @@ impl EasterEgg3dAnimation {
             rows,
             done,
             start: Instant::now(),
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 raster: BlockRaster::new(0.0),
                 exit: None,
                 shuffle: None,
@@ -1250,15 +1259,17 @@ impl EasterEgg3dAnimation {
                 stars: Vec::new(),
                 cells: Vec::new(),
                 ansi_cache: HashMap::new(),
-            }),
-            timer: Mutex::new(None),
+            })),
+            timer: Arc::new(Mutex::new(None)),
+            last_render: Arc::new(Mutex::new(Instant::now())),
             alive: Arc::new(AtomicBool::new(true)),
         }
     }
 
-    /// Like [`Self::new`], but also drives frames with a 33 ms timer that
-    /// requests renders through `waker` (upstream's `setInterval`). Hosts
-    /// without a waker keep the pump-driven fallback.
+    /// Like [`Self::new`], but also drives frames with upstream's 30 fps
+    /// `setInterval` (`easter-egg-3d.ts:908-913`), requesting renders through
+    /// `waker` and stopping on either guard. Hosts without a waker keep the
+    /// pump-driven fallback.
     fn with_render_waker(
         screen: Vec<String>,
         model: Model,
@@ -1269,10 +1280,19 @@ impl EasterEgg3dAnimation {
     ) -> Self {
         let animation = Self::new(screen, model, colors, rows, done);
         let alive = Arc::clone(&animation.alive);
-        let id = ui_loop::set_interval(Duration::from_millis(FRAME_MS), move || {
-            if alive.load(Ordering::SeqCst) {
-                waker.request_render();
-            }
+        let inner = Arc::clone(&animation.inner);
+        let timer = Arc::clone(&animation.timer);
+        let last_render = Arc::clone(&animation.last_render);
+        let done_for_timer = Arc::clone(&animation.done);
+        let id = ui_loop::set_interval(Duration::from_secs_f64(FRAME_MS / 1000.0), move || {
+            frame_tick(
+                &alive,
+                &inner,
+                &last_render,
+                &timer,
+                &done_for_timer,
+                &waker,
+            );
         });
         *animation.timer.lock().expect("frame timer") = Some(id);
         animation
@@ -1448,8 +1468,14 @@ impl EasterEgg3dAnimation {
         if alpha <= 0.0 || height < 2 {
             return None;
         }
-        let key = super::super::interactive_mode::key_display_text(action::SELECT_CANCEL);
-        let text = format!("{key} to return");
+        // Upstream uses non-capitalizing `formatKeyText` on the first bound
+        // key (`easter-egg-3d.ts:1203`, `keybinding-hints.ts:17-27`): "escape
+        // to return", not "Escape to return".
+        let key = keybindings::keys_for(action::SELECT_CANCEL)
+            .first()
+            .copied()
+            .unwrap_or("escape");
+        let text = format!("{} to return", theme::format_key_text(key));
         if text.len() > width {
             return None;
         }
@@ -1573,9 +1599,47 @@ fn braille(bits: u8) -> char {
     char::from_u32(0x2800 + u32::from(bits)).expect("braille range")
 }
 
+/// One frame-timer beat, ported from the `setInterval` callback in
+/// `easter-egg-3d.ts:908-913` (and yannelli's `animation.rs:146-156`): finish
+/// when the exit timeline completes or the animation has not been rendered for
+/// a full second; otherwise request a frame. `alive` is the port's extra guard
+/// for a dropped overlay.
+#[allow(clippy::too_many_arguments)] // mirrors the callback's captured state
+fn frame_tick(
+    alive: &AtomicBool,
+    inner: &Mutex<Inner>,
+    last_render: &Mutex<Instant>,
+    timer: &Mutex<Option<ui_loop::TimerId>>,
+    done: &AtomicBool,
+    waker: &TuiRenderWaker,
+) {
+    if !alive.load(Ordering::SeqCst) {
+        return;
+    }
+    let finished = {
+        let inner = inner.lock().expect("animation state");
+        let exited = inner.exit.is_some() && EasterEgg3dAnimation::exit_progress(&inner) >= 1.0;
+        let stale = last_render.lock().expect("last render").elapsed() > Duration::from_secs(1);
+        exited || stale
+    };
+    if finished {
+        alive.store(false, Ordering::SeqCst);
+        done.store(true, Ordering::SeqCst);
+        let id = timer.lock().expect("frame timer").take();
+        if let Some(id) = id {
+            ui_loop::clear_timer(id);
+        }
+    } else {
+        waker.request_render();
+    }
+}
+
 impl Component for EasterEgg3dAnimation {
     #[allow(clippy::too_many_lines)] // mirrors the TS animation frame; split when extending
     fn render(&self, width: usize) -> Vec<String> {
+        // `lastRender = performance.now()` (`easter-egg-3d.ts:954`): a fresh
+        // frame keeps the timer's one-second-idle guard at bay.
+        *self.last_render.lock().expect("last render") = Instant::now();
         let height = usize::from(self.rows.load(Ordering::SeqCst)).max(1);
         let foreground = self.foreground;
         let background = self.background;
@@ -2146,6 +2210,40 @@ mod tests {
         assert_eq!(wide[0][1].text, "");
     }
 
+    /// JS `slice` clamps its end to the array length, so a truncated
+    /// `38;2;...` sequence must resolve nothing instead of panicking
+    /// (`easter-egg-3d.ts:337`).
+    #[test]
+    fn parse_screen_survives_truncated_extended_sgr() {
+        for line in [
+            "\x1b[38;2;100mx",
+            "\x1b[38;5mx",
+            "\x1b[48;2;10;20mx",
+            "\x1b[38;2mx",
+        ] {
+            let cells = parse_screen(&[line.to_string()], 40, [255.0; 3], [0.0; 3]);
+            assert_eq!(cells[0].len(), 1, "{line:?}");
+            assert_eq!(cells[0][0].fg, [255.0; 3], "{line:?}");
+            assert!(cells[0][0].bg.is_none(), "{line:?}");
+        }
+        // A complete sequence still resolves as before.
+        let cells = parse_screen(&["\x1b[38;2;1;2;3mx".to_string()], 40, [0.0; 3], [0.0; 3]);
+        assert_eq!(cells[0][0].fg, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn frame_interval_is_thirty_fps() {
+        // Upstream `1000 / 30` (`easter-egg-3d.ts:221`, `math.rs:25`), not a
+        // hardcoded 33 ms beat.
+        assert_eq!(FRAME_MS, 1000.0 / 30.0);
+        let period = Duration::from_secs_f64(FRAME_MS / 1000.0);
+        assert!(
+            period > Duration::from_millis(33),
+            "30 fps is slower than 33 ms"
+        );
+        assert!(period < Duration::from_millis(34));
+    }
+
     #[test]
     fn the_raster_draws_lit_cells_and_survives_resize() {
         let mut raster = BlockRaster::new(10.0);
@@ -2245,6 +2343,61 @@ mod tests {
         assert!(!tui.render_requested());
         std::thread::sleep(Duration::from_millis(120));
         assert!(!tui.render_requested(), "finish cancels the timer");
+    }
+
+    /// The timer ports upstream's idle guard (`easter-egg-3d.ts:910`,
+    /// `animation.rs:152`): a full second without a render finishes the egg.
+    #[test]
+    fn frame_timer_stops_when_not_rendered_for_a_second() {
+        let mut tui = Tui::new(Box::new(pi_tui::terminal::CaptureTerminal::new()));
+        let (animation, done) = test_animation_with_waker(tui.render_waker());
+        *animation.last_render.lock().expect("last render") = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("backdate");
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            done.load(Ordering::SeqCst),
+            "a stale animation finishes itself"
+        );
+        tui.render_now(false); // clear any frame flagged before the stop
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(
+            !tui.render_requested(),
+            "the stopped timer requests no more frames"
+        );
+    }
+
+    /// The other stop guard finishes as soon as the exit timeline completes
+    /// (`easter-egg-3d.ts:910`, `animation.rs:151`). `last_render` is left
+    /// fresh here so only the exit guard can stop the timer.
+    #[test]
+    fn frame_timer_stops_when_the_exit_completes() {
+        let tui = Tui::new(Box::new(pi_tui::terminal::CaptureTerminal::new()));
+        let (animation, done) = test_animation_with_waker(tui.render_waker());
+        animation.close();
+        {
+            let mut inner = animation.inner.lock().expect("animation state");
+            let exit = inner.exit.as_mut().expect("exit armed");
+            exit.start = Instant::now()
+                .checked_sub(Duration::from_millis(
+                    (EXIT_DURATION * 1000.0 + 100.0) as u64,
+                ))
+                .expect("backdate");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            done.load(Ordering::SeqCst),
+            "the completed exit finishes from the timer"
+        );
+    }
+
+    /// Upstream's hint uses non-capitalizing `formatKeyText`
+    /// (`easter-egg-3d.ts:1203`): "escape to return", not "Escape to return".
+    #[test]
+    fn hint_uses_the_lowercase_bound_key() {
+        let hint = EasterEgg3dAnimation::hint(40, 10, 1.0, [0.0; 3]).expect("hint");
+        assert_eq!(hint.text, "escape to return");
+        assert_eq!(hint.key_length, "escape".len());
     }
 
     #[test]
