@@ -16,7 +16,10 @@
 //!   component surface the bundled MCP extension imports
 //!   (`extensions/mcp/ui.ts:6-18`, `:25`; `extensions/codemode/renderer.ts:10`).
 //!   There is no terminal in `QuickJS`, so `render(width)` returns plain rows
-//!   for a host-side painter rather than driving stdout.
+//!   for a host-side painter rather than driving stdout. The shim also ports
+//!   the pure runtime exports from `packages/tui/src/index.ts`: `fuzzyMatch`/
+//!   `fuzzyFilter` (`fuzzy.ts`), `styleText`/`styleTextWithAnsi` (`colors.ts`),
+//!   `TruncatedText` and `SettingsList` (`components/*`).
 //! - `@earendil-works/pi-agent-core` — type-only surfaces (erased upstream)
 //!   and `AgentToolResult` / content shape helpers
 //!   (`packages/agent/src/types.ts:424-440`); no live agent loop.
@@ -1342,6 +1345,42 @@ SOURCE: /[\s\S]+/
         assert_eq!(result["mouse"], "function");
         assert_eq!(result["stripped"], "red");
         assert_eq!(result["wrapped"], json!(["hello", "world"]));
+    }
+
+    #[test]
+    fn pi_tui_fuzzy_style_truncated_and_settings_exports_work() {
+        let result = evaluate(
+            r#"
+            import {
+                fuzzyMatch, fuzzyFilter, styleText, TruncatedText, SettingsList,
+            } from "@earendil-works/pi-tui";
+            const sorted = fuzzyFilter(["claude-3", "gpt-4", "claude-opus"], "cl opus", (item) => item);
+            const truncated = new TruncatedText("a very long line", 1, 1).render(10);
+            const styled = styleText("hi", { bold: true, fg: { kind: "rgb", r: 255, g: 0, b: 0 } }, "truecolor");
+            let changed;
+            const list = new SettingsList(
+                [{ id: "model", label: "Model", currentValue: "a", values: ["a", "b"] }],
+                5, {}, (id, value) => { changed = value; }, () => {},
+            );
+            list.handleInput("\r");
+            globalThis.__result = JSON.stringify({
+                fuzzy: fuzzyMatch("opus", "claude-opus").matches,
+                filtered: sorted,
+                truncatedWidth: truncated[0].length,
+                bold: styled.includes("\u001b[1m"),
+                red: styled.includes("2;255;0;0"),
+                changed,
+                settingsRows: list.render(40).length,
+            });
+            "#,
+        );
+        assert_eq!(result["fuzzy"], true);
+        assert_eq!(result["filtered"], json!(["claude-opus"]));
+        assert_eq!(result["truncatedWidth"], 10);
+        assert_eq!(result["bold"], true);
+        assert_eq!(result["red"], true);
+        assert_eq!(result["changed"], "b");
+        assert_eq!(result["settingsRows"], 1);
     }
 
     #[test]

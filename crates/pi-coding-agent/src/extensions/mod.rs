@@ -13,6 +13,14 @@
 //! (`main.ts:861-869`); error-level diagnostics abort startup with the
 //! load-failure hint (`main.ts:986-990`).
 //!
+//! The fix wave wires the two tool-execution events upstream's agent session
+//! emits for every call (`_beforeToolCall`/`_afterToolCall`,
+//! `agent-session.ts:710-780`): [`ExtensionAwareExecutor`] runs
+//! `emit_tool_call` (with in-place `input` mutation and block/terminate) and
+//! `emit_tool_result` (with the content/details/structuredContent/isError/
+//! usage patch chain) around both extension and builtin dispatches, closing
+//! the gap where these runners existed but were only reached by unit tests.
+//!
 //! Slice 4 adds the runtime events over that spine: the `session_start`
 //! emission at the end of bind (`bindExtensions`, `agent-session.ts:3445`),
 //! the `user_bash` interception for interactive `!` commands
@@ -634,32 +642,72 @@ impl ToolExecutor for ExtensionAwareExecutor {
         call: AgentToolCall,
         updates: tokio::sync::mpsc::UnboundedSender<AgentToolResult>,
     ) -> pi_agent::types::BoxFuture<'_, Result<AgentToolResult, String>> {
+        let Some(runner) = self.runner.clone() else {
+            return self.builtin.execute(call, updates);
+        };
+        let name = call.name.clone();
+        let call_id = call.id.clone();
+        let arguments = Value::Object(call.arguments.clone());
         if self
             .extension
             .iter()
             .any(|definition| definition.name == call.name)
         {
-            let name = call.name.clone();
-            let call_id = call.id.clone();
-            let arguments = Value::Object(call.arguments);
             Box::pin(async move { self.execute_extension(&name, &call_id, &arguments) })
         } else {
-            self.builtin.execute(call, updates)
+            // Upstream's agent-session installs `beforeToolCall`/`afterToolCall`
+            // hooks for *every* tool, builtins included (agent-session.ts:710-780).
+            // The mode files own the agent-loop seam; this composite executor is
+            // the closest host path reachable here, so builtin calls get the same
+            // pair of events around them.
+            let (decision, mutated) = match tool_call_decision(&runner, &call_id, &name, &arguments)
+            {
+                Ok(value) => value,
+                Err(message) => return Box::pin(async move { Err(message) }),
+            };
+            if decision.block {
+                let reason = decision
+                    .reason
+                    .unwrap_or_else(|| format!("Tool call blocked by extension: {name}"));
+                return Box::pin(async move { Ok(AgentToolResult::error(reason)) });
+            }
+            let mut call = call;
+            if let Value::Object(map) = &mutated {
+                call.arguments = map.clone();
+            }
+            let executed_args = Value::Object(call.arguments.clone());
+            let builtin = self.builtin.execute(call, updates);
+            Box::pin(async move {
+                let result = builtin.await?;
+                tool_result_after(&runner, &call_id, &name, &executed_args, result)
+            })
         }
     }
 }
 
 #[cfg(feature = "ext-js")]
 impl ExtensionAwareExecutor {
-    /// One extension tool call: argument validation like the builtins
-    /// (`BuiltinToolExecutor::run`), then the runner dispatch. The runner
-    /// lock is held only across the synchronous JS execution.
+    /// One extension tool call: emit `tool_call` (upstream's `_beforeToolCall`,
+    /// `agent-session.ts:718-742`), validate and dispatch, then emit
+    /// `tool_result` (`_afterToolCall`, `:744-780`). The runner lock is held
+    /// only across the synchronous JS execution.
     fn execute_extension(
         &self,
         name: &str,
         call_id: &str,
         arguments: &Value,
     ) -> Result<AgentToolResult, String> {
+        let runner = self
+            .runner
+            .as_ref()
+            .expect("extension tools exist only with a runner");
+        let (decision, mutated) = tool_call_decision(runner, call_id, name, arguments)?;
+        if decision.block {
+            let reason = decision
+                .reason
+                .unwrap_or_else(|| format!("Tool call blocked by extension: {name}"));
+            return Ok(AgentToolResult::error(reason));
+        }
         let definition = self
             .extension
             .iter()
@@ -668,25 +716,100 @@ impl ExtensionAwareExecutor {
         let arguments = validate_tool_arguments(
             name,
             &definition.parameters,
-            arguments,
+            &mutated,
             definition.prepare_arguments,
         )?;
-        let runner = self
-            .runner
-            .as_ref()
-            .expect("extension tools exist only with a runner");
-        let mut runner = runner.lock().expect("extension runner mutex poisoned");
-        // The run loop is the host's tick point: a `list_changed`
-        // notification must be reflected before a codemode script or a
-        // direct MCP call reaches the tool it names (`runtime.ts:382-384`).
-        // A refresh failure is a server-state value upstream, never a tool
-        // error, so the tick's result is deliberately dropped here.
-        let _ = runner.mcp_tick(Instant::now());
-        let value = runner
-            .execute_tool(name, call_id, &arguments)
-            .map_err(|error| error.to_string())?;
-        Ok(tool_result_from_extension(&value))
+        let value = {
+            let mut runner = runner.lock().expect("extension runner mutex poisoned");
+            runner
+                .execute_tool(name, call_id, &arguments)
+                .map_err(|error| error.to_string())?
+        };
+        let result = tool_result_from_extension(&value);
+        tool_result_after(runner, call_id, name, &arguments, result)
     }
+}
+
+/// The host's `tool_call` interception (`agent-session.ts:718-742`): the
+/// runner's `emit_tool_call` lets handlers mutate `event.input` in place and
+/// optionally block/terminate. Returns the combined decision and the
+/// (possibly mutated) input the tool must actually receive. Also advances
+/// the MCP tick, the host's run-loop refresh point (`runtime.ts:382-384`).
+#[cfg(feature = "ext-js")]
+fn tool_call_decision(
+    runner: &Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+    call_id: &str,
+    name: &str,
+    arguments: &Value,
+) -> Result<(pi_ext_js::events::ToolCallResult, Value), String> {
+    let mut runner = runner.lock().expect("extension runner mutex poisoned");
+    // A `list_changed` notification must be reflected before a codemode
+    // script or a direct MCP call reaches the tool it names. A refresh
+    // failure is a server-state value upstream, never a tool error.
+    let _ = runner.mcp_tick(Instant::now());
+    let (decision, event) = runner
+        .emit_tool_call(call_id, name, arguments)
+        .map_err(|error| error.to_string())?;
+    let mutated = event
+        .get("input")
+        .cloned()
+        .unwrap_or_else(|| arguments.clone());
+    Ok((decision.unwrap_or_default(), mutated))
+}
+
+/// The host's `tool_result` interception (`agent-session.ts:744-780`):
+/// handlers patch content/details/structuredContent/isError/usage, and
+/// replacing content without structuredContent drops the latter. The runner
+/// applies the chain and returns the final event; fold it back into the
+/// `AgentToolResult` the agent loop consumes.
+#[cfg(feature = "ext-js")]
+fn tool_result_after(
+    runner: &Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+    call_id: &str,
+    name: &str,
+    arguments: &Value,
+    result: AgentToolResult,
+) -> Result<AgentToolResult, String> {
+    let mut runner = runner.lock().expect("extension runner mutex poisoned");
+    let content = serde_json::to_value(&result.content).unwrap_or_else(|_| json!([]));
+    let mut event = pi_ext_js::events::tool_result(
+        call_id,
+        name,
+        arguments,
+        &content,
+        result.is_error,
+        Some(result.details.clone()),
+    );
+    if let Some(structured) = &result.structured_content {
+        event["structuredContent"] = structured.clone();
+    }
+    if let Some(usage) = &result.usage {
+        event["usage"] = serde_json::to_value(usage).unwrap_or_else(|_| json!({}));
+    }
+    let Some(patched) = runner
+        .emit_tool_result(event)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(result);
+    };
+    let mut result = result;
+    if let Some(content) = patched.get("content") {
+        result.content = serde_json::from_value(content.clone()).unwrap_or(result.content);
+    }
+    if let Some(details) = patched.get("details") {
+        result.details = details.clone();
+    }
+    result.structured_content = patched
+        .get("structuredContent")
+        .cloned()
+        .filter(|value| !value.is_null());
+    if let Some(is_error) = patched.get("isError").and_then(Value::as_bool) {
+        result.is_error = is_error;
+    }
+    if let Some(usage) = patched.get("usage") {
+        result.usage = serde_json::from_value(usage.clone()).ok();
+    }
+    Ok(result)
 }
 
 /// The load outcome: the host plus the resolved trust decision.
@@ -1202,6 +1325,88 @@ mod tests {
             runner: Some(Arc::new(Mutex::new(runner))),
             extension_tools: Vec::new(),
         }
+    }
+
+    #[test]
+    fn tool_execution_events_reach_registered_handlers() {
+        let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
+            cwd: "/tmp".to_string(),
+            mode: "print".to_string(),
+            settings: json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        runner
+            .load_extension(
+                "<test>",
+                Some(
+                    r#"
+            export default function (pi) {
+              pi.on("tool_call", (event) => pi.appendEntry("tool_call", event.toolName));
+              pi.on("tool_result", (event) =>
+                pi.appendEntry("tool_result", event.content[0]?.text ?? ""));
+              pi.registerTool({
+                name: "probe", label: "probe", description: "probe",
+                parameters: { type: "object", properties: {} },
+                execute: async () => ({ content: [{ type: "text", text: "probed" }], details: {} }),
+              });
+            }
+            "#,
+                ),
+            )
+            .expect("load");
+        runner.bind().expect("bind");
+        let runner = Arc::new(Mutex::new(runner));
+        let definition = ToolDefinition {
+            name: "probe",
+            label: "probe",
+            description: "probe".to_string(),
+            parameters: json!({ "type": "object", "properties": {} }),
+            output_schema: None,
+            prompt_snippet: None,
+            prompt_guidelines: Vec::new(),
+            constrained_sampling: None,
+            prepare_arguments: None,
+            execution_mode: None,
+            render_shell: None,
+            renderers: EXTENSION_RENDERERS,
+        };
+        let builtin = ToolRegistry::new(vec![]).executor("/tmp");
+        let executor = ExtensionAwareExecutor {
+            builtin,
+            runner: Some(runner.clone()),
+            extension: vec![definition],
+        };
+        let result = executor
+            .execute_extension("probe", "t1", &json!({}))
+            .expect("execute");
+        assert_eq!(
+            result.content.first().and_then(|block| match block {
+                pi_ai::types::ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            }),
+            Some("probed")
+        );
+        let entries = runner
+            .lock()
+            .expect("runner")
+            .core()
+            .lock()
+            .expect("core")
+            .entries
+            .clone();
+        assert!(
+            entries
+                .iter()
+                .any(|(kind, value)| kind == "tool_call" && *value == json!("probe")),
+            "tool_call handler must have run, got {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(kind, value)| kind == "tool_result" && *value == json!("probed")),
+            "tool_result handler must have run, got {entries:?}"
+        );
     }
 
     #[test]

@@ -42,13 +42,17 @@ pub mod node;
 
 /// Sources of the virtual modules the host serves.
 ///
-/// `typebox` and `@earendil-works/pi-codemode/declarations` are the
-/// specifiers the bundled `tool-search` extension imports (E1); E4 adds the
+/// `typebox`, `@sinclair/typebox`, their `/compile` and `/value` subpaths,
+/// and `@earendil-works/pi-codemode/declarations` mirror upstream's full
+/// virtual-module table (`virtual-modules.ts:16-21`); the bundled
+/// `tool-search` extension imports the base table (E1). E4 adds the
 /// `node:*` built-ins and the host packages in [`node`]. Every other
 /// specifier is rejected with the documented E1 explanation.
 pub fn virtual_module_source(specifier: &str) -> Option<&'static str> {
     match specifier {
         "typebox" | "@sinclair/typebox" => Some(crate::glue::TYPEBOX_SHIM),
+        "typebox/compile" | "@sinclair/typebox/compile" => Some(crate::glue::TYPEBOX_COMPILE_SHIM),
+        "typebox/value" | "@sinclair/typebox/value" => Some(crate::glue::TYPEBOX_VALUE_SHIM),
         "@earendil-works/pi-codemode/declarations" => Some(crate::glue::DECLARATIONS_SHIM),
         _ => node::source(specifier).or_else(|| crate::hostpkg::source(specifier)),
     }
@@ -746,6 +750,31 @@ mod tests {
             ..Default::default()
         })
         .expect("host")
+    }
+
+    #[test]
+    fn typebox_subpath_virtual_modules_resolve() {
+        for specifier in [
+            "typebox",
+            "typebox/compile",
+            "typebox/value",
+            "@sinclair/typebox",
+            "@sinclair/typebox/compile",
+            "@sinclair/typebox/value",
+        ] {
+            let source = virtual_module_source(specifier)
+                .unwrap_or_else(|| panic!("{specifier} must resolve"));
+            assert!(!source.is_empty(), "empty shim for {specifier}");
+        }
+        assert_eq!(
+            virtual_module_source("typebox/compile"),
+            Some(crate::glue::TYPEBOX_COMPILE_SHIM)
+        );
+        assert_eq!(
+            virtual_module_source("typebox/value"),
+            Some(crate::glue::TYPEBOX_VALUE_SHIM)
+        );
+        assert_eq!(virtual_module_source("typebox/missing"), None);
     }
 
     #[test]

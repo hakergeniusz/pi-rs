@@ -32,16 +32,27 @@
 //!    calls the bundled `mcp` extension makes when a server connects,
 //!    `index.ts:416-443`; the execute wrappers forward to the native
 //!    manager, `mcp_manager.rs`).
-//! 2. [`TYPEBOX_SHIM`] — the `typebox` virtual module. Upstream serves the
-//!    real bundled `TypeBox` (`virtual-modules.ts`); the E1 shim reproduces
-//!    the exact construction semantics of the builders extensions use
-//!    (`TypeBox` 1.3.27 `Memory.Create`: enumerable keys are
-//!    `{...schema, ...options}`, and `~kind`/`~optional` are attached as
-//!    non-enumerable, so `JSON.stringify` output is byte-identical).
+//! 2. [`TYPEBOX_SHIM`], [`TYPEBOX_COMPILE_SHIM`] and [`TYPEBOX_VALUE_SHIM`]
+//!    — the `typebox`, `typebox/compile` and `typebox/value` virtual modules
+//!    (`virtual-modules.ts:16-21`). Upstream serves the real bundled
+//!    `TypeBox`; the E1 shim reproduces the exact construction semantics of
+//!    the builders extensions use (`TypeBox` 1.3.27 `Memory.Create`:
+//!    enumerable keys are `{...schema, ...options}`, and `~kind`/`~optional`
+//!    are attached as non-enumerable, so `JSON.stringify` output is
+//!    byte-identical), and the two subpaths share one schema validator.
 //! 3. [`DECLARATIONS_SHIM`] — the `@earendil-works/pi-codemode/declarations`
 //!    virtual module: a verbatim port of `resolveSchemaRef`
 //!    (`packages/codemode/src/declarations.ts:160-180`), the only binding
 //!    the bundled `tool-search` extension imports from it.
+//!
+//! The bootstrap also exposes the two `ExtensionContext` data surfaces
+//! upstream types as present (`types.ts:355-358`): `__piCreateCtx` adds
+//! read-only `sessionManager` (`session-manager.ts:245`) and `modelRegistry`
+//! (`model-registry.ts`) views over the host ops, so adapters such as
+//! pi-guardrails can call `ctx.modelRegistry.classify` without throwing.
+//! `pi.setModel` (`loader.ts:453-455`) now records the change and notifies
+//! `model_select` listeners; the Rust host emission path in `modes/rpc.rs`
+//! needs a dedicated op to be reachable from here.
 
 /// The per-host bootstrap: state, contexts, sessions, bus, `pi` API.
 pub const GLUE: &str = r#"
@@ -336,6 +347,137 @@ function createBus() {
 
 globalThis.__piBus = createBus();
 
+// `runtime.setModel` (loader.ts:453-455 → model-runtime/setModel in
+// agent-session.ts:2644): record the model change and notify listeners. The
+// host-side `model_select` emission (modes/rpc.rs `emit_model_select`) lives
+// behind a Rust op that is not reachable from this bootstrap; when one is
+// installed we forward to it, and in every build the in-JS bus receives the
+// same `{type:"model_select", model, previousModel, source}` payload so
+// `pi.events.on("model_select", …)` subscribers fire. `Promise<boolean>`
+// (`types.ts:1840`) resolves true once the change is recorded.
+globalThis.__piSetModel = function (model) {
+  const runtime = globalThis.__piRuntime;
+  const previous = runtime.currentModel;
+  if (previous && previous.provider === model.provider && previous.id === model.id) {
+    return Promise.resolve(true);
+  }
+  runtime.currentModel = model;
+  const event = {
+    type: "model_select",
+    model,
+    ...(previous ? { previousModel: previous } : {}),
+    source: "set",
+  };
+  if (typeof globalThis.__piOps.setModel === "function") {
+    try {
+      globalThis.__piOps.setModel(JSON.stringify(event));
+    } catch (_error) {
+      // The host op is best-effort: the in-JS notification still stands.
+    }
+  }
+  globalThis.__piBus.emit("model_select", event);
+  return Promise.resolve(true);
+};
+
+// Read-only `sessionManager` view (`types.ts:356`,
+// `session-manager.ts:245` `ReadonlySessionManager`). Backed by the
+// `getSessionMetadata`/`getSessionName`/`cwd` ops already installed on the
+// host; methods whose state does not cross the engine boundary return the
+// upstream empty shape rather than throwing.
+globalThis.__piCreateSessionManagerView = function () {
+  const meta = () => {
+    globalThis.__piAssertRuntimeActive();
+    try {
+      return JSON.parse(globalThis.__piOps.getSessionMetadata());
+    } catch (_error) {
+      return {};
+    }
+  };
+  return {
+    getCwd: () => meta().cwd ?? globalThis.__piOps.cwd(),
+    getSessionDir: () => undefined,
+    getSessionId: () => undefined,
+    getSessionFile: () => undefined,
+    getLeafId: () => undefined,
+    getLeafEntry: () => undefined,
+    getEntry: () => undefined,
+    getLabel: () => undefined,
+    getBranch: () => [],
+    buildContextEntries: () => ({ entries: [] }),
+    buildSessionProjection: () => ({ messages: [] }),
+    getHeader: () => undefined,
+    getEntries: () => [],
+    getTree: () => [],
+    getSessionName: () => {
+      const name = globalThis.__piOps.getSessionName();
+      return name === "" ? undefined : name;
+    },
+  };
+};
+
+// Read-only `modelRegistry` view (`types.ts:357`, `model-registry.ts`).
+// Synchronous lookups use the current model from `getModel`; request-time
+// methods resolve non-throwing defaults (upstream's `classify` never
+// rejects) so adapters such as pi-guardrails can call `classify` safely.
+globalThis.__piCreateModelRegistryView = function () {
+  const current = () => {
+    globalThis.__piAssertRuntimeActive();
+    const raw = globalThis.__piOps.getModel();
+    return raw === "" ? undefined : JSON.parse(raw);
+  };
+  const resolved = (value) => Promise.resolve(value);
+  const find = (provider, id) => {
+    const model = current();
+    return model && model.provider === provider && model.id === id ? model : undefined;
+  };
+  const errorResult = (model, message) => ({
+    api: model?.api ?? "unknown",
+    provider: model?.provider ?? "unknown",
+    model: model?.id ?? "unknown",
+    answers: {},
+    stopReason: "error",
+    errorMessage: message,
+    timestamp: Date.now(),
+  });
+  return {
+    refresh: () => resolved({}),
+    getError: () => undefined,
+    getAll: () => {
+      const model = current();
+      return model ? [model] : [];
+    },
+    getAvailable: () => {
+      const model = current();
+      return model ? [model] : [];
+    },
+    find,
+    findOfType: (type, provider, id) => {
+      const model = find(provider, id);
+      return model && (type === "language" || model.type === type) ? model : undefined;
+    },
+    hasConfiguredAuth: () => true,
+    getApiKeyAndHeaders: () => resolved({ apiKey: undefined, headers: {} }),
+    getProviderAuthStatus: () => "ready",
+    getProvider: (provider) => ({ name: provider }),
+    getModelsOfType: () => [],
+    getAvailableOfType: () => resolved([]),
+    getModelOfType: () => undefined,
+    classify: (model) => resolved(errorResult(model, "classify has no host classifier backend")),
+    generateImages: (model) =>
+      resolved({
+        images: [],
+        stopReason: "error",
+        errorMessage: "generateImages has no host image backend",
+        model: model?.id ?? "unknown",
+      }),
+    getProviderDisplayName: (provider) => provider,
+    getProviderAuth: () => resolved(undefined),
+    getApiKeyForProvider: () => resolved(undefined),
+    isUsingOAuth: () => false,
+    getRegisteredProviderIds: () => [],
+  };
+};
+
 // `exec` (core/exec.ts): the Rust op runs the process synchronously and
 // returns the ExecResult JSON; a validation failure throws like upstream's
 // RangeError.
@@ -539,8 +681,12 @@ globalThis.__piCreateApi = function (extIdx) {
     unregisterVirtualModel() {
       throw new Error("pi.unregisterVirtualModel is not available in the E1 headless extensions core (E2)");
     },
-    setModel() {
-      throw new Error("pi.setModel is not available in the E1 headless extensions core (E2)");
+    setModel(model) {
+      assertAction();
+      if (!model || typeof model !== "object") {
+        return Promise.resolve(false);
+      }
+      return globalThis.__piSetModel(model);
     },
 
     sendMessage(message, options) {
@@ -1356,6 +1502,12 @@ globalThis.__piCreateCtx = function () {
       const raw = globalThis.__piOps.getModel();
       return raw === "" ? undefined : JSON.parse(raw);
     },
+    get sessionManager() {
+      return globalThis.__piSessionManagerView ??= globalThis.__piCreateSessionManagerView();
+    },
+    get modelRegistry() {
+      return globalThis.__piModelRegistryView ??= globalThis.__piCreateModelRegistryView();
+    },
     get scopedModels() {
       assertActive();
       return [];
@@ -1414,28 +1566,50 @@ globalThis.__piCreateCommandCtx = function () {
     globalThis.__piAssertRuntimeActive();
     return JSON.parse(globalThis.__piOps.getSystemPromptOptions());
   };
+  // Session mutation ops are installed by the interactive/RPC host (the
+  // mode files own the real implementations). The bootstrap forwards to them
+  // when present so a bound host drives real session changes, and keeps the
+  // upstream unbound defaults as the fallback for headless modes.
   base.waitForIdle = () => {
     globalThis.__piAssertRuntimeActive();
+    if (typeof globalThis.__piOps.waitForIdle === "function") {
+      return Promise.resolve(globalThis.__piOps.waitForIdle());
+    }
     return Promise.resolve();
   };
   base.newSession = () => {
     globalThis.__piAssertRuntimeActive();
+    if (typeof globalThis.__piOps.newSession === "function") {
+      return Promise.resolve(globalThis.__piOps.newSession() === "true");
+    }
     return Promise.resolve({ cancelled: false });
   };
   base.fork = () => {
     globalThis.__piAssertRuntimeActive();
+    if (typeof globalThis.__piOps.fork === "function") {
+      return Promise.resolve(JSON.parse(globalThis.__piOps.fork() || "{\"cancelled\":false}"));
+    }
     return Promise.resolve({ cancelled: false });
   };
   base.navigateTree = () => {
     globalThis.__piAssertRuntimeActive();
+    if (typeof globalThis.__piOps.navigateTree === "function") {
+      return Promise.resolve(JSON.parse(globalThis.__piOps.navigateTree() || "{\"cancelled\":false}"));
+    }
     return Promise.resolve({ cancelled: false });
   };
   base.switchSession = () => {
     globalThis.__piAssertRuntimeActive();
+    if (typeof globalThis.__piOps.switchSession === "function") {
+      return Promise.resolve(JSON.parse(globalThis.__piOps.switchSession() || "{\"cancelled\":false}"));
+    }
     return Promise.resolve({ cancelled: false });
   };
   base.reload = () => {
     globalThis.__piAssertRuntimeActive();
+    if (typeof globalThis.__piOps.reload === "function") {
+      return Promise.resolve(globalThis.__piOps.reload());
+    }
     return Promise.resolve();
   };
   return base;
@@ -2890,6 +3064,114 @@ Type.Enum = () => unsupported("Enum");
 Type.KeyOf = () => unsupported("KeyOf");
 Type.Recursive = () => unsupported("Recursive");
 export default Type;
+"#;
+
+/// The `typebox/compile` virtual module (`virtual-modules.ts:7,19`): serves
+/// the `Compile` builder extensions use to turn a TypeBox schema into a
+/// validator. The E1 shim supports the same schema subset as `TYPEBOX_SHIM`
+/// (string/number/boolean/object/array/anyOf plus `const`/`enum`), matching
+/// the real TypeBox `Value.Check` semantics for those keywords.
+pub const TYPEBOX_COMPILE_SHIM: &str = r#"
+const isObject = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+export function check(schema, value) {
+  if (schema === true) return true;
+  if (schema === false) return false;
+  if (!isObject(schema)) return false;
+  if ("const" in schema) return JSON.stringify(value) === JSON.stringify(schema.const);
+  if ("enum" in schema) return schema.enum.some((entry) => JSON.stringify(entry) === JSON.stringify(value));
+  if (schema.anyOf) return schema.anyOf.some((variant) => check(variant, value));
+  switch (schema.type) {
+    case "string": return typeof value === "string";
+    case "number": return typeof value === "number" && Number.isFinite(value);
+    case "integer": return Number.isInteger(value);
+    case "boolean": return typeof value === "boolean";
+    case "null": return value === null;
+    case "array":
+      if (!Array.isArray(value)) return false;
+      if (schema.minItems !== undefined && value.length < schema.minItems) return false;
+      if (schema.maxItems !== undefined && value.length > schema.maxItems) return false;
+      return value.every((item) => check(schema.items ?? {}, item));
+    case "object": {
+      if (!isObject(value)) return false;
+      for (const key of schema.required ?? []) if (!(key in value)) return false;
+      for (const [key, child] of Object.entries(schema.properties ?? {})) {
+        if (key in value && !check(child, value[key])) return false;
+      }
+      return true;
+    }
+    default: return true;
+  }
+}
+export function Compile(schema) {
+  const validator = (value) => check(schema, value);
+  validator.schema = schema;
+  return validator;
+}
+export function CompileString(schema) { return `(${check})(${JSON.stringify(schema)}, value)`; }
+export const Check = check;
+export default { Compile, CompileString, Check };
+"#;
+
+/// The `typebox/value` virtual module (`virtual-modules.ts:8,20`): the `Value`
+/// namespace extensions use for runtime schema checks/conversion. Built on
+/// the same validator as `typebox/compile` so both specifiers stay coherent.
+pub const TYPEBOX_VALUE_SHIM: &str = r#"
+import { check } from "typebox/compile";
+const isObject = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+function convert(schema, value) {
+  if (!isObject(schema)) return value;
+  switch (schema.type) {
+    case "string":
+      if (typeof value === "number" || typeof value === "boolean") return String(value);
+      return value;
+    case "number":
+    case "integer":
+      if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
+      return value;
+    case "boolean":
+      if (value === "true") return true;
+      if (value === "false") return false;
+      return value;
+    case "array":
+      return Array.isArray(value) ? value.map((item) => convert(schema.items ?? {}, item)) : value;
+    case "object": {
+      if (!isObject(value)) return value;
+      const result = { ...value };
+      for (const [key, child] of Object.entries(schema.properties ?? {})) {
+        if (key in result) result[key] = convert(child, result[key]);
+      }
+      return result;
+    }
+    default: return value;
+  }
+}
+function defaults(schema) {
+  if (!isObject(schema)) return undefined;
+  switch (schema.type) {
+    case "string": return schema.default ?? "";
+    case "number":
+    case "integer": return schema.default ?? 0;
+    case "boolean": return schema.default ?? false;
+    case "array": return schema.default ?? [];
+    case "object": {
+      const result = { ...(schema.default ?? {}) };
+      for (const [key, child] of Object.entries(schema.properties ?? {})) {
+        if (!(key in result) && child.default !== undefined) result[key] = defaults(child);
+      }
+      return result;
+    }
+    default: return schema.default;
+  }
+}
+export function Check(schema, value) { return check(schema, value); }
+export function Convert(schema, value) { return convert(schema, value); }
+export function Default(schema, value) { return value === undefined ? defaults(schema) : value; }
+export function Clean(schema, value) { return convert(schema, value); }
+export function Clone(value) { return value === undefined ? undefined : JSON.parse(JSON.stringify(value)); }
+export function Equal(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+export function Parse(schema, value) { return convert(schema, value); }
+export const Value = { Check, Convert, Default, Clean, Clone, Equal, Parse };
+export default Value;
 "#;
 
 /// The `@earendil-works/pi-codemode/declarations` virtual module: a
