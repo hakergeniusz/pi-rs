@@ -8,6 +8,13 @@
 //! (`packages/ai/src/api/simple-options.ts:49-80`). `ModelCost.tiers` mirrors
 //! `ModelCostSchema.tiers` (`providers/model-schema.ts:53-74`) consumed by
 //! `calculateCost` (`models.ts:1279-1299`).
+//!
+//! Non-chat model shapes (`ImageModel`, `ClassifierModel`, `ModelType`,
+//! `ModelOutputModality`) port `types.ts:843-924`: image and classifier models
+//! share `BaseModel` with chat models but carry their own `type` discriminant
+//! and type-specific fields (`output` / `contextWindow`). The classifier and
+//! image result types live with their adapters (see `providers::classifier`
+//! and `providers::images`) and mirror `types.ts:672-755`.
 
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
@@ -429,6 +436,119 @@ pub struct Model {
     /// Compatibility overrides for OpenAI-compatible APIs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<JsonObject>,
+}
+
+/// Output modalities an image model can emit (TS `("text" | "image")[]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelOutputModality {
+    Text,
+    Image,
+}
+
+impl ModelOutputModality {
+    /// Wire name (TS string literal).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelOutputModality::Text => "text",
+            ModelOutputModality::Image => "image",
+        }
+    }
+}
+
+/// What a catalog entry is for (TS `ModelType`, `types.ts:921-925`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelType {
+    Chat,
+    Image,
+    Classifier,
+}
+
+impl ModelType {
+    /// Wire name (TS string literal; chat models omit `type` on the wire).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelType::Chat => "chat",
+            ModelType::Image => "image",
+            ModelType::Classifier => "classifier",
+        }
+    }
+}
+
+/// Image-generation model from the catalog (TS `ImageModel`,
+/// `types.ts:900-903`). Shares `BaseModel` with [`Model`] but is only usable
+/// with `generateImages()`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageModel {
+    pub id: String,
+    pub name: String,
+    /// `KnownImageApi` wire name or a custom string.
+    pub api: String,
+    pub provider: String,
+    pub base_url: String,
+    pub input: Vec<ModelInputModality>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_limits: Option<ModelInputLimits>,
+    #[serde(default)]
+    pub cost: ModelCost,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
+    /// Always `"image"` on the wire.
+    pub r#type: String,
+    /// Always includes `"image"`; `"text"` means text blocks may be returned too.
+    pub output: Vec<ModelOutputModality>,
+}
+
+/// Structured classifier model from the catalog (TS `ClassifierModel`,
+/// `types.ts:906-911`). Shares `BaseModel` with [`Model`] but is only usable
+/// with `classify()`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifierModel {
+    pub id: String,
+    pub name: String,
+    /// `KnownClassifierApi` wire name or a custom string.
+    pub api: String,
+    pub provider: String,
+    pub base_url: String,
+    pub input: Vec<ModelInputModality>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_limits: Option<ModelInputLimits>,
+    #[serde(default)]
+    pub cost: ModelCost,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
+    /// Always `"classifier"` on the wire.
+    pub r#type: String,
+    pub context_window: u64,
+    /// System One compatibility overrides (opaque here; the System One wire
+    /// paths are NOT ported, see `providers::classifier` docs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<JsonObject>,
+}
+
+impl ImageModel {
+    /// The model's type discriminant (TS `getModelType`).
+    pub fn model_type(&self) -> ModelType {
+        ModelType::Image
+    }
+}
+
+impl ClassifierModel {
+    /// The model's type discriminant (TS `getModelType`).
+    pub fn model_type(&self) -> ModelType {
+        ModelType::Classifier
+    }
+}
+
+impl Model {
+    /// The model's type discriminant (TS `getModelType`; legacy chat entries
+    /// omit `type`, so the literal value is ignored here).
+    pub fn model_type(&self) -> ModelType {
+        ModelType::Chat
+    }
 }
 
 /// Handle for providers with server-side continuation (TS `DeferredHandle`).

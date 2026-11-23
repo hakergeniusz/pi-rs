@@ -40,10 +40,18 @@ pub mod types;
 
 pub use constrained_sampling::{ConstrainedSampling, GrammarFormat, GrammarVariants, StrictMode};
 pub use event_stream::AssistantMessageEventStream;
+pub use providers::classifier::{
+    ClassifierAnswer, ClassifierBoolCriteria, ClassifierContext, ClassifierOptions,
+    ClassifierQuestion, ClassifierResult, ClassifierStopReason,
+};
+pub use providers::images::{AssistantImages, ImagesContext, ImagesOptions, ImagesStopReason};
+/// Non-chat provider arms: classifier and image generation wire paths.
+pub use providers::{classify, generate_images};
 pub use types::get_supported_thinking_levels;
 pub use types::{
-    AssistantContent, AssistantMessage, AssistantMessageEvent, ContentBlock, Context, HookFuture,
-    InputContent, KnownApi, Message, Model, PayloadHook, ProviderHook, ProviderResponse,
-    ResponseHook, StopReason, StreamEventHook, StreamOptions, SystemMessage, ThinkingLevel, Tool,
-    ToolCall, ToolChoice, ToolResultMessage, TranscriptContext, Usage, UserContent, UserMessage,
+    AssistantContent, AssistantMessage, AssistantMessageEvent, ClassifierModel, ContentBlock,
+    Context, HookFuture, ImageModel, InputContent, KnownApi, Message, Model, ModelOutputModality,
+    ModelType, PayloadHook, ProviderHook, ProviderResponse, ResponseHook, StopReason,
+    StreamEventHook, StreamOptions, SystemMessage, ThinkingLevel, Tool, ToolCall, ToolChoice,
+    ToolResultMessage, TranscriptContext, Usage, UserContent, UserMessage,
 };

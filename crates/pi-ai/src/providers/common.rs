@@ -4,12 +4,16 @@
 //! `api/simple-options.ts:49-80`).
 
 use crate::cost::calculate_cost;
-use crate::retry::{ProviderError, ProviderRetryOptions, retry_provider_request};
+use crate::retry::{
+    ProviderError, ProviderRetryOptions, is_retryable_provider_error, provider_retry_delay_ms,
+    retry_provider_request,
+};
 use crate::types::{
     AssistantMessage, JsonValue, Message, Model, PayloadHook, ProviderHook, ProviderResponse,
     ResponseHook, StopReason, StreamEventHook, StreamOptions, SystemMessage, Usage, now_ms,
 };
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 /// Base assistant message for stream accumulation.
 pub fn initial_output(model: &Model) -> AssistantMessage {
@@ -297,6 +301,126 @@ pub async fn apply_stream_event_hook(
         callback(event, model.clone()).await?;
     }
     Ok(())
+}
+
+/// Shared options of the non-streaming classifier/image JSON POST
+/// (`packages/ai/src/types.ts:365-382` `ClassifierOptions`/`ImagesOptions`,
+/// `api/classifier-shared.ts:47-98`). Hooks and custom fetch are not exposed
+/// by the Rust port; auth is resolved by the caller.
+#[derive(Debug, Clone, Default)]
+pub struct JsonPostOptions {
+    pub api_key: Option<String>,
+    /// Upstream classifier default is 2; image generation passes through 0.
+    pub max_retries: u32,
+    pub max_retry_delay_ms: Option<u64>,
+    pub headers: BTreeMap<String, Option<String>>,
+    /// Statuses that fail at once even though they are normally retried
+    /// (`api/openai-decisions.ts:108` retries no 504s).
+    pub no_retry_statuses: Vec<u16>,
+}
+
+/// POST one JSON document and parse the JSON response, with the SDK retry
+/// policy (`utils/provider-retry.ts:99-128`). Returns the provider error text
+/// (including the HTTP status and body) rather than throwing, so classifier
+/// and image adapters can package it into their result types.
+fn insert_header(headers: &mut reqwest::header::HeaderMap, name: &str, value: &str) {
+    if let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        && let Ok(value) = reqwest::header::HeaderValue::from_str(value)
+    {
+        headers.insert(name, value);
+    }
+}
+
+pub(crate) async fn post_json_with_retry(
+    label: &str,
+    url: &str,
+    model_headers: Option<&BTreeMap<String, String>>,
+    options: &JsonPostOptions,
+    body: &JsonValue,
+) -> Result<JsonValue, String> {
+    let client = reqwest::Client::new();
+    let mut remaining = options.max_retries;
+    let mut retry_index = 0u32;
+    loop {
+        let result: Result<JsonValue, ProviderError> = async {
+            let mut headers = reqwest::header::HeaderMap::new();
+            insert_header(&mut headers, "content-type", "application/json");
+            if let Some(key) = options.api_key.as_deref() {
+                insert_header(&mut headers, "authorization", &format!("Bearer {key}"));
+            }
+            if let Some(model_headers) = model_headers {
+                for (name, value) in model_headers {
+                    insert_header(&mut headers, name, value);
+                }
+            }
+            for (name, value) in &options.headers {
+                if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
+                    match value {
+                        Some(value) => insert_header(&mut headers, name, value),
+                        None => {
+                            headers.remove(header_name);
+                        }
+                    }
+                }
+            }
+            let builder = client.post(url).headers(headers).json(body);
+            let response = builder.send().await.map_err(|error| ProviderError {
+                status: None,
+                headers: BTreeMap::new(),
+                message: format!("{label} error: request failed: {error}"),
+            })?;
+            let status = response.status();
+            let headers: BTreeMap<String, String> = response
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_ascii_lowercase(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            if status.is_success() {
+                return response.json::<JsonValue>().await.map_err(|error| ProviderError {
+                    status: Some(status.as_u16()),
+                    headers,
+                    message: format!("{label} error: invalid JSON response: {error}"),
+                });
+            }
+            let error_body = response.text().await.unwrap_or_default();
+            Err(ProviderError {
+                status: Some(status.as_u16()),
+                headers,
+                message: if status.as_u16() == 504 {
+                    format!(
+                        "{label} error (504): the request timed out at the gateway. Very large inputs (above roughly 600K tokens) currently exceed its time limit."
+                    )
+                } else {
+                    format!("{label} error ({}): {}", status.as_u16(), error_body)
+                },
+            })
+        }
+        .await;
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let message = error.message.clone();
+                if remaining == 0
+                    || !is_retryable_provider_error(&error)
+                    || error
+                        .status
+                        .is_some_and(|status| options.no_retry_statuses.contains(&status))
+                {
+                    return Err(message);
+                }
+                let retry = retry_index;
+                remaining -= 1;
+                retry_index += 1;
+                let delay = provider_retry_delay_ms(&error, retry, options.max_retry_delay_ms)?;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
