@@ -3067,10 +3067,10 @@ export default Type;
 "#;
 
 /// The `typebox/compile` virtual module (`virtual-modules.ts:7,19`): serves
-/// the `Compile` builder extensions use to turn a TypeBox schema into a
+/// the `Compile` builder extensions use to turn a `TypeBox` schema into a
 /// validator. The E1 shim supports the same schema subset as `TYPEBOX_SHIM`
 /// (string/number/boolean/object/array/anyOf plus `const`/`enum`), matching
-/// the real TypeBox `Value.Check` semantics for those keywords.
+/// the real `TypeBox` `Value.Check` semantics for those keywords.
 pub const TYPEBOX_COMPILE_SHIM: &str = r#"
 const isObject = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 export function check(schema, value) {

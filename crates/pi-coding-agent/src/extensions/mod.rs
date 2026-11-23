@@ -673,7 +673,7 @@ impl ToolExecutor for ExtensionAwareExecutor {
             }
             let mut call = call;
             if let Value::Object(map) = &mutated {
-                call.arguments = map.clone();
+                call.arguments.clone_from(map);
             }
             let executed_args = Value::Object(call.arguments.clone());
             let builtin = self.builtin.execute(call, updates);

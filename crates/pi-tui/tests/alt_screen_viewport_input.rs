@@ -117,16 +117,17 @@ fn page_keys_scroll_the_primary_view_by_a_page() {
     alt.stop();
 }
 
-/// `home`/`end` (`tui.altScreen.top` / `bottom`), `:774-782`.
+/// `ctrl+home`/`ctrl+end` (`tui.altScreen.top` / `bottom`), upstream
+/// keybindings.ts:216-222. Plain `home`/`end` move the editor cursor instead.
 #[test]
 fn home_and_end_jump_to_the_ends() {
     let mut alt = Alt::new((20, 10));
     alt.transcript(200);
     alt.tui.alt_screen_scroll_to_bottom();
-    assert!(alt.key("\x1b[H"), "home is consumed");
+    assert!(alt.key("\x1b[7^"), "ctrl+home is consumed");
     assert_eq!(alt.top(), 0);
-    assert!(alt.key("\x1b[F"), "end is consumed");
-    assert!(alt.top() > 0, "end scrolls away from the top");
+    assert!(alt.key("\x1b[8^"), "ctrl+end is consumed");
+    assert!(alt.top() > 0, "ctrl+end scrolls away from the top");
     alt.stop();
 }
 
