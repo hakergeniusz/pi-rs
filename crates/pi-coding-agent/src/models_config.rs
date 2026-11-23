@@ -168,6 +168,7 @@ impl ModelCostOverride {
             cache_read: self.cache_read.unwrap_or(0.0),
             cache_write: self.cache_write.unwrap_or(0.0),
             cache_write_1h: self.cache_write_1h,
+            tiers: None,
         }
     }
 }
@@ -602,7 +603,7 @@ fn merge_json_objects(
 
 fn merge_cost(base: &ModelCost, r#override: Option<&ModelCostOverride>) -> ModelCost {
     let Some(r#override) = r#override else {
-        return *base;
+        return base.clone();
     };
     ModelCost {
         input: r#override.input.unwrap_or(base.input),
@@ -613,6 +614,8 @@ fn merge_cost(base: &ModelCost, r#override: Option<&ModelCostOverride>) -> Model
             Some(value) => Some(value),
             None => base.cache_write_1h,
         },
+        // Overrides never replace catalog tiers (`pi-ai-schemas.ts:35`).
+        tiers: base.tiers.clone(),
     }
 }
 
@@ -905,7 +908,7 @@ pub fn extension_model_from_definition(
         base_url,
         input: definition.input.clone(),
         input_limits: definition.input_limits,
-        cost: definition.cost,
+        cost: definition.cost.clone(),
         headers: None,
         r#type: None,
         reasoning: definition.reasoning,

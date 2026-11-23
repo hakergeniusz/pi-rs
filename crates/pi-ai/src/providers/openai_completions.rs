@@ -7,19 +7,26 @@
 //! tool-call delta accumulation, finish-reason and usage mapping.
 //! The `onPayload`/`onResponse`/`onProviderStreamEvent` bridges mirror
 //! `api/openai-completions.ts:375-378,392,545`.
-//! Deferred: compat autodetection matrix, grammar tools, prompt-cache keys.
+//! The resolved compat matrix ports `detectCompat`/`getCompat` and the payload
+//! flags `buildParams` applies (`openai-completions.ts:761-970,1588-1739`):
+//! `maxTokensField`, `supportsDeveloperRole`, `supportsStore` and the main
+//! `thinkingFormat` variants. Catalog `model.headers` are merged into requests
+//! (`openai-completions.ts:751,773-776`).
+//! Deferred: grammar tools, prompt-cache keys, strict tool schemas.
 //! `OpenAI`-wire-compatible providers: llama.cpp, vLLM, `OpenRouter`, Groq, …
 
 use crate::event_stream::{AssistantMessageEventStream, EventSender};
 use crate::providers::common::{
-    apply_payload_hook, apply_response_hook, apply_stream_event_hook, finalize, initial_output,
-    is_leading_system, response_metadata, system_text, system_update_text, tools_at_point,
+    apply_headers, apply_payload_hook, apply_response_hook, apply_stream_event_hook, finalize,
+    initial_output, is_leading_system, request_headers, response_metadata, send_with_retry,
+    system_text, system_update_text, tools_at_point,
 };
 use crate::sse::{SseError, read_sse_stream};
 use crate::streaming_json::parse_tool_call_arguments;
 use crate::types::{
-    AssistantContent, AssistantMessage, AssistantMessageEvent, InputContent, Message, Model,
-    StopReason, StreamOptions, ToolCall, TranscriptContext, UserContent, now_ms,
+    AssistantContent, AssistantMessage, AssistantMessageEvent, InputContent, JsonObject, Message,
+    Model, StopReason, StreamOptions, ThinkingLevel, ToolCall, TranscriptContext, UserContent,
+    now_ms,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -88,6 +95,142 @@ async fn run(
 
 type StreamResult<T> = Result<T, String>;
 
+/// Wire field chosen for a request's output cap (`openai-completions.ts:834-841`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaxTokensField {
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+/// The payload-shaping subset of upstream `ResolvedOpenAICompletionsCompat`
+/// (`openai-completions.ts:1644-1691`), with explicit `model.compat` overrides
+/// layered on top (`openai-completions.ts:1698-1739`).
+#[derive(Debug, Clone)]
+struct OpenAiCompat {
+    max_tokens_field: MaxTokensField,
+    supports_developer_role: bool,
+    supports_store: bool,
+    supports_reasoning_effort: bool,
+    thinking_format: String,
+}
+
+fn compat_bool(compat: Option<&JsonObject>, key: &str) -> Option<bool> {
+    compat?.get(key).and_then(Value::as_bool)
+}
+
+fn compat_str(compat: Option<&JsonObject>, key: &str) -> Option<String> {
+    compat?.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// `detectCompat` + `getCompat` (`openai-completions.ts:1593-1739`).
+fn resolve_compat(model: &Model) -> OpenAiCompat {
+    let provider = model.provider.as_str();
+    let base = model.base_url.as_str();
+    let has = |needle: &str| base.contains(needle);
+
+    let is_zai = provider == "zai"
+        || provider == "zai-coding-cn"
+        || has("api.z.ai")
+        || has("open.bigmodel.cn");
+    let is_together = provider == "together" || has("api.together.ai") || has("api.together.xyz");
+    let is_moonshot =
+        provider == "moonshotai" || provider == "moonshotai-cn" || has("api.moonshot.");
+    let is_openrouter = provider == "openrouter" || has("openrouter.ai");
+    let is_cloudflare_workers = provider == "cloudflare-workers-ai" || has("api.cloudflare.com");
+    let is_cloudflare_gateway =
+        provider == "cloudflare-ai-gateway" || has("gateway.ai.cloudflare.com");
+    let is_nvidia = provider == "nvidia" || has("integrate.api.nvidia.com");
+    let is_ant_ling = provider == "ant-ling" || has("api.ant-ling.com");
+    let is_cerebras = provider == "cerebras" || has("cerebras.ai");
+    let is_deepseek = provider == "deepseek" || base.to_ascii_lowercase().contains("deepseek.com");
+    let is_grok = provider == "xai" || has("api.x.ai");
+
+    let is_non_standard = is_nvidia
+        || is_cerebras
+        || is_grok
+        || is_together
+        || has("chutes.ai")
+        || is_deepseek
+        || is_zai
+        || is_moonshot
+        || provider == "opencode"
+        || has("opencode.ai")
+        || is_cloudflare_workers
+        || is_cloudflare_gateway
+        || is_ant_ling;
+    let use_max_tokens = has("chutes.ai")
+        || is_deepseek
+        || is_moonshot
+        || is_cloudflare_gateway
+        || is_together
+        || is_nvidia
+        || is_ant_ling
+        || is_zai;
+    let is_openrouter_dev =
+        is_openrouter && (model.id.starts_with("anthropic/") || model.id.starts_with("openai/"));
+
+    let detected_thinking = if is_deepseek {
+        "deepseek"
+    } else if is_zai {
+        "zai"
+    } else if is_together {
+        "together"
+    } else if is_ant_ling {
+        "ant-ling"
+    } else if is_openrouter {
+        "openrouter"
+    } else {
+        "openai"
+    };
+
+    let max_tokens_field = match compat_str(model.compat.as_ref(), "maxTokensField").as_deref() {
+        Some("max_tokens") => MaxTokensField::MaxTokens,
+        None if use_max_tokens => MaxTokensField::MaxTokens,
+        Some(_) | None => MaxTokensField::MaxCompletionTokens,
+    };
+
+    OpenAiCompat {
+        max_tokens_field,
+        supports_developer_role: compat_bool(model.compat.as_ref(), "supportsDeveloperRole")
+            .unwrap_or(is_openrouter_dev || (!is_non_standard && !is_openrouter)),
+        supports_store: compat_bool(model.compat.as_ref(), "supportsStore")
+            .unwrap_or(!is_non_standard),
+        supports_reasoning_effort: compat_bool(model.compat.as_ref(), "supportsReasoningEffort")
+            .unwrap_or(
+                !is_grok
+                    && !is_zai
+                    && !is_moonshot
+                    && !is_together
+                    && !is_cloudflare_gateway
+                    && !is_nvidia
+                    && !is_ant_ling,
+            ),
+        thinking_format: compat_str(model.compat.as_ref(), "thinkingFormat")
+            .unwrap_or_else(|| detected_thinking.to_string()),
+    }
+}
+
+fn level_key(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Minimal => "minimal",
+        ThinkingLevel::Off => "off",
+        ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High => "high",
+    }
+}
+
+/// `model.thinkingLevelMap[level] ?? level` (`openai-completions.ts:934,951`).
+fn mapped_effort(model: &Model, level: ThinkingLevel) -> String {
+    model
+        .thinking_level_map
+        .as_ref()
+        .and_then(|map| map.get(level_key(level)))
+        .and_then(Value::as_str)
+        .unwrap_or(level_key(level))
+        .to_string()
+}
+
 /// Streaming state for text/thinking/tool-call blocks.
 #[derive(Default)]
 struct StreamState {
@@ -125,14 +268,24 @@ async fn request_and_stream(
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| format!("client build failed: {e}"))?;
-    let response = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {bearer}"))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+    // Upstream's createClient merges identity headers, `model.headers` and
+    // options headers before handing them to the SDK
+    // (`openai-completions.ts:751,773-776`). Catalog headers supply Copilot's
+    // User-Agent/Editor-* and NVIDIA's NVCF-POLL-SECONDS.
+    let auth = format!("Bearer {bearer}");
+    let headers = request_headers(
+        &[
+            ("content-type", "application/json"),
+            ("authorization", &auth),
+        ],
+        model,
+        options,
+    );
+    let response = send_with_retry(
+        || apply_headers(client.post(&url).json(&body), headers.clone()),
+        options,
+    )
+    .await?;
 
     // `onResponse` sees the raw status/headers before the body is consumed
     // (and before the `start` event). Upstream's SDK throws on non-2xx before
@@ -487,6 +640,14 @@ pub fn build_request_body(
     let mut params: Vec<Value> = Vec::new();
     // Tools are declared by system messages inside the transcript.
     let tools = tools_at_point(messages);
+    let compat = resolve_compat(model);
+    // Reasoning models with developer-role support use `developer` instead of
+    // `system` for instructions (`openai-completions.ts:1226,1254`).
+    let instruction_role = if model.reasoning && compat.supports_developer_role {
+        "developer"
+    } else {
+        "system"
+    };
 
     for (i, msg) in messages.iter().enumerate() {
         match msg {
@@ -499,7 +660,7 @@ pub fn build_request_body(
                 if text.is_empty() {
                     continue;
                 }
-                params.push(json!({ "role": "system", "content": text }));
+                params.push(json!({ "role": instruction_role, "content": text }));
             }
             Message::User(user) => match &user.content {
                 UserContent::Text(text) => {
@@ -578,6 +739,12 @@ pub fn build_request_body(
         "stream_options": { "include_usage": true },
     });
 
+    // Non-standard endpoints reject `store`; opt out when supported
+    // (`openai-completions.ts:830-832`).
+    if compat.supports_store {
+        body["store"] = json!(false);
+    }
+
     if !tools.is_empty() {
         let converted: Vec<Value> = tools
             .iter()
@@ -601,9 +768,108 @@ pub fn build_request_body(
     if let Some(temperature) = options.temperature {
         body["temperature"] = json!(temperature);
     }
+
+    // `maxTokensField` (`openai-completions.ts:834-841`): most compatible
+    // endpoints only understand the legacy `max_tokens` name.
     if let Some(max_tokens) = options.max_tokens {
-        body["max_tokens"] = json!(max_tokens.min(model.max_tokens));
+        let capped = max_tokens.min(model.max_tokens);
+        match compat.max_tokens_field {
+            MaxTokensField::MaxTokens => {
+                body["max_tokens"] = json!(capped);
+            }
+            MaxTokensField::MaxCompletionTokens => {
+                body["max_completion_tokens"] = json!(capped);
+            }
+        }
     }
+
+    // `thinkingFormat` family (`openai-completions.ts:868-968`).
+    let reasoning = options
+        .reasoning
+        .filter(|level| *level != ThinkingLevel::Off);
+    let effort_value = reasoning.map(|level| mapped_effort(model, level));
+    let off_value = model
+        .thinking_level_map
+        .as_ref()
+        .and_then(|map| map.get("off"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if model.reasoning {
+        match compat.thinking_format.as_str() {
+            "deepseek" => {
+                if reasoning.is_some() {
+                    body["thinking"] = json!({ "type": "enabled" });
+                } else if !matches!(
+                    model.thinking_level_map.as_ref().and_then(|m| m.get("off")),
+                    Some(Value::Null)
+                ) {
+                    body["thinking"] = json!({ "type": "disabled" });
+                }
+                if compat.supports_reasoning_effort
+                    && let Some(effort) = &effort_value
+                {
+                    body["reasoning_effort"] = json!(effort);
+                }
+            }
+            "qwen" => {
+                body["enable_thinking"] = json!(reasoning.is_some());
+                if compat.supports_reasoning_effort
+                    && let Some(effort) = &effort_value
+                {
+                    body["reasoning_effort"] = json!(effort);
+                }
+            }
+            "openrouter" => {
+                if let Some(effort) = &effort_value {
+                    body["reasoning"] = json!({ "effort": effort });
+                } else {
+                    body["reasoning"] = json!({ "effort": off_value.as_deref().unwrap_or("none") });
+                }
+            }
+            "together" => {
+                body["reasoning"] = json!({ "enabled": reasoning.is_some() });
+                if compat.supports_reasoning_effort
+                    && let Some(effort) = &effort_value
+                {
+                    body["reasoning_effort"] = json!(effort);
+                }
+            }
+            "zai" => {
+                body["thinking"] = json!({
+                    "type": if reasoning.is_some() { "enabled" } else { "disabled" },
+                    "clear_thinking": false,
+                });
+                if compat.supports_reasoning_effort
+                    && let Some(effort) = &effort_value
+                {
+                    body["reasoning_effort"] = json!(effort);
+                }
+            }
+            "ant-ling" => {
+                if let Some(mapped) = reasoning.and_then(|level| {
+                    model
+                        .thinking_level_map
+                        .as_ref()
+                        .and_then(|map| map.get(level_key(level)))
+                        .and_then(Value::as_str)
+                }) {
+                    body["reasoning"] = json!({ "effort": mapped });
+                }
+            }
+            // Default OpenAI-style `reasoning_effort` (`openai-completions.ts:960-968`).
+            _ => {
+                if compat.supports_reasoning_effort {
+                    if let Some(effort) = &effort_value {
+                        body["reasoning_effort"] = json!(effort);
+                    } else if let Some(off) = &off_value {
+                        body["reasoning_effort"] = json!(off);
+                    }
+                }
+            }
+        }
+    }
+
+    // Sampling overrides named fields last (`openai-completions.ts:994-998`).
     if let Some(sampling) = &options.sampling_params {
         for (key, value) in sampling {
             body[key] = value.clone();
@@ -781,5 +1047,132 @@ mod tests {
         assert_eq!(output.usage.output, 5);
         assert_eq!(output.usage.total_tokens, 15);
         assert_eq!(output.usage.cache_read, 4);
+    }
+
+    fn with_compat(mut model: Model, compat: Value) -> Model {
+        model.compat = serde_json::from_value(compat).ok();
+        model
+    }
+
+    fn system_user_context() -> TranscriptContext {
+        TranscriptContext {
+            messages: vec![
+                Message::System(SystemMessage {
+                    content: crate::types::StringOrTextBlocks::Text("Be terse.".into()),
+                    sections: None,
+                    tools_added: None,
+                    tools_removed: None,
+                    timestamp: 1,
+                }),
+                Message::User(UserMessage {
+                    content: UserContent::Text("hi".into()),
+                    timestamp: 2,
+                }),
+            ],
+        }
+    }
+
+    #[test]
+    fn compat_selects_max_tokens_field() {
+        let context = system_user_context();
+        let options = StreamOptions {
+            max_tokens: Some(1000),
+            ..Default::default()
+        };
+
+        // Explicit catalog override: legacy max_tokens.
+        let legacy = with_compat(test_model(), json!({ "maxTokensField": "max_tokens" }));
+        let body = build_request_body(&legacy, &context, &options).unwrap();
+        assert_eq!(body["max_tokens"], 1000);
+        assert!(body.get("max_completion_tokens").is_none());
+
+        // Default OpenAI behavior: max_completion_tokens.
+        let body = build_request_body(&test_model(), &context, &options).unwrap();
+        assert_eq!(body["max_completion_tokens"], 1000);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn compat_switches_system_to_developer_role() {
+        let context = system_user_context();
+        let mut model = test_model();
+        model.reasoning = true;
+        let with_role = with_compat(model.clone(), json!({ "supportsDeveloperRole": true }));
+        let body = build_request_body(&with_role, &context, &StreamOptions::default()).unwrap();
+        assert_eq!(body["messages"][0]["role"], "developer");
+
+        let no_role = with_compat(model, json!({ "supportsDeveloperRole": false }));
+        let body = build_request_body(&no_role, &context, &StreamOptions::default()).unwrap();
+        assert_eq!(body["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn compat_thinking_formats_shape_the_payload() {
+        let context = system_user_context();
+        let options = StreamOptions {
+            reasoning: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        };
+        let mut base = test_model();
+        base.reasoning = true;
+
+        let deepseek = with_compat(base.clone(), json!({ "thinkingFormat": "deepseek" }));
+        let body = build_request_body(&deepseek, &context, &options).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "medium");
+
+        let qwen = with_compat(base.clone(), json!({ "thinkingFormat": "qwen" }));
+        let body = build_request_body(&qwen, &context, &options).unwrap();
+        assert_eq!(body["enable_thinking"], true);
+        assert_eq!(body["reasoning_effort"], "medium");
+
+        let openrouter = with_compat(base.clone(), json!({ "thinkingFormat": "openrouter" }));
+        let body = build_request_body(&openrouter, &context, &options).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "medium");
+
+        let openai = with_compat(base, json!({ "thinkingFormat": "openai" }));
+        let body = build_request_body(&openai, &context, &options).unwrap();
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn supports_store_adds_store_false() {
+        let context = system_user_context();
+        let stored = with_compat(test_model(), json!({ "supportsStore": true }));
+        let body = build_request_body(&stored, &context, &StreamOptions::default()).unwrap();
+        assert_eq!(body["store"], false);
+
+        let unstored = with_compat(test_model(), json!({ "supportsStore": false }));
+        let body = build_request_body(&unstored, &context, &StreamOptions::default()).unwrap();
+        assert!(body.get("store").is_none());
+    }
+
+    #[test]
+    fn catalog_headers_reach_request_headers() {
+        // End-to-end: models.json -> Model.headers -> merged request headers.
+        let model = crate::catalog::catalog()
+            .get("github-copilot", "claude-fable-5")
+            .unwrap();
+        let headers = request_headers(
+            &[("content-type", "application/json")],
+            model,
+            &StreamOptions::default(),
+        );
+        assert_eq!(
+            headers["user-agent"].as_deref(),
+            Some("GitHubCopilotChat/0.35.0")
+        );
+        assert_eq!(headers["editor-version"].as_deref(), Some("vscode/1.107.0"));
+        assert_eq!(
+            headers["copilot-integration-id"].as_deref(),
+            Some("vscode-chat")
+        );
+
+        let nvidia = crate::catalog::catalog()
+            .get("nvidia", "deepseek-ai/deepseek-v4.1-flash")
+            .unwrap();
+        let headers = request_headers(&[], nvidia, &StreamOptions::default());
+        assert_eq!(headers["nvcf-poll-seconds"].as_deref(), Some("3600"));
     }
 }

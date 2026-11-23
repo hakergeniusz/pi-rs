@@ -5,7 +5,9 @@
 //! so session JSONL and RPC payloads stay compatible with the TS implementation.
 //! The `StreamOptions` hook slots port `ProviderRequestOptions`/`StreamOptions`
 //! (`packages/ai/src/types.ts:155-158,161-232`) and `buildBaseOptions`
-//! (`packages/ai/src/api/simple-options.ts:49-80`).
+//! (`packages/ai/src/api/simple-options.ts:49-80`). `ModelCost.tiers` mirrors
+//! `ModelCostSchema.tiers` (`providers/model-schema.ts:53-74`) consumed by
+//! `calculateCost` (`models.ts:1279-1299`).
 
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
@@ -286,8 +288,29 @@ pub enum CacheRetention {
     Long,
 }
 
-/// Model cost per million tokens (TS `ModelCost`).
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+/// A request-wide pricing tier (TS `ModelCostTier`,
+/// `providers/model-schema.ts:61-66`): the highest threshold below the request's
+/// total input replaces every base rate for the whole request
+/// (`models.ts:1282-1288`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCostTier {
+    #[serde(default)]
+    pub input_tokens_above: u64,
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub output: f64,
+    #[serde(default)]
+    pub cache_read: f64,
+    #[serde(default)]
+    pub cache_write: f64,
+}
+
+/// Model cost per million tokens (TS `ModelCost`, including the optional
+/// `tiers` array from `providers/model-schema.ts:67-74`). Not `Copy`: the tier
+/// list is owned heap data.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCost {
     #[serde(default)]
@@ -298,8 +321,12 @@ pub struct ModelCost {
     pub cache_read: f64,
     #[serde(default)]
     pub cache_write: f64,
+    /// Explicit 1h cache-write rate when a catalog supplies one; upstream
+    /// otherwise derives it as `2 * input` (`models.ts:1290-1296`).
     #[serde(default)]
     pub cache_write_1h: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<Vec<ModelCostTier>>,
 }
 
 /// Input modalities a model accepts (TS `ModelInputModality`).
@@ -755,6 +782,12 @@ pub struct StreamOptions {
     pub headers: BTreeMap<String, Option<String>>,
     pub cache_retention: Option<CacheRetention>,
     pub session_id: Option<String>,
+    /// Per-request provider retry budget forwarded to `retryProviderRequest`
+    /// (`utils/provider-retry.ts:107-127`); 0 disables retries.
+    pub max_retries: u32,
+    /// Server-requested retry delays above this cap fail immediately
+    /// (60s default when `None`, 0 disables the cap).
+    pub max_retry_delay_ms: Option<u64>,
     pub disable_continuation: bool,
     /// Thinking level for simple streams (TS `SimpleStreamOptions.reasoning`).
     pub reasoning: Option<ThinkingLevel>,

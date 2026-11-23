@@ -4,9 +4,10 @@
 //! `api/simple-options.ts:49-80`).
 
 use crate::cost::calculate_cost;
+use crate::retry::{ProviderError, ProviderRetryOptions, retry_provider_request};
 use crate::types::{
     AssistantMessage, JsonValue, Message, Model, PayloadHook, ProviderHook, ProviderResponse,
-    ResponseHook, StopReason, StreamEventHook, SystemMessage, Usage, now_ms,
+    ResponseHook, StopReason, StreamEventHook, StreamOptions, SystemMessage, Usage, now_ms,
 };
 use std::collections::BTreeMap;
 
@@ -152,6 +153,103 @@ pub fn response_metadata(response: &reqwest::Response) -> ProviderResponse {
         status: response.status().as_u16(),
         headers,
     }
+}
+
+/// Merge adapter defaults, catalog `model.headers` and per-call option headers
+/// into one lowercased map (TS `mergeHeaders(getIdentityHeaders(...), ...,
+/// model.headers, optionsHeaders)`: `openai-completions.ts:751,773-776`,
+/// `anthropic-messages.ts:1278-1287,1323-1332`). Catalog headers can replace a
+/// default (GitHub Copilot's `User-Agent`/`Editor-*`); option headers win over
+/// both. A `None` option value removes the header entirely.
+pub fn request_headers(
+    defaults: &[(&str, &str)],
+    model: &Model,
+    options: &StreamOptions,
+) -> BTreeMap<String, Option<String>> {
+    let mut headers = BTreeMap::new();
+    for (name, value) in defaults {
+        headers.insert(name.to_ascii_lowercase(), Some((*value).to_string()));
+    }
+    if let Some(model_headers) = &model.headers {
+        for (name, value) in model_headers {
+            headers.insert(name.to_ascii_lowercase(), Some(value.clone()));
+        }
+    }
+    for (name, value) in &options.headers {
+        headers.insert(name.to_ascii_lowercase(), value.clone());
+    }
+    headers
+}
+
+/// Send a provider request with the SDK-compatible retry wrapper
+/// (`utils/provider-retry.ts:99-128`): transient 408/409/429/5xx responses and
+/// transport failures are retried according to `StreamOptions.max_retries`,
+/// honouring `retry-after-ms`/`retry-after` and the delay cap. Non-2xx bodies
+/// are consumed so the error is the same one `read_sse_stream` would report.
+pub async fn send_with_retry(
+    build: impl Fn() -> reqwest::RequestBuilder,
+    options: &StreamOptions,
+) -> Result<reqwest::Response, String> {
+    let policy = ProviderRetryOptions {
+        max_retries: options.max_retries,
+        max_retry_delay_ms: options.max_retry_delay_ms,
+        ..Default::default()
+    };
+    retry_provider_request(
+        || async {
+            let response = build().send().await.map_err(|error| ProviderError {
+                status: None,
+                headers: BTreeMap::new(),
+                message: format!("request failed: {error}"),
+            })?;
+            let status = response.status();
+            let headers: BTreeMap<String, String> = response
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_ascii_lowercase(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            if status.is_success() {
+                return Ok(response);
+            }
+            let body = response.text().await.unwrap_or_default();
+            Err(ProviderError {
+                status: Some(status.as_u16()),
+                headers,
+                message: format!("HTTP {status}: {body}"),
+            })
+        },
+        &policy,
+    )
+    .await
+}
+
+/// Apply a merged header map to a request builder. `None` removes a header so
+/// callers can suppress a default through `options.headers`.
+pub fn apply_headers(
+    builder: reqwest::RequestBuilder,
+    headers: BTreeMap<String, Option<String>>,
+) -> reqwest::RequestBuilder {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        if let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
+            match value {
+                Some(value) => {
+                    if let Ok(value) = value.parse() {
+                        map.insert(name, value);
+                    }
+                }
+                None => {
+                    map.remove(&name);
+                }
+            }
+        }
+    }
+    builder.headers(map)
 }
 
 /// Run `onPayload` before the request is sent (TS `openai-completions.ts:375-378`,
@@ -327,5 +425,41 @@ mod tests {
             update.contains("Removed system prompt section \"gone\""),
             "{update}"
         );
+    }
+
+    #[test]
+    fn catalog_headers_override_defaults_and_options_win() {
+        let model = Model {
+            headers: Some(
+                [
+                    (
+                        "User-Agent".to_string(),
+                        "GitHubCopilotChat/0.35.0".to_string(),
+                    ),
+                    ("Editor-Version".to_string(), "vscode/1.107.0".to_string()),
+                    ("x-nvcF-poll-seconds".to_string(), "30".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..Model::default()
+        };
+        let mut options = StreamOptions::default();
+        options
+            .headers
+            .insert("USER-AGENT".to_string(), Some("custom/1".to_string()));
+        options.headers.insert("editor-version".to_string(), None);
+
+        let headers = request_headers(
+            &[("content-type", "application/json"), ("user-agent", "pi")],
+            &model,
+            &options,
+        );
+        assert_eq!(headers["content-type"].as_deref(), Some("application/json"));
+        // Catalog overrides the default; options override the catalog.
+        assert_eq!(headers["user-agent"].as_deref(), Some("custom/1"));
+        assert_eq!(headers.get("editor-version"), Some(&None));
+        assert_eq!(headers["x-nvcf-poll-seconds"].as_deref(), Some("30"));
+        assert_eq!(headers.len(), 4, "case variants must dedupe: {headers:?}");
     }
 }

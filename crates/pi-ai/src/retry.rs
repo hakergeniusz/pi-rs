@@ -8,17 +8,27 @@
 //!
 //! `retryAssistantCall`'s loop with the abortable backoff sleep lands with
 //! the agent-session retry machine (E2 slice 6e part 2); this module is the
-//! classification + policy surface that machine consumes.
+//! classification + policy surface that machine consumes. `retryProviderRequest`
+//! additionally ports the SDK-level request wrapper
+//! (`packages/ai/src/utils/provider-retry.ts:1-128`) used by the wire adapters.
 
+use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::LazyLock;
+use std::time::Duration;
 
-use crate::types::{AssistantMessage, StopReason};
+use crate::types::{AssistantMessage, StopReason, now_ms};
 
 /// `Number.MAX_SAFE_INTEGER` — the JS-side clamp for the computed delay.
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
 /// `DEFAULT_MAX_AGENT_RETRY_DELAY_MS` (`retry.ts:151`).
 pub const DEFAULT_MAX_AGENT_RETRY_DELAY_MS: u64 = 60_000;
+
+/// `DEFAULT_MAX_RETRY_DELAY_MS` (`utils/provider-retry.ts:1`), the cap for
+/// server-requested provider delays. Same value as the agent-level cap but a
+/// distinct upstream constant.
+pub const DEFAULT_MAX_PROVIDER_RETRY_DELAY_MS: u64 = 60_000;
 
 /// `RetryPolicy` (`retry.ts:143-150`): bounded attempts with exponential
 /// backoff.
@@ -190,6 +200,122 @@ pub fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
     RETRYABLE_PATTERN.is_match(error_message).unwrap_or(false)
 }
 
+/// A provider error carrying the HTTP metadata the SDK retry policy reads
+/// (`utils/provider-retry.ts:11-22`). Header names are lowercased, like the JS
+/// `Headers` object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderError {
+    pub status: Option<u16>,
+    pub headers: BTreeMap<String, String>,
+    pub message: String,
+}
+
+/// `ProviderRetryOptions` (`utils/provider-retry.ts:3-9`). Defaults mirror
+/// upstream's `retryProviderRequest`: no retries unless the caller opts in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderRetryOptions {
+    pub max_retries: u32,
+    pub max_retry_delay_ms: Option<u64>,
+    /// Statuses that fail at once although the default policy would retry
+    /// them (`utils/provider-retry.ts:8,121`).
+    pub no_retry_statuses: Vec<u16>,
+}
+
+fn response_header<'a>(error: &'a ProviderError, name: &str) -> Option<&'a str> {
+    error.headers.get(name).map(String::as_str)
+}
+
+/// `isRetryableProviderError` (`utils/provider-retry.ts:24-37`): the SDK's
+/// `x-should-retry` override wins, a missing status is a transport failure and
+/// is retryable, then 408/409/429/5xx.
+#[must_use]
+pub fn is_retryable_provider_error(error: &ProviderError) -> bool {
+    match response_header(error, "x-should-retry") {
+        Some("true") => return true,
+        Some("false") => return false,
+        _ => {}
+    }
+    let Some(status) = error.status else {
+        return true;
+    };
+    status == 408 || status == 409 || status == 429 || status >= 500
+}
+
+fn validate_server_delay(delay_ms: u64, max: Option<u64>, message: &str) -> Result<u64, String> {
+    let max = max.unwrap_or(DEFAULT_MAX_PROVIDER_RETRY_DELAY_MS);
+    if max > 0 && delay_ms > max {
+        return Err(format!(
+            "Server requested {}s retry delay (max: {}s). {message}",
+            delay_ms.div_ceil(1000),
+            max.div_ceil(1000)
+        ));
+    }
+    Ok(delay_ms)
+}
+
+/// `getRetryDelayMs` (`utils/provider-retry.ts:53-69`): server-provided
+/// `retry-after-ms` / `retry-after` (number of seconds) take precedence over
+/// an exponential `min(0.5 * 2^index, 8) * 1000` backoff with up to 25% jitter.
+/// The HTTP-date form of `retry-after` is not parsed (no HTTP-date dependency
+/// in this crate) and falls through to exponential backoff.
+pub fn provider_retry_delay_ms(
+    error: &ProviderError,
+    retry_index: u32,
+    max: Option<u64>,
+) -> Result<u64, String> {
+    if let Some(value) = response_header(error, "retry-after-ms")
+        && let Ok(ms) = value.parse::<f64>()
+        && ms.is_finite()
+    {
+        return validate_server_delay(ms.round() as u64, max, &error.message);
+    }
+    if let Some(value) = response_header(error, "retry-after")
+        && let Ok(seconds) = value.parse::<f64>()
+        && seconds.is_finite()
+    {
+        return validate_server_delay((seconds * 1000.0).round() as u64, max, &error.message);
+    }
+    let exponent = i32::try_from(retry_index).unwrap_or(i32::MAX);
+    let base = (0.5_f64 * 2_f64.powi(exponent)).min(8.0) * 1000.0;
+    let jitter = (now_ms().unsigned_abs() % 251) as f64 / 1000.0;
+    Ok((base * (1.0 - jitter)).round() as u64)
+}
+
+/// `retryProviderRequest` (`utils/provider-retry.ts:99-128`): retry a fresh
+/// provider request for transient errors, honouring server-requested delays
+/// and a bounded cap. Each failed attempt consumes one retry; a
+/// server-requested delay above `max_retry_delay_ms` fails immediately.
+pub async fn retry_provider_request<T, F, Fut>(
+    mut request: F,
+    options: &ProviderRetryOptions,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, ProviderError>>,
+{
+    let mut remaining = options.max_retries;
+    loop {
+        match request().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if remaining == 0
+                    || !is_retryable_provider_error(&error)
+                    || error
+                        .status
+                        .is_some_and(|status| options.no_retry_statuses.contains(&status))
+                {
+                    return Err(error.message);
+                }
+                let retry_index = options.max_retries - remaining;
+                remaining -= 1;
+                let delay =
+                    provider_retry_delay_ms(&error, retry_index, options.max_retry_delay_ms)?;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +437,126 @@ mod tests {
         assert_eq!(retry_delay_ms(&capped, 4), 5000);
         // Enormous attempt numbers clamp instead of overflowing.
         assert_eq!(retry_delay_ms(&capped, u32::MAX), 5000);
+    }
+
+    fn provider_error(status: Option<u16>, headers: &[(&str, &str)]) -> ProviderError {
+        ProviderError {
+            status,
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            message: "provider failed".to_string(),
+        }
+    }
+
+    #[test]
+    fn sdk_retry_policy_classifies_statuses_and_headers() {
+        for status in [408, 409, 429, 500, 502, 503, 504] {
+            assert!(is_retryable_provider_error(&provider_error(
+                Some(status),
+                &[]
+            )));
+        }
+        for status in [400, 401, 403, 404, 422] {
+            assert!(!is_retryable_provider_error(&provider_error(
+                Some(status),
+                &[]
+            )));
+        }
+        // Transport failures have no status.
+        assert!(is_retryable_provider_error(&provider_error(None, &[])));
+        // x-should-retry overrides the status.
+        assert!(is_retryable_provider_error(&provider_error(
+            Some(400),
+            &[("x-should-retry", "true")]
+        )));
+        assert!(!is_retryable_provider_error(&provider_error(
+            Some(500),
+            &[("x-should-retry", "false")]
+        )));
+    }
+
+    #[test]
+    fn server_retry_delays_are_honoured_or_capped() {
+        let error = provider_error(
+            Some(429),
+            &[("retry-after-ms", "250"), ("retry-after", "30")],
+        );
+        assert_eq!(provider_retry_delay_ms(&error, 3, None).unwrap(), 250);
+        let error = provider_error(Some(503), &[("retry-after", "2")]);
+        assert_eq!(provider_retry_delay_ms(&error, 0, None).unwrap(), 2000);
+        // A server delay beyond the cap fails like upstream.
+        let error = provider_error(Some(503), &[("retry-after-ms", "90000")]);
+        assert!(
+            provider_retry_delay_ms(&error, 0, None)
+                .unwrap_err()
+                .contains("retry delay")
+        );
+        // Exponential fallback is 500ms..8s before jitter.
+        let error = provider_error(Some(500), &[]);
+        let delay = provider_retry_delay_ms(&error, 0, None).unwrap();
+        assert!((375..=500).contains(&delay), "unexpected delay {delay}");
+        let delay = provider_retry_delay_ms(&error, 9, None).unwrap();
+        assert!((6000..=8000).contains(&delay), "unexpected delay {delay}");
+    }
+
+    #[tokio::test]
+    async fn retry_wrapper_retries_then_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = AtomicU32::new(0);
+        let policy = ProviderRetryOptions {
+            max_retries: 2,
+            max_retry_delay_ms: Some(0), // no wall-clock sleep in the test
+            ..Default::default()
+        };
+        let result = retry_provider_request(
+            || {
+                let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt < 2 {
+                        Err(provider_error(Some(429), &[("retry-after-ms", "1")]))
+                    } else {
+                        Ok(attempt)
+                    }
+                }
+            },
+            &policy,
+        )
+        .await;
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_wrapper_stops_at_budget_and_honours_no_retry_statuses() {
+        let calls = std::cell::Cell::new(0);
+        let policy = ProviderRetryOptions {
+            max_retries: 2,
+            max_retry_delay_ms: Some(0),
+            no_retry_statuses: vec![504],
+        };
+        let error = retry_provider_request(
+            || {
+                calls.set(calls.get() + 1);
+                async { Err::<(), _>(provider_error(Some(500), &[("retry-after-ms", "0")])) }
+            },
+            &policy,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "provider failed");
+        assert_eq!(calls.get(), 3, "initial call + two retries");
+
+        let calls = std::cell::Cell::new(0);
+        let _ = retry_provider_request(
+            || {
+                calls.set(calls.get() + 1);
+                async { Err::<(), _>(provider_error(Some(504), &[])) }
+            },
+            &policy,
+        )
+        .await;
+        assert_eq!(calls.get(), 1, "no_retry_statuses fails immediately");
     }
 }

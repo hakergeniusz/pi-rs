@@ -4,13 +4,17 @@
 //! P1 scope: api-key auth, request building (system/messages/tools/thinking
 //! budgets), SSE streaming mapped to the unified protocol, stop-reason and
 //! usage mapping, catalog-priced cost. The hook bridges mirror
-//! `api/anthropic-messages.ts:905-908,943,954`. Deferred: OAuth, Claude Code
-//! name mapping, model fallbacks, threads, retries, `OpenRouter` billing.
+//! `api/anthropic-messages.ts:905-908,943,954`. `forceAdaptiveThinking` ports
+//! the adaptive branch (`anthropic-messages.ts:1228-1235,1557-1575`), and
+//! catalog `model.headers` are merged (`anthropic-messages.ts:1278-1332`).
+//! Deferred: OAuth, Claude Code name mapping, model fallbacks, threads,
+//! retries, `OpenRouter` billing, prompt cache control / interleaved beta.
 
 use crate::event_stream::{AssistantMessageEventStream, EventSender};
 use crate::providers::common::{
-    apply_payload_hook, apply_response_hook, apply_stream_event_hook, finalize, initial_output,
-    is_leading_system, response_metadata, system_text, system_update_text,
+    apply_headers, apply_payload_hook, apply_response_hook, apply_stream_event_hook, finalize,
+    initial_output, is_leading_system, request_headers, response_metadata, send_with_retry,
+    system_text, system_update_text,
 };
 use crate::sse::{SseError, read_sse_stream};
 use crate::streaming_json::parse_tool_call_arguments;
@@ -119,20 +123,29 @@ async fn request_and_stream(
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| format!("client build failed: {e}"))?;
-    let mut request = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("anthropic-version", "2023-06-01");
-    if let Some(token) = &access_token {
-        request = request.header("authorization", format!("Bearer {token}"));
-    } else if let Some(key) = &api_key {
-        request = request.header("x-api-key", key);
+    // Upstream's createClient merges identity + accept defaults, catalog
+    // `model.headers` and options headers (`anthropic-messages.ts:1278-1287,
+    // 1323-1332`); this is how Copilot's User-Agent/Editor-* arrive.
+    let auth_header = if let Some(token) = &access_token {
+        Some(("authorization", format!("Bearer {token}")))
+    } else {
+        api_key.as_ref().map(|key| ("x-api-key", key.clone()))
+    };
+    let mut defaults = vec![
+        ("content-type", "application/json"),
+        ("accept", "application/json"),
+        ("anthropic-version", "2023-06-01"),
+        ("anthropic-dangerous-direct-browser-access", "true"),
+    ];
+    if let Some((name, value)) = &auth_header {
+        defaults.push((*name, value.as_str()));
     }
-    let response = request
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+    let headers = request_headers(&defaults, model, options);
+    let response = send_with_retry(
+        || apply_headers(client.post(&url).json(&body), headers.clone()),
+        options,
+    )
+    .await?;
 
     // `onResponse` observes the raw status/headers before the body is consumed
     // and before the `start` event (TS line 943). Upstream's SDK throws on
@@ -708,38 +721,65 @@ pub fn build_request_body(
         body["temperature"] = json!(temperature);
     }
 
-    // Thinking budgets: token-based via model.thinkingLevelMap when present,
-    // otherwise level defaults capped to half the max tokens.
+    // Thinking: adaptive models select an effort level; older models take a
+    // token budget (`anthropic-messages.ts:1226-1253,1557-1575`).
     if let Some(level) = options.reasoning
         && model.reasoning
     {
-        let default_budgets: [(ThinkingLevel, u64); 5] = [
-            (ThinkingLevel::Minimal, 1024),
-            (ThinkingLevel::Off, 0),
-            (ThinkingLevel::Low, 2048),
-            (ThinkingLevel::Medium, 4096),
-            (ThinkingLevel::High, 8192),
-        ];
-        let mapped = model
-            .thinking_level_map
+        let force_adaptive = model
+            .compat
             .as_ref()
-            .and_then(|m| m.get(map_key(level)))
-            .cloned();
-        let budget = mapped
-            .as_ref()
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                default_budgets
-                    .iter()
-                    .find(|(l, _)| *l == level)
-                    .map(|(_, b)| *b)
-            })
-            .unwrap_or(0);
-        if budget > 0 {
-            body["thinking"] = json!({
-                "type": "enabled",
-                "budget_tokens": budget.min(max_tokens / 2).max(1024),
-            });
+            .and_then(|compat| compat.get("forceAdaptiveThinking"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if force_adaptive {
+            // `mapThinkingLevelToEffort` (`anthropic-messages.ts:1186-1204`):
+            // the catalog mapping wins, otherwise levels collapse to
+            // low/medium/high. Adaptive thinking needs no budget or beta header.
+            let effort = model
+                .thinking_level_map
+                .as_ref()
+                .and_then(|map| map.get(map_key(level)))
+                .and_then(Value::as_str)
+                .map_or_else(
+                    || match level {
+                        ThinkingLevel::Minimal | ThinkingLevel::Low => "low".to_string(),
+                        ThinkingLevel::Medium => "medium".to_string(),
+                        ThinkingLevel::High | ThinkingLevel::Off => "high".to_string(),
+                    },
+                    str::to_string,
+                );
+            body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
+            body["output_config"] = json!({ "effort": effort });
+        } else {
+            let default_budgets: [(ThinkingLevel, u64); 5] = [
+                (ThinkingLevel::Minimal, 1024),
+                (ThinkingLevel::Off, 0),
+                (ThinkingLevel::Low, 2048),
+                (ThinkingLevel::Medium, 4096),
+                (ThinkingLevel::High, 8192),
+            ];
+            let mapped = model
+                .thinking_level_map
+                .as_ref()
+                .and_then(|m| m.get(map_key(level)))
+                .cloned();
+            let budget = mapped
+                .as_ref()
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    default_budgets
+                        .iter()
+                        .find(|(l, _)| *l == level)
+                        .map(|(_, b)| *b)
+                })
+                .unwrap_or(0);
+            if budget > 0 {
+                body["thinking"] = json!({
+                    "type": "enabled",
+                    "budget_tokens": budget.min(max_tokens / 2).max(1024),
+                });
+            }
         }
     }
 
@@ -894,5 +934,59 @@ mod tests {
             output.usage.input, 0,
             "missing input preserved from message_start"
         );
+    }
+
+    fn thinking_context() -> TranscriptContext {
+        TranscriptContext {
+            messages: vec![
+                Message::System(SystemMessage {
+                    content: crate::types::StringOrTextBlocks::Text("Be terse.".into()),
+                    sections: None,
+                    tools_added: None,
+                    tools_removed: None,
+                    timestamp: 1,
+                }),
+                Message::User(UserMessage {
+                    content: UserContent::Text("hi".into()),
+                    timestamp: 2,
+                }),
+            ],
+        }
+    }
+
+    #[test]
+    fn force_adaptive_thinking_uses_effort_not_budget() {
+        let mut model = test_model();
+        model.compat = json!({ "forceAdaptiveThinking": true })
+            .as_object()
+            .cloned();
+        let options = StreamOptions {
+            reasoning: Some(ThinkingLevel::Low),
+            max_tokens: Some(8192),
+            ..Default::default()
+        };
+        let body = build_request_body(&model, &thinking_context(), &options).unwrap();
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert_eq!(body["output_config"]["effort"], "low");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+
+        // The catalog mapping overrides the default effort level.
+        model.thinking_level_map = Some(json!({ "low": "xhigh" }).as_object().cloned().unwrap());
+        let body = build_request_body(&model, &thinking_context(), &options).unwrap();
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn legacy_models_still_send_budget_tokens() {
+        let model = test_model();
+        let options = StreamOptions {
+            reasoning: Some(ThinkingLevel::Medium),
+            ..Default::default()
+        };
+        let body = build_request_body(&model, &thinking_context(), &options).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 4096);
+        assert!(body.get("output_config").is_none());
     }
 }
