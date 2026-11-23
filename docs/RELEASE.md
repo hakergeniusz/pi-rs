@@ -1,8 +1,9 @@
 # Cutting a pi-rs release
 
 This is the release runbook. It complements `PLAN.md` (P7 exit: "tagged
-v0.1.0") and `AGENTS.md` (git/release policy). The installer contract
-(`scripts/install.sh`) is defined at the bottom of this document.
+v0.1.0") and `AGENTS.md` (git/release policy). The installer contracts
+(`scripts/install.sh` for Linux/macOS and `scripts/install.ps1` for Windows)
+are defined at the bottom of this document.
 
 ## v0.1.0 — actual release state (2026-11-21)
 
@@ -133,8 +134,8 @@ is then:
 1. push the annotated tag (approval required — see `WIRING.md` §3);
 2. watch the workflow: `gh run list --branch v0.1.0 --limit 5` then
    `gh run watch <run-id> --exit-status`;
-3. confirm the Release exists and has **eight** assets (four binaries + four
-   `.sha256` files);
+3. confirm the Release exists and has **ten** assets (five binaries + five
+   `.sha256` files), including `pi-windows-x86_64.exe` and its checksum;
 4. edit the Release notes if the generated ones need context (approval not
    needed for wording, but announce the release only after user sign-off).
 
@@ -149,11 +150,12 @@ gh release create v0.1.0 \
   dist/pi-linux-aarch64 dist/pi-linux-aarch64.sha256 \
   dist/pi-darwin-x86_64 dist/pi-darwin-x86_64.sha256 \
   dist/pi-darwin-aarch64 dist/pi-darwin-aarch64.sha256 \
+  dist/pi-windows-x86_64.exe dist/pi-windows-x86_64.exe.sha256 \
   --title "pi-rs v0.1.0" --generate-notes
 ```
 
 Generate each checksum in the directory containing the binary, so the file
-contains just the basename (this is the format the installer parses):
+contains just the basename (this is the format the installers parse):
 
 ```sh
 cd dist
@@ -161,12 +163,20 @@ sha256sum pi-linux-x86_64 > pi-linux-x86_64.sha256       # Linux
 shasum -a 256 pi-darwin-aarch64 > pi-darwin-aarch64.sha256  # macOS/BSD
 ```
 
+On Windows, generate the checksum in PowerShell (the CI staging step uses the
+same command; the basename in the file includes the `.exe` extension):
+
+```powershell
+$hash = (Get-FileHash -Algorithm SHA256 pi-windows-x86_64.exe).Hash.ToLower()
+[System.IO.File]::WriteAllText("pi-windows-x86_64.exe.sha256", "$hash  pi-windows-x86_64.exe`n")
+```
+
 `gh release upload v0.1.0 <files...>` attaches additional assets to an
 existing release. Never commit release binaries — they are build artifacts.
 
 ## 6. Installer contract
 
-`scripts/install.sh` expects, for release tag `TAG`:
+Both installers expect, for release tag `TAG`:
 
 | Asset | Purpose |
 |---|---|
@@ -174,13 +184,31 @@ existing release. Never commit release binaries — they are build artifacts.
 | `pi-linux-aarch64` | binary, Linux ARM64 |
 | `pi-darwin-x86_64` | binary, macOS Intel |
 | `pi-darwin-aarch64` | binary, macOS Apple Silicon |
-| `<binary asset>.sha256` | one checksum file per binary, format `<sha>  <basename>` (a single `SHA256SUMS` with the same lines is also accepted as a fallback) |
+| `pi-windows-x86_64.exe` | binary, Windows x86-64 (per-user, no admin needed) |
+| `<binary asset>.sha256` | one checksum file per binary, format `<sha>  <basename>`; the basename includes the `.exe` extension for the Windows asset. A single `SHA256SUMS` with the same lines is also accepted as a fallback by `install.sh`. |
 
-The installer maps `uname -s`/`uname -m` to that table, downloads the binary
-and its checksum, verifies SHA-256 (with `sha256sum` or `shasum -a 256`), and
-only then copies it to `$PI_INSTALL_DIR/pi` (default `~/.local/bin/pi`). It
-never pipes downloads to a shell, never writes outside the prefix (apart from
-a cleaned-up `TMPDIR` scratch dir), and uses `sudo` only with `--sudo`.
+`scripts/install.sh` maps `uname -s`/`uname -m` to that table, downloads the
+binary and its checksum, verifies SHA-256 (with `sha256sum` or `shasum -a
+256`), and only then copies it to `$PI_INSTALL_DIR/pi-rs` (default
+`~/.local/bin/pi-rs`). It never pipes downloads to a shell, never writes
+outside the prefix (apart from a cleaned-up `TMPDIR` scratch dir), and uses
+`sudo` only with `--sudo`.
+
+`scripts/install.ps1` supports the one-liner:
+
+```powershell
+irm https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.ps1 | iex
+```
+
+It detects an x86-64 host (clear error otherwise), downloads
+`pi-windows-x86_64.exe` plus `pi-windows-x86_64.exe.sha256` with
+`Invoke-WebRequest -UseBasicParsing`, verifies SHA-256 with `Get-FileHash`
+**before** writing anything, and installs to `<Prefix>\pi-rs.exe` (default
+`$env:LOCALAPPDATA\Programs\pi-rs`). It writes only inside the prefix, except
+that the opt-in `-AddToPath` switch appends the prefix to the *user* PATH.
+`-Version` selects the release tag (default `v0.1.1`; pass `latest` for the
+newest release) and `-Force` replaces an existing install. No downloaded
+content other than this script itself is ever passed to `iex`.
 
 ## 7. Verify a release locally with the installer
 
@@ -207,6 +235,21 @@ cd "$DEST" && sha256sum -c pi-linux-x86_64.sha256   # or shasum -a 256 -c ...
 
 A mismatch, a 404, or a token error must leave the prefix untouched. After
 verifying, remove the scratch dir (use `trash` on the operator's workstation).
+
+The Windows installer can be verified the same way, downloading the script as
+a file first so it can be read before running:
+
+```powershell
+irm https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.ps1 -OutFile install.ps1
+$DEST = Join-Path $env:TEMP 'pi-rs-install-test'
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Prefix $DEST -Version v0.1.1
+& (Join-Path $DEST 'pi-rs.exe') --version    # must report 0.1.1
+```
+
+Expect a `checksum OK` line followed by the install path and next steps. A
+checksum mismatch aborts before the prefix is touched. To uninstall, remove
+`<Prefix>\pi-rs.exe` (and, if you used `-AddToPath`, remove the prefix from
+your user PATH).
 
 ## 8. Post-release
 

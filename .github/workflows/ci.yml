@@ -181,10 +181,13 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $env:ASSET = "pi-${{ matrix.os }}-${{ matrix.arch }}"
+          # Keep the .exe extension in the published asset name so the binary is
+          # self-describing; the checksum filename derives from the asset name.
+          $env:ASSET = "pi-${{ matrix.os }}-${{ matrix.arch }}.exe"
           Copy-Item "target/${{ matrix.target }}/release/pi.exe" "dist/$env:ASSET"
           $hash = (Get-FileHash -Algorithm SHA256 "dist/$env:ASSET").Hash.ToLower()
           # Match sha256sum's `<sha>  <basename>\n` format (two spaces, LF).
+          # The basename now includes the .exe extension.
           [System.IO.File]::WriteAllText("dist/${env:ASSET}.sha256", "$hash  ${env:ASSET}`n")
           Get-Content "dist/$env:ASSET.sha256"
       - name: Upload assets
@@ -215,6 +218,10 @@ jobs:
         run: |
           set -eu
           shopt -s nullglob
+          # The glob covers extensionless Linux/macOS assets and the Windows
+          # .exe asset alike; .sha256 files are skipped and each remaining
+          # binary must have a matching <asset>.sha256 (e.g. the checksum for
+          # pi-windows-x86_64.exe is pi-windows-x86_64.exe.sha256).
           assets=(dist/pi-*-*)
           test ${#assets[@]} -gt 0
           for asset in "${assets[@]}"; do
