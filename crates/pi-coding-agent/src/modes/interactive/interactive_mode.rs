@@ -11,6 +11,16 @@
 //! `interactive-mode.ts:641-700`); the selector dialogs are editor-slot
 //! swaps, and the extension host is deferred.
 //!
+//! Startup notices and update notifications are bordered with
+//! [`super::components::dynamic_border::DynamicBorder`]
+//! (`components/dynamic-border.ts`; `interactive-mode.ts:871-918,4821-4869`).
+//! Header-logo clicks play the full 3D egg on both renderers: upstream's lazy
+//! wrapper only permits `TuiAltScreen` (`components/easter-egg-3d.lazy.ts:8-17`),
+//! but this port's main-screen `Tui` composites overlays, so regular mode
+//! plays the same animation after a one-line mouse dispatch in the flat tree
+//! (`packages/tui/src/tui.ts:81-116,1087-1121`). The deviation is local to the
+//! guard; the animation component itself is unchanged.
+//!
 //! Image/MCP wiring parity (`sdk.ts:296-331`, `tool-result-images.ts:24-67`,
 //! `interactive-mode.ts:5153-5174`, `extensions/mcp/runtime.ts:382-384`):
 //! the mode owns a live [`crate::images::ImageSettings`] cell, refreshed from
@@ -411,6 +421,11 @@ struct UiSnapshotState {
 /// total widget lines one `setWidget` renders.
 #[cfg(feature = "ext-js")]
 const MAX_WIDGET_LINES: usize = 10;
+
+/// Display-only companion to `lastChangelogVersion` (`interactive-mode.ts:1379`).
+/// `main.rs` owns the ping setting and records it before the mode is built, so
+/// the visible "What's New" block tracks its own seen version instead.
+const DISPLAY_VERSION_SETTING: &str = "lastDisplayedChangelogVersion";
 
 /// One registered autocomplete wrapper (E3 slice 8): the engine-side
 /// chain index (the order `addAutocompleteProvider` registered) and the
@@ -1978,6 +1993,18 @@ pub struct InteractiveMode {
     /// host owns it because the port has no timers: `pump` refreshes the
     /// terminal rows and hides the overlay once the exit completes.
     easter_egg: Option<EasterEggHandle>,
+    /// The same animation in regular (main-screen) mode. Upstream's lazy
+    /// wrapper refuses it (`tui instanceof TuiAltScreen`,
+    /// `easter-egg-3d.lazy.ts:9`), but this port's Tui composites overlays
+    /// on the main screen too, so a logo click can play the full animation
+    /// instead of silently doing nothing. Kept apart from `easter_egg` so
+    /// the fullscreen-only handle keeps its own lifecycle and tests.
+    regular_easter_egg: Option<EasterEggHandle>,
+    /// `startupNoticesShown` (`interactive-mode.ts:512,872-875`).
+    startup_notices_shown: bool,
+    /// The version passed to the startup header; also the version the startup
+    /// changelog notice records as seen.
+    version: String,
     /// Header-logo clicks queued by the header's callback, which cannot
     /// borrow the mode during dispatch (`header.onLogoClick`,
     /// `interactive-mode.ts:792`).
@@ -2267,6 +2294,9 @@ impl InteractiveMode {
             editor_id,
             viewport: None,
             easter_egg: None,
+            regular_easter_egg: None,
+            startup_notices_shown: false,
+            version: options.version.clone(),
             easter_egg_requests,
             auth_path: options
                 .auth_path
@@ -2508,6 +2538,10 @@ impl InteractiveMode {
         // chain only changes at load/reload).
         #[cfg(feature = "ext-js")]
         mode.setup_markdown_transformers();
+        // The one-time startup notice block (`interactive-mode.ts:2172`):
+        // "What's New" framed by two DynamicBorders when a shipped changelog
+        // has entries the display setting has not seen yet.
+        mode.show_startup_notices_if_needed();
         // The initial program status report (`interactive-mode.ts:1040`,
         // `init` after `ui.start()`): an idle report now is re-written once
         // the terminal confirms OSC 7501 support. The init title follows
@@ -3929,6 +3963,21 @@ impl InteractiveMode {
         }
         let screen = self.tui.last_lines().to_vec();
         self.easter_egg = Some(play_easter_egg_3d(&mut self.tui, screen, egg));
+        true
+    }
+
+    /// Play the full 3D egg in regular mode. Upstream's wrapper gives up here
+    /// (`easter-egg-3d.lazy.ts:9`), but the port's `Tui::show_overlay`
+    /// composites the animation over the main-screen frame, so the header
+    /// logo click shows the same dissolve/spin/puzzle instead of nothing.
+    /// The screen is still captured before the overlay mounts, exactly as in
+    /// the fullscreen branch.
+    fn play_easter_egg_regular(&mut self, egg: EasterEgg3d) -> bool {
+        if self.tui.has_overlay() {
+            return true;
+        }
+        let screen = self.tui.last_lines().to_vec();
+        self.regular_easter_egg = Some(play_easter_egg_3d(&mut self.tui, screen, egg));
         true
     }
 
@@ -6074,7 +6123,9 @@ impl InteractiveMode {
         let extension_shortcuts: Vec<(String, String)> = Vec::new();
         let hotkeys = hotkeys_markdown(&extension_shortcuts);
         self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
-        self.add_to_chat(Box::new(super::components::header::DynamicBorder::new()));
+        self.add_to_chat(Box::new(
+            super::components::dynamic_border::DynamicBorder::new(),
+        ));
         self.add_to_chat(Box::new(Text::new(
             theme::theme().fg(
                 pi_tui::theme::ThemeColor::Accent,
@@ -6092,7 +6143,9 @@ impl InteractiveMode {
             None,
             pi_tui::components::markdown::MarkdownOptions::default(),
         )));
-        self.add_to_chat(Box::new(super::components::header::DynamicBorder::new()));
+        self.add_to_chat(Box::new(
+            super::components::dynamic_border::DynamicBorder::new(),
+        ));
         self.tui.request_render();
     }
 
@@ -6119,7 +6172,9 @@ impl InteractiveMode {
         };
 
         self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
-        self.add_to_chat(Box::new(super::components::header::DynamicBorder::new()));
+        self.add_to_chat(Box::new(
+            super::components::dynamic_border::DynamicBorder::new(),
+        ));
         self.add_to_chat(Box::new(Text::new(
             theme::theme().fg(pi_tui::theme::ThemeColor::Accent, &bold_text("What's New")),
             1,
@@ -6142,7 +6197,175 @@ impl InteractiveMode {
                 ..pi_tui::components::markdown::MarkdownOptions::default()
             },
         )));
-        self.add_to_chat(Box::new(super::components::header::DynamicBorder::new()));
+        self.add_to_chat(Box::new(
+            super::components::dynamic_border::DynamicBorder::new(),
+        ));
+        self.tui.request_render();
+    }
+
+    /// `showStartupNoticesIfNeeded` (`interactive-mode.ts:871-918`): the
+    /// bordered "What's New" block once at startup. Upstream reads
+    /// `lastChangelogVersion`; this port's `main.rs` already consumes that
+    /// setting for the install/update ping before the mode is built, so the
+    /// display uses a second, display-only key. Extension changelog updates
+    /// have no host data source in the port and remain a documented gap.
+    pub fn show_startup_notices_if_needed(&mut self) {
+        if self.startup_notices_shown {
+            return;
+        }
+        self.startup_notices_shown = true;
+        // Upstream skips notices on a resumed session (`:1373-1377`).
+        if self.session.get_branch(None).is_ok_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, crate::session::records::SessionEntry::Message(_)))
+        }) {
+            return;
+        }
+        let last = self
+            .settings
+            .get(DISPLAY_VERSION_SETTING)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let entries = crate::changelog::parse_changelog(&crate::changelog::get_changelog_path());
+        let fresh = match last
+            .as_deref()
+            .and_then(|version| crate::changelog::get_new_entries(&entries, version))
+        {
+            Some(new_entries) => new_entries,
+            // No readable saved version: upstream records the current one and
+            // shows nothing. The very first run with a shipped changelog shows
+            // it once, matching the visible startup block in the 1.5.2 TUI.
+            None if last.is_none() => entries,
+            None => Vec::new(),
+        };
+        if fresh.is_empty() {
+            return;
+        }
+        self.settings
+            .set(DISPLAY_VERSION_SETTING, serde_json::json!(self.version));
+        let markdown = fresh
+            .iter()
+            .map(|entry| {
+                crate::changelog::normalize_changelog_links(&entry.content, &entry.version_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        if self.chat_len() > 0 {
+            self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        }
+        self.add_to_chat(Box::new(
+            super::components::dynamic_border::DynamicBorder::new(),
+        ));
+        if self.settings.get_collapse_changelog() {
+            let version_text = fresh.first().map_or_else(
+                || self.version.clone(),
+                crate::changelog::ChangelogEntry::version_string,
+            );
+            let condensed = format!(
+                "Updated to v{version_text}. Use {} to view full changelog.",
+                theme::theme().fg(pi_tui::theme::ThemeColor::Accent, "/changelog")
+            );
+            self.add_to_chat(Box::new(Text::new(condensed, 1, 0)));
+        } else {
+            self.add_to_chat(Box::new(Text::new(
+                theme::theme().fg(pi_tui::theme::ThemeColor::Accent, &bold_text("What's New")),
+                1,
+                0,
+            )));
+            self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+            let transform = self
+                .markdown_transform_ctx
+                .make("changelog", None, None, None);
+            self.add_to_chat(Box::new(pi_tui::components::markdown::Markdown::new(
+                markdown.trim().to_string(),
+                1,
+                0,
+                theme::markdown_theme(),
+                None,
+                pi_tui::components::markdown::MarkdownOptions {
+                    transform,
+                    ..pi_tui::components::markdown::MarkdownOptions::default()
+                },
+            )));
+            self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        }
+        self.add_to_chat(Box::new(
+            super::components::dynamic_border::DynamicBorder::new(),
+        ));
+        self.tui.request_render();
+    }
+
+    /// `showNewVersionNotification` (`interactive-mode.ts:4821-4849`): the
+    /// warning-bordered update notice. The port has no update checker yet, so
+    /// this is a public surface for the host to call once one lands.
+    pub fn show_new_version_notification(&mut self, version: &str, note: Option<&str>) {
+        let muted = |text: &str| theme::theme().fg(pi_tui::theme::ThemeColor::Muted, text);
+        let accent = |text: &str| theme::theme().fg(pi_tui::theme::ThemeColor::Accent, text);
+        let border = || super::components::dynamic_border::DynamicBorder::warning();
+        self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        self.add_to_chat(Box::new(border()));
+        let heading = format!(
+            "{}\nNew version {} is available. Run {}",
+            theme::theme().fg(
+                pi_tui::theme::ThemeColor::Warning,
+                &bold_text("Update Available")
+            ),
+            version,
+            accent("pi update")
+        );
+        self.add_to_chat(Box::new(Text::new(heading, 1, 0)));
+        if let Some(note) = note.filter(|note| !note.trim().is_empty()) {
+            self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+            self.add_to_chat(Box::new(pi_tui::components::markdown::Markdown::new(
+                note.trim().to_string(),
+                1,
+                0,
+                theme::markdown_theme(),
+                None,
+                pi_tui::components::markdown::MarkdownOptions::default(),
+            )));
+            self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        }
+        self.add_to_chat(Box::new(Text::new(
+            format!("{}https://pi.dev/changelog", muted("Changelog: ")),
+            1,
+            0,
+        )));
+        self.add_to_chat(Box::new(border()));
+        self.tui.request_render();
+    }
+
+    /// `showPackageUpdateNotification` (`interactive-mode.ts:4851-4869`): the
+    /// warning-bordered package update notice. Also a host-facing surface: no
+    /// package-update checker exists in the port yet.
+    pub fn show_package_update_notification(&mut self, packages: &[String]) {
+        let muted = |text: &str| theme::theme().fg(pi_tui::theme::ThemeColor::Muted, text);
+        let accent = |text: &str| theme::theme().fg(pi_tui::theme::ThemeColor::Accent, text);
+        self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
+        self.add_to_chat(Box::new(
+            super::components::dynamic_border::DynamicBorder::warning(),
+        ));
+        let lines = packages
+            .iter()
+            .map(|package| format!("- {package}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!(
+            "{}\nPackage updates are available. Run {}\n{}\n{}",
+            theme::theme().fg(
+                pi_tui::theme::ThemeColor::Warning,
+                &bold_text("Package Updates Available")
+            ),
+            accent("pi update --extensions"),
+            muted("Packages:"),
+            lines
+        );
+        self.add_to_chat(Box::new(Text::new(text, 1, 0)));
+        self.add_to_chat(Box::new(
+            super::components::dynamic_border::DynamicBorder::warning(),
+        ));
         self.tui.request_render();
     }
 
@@ -7132,6 +7355,13 @@ impl InteractiveMode {
         for event in events {
             match event {
                 StdinEvent::Data(sequence) => {
+                    // Regular-mode mouse reports: upstream's `Tui` dispatches
+                    // them to the component under the pointer before keyboard
+                    // handling. The alt screen consumes them in its own input
+                    // listener; `Tui::handle_mouse_input` is a no-op there.
+                    if self.tui.handle_mouse_input(&sequence) {
+                        continue;
+                    }
                     // A live `!` command owns the terminal: forward raw bytes
                     // into the pty, and let `^C`/Esc abort it (upstream's
                     // `abortBash`, `agent-session.ts:4067-4071`) instead of
@@ -7405,6 +7635,12 @@ impl InteractiveMode {
     /// viewport on the alt screen (`switchTuiMode("fullscreen")`'s
     /// `mountInteractiveTui` + `setLayoutRoot`, `interactive-mode.ts:672-680`).
     fn enter_fullscreen(&mut self) -> Result<(), String> {
+        // A regular-mode egg overlays the main-screen frame; it cannot span
+        // the renderer swap. Retire it so a fullscreen logo click can mount
+        // its own animation (upstream's guard allows only one at a time).
+        if let Some(handle) = self.regular_easter_egg.take() {
+            self.tui.hide_overlay(handle.overlay);
+        }
         let hosts = self.tui.take_root_children();
         let scrollbar = self.settings.get_fullscreen_scrollbar().into();
         let options = self.fullscreen_options();
@@ -12514,23 +12750,37 @@ impl InteractiveMode {
             Err(_) => Vec::new(),
         };
         for (column, row) in pending_clicks {
-            self.play_easter_egg(EasterEgg3d::PiLogo {
+            let egg = EasterEgg3d::PiLogo {
                 column: usize::try_from(column).unwrap_or(0),
                 row: usize::try_from(row).unwrap_or(0),
-            });
+            };
+            // Fullscreen keeps upstream's handle; the main-screen Tui can
+            // composite overlays too, so the logo plays there as well.
+            if self.tui.alt_screen_active() {
+                self.play_easter_egg(egg);
+            } else {
+                self.play_easter_egg_regular(egg);
+            }
         }
-        if let Some(handle) = &self.easter_egg
-            && let Ok(size) = self.tui.terminal().size()
-        {
-            handle.rows.store(size.rows, Ordering::SeqCst);
+        if let Ok(size) = self.tui.terminal().size() {
+            for handle in [&self.easter_egg, &self.regular_easter_egg]
+                .into_iter()
+                .flatten()
+            {
+                handle.rows.store(size.rows, Ordering::SeqCst);
+            }
         }
-        if self
-            .easter_egg
-            .as_ref()
-            .is_some_and(|handle| handle.done.load(Ordering::SeqCst))
-            && let Some(handle) = self.easter_egg.take()
-        {
-            self.tui.hide_overlay(handle.overlay);
+        let egg_done = [&self.easter_egg, &self.regular_easter_egg]
+            .into_iter()
+            .flatten()
+            .any(|handle| handle.done.load(Ordering::SeqCst));
+        if egg_done {
+            for handle in [self.easter_egg.take(), self.regular_easter_egg.take()]
+                .into_iter()
+                .flatten()
+            {
+                self.tui.hide_overlay(handle.overlay);
+            }
             self.tui.request_render();
         }
 
@@ -16778,6 +17028,61 @@ export default function (pi) {
         mode.shutdown().expect("shutdown");
     }
 
+    /// A header-logo click in regular mode (the user's terminal) still plays
+    /// the full 3D animation. Upstream's lazy wrapper bails out on the main
+    /// screen (`easter-egg-3d.lazy.ts:9`); this port composites the same
+    /// overlay there, so the visible frame changes instead of keeping the
+    /// tiny header logo alone.
+    #[test]
+    fn header_logo_click_plays_the_visible_3d_egg_in_regular_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+        assert!(mode.switch_tui_mode(TuiMode::Regular));
+        mode.tui.render_now(true);
+        let before = capture.frames().last().cloned().expect("a startup frame");
+        assert!(
+            strip_terminal_sequences(&before)
+                .chars()
+                .all(|c| !('\u{2800}'..='\u{28ff}').contains(&c)),
+            "the startup frame has no braille dust"
+        );
+
+        // A real SGR 1006 mouse-up on the header logo (column 2, row 2):
+        // the flat-tree mouse dispatch reaches `onLogoClick`, whose queued
+        // position the pump turns into the animation.
+        assert!(mode.tui.handle_mouse_input("\x1b[<0;2;2m"));
+        mode.pump();
+        // Let the dissolve/fly timeline advance so braille dots are painted.
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        mode.pump();
+        mode.tui.render_now(true);
+        let after = capture.frames().last().cloned().expect("the egg frame");
+        assert!(mode.regular_easter_egg.is_some(), "the overlay is playing");
+        assert!(mode.tui.has_overlay(), "the full-screen overlay is mounted");
+        assert_ne!(before, after, "the visible frame changed");
+        let plain = strip_terminal_sequences(&after);
+        assert!(
+            plain
+                .chars()
+                .any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+            "braille animation is visible: {plain}"
+        );
+
+        // The pump retires the overlay when the animation reports completion,
+        // exactly like the fullscreen handle.
+        mode.regular_easter_egg
+            .as_ref()
+            .expect("handle")
+            .done
+            .store(true, Ordering::SeqCst);
+        mode.pump();
+        assert!(mode.regular_easter_egg.is_none(), "the egg was retired");
+        assert!(!mode.tui.has_overlay(), "the overlay was hidden");
+
+        mode.shutdown().expect("shutdown");
+    }
+
     /// `/name`'s argument parsing: everything after the command word,
     /// trimmed (`interactive-mode.ts:6860`).
     #[test]
@@ -17556,6 +17861,16 @@ export default function (pi) {
         let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
         assert!(frame.contains("Keyboard Shortcuts"), "{frame}");
         assert!(frame.contains("Send message"), "{frame}");
+        // `interactive-mode.ts:7109,7113`: the shortcut table is framed by
+        // two full-width DynamicBorder rules (the frame is 100 columns wide).
+        assert!(
+            frame
+                .lines()
+                .filter(|line| line.chars().all(|c| c == '─'))
+                .count()
+                >= 2,
+            "the rendered frame contains the horizontal rules: {frame}"
+        );
 
         mode.shutdown().expect("shutdown");
     }
@@ -17573,6 +17888,41 @@ export default function (pi) {
         let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
         assert!(frame.contains("What's New"), "{frame}");
         assert!(frame.contains("No changelog entries found."), "{frame}");
+        // `interactive-mode.ts:6978,6982`: two DynamicBorder rules.
+        assert!(
+            frame
+                .lines()
+                .filter(|line| line.chars().all(|c| c == '─'))
+                .count()
+                >= 2,
+            "the rendered frame contains the horizontal rules: {frame}"
+        );
+
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// The update notifications (`interactive-mode.ts:4821-4869`) render as
+    /// warning-bordered blocks; the frame must contain the rule characters.
+    #[test]
+    fn update_notifications_render_with_horizontal_rules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+
+        mode.show_new_version_notification("1.2.3", Some("A new release."));
+        mode.show_package_update_notification(&["foo@1.0.0".to_string()]);
+        mode.tui.render_now(true);
+        let frame = pi_tui::ansi::strip_terminal_sequences(&capture.output());
+        assert!(frame.contains("Update Available"), "{frame}");
+        assert!(frame.contains("Package Updates Available"), "{frame}");
+        assert!(
+            frame
+                .lines()
+                .filter(|line| line.chars().all(|c| c == '─'))
+                .count()
+                >= 4,
+            "four warning rules frame the two notices: {frame}"
+        );
 
         mode.shutdown().expect("shutdown");
     }

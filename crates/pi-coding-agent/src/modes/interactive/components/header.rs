@@ -1,5 +1,6 @@
-//! Header pieces: the pi logo, the dynamic border, and the built-in startup
-//! header (logo + key hints, expandable with ctrl+o).
+//! Header pieces: the pi logo, the built-in startup header (logo + key hints,
+//! expandable with ctrl+o), and a re-export of [`DynamicBorder`] for the
+//! surfaces that used to import it from here.
 //!
 //! Ground truth: `modes/interactive/components/pi-logo.ts`,
 //! `dynamic-border.ts`, and the header construction in
@@ -7,9 +8,9 @@
 
 use pi_tui::component::Component;
 use pi_tui::mouse::{MouseEvent, MouseEventKind, MouseEventResult};
-use pi_tui::theme::ThemeColor;
 
 use super::super::theme;
+pub use super::dynamic_border::DynamicBorder;
 
 /// The brand colors (`pi-logo.ts:4-6`).
 fn coral() -> pi_tui::color::Color {
@@ -50,32 +51,6 @@ pub fn pi_wordmark() -> String {
         pi_tui::color::foreground_ansi(coral(), mode),
         pi_tui::color::foreground_ansi(yellow(), mode)
     )
-}
-
-/// `DynamicBorder` (`dynamic-border.ts`): a full-width `─` line that
-/// re-measures every render.
-pub struct DynamicBorder {
-    color: pi_tui::theme::Styler,
-}
-
-impl DynamicBorder {
-    pub fn new() -> Self {
-        DynamicBorder {
-            color: theme::theme().fg_styler(ThemeColor::Border),
-        }
-    }
-}
-
-impl Default for DynamicBorder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Component for DynamicBorder {
-    fn render(&self, width: usize) -> Vec<String> {
-        vec![(self.color)(&"─".repeat(width))]
-    }
 }
 
 /// `ExpandableText` + `BuiltInHeader` (`interactive-mode.ts:245-275`): the

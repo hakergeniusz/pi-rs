@@ -15,6 +15,7 @@ pub mod component_proxy;
 pub mod custom_entry;
 #[cfg(feature = "ext-js")]
 pub mod custom_message;
+pub mod dynamic_border;
 pub mod easter_egg_3d;
 #[cfg(feature = "ext-js")]
 pub mod extension_custom;

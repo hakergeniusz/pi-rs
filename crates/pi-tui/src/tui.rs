@@ -32,10 +32,13 @@ use std::sync::{Arc, Mutex};
 use crate::ansi::{
     SEGMENT_RESET, normalize_terminal_output, strip_terminal_sequences, visible_width,
 };
-use crate::component::Component;
+use crate::component::{Component, dispatch_mouse_band};
 use crate::frame::CellGrid;
 use crate::keys::{is_key_release, matches_key};
-use crate::mouse::{ComponentId, component_id};
+use crate::mouse::{
+    ComponentId, MouseEvent, MouseEventKind, component_id, dispatch_mouse_event,
+    parse_sgr_mouse_event,
+};
 use crate::terminal::{Terminal, TerminalSize};
 use crate::terminal_colors::{
     OscColorTarget, RgbColor, TERMINAL_COLOR_REPLY_COUNT, TERMINAL_PALETTE_SIZE,
@@ -2397,6 +2400,87 @@ impl Tui {
         mutation.is_some_and(|mutation| mutation.consume)
     }
 
+    /// Mouse reports on the regular (main-screen) renderer.
+    ///
+    /// Upstream's `Tui.handleTerminalInput` routes mouse reports to the
+    /// component under the pointer on both renderers; the alt screen's
+    /// selection state machine consumes them before this point, so this is the
+    /// flat-tree half. The port had only the alt-screen half, which is why a
+    /// logo click in regular mode could never reach `onLogoClick`.
+    ///
+    /// Returns true when a component consumed the report. Synthesizing a
+    /// `Click` on release mirrors upstream's press-target gesture (`click`
+    /// fires on mouse-up at `tui-alt-screen.ts:1030-1043`).
+    pub fn handle_mouse_input(&mut self, data: &str) -> bool {
+        if self.stopped || self.alt_screen_active() {
+            return false;
+        }
+        let Some(raw) = parse_sgr_mouse_event(data) else {
+            return false;
+        };
+        // Only left-button reports reach components here; upstream's wheel
+        // and right-click behaviours belong to the alt-screen viewport.
+        if raw.button & 3 != 0 || raw.x < 0 || raw.y < 0 {
+            return false;
+        }
+        let size = self.terminal.size().unwrap_or(TerminalSize {
+            columns: 80,
+            rows: 24,
+        });
+        let event = MouseEvent::new(
+            if raw.release {
+                MouseEventKind::Click
+            } else {
+                MouseEventKind::Press
+            },
+            raw.button,
+            raw.x,
+            raw.y,
+            size.columns as usize,
+            size.rows.max(1) as usize,
+        );
+        // Overlays are on top of the document, topmost first (upstream's
+        // `dispatchMouseToOverlay`, `tui.ts:861-882`). Their bounds were
+        // recorded by the last frame.
+        for (_, bounds, _) in self.rendered_overlays_topmost_first() {
+            if raw.x >= bounds.col
+                && raw.x < bounds.col + bounds.width as i64
+                && raw.y >= bounds.row
+                && raw.y < bounds.row + bounds.height as i64
+            {
+                let local = MouseEvent {
+                    x: raw.x - bounds.col,
+                    y: raw.y - bounds.row,
+                    ..event
+                };
+                if let Some(entry) = self
+                    .overlays
+                    .iter_mut()
+                    .find(|entry| entry.bounds == Some(bounds))
+                    && dispatch_mouse_event(entry.component.as_mut(), &local).is_some()
+                {
+                    self.request_render();
+                    return true;
+                }
+            }
+        }
+        let result = dispatch_mouse_band(
+            0,
+            false,
+            self.root_children_mut(),
+            None,
+            &event,
+            raw.x,
+            raw.y,
+            size.columns as usize,
+        );
+        let handled = result.is_some();
+        if handled {
+            self.request_render();
+        }
+        handled
+    }
+
     /// Global debug key. `tui.ts:1074-1078`.
     pub fn is_debug_key(data: &str) -> bool {
         matches_key(data, "shift+ctrl+d")
@@ -3120,6 +3204,44 @@ mod tests {
         fn set_focused(&mut self, focused: bool) {
             <Self as Focusable>::set_focused(self, focused);
         }
+    }
+
+    struct MouseSink(std::sync::Arc<std::sync::Mutex<Vec<MouseEvent>>>);
+
+    impl Component for MouseSink {
+        fn render(&self, _width: usize) -> Vec<String> {
+            vec!["sink".to_string()]
+        }
+
+        fn handle_mouse(&mut self, event: &MouseEvent) -> Option<crate::mouse::MouseEventResult> {
+            self.0.lock().expect("mouse log").push(*event);
+            Some(crate::mouse::MouseEventResult::handled())
+        }
+    }
+
+    #[test]
+    fn main_screen_mouse_reports_reach_the_component_under_the_pointer() {
+        let terminal = CaptureTerminal::with_size(TerminalSize {
+            columns: 40,
+            rows: 10,
+        });
+        let mut tui = Tui::new(Box::new(terminal));
+        tui.start().expect("tui start");
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tui.add_child(Box::new(Static(&["header"])));
+        tui.add_child(Box::new(MouseSink(std::sync::Arc::clone(&hits))));
+        tui.render_now(true);
+
+        // SGR 1006 release on row 2, column 3 (one-based terminal cells).
+        assert!(tui.handle_mouse_input("\x1b[<0;3;2m"));
+        let events = hits.lock().expect("mouse log").clone();
+        assert_eq!(events.len(), 1, "the second band received the click");
+        assert_eq!(events[0].kind, MouseEventKind::Click);
+        assert_eq!((events[0].x, events[0].y), (2, 0), "local to the sink");
+        assert_eq!((events[0].screen_x, events[0].screen_y), (2, 1));
+
+        assert!(!tui.handle_mouse_input("\x1b[<0;3;99m"), "outside the tree");
+        assert_eq!(hits.lock().expect("mouse log").len(), 1);
     }
 
     fn tui(lines: &'static [&'static str], size: (u16, u16)) -> (Tui, FrameCapture) {
