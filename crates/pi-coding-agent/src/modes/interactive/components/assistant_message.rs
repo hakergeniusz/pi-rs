@@ -8,6 +8,11 @@
 //! reflows instead of re-parsing from scratch. The per-run click-to-toggle
 //! (upstream's `MouseRegion`) is deferred with the mouse work; `ctrl+t`
 //! toggles all thinking blocks, like upstream's `app.thinking.toggle`.
+//!
+//! Alt-screen prompt markers (`assistant-message.ts:104-115`,
+//! `tui-alt-screen.ts:75,515-529`) wrap the rendered lines in OSC 133 zones
+//! when the mode enables them; messages with tool calls are skipped, and the
+//! main screen never sees the markers (`tui-main-screen.ts:266-269`).
 
 use pi_tui::component::Component;
 use pi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
@@ -36,6 +41,7 @@ enum SlotKind {
 
 /// The assistant message. `AssistantMessageComponent`
 /// (`assistant-message.ts:31-`).
+#[allow(clippy::struct_excessive_bools)] // mirrors the TS component's state flags; split when extending
 pub struct AssistantMessageComponent {
     items: Vec<Item>,
     markdown_theme: MarkdownTheme,
@@ -50,6 +56,11 @@ pub struct AssistantMessageComponent {
     /// (`markdown-transform.ts:18` — "read per transform, so a reused
     /// component sees a stream end").
     streaming_flag: Arc<AtomicBool>,
+    /// Whether the last update contained tool calls (`hasToolCalls`): such
+    /// messages do not mark an OSC 133 prompt zone.
+    has_tool_calls: bool,
+    /// Alt-screen-only prompt zone markers (see the module doc).
+    osc133: bool,
 }
 
 /// Spacers go in lazily, right before the next visible block
@@ -93,8 +104,15 @@ impl AssistantMessageComponent {
             output_pad,
             streaming: false,
             streaming_flag: Arc::new(AtomicBool::new(false)),
+            has_tool_calls: false,
+            osc133: false,
             transform_ctx,
         }
+    }
+
+    /// Enable the markers only on the alt screen (`tui-main-screen.ts:268`).
+    pub fn set_osc133_markers(&mut self, enabled: bool) {
+        self.osc133 = enabled;
     }
 
     /// `setHideThinkingBlock` (`assistant-message.ts:82-88`).
@@ -334,6 +352,7 @@ impl AssistantMessageComponent {
             _ => {}
         }
 
+        self.has_tool_calls = has_tool_calls;
         self.items = items;
     }
 }
@@ -348,7 +367,11 @@ impl Component for AssistantMessageComponent {
                 Item::Text(text) => lines.extend(text.render(width)),
             }
         }
-        lines
+        if self.osc133 && !self.has_tool_calls && !lines.is_empty() {
+            super::user_message::with_osc133_markers(lines)
+        } else {
+            lines
+        }
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -385,6 +408,44 @@ mod tests {
             .iter()
             .map(|line| strip_terminal_sequences(line).trim_end().to_string())
             .collect()
+    }
+
+    /// The alt-screen prompt markers skip tool-call messages
+    /// (`assistant-message.ts:106-113`).
+    #[test]
+    fn osc133_markers_skip_tool_call_messages() {
+        let mut component = AssistantMessageComponent::new(
+            false,
+            "Thinking...",
+            1,
+            MarkdownTransformCtx::default(),
+        );
+        component.update_content(&assistant_text_message("hello there"), false);
+        assert!(!component.render(40).join("\n").contains("\x1b]133;A"));
+        component.set_osc133_markers(true);
+        assert!(
+            component.render(40).join("\n").contains("\x1b]133;A\x07"),
+            "a plain message marks its zone"
+        );
+
+        let mut with_tool = assistant_text_message("");
+        with_tool
+            .content
+            .push(pi_ai::types::AssistantContent::ToolCall(
+                pi_ai::types::ToolCall {
+                    id: "c1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::Map::new(),
+                    thought_signature: None,
+                    namespace: None,
+                    arguments_error: None,
+                },
+            ));
+        component.update_content(&with_tool, false);
+        assert!(
+            !component.render(40).join("\n").contains("\x1b]133;A"),
+            "a tool-call message has no prompt zone"
+        );
     }
 
     #[test]

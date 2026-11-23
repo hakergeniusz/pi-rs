@@ -11,12 +11,17 @@
 //! updates, the rendered bytes the same), and resolver-supplied extension
 //! renderers cross the handle bridge as adopted components
 //! ([`super::component_proxy::ComponentProxy`]) with builtin/absent slots
-//! falling back to the text paths (`tool-execution.ts:299-344`). The
-//! image-block display of results is deferred with the image work; the
-//! `showImages` render-context flag (`tool-execution.ts:122-144`, fed by the
-//! mode's `onShowImagesChange` sweep at `interactive-mode.ts:5153-5160`) is
-//! read from a shared live [`ImageSettings`] cell, so a mid-session settings
-//! change reaches every row on its next frame without a component sweep.
+//! falling back to the text paths (`tool-execution.ts:299-344`).
+//!
+//! Image blocks of a result render inline after the box
+//! (`tool-execution.ts:283-336,364-389`): a `Spacer(1)` then an [`Image`]
+//! per block, with pi's `toolOutput` fallback color and `imageWidthCells`
+//! cap. Sources are compared before rebuilding so an unchanged image keeps
+//! its Kitty id/cached lines across result updates. The `showImages` flag
+//! (`tool-execution.ts:122-144`, fed by `onShowImagesChange` at
+//! `interactive-mode.ts:5153-5160`) is read from a shared live
+//! [`ImageSettings`] cell, so a mid-session settings change reaches every
+//! row on its next frame.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -25,6 +30,7 @@ use std::time::Instant;
 
 use pi_tui::component::Component;
 use pi_tui::components::box_component::BoxComponent;
+use pi_tui::components::image::{Image, ImageOptions, ImageTheme};
 use pi_tui::components::mouse_region::MouseRegion;
 use pi_tui::components::text::Text;
 use pi_tui::mouse::{MouseButton, MouseEvent, MouseEventKind, MouseEventResult};
@@ -182,6 +188,14 @@ pub struct ToolResultView {
     pub duration_ms: Option<u64>,
 }
 
+/// One image block of a tool result (`tool-execution.ts:366-383`):
+/// base64 bytes plus the mime type the `Image` component needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultImage {
+    pub data: String,
+    pub mime_type: String,
+}
+
 /// The row. `ToolExecutionComponent` (`tool-execution.ts:31-`).
 // The bools mirror pi's row-state flags one-to-one.
 #[allow(clippy::struct_excessive_bools)]
@@ -213,6 +227,11 @@ pub struct ToolExecutionComponent {
     /// `showImages` is read per render instead of being frozen at mount, so a
     /// `ShowImagesChange` reaches an already-open row.
     image_settings: Arc<Mutex<ImageSettings>>,
+    /// Image blocks of the current result (`tool-execution.ts:366-389`).
+    image_sources: Vec<ToolResultImage>,
+    /// The components built from `image_sources`, paired with the source
+    /// they were built from; unchanged pairs are reused across updates.
+    image_components: Vec<(ToolResultImage, Image)>,
 }
 
 impl ToolExecutionComponent {
@@ -273,6 +292,8 @@ impl ToolExecutionComponent {
             content_box: BoxComponent::new(1, 1),
             click_toggle: Arc::new(AtomicBool::new(false)),
             image_settings,
+            image_sources: Vec::new(),
+            image_components: Vec::new(),
         };
         component.update_display();
         component
@@ -308,6 +329,69 @@ impl ToolExecutionComponent {
         self.result = Some(result);
         self.is_partial = is_partial;
         self.update_display();
+    }
+
+    /// The result's image blocks (`tool-execution.ts:366-383`): only blocks
+    /// carrying both base64 data and a mime type are displayed, matching
+    /// upstream's `img.data && img.mimeType` guard.
+    pub fn update_images(&mut self, images: Vec<ToolResultImage>) {
+        self.image_sources = images
+            .into_iter()
+            .filter(|image| !image.data.is_empty() && !image.mime_type.is_empty())
+            .collect();
+        self.rebuild_images();
+    }
+
+    /// `setShowImages`/`setImageWidthCells` sweep
+    /// (`interactive-mode.ts:5153-5168`): the live cell has changed, so
+    /// rebuild this row's image components from the current snapshot.
+    pub fn refresh_images(&mut self) {
+        self.rebuild_images();
+    }
+
+    /// Build one [`Image`] per source, reusing the previous component (and
+    /// therefore its Kitty id and cached lines) when the source is unchanged
+    /// (`tool-execution.ts:370-388`).
+    fn rebuild_images(&mut self) {
+        let settings = self.image_settings.lock().expect("image settings");
+        let width_cells = settings.image_width_cells.max(1) as usize;
+        let previous: Vec<Option<_>> = std::mem::take(&mut self.image_components)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut previous = previous;
+        self.image_components = self
+            .image_sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                if previous
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|(old_source, _)| old_source == source)
+                {
+                    // Reuse the component so its Kitty id and cached lines
+                    // survive an unrelated result update.
+                    return previous[index].take().expect("reused image");
+                }
+                let theme = theme::theme();
+                let image = Image::new(
+                    source.data.clone(),
+                    source.mime_type.clone(),
+                    ImageTheme {
+                        fallback_color: Box::new(move |text: &str| {
+                            theme.fg(pi_tui::theme::ThemeColor::ToolOutput, text)
+                        }),
+                    },
+                    ImageOptions {
+                        max_width_cells: Some(width_cells),
+                        ..ImageOptions::default()
+                    },
+                    None,
+                );
+                (source.clone(), image)
+            })
+            .collect();
     }
 
     /// `setExpanded` (`tool-execution.ts:211-214`).
@@ -690,6 +774,20 @@ impl Component for ToolExecutionComponent {
         // `tool-execution.ts:87`: the row opens with a blank line.
         let mut lines = vec![String::new()];
         lines.extend(self.content_box.render(width));
+        // `tool-execution.ts:375-388`: each image gets a `Spacer(1)` then
+        // the component's own rows. `showImages` is read live so a settings
+        // change takes effect without rebuilding the row.
+        if self
+            .image_settings
+            .lock()
+            .expect("image settings")
+            .show_images
+        {
+            for (_, image) in &self.image_components {
+                lines.push(String::new());
+                lines.extend(image.render(width));
+            }
+        }
         lines
     }
 
@@ -798,6 +896,57 @@ mod tests {
         assert!(
             lines.iter().any(|line| line.contains("Took 1.2s")),
             "lines: {lines:?}"
+        );
+    }
+
+    /// A result's image blocks render inline (`tool-execution.ts:366-389`),
+    /// after a spacer, and respect the live `showImages` flag.
+    #[test]
+    fn result_images_render_below_the_box_and_follow_show_images() {
+        // 1x1 PNG, the smallest payload `Image::new` can sniff.
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+        let mut component = ToolExecutionComponent::new(
+            "read",
+            "call-1",
+            serde_json::json!({ "path": "/tmp/pic.png" }),
+            1,
+            "/tmp",
+            None,
+            None,
+        );
+        component.update_result(
+            ToolResultView {
+                text: "done".to_string(),
+                is_error: false,
+                duration_ms: None,
+            },
+            false,
+        );
+        let baseline = plain(&component, 60).len();
+        component.update_images(vec![ToolResultImage {
+            data: PNG.to_string(),
+            mime_type: "image/png".to_string(),
+        }]);
+        let lines = plain(&component, 60);
+        assert!(
+            lines.len() >= baseline + 2,
+            "spacer + image rows were added: {lines:?}"
+        );
+        let raw = component.render(60).join("\n");
+        assert!(
+            raw.contains("[Image: image/png") || raw.contains("\x1b_G") || raw.contains("\x1b]_"),
+            "an image (or its fallback) rendered: {raw:?}"
+        );
+
+        component
+            .image_settings
+            .lock()
+            .expect("image settings")
+            .show_images = false;
+        assert_eq!(
+            plain(&component, 60).len(),
+            baseline,
+            "showImages=false hides the inline rows"
         );
     }
 

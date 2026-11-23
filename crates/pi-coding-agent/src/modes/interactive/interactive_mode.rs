@@ -99,6 +99,7 @@ use super::components::assistant_message::AssistantMessageComponent;
 use super::components::auth_selector::{
     AuthSelectorComponent, AuthSelectorEvent, LoginPromptComponent, LoginPromptEvent,
 };
+use super::components::bash_execution::BashExecutionComponent;
 #[cfg(feature = "ext-js")]
 use super::components::component_proxy::ComponentProxy;
 use super::components::easter_egg_3d::{EasterEgg3d, EasterEggHandle, play_easter_egg_3d};
@@ -123,7 +124,7 @@ use super::components::settings_selector::{
     SettingsSelectorComponent, SettingsSelectorConfig, SettingsSelectorEvent,
 };
 use super::components::status_indicator::{IdleStatus, StatusIndicator, StatusKind};
-use super::components::tool_execution::{ToolExecutionComponent, ToolResultView};
+use super::components::tool_execution::{ToolExecutionComponent, ToolResultImage, ToolResultView};
 use super::components::tree_selector::{TreeSelectorComponent, TreeSelectorEvent};
 use super::components::trust_selector::{TrustSelectorComponent, TrustSelectorEvent};
 use super::components::user_message::UserMessageComponent;
@@ -358,6 +359,16 @@ enum AppAction {
     FollowUp,
     /// alt+up (`app.message.dequeue`): restore queued messages to the editor.
     Dequeue,
+    /// ctrl+z (`app.suspend`): SIGTSTP the process group, resume on SIGCONT.
+    Suspend,
+    /// ctrl+l (`app.model.select`): mount the model selector.
+    ModelSelect,
+    /// ctrl+g (`app.editor.external`): edit the draft in `$VISUAL`/`$EDITOR`.
+    ExternalEditor,
+    /// ctrl+x (`app.message.copy`): copy the last assistant message.
+    CopyMessage,
+    /// ctrl+v (`app.clipboard.pasteImage`): paste clipboard image/text.
+    PasteImage,
 }
 
 /// Events the editor host queues for the orchestrator.
@@ -890,6 +901,7 @@ impl Component for ChatEditor {
         self.editor.render(width)
     }
 
+    #[allow(clippy::too_many_lines)] // mirrors CustomEditor.handleInput; split when extending
     fn handle_input(&mut self, data: &str) -> Option<ComponentMutation> {
         // The extension editor component owns every key while live (E3
         // slice 9): `this.editor` is the custom component upstream — its
@@ -928,8 +940,28 @@ impl Component for ChatEditor {
             }
         }
 
+        // Selection page keys move an open autocomplete menu before app
+        // actions run (`custom-editor.ts:96-103`); this is what lets a host
+        // bind ctrl+v even though pasting images is the default. Escape with
+        // the menu open is forwarded too (`:109-120`, fix #2): interrupting
+        // would abort the agent run and clear the draft instead of just
+        // dismissing the suggestions.
+        let autocomplete_open = self.editor.is_showing_autocomplete();
+        let mut pass_through = autocomplete_open
+            && (pi_tui::keybindings::matches(data, pi_tui::keybindings::action::SELECT_PAGE_UP)
+                || pi_tui::keybindings::matches(
+                    data,
+                    pi_tui::keybindings::action::SELECT_PAGE_DOWN,
+                ));
+
         // App keybindings first (`custom-editor.ts:104-153`).
-        let action = if theme::app_keys::matches(data, theme::app_keys::CLEAR) {
+        let action = if pass_through {
+            None
+        } else if theme::app_keys::matches(data, theme::app_keys::CLIPBOARD_PASTE_IMAGE) {
+            // The paste chord is checked ahead of the app-action loop
+            // (`custom-editor.ts:105-108`).
+            Some(AppAction::PasteImage)
+        } else if theme::app_keys::matches(data, theme::app_keys::CLEAR) {
             Some(AppAction::Clear)
         } else if theme::app_keys::matches(data, theme::app_keys::EXIT) {
             // Exit only when the editor is empty; otherwise the editor
@@ -940,7 +972,20 @@ impl Component for ChatEditor {
                 None
             }
         } else if theme::app_keys::matches(data, theme::app_keys::INTERRUPT) {
-            Some(AppAction::Interrupt)
+            if autocomplete_open {
+                pass_through = true;
+                None
+            } else {
+                Some(AppAction::Interrupt)
+            }
+        } else if theme::app_keys::matches(data, theme::app_keys::SUSPEND) {
+            Some(AppAction::Suspend)
+        } else if theme::app_keys::matches(data, theme::app_keys::MODEL_SELECT) {
+            Some(AppAction::ModelSelect)
+        } else if theme::app_keys::matches(data, theme::app_keys::EDITOR_EXTERNAL) {
+            Some(AppAction::ExternalEditor)
+        } else if theme::app_keys::matches(data, theme::app_keys::MESSAGE_COPY) {
+            Some(AppAction::CopyMessage)
         } else if theme::app_keys::matches(data, theme::app_keys::THINKING_CYCLE) {
             Some(AppAction::CycleThinking)
         } else if theme::app_keys::matches(data, theme::app_keys::MODEL_CYCLE_FORWARD) {
@@ -958,13 +1003,15 @@ impl Component for ChatEditor {
         } else {
             None
         };
-        if let Some(action) = action {
+        if !pass_through && let Some(action) = action {
             self.events
                 .lock()
                 .expect("editor events")
                 .push(EditorEventOut::Action(action));
             return Some(ComponentMutation { consume: true });
         }
+        // Forwarded to the built-in editor: it dismisses its autocomplete
+        // popup while preserving the draft (`custom-editor.ts:118-120`).
         let mutation = Component::handle_input(&mut self.editor, data);
         while let Some(text) = self.editor.take_submitted() {
             self.events
@@ -1043,16 +1090,30 @@ struct AgentRun {
 struct BashRun {
     command: String,
     excluded: bool,
-    started: Instant,
-    /// The chat row receiving live output (`BashExecutionComponent` upstream).
+    /// The chat row receiving live output (now the dedicated
+    /// `BashExecutionComponent`, `bash-execution.ts:21`).
     index: usize,
-    streamed: String,
     /// Accumulates the streamed `onChunk` deltas into the output the final
     /// `BashExecutionMessage` carries (`agent-session.ts:4022-4025`).
     deltas: BashExecutionDeltaCollector,
     events: std::sync::mpsc::Receiver<crate::tools::bash::bash_pty::BashPtyEvent>,
     control: crate::tools::bash::bash_pty::BashPtyControl,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// The image blocks of a tool result (`tool-execution.ts:366-383`): the row
+/// renders these inline below its box in addition to the text output.
+fn tool_result_images(blocks: &[pi_ai::types::ContentBlock]) -> Vec<ToolResultImage> {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            pi_ai::types::ContentBlock::Image(image) => Some(ToolResultImage {
+                data: image.data.clone(),
+                mime_type: image.mime_type.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Feed one streamed PTY chunk into a bash execution's delta collector and
@@ -2139,6 +2200,14 @@ impl InteractiveMode {
             .editor
             .set_autocomplete_provider(Some(Arc::clone(&base_autocomplete_provider)));
 
+        let (agent_dir, settings, hide_thinking_block, output_pad, queues) =
+            Self::startup_settings(options, runtime);
+        // `shouldShowStartupDetails` (`interactive-mode.ts:1555-1557`): the
+        // compact onboarding advertises loaded resources when verbose output
+        // is enabled (the default `quietStartup: false`).
+        let show_startup_details =
+            settings.get_quiet_startup() == crate::config::settings::QuietStartup::Off;
+
         // The header's logo-click queue (`header.onLogoClick`): the callback
         // cannot borrow the mode, so it parks the logo's position here.
         let easter_egg_requests: Arc<Mutex<Vec<(i64, i64)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2149,6 +2218,7 @@ impl InteractiveMode {
             editor_host,
             FooterComponent::new(Self::footer_data(runtime)),
             &easter_egg_requests,
+            show_startup_details,
         );
 
         let theme_query_start = Self::arm_theme_queries(
@@ -2157,8 +2227,6 @@ impl InteractiveMode {
             &theme_late_reports,
             &theme_scheme_reports,
         );
-        let (agent_dir, settings, hide_thinking_block, output_pad, queues) =
-            Self::startup_settings(options, runtime);
         // The live image settings (E4 image wiring): one cell shared by the
         // settings handlers, the tool rows and the agent-loop seams. Seeded
         // from the boot settings; every later change refreshes it in place.
@@ -2694,10 +2762,11 @@ impl InteractiveMode {
         editor_host: ChatEditor,
         footer: FooterComponent,
         easter_egg_requests: &Arc<Mutex<Vec<(i64, i64)>>>,
+        show_startup_details: bool,
     ) -> (Tui, ComponentId) {
         let mut tui = Tui::new(terminal);
         tui.set_clear_on_shrink(true);
-        let mut header = Self::build_header(version, model_id);
+        let mut header = Self::build_header(version, model_id, show_startup_details);
         // `header.onLogoClick = …` (`interactive-mode.ts:792`): the 3D pi
         // logo lifts off the logo's screen position. The callback cannot
         // borrow the mode, so it queues the position for `pump`.
@@ -2975,7 +3044,7 @@ impl InteractiveMode {
 
     /// The startup header (`interactive-mode.ts:1049-1122`): the logo carries
     /// the version, its second line the hints; ctrl+o expands.
-    fn build_header(version: &str, _model_id: &str) -> BuiltInHeader {
+    fn build_header(version: &str, _model_id: &str, show_startup_details: bool) -> BuiltInHeader {
         let (logo_top, logo_bottom) = pi_logo_lines();
         let with_logo = |hints: String| {
             format!(
@@ -2992,6 +3061,9 @@ impl InteractiveMode {
             ),
             theme::key_hint(theme::app_keys::EXIT, "to exit (empty)"),
             theme::key_hint(theme::app_keys::SUSPEND, "to suspend"),
+            // `theme::key_text` only resolves app actions; the editor's
+            // `ctrl+k` binding comes from `pi_tui::keybindings`.
+            theme::raw_key_hint("ctrl+k", "to delete to end"),
             theme::key_hint(theme::app_keys::THINKING_CYCLE, "to cycle thinking level"),
             theme::raw_key_hint(
                 &format!(
@@ -3001,11 +3073,23 @@ impl InteractiveMode {
                 ),
                 "to cycle models",
             ),
+            theme::key_hint(theme::app_keys::MODEL_SELECT, "to select model"),
+            theme::key_hint(theme::app_keys::TOOLS_EXPAND, "to expand tools"),
+            theme::key_hint(theme::app_keys::THINKING_TOGGLE, "to expand thinking"),
+            theme::key_hint(theme::app_keys::EDITOR_EXTERNAL, "for external editor"),
             theme::raw_key_hint("/", "for commands"),
             theme::raw_key_hint("!", "to run bash"),
             theme::raw_key_hint("!!", "to run bash (no context)"),
-            theme::key_hint(theme::app_keys::TOOLS_EXPAND, "to expand tools"),
-            theme::key_hint(theme::app_keys::THINKING_TOGGLE, "to expand thinking"),
+            theme::key_hint(theme::app_keys::MESSAGE_FOLLOW_UP, "to queue follow-up"),
+            theme::key_hint(
+                theme::app_keys::MESSAGE_DEQUEUE,
+                "to edit all queued messages",
+            ),
+            theme::key_hint(
+                theme::app_keys::CLIPBOARD_PASTE_IMAGE,
+                "to paste files on macOS, images, or text",
+            ),
+            theme::raw_key_hint("drop files", "to attach"),
         ]
         .join("\n");
         let compact_instructions = [
@@ -3033,7 +3117,14 @@ impl InteractiveMode {
                 with_logo(compact_instructions),
                 theme::theme().fg(
                     pi_tui::theme::ThemeColor::Dim,
-                    "Press ctrl+o to show full startup help."
+                    &format!(
+                        "Press ctrl+o to show full startup help{}.",
+                        if show_startup_details {
+                            " and loaded resources"
+                        } else {
+                            ""
+                        }
+                    ),
                 ),
                 onboarding
             ),
@@ -3171,11 +3262,10 @@ impl InteractiveMode {
         if self.chat_len() > 0 {
             self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
         }
-        self.add_to_chat(Box::new(UserMessageComponent::new(
-            text,
-            self.output_pad,
-            self.markdown_transform_ctx.clone(),
-        )));
+        let mut component =
+            UserMessageComponent::new(text, self.output_pad, self.markdown_transform_ctx.clone());
+        component.set_osc133_markers(self.tui.alt_screen_active());
+        self.add_to_chat(Box::new(component));
         self.tui.request_render();
     }
 
@@ -3446,11 +3536,13 @@ impl InteractiveMode {
                     if self.chat_len() > 0 {
                         self.add_to_chat(Box::new(pi_tui::components::spacer::Spacer::new(1)));
                     }
-                    self.add_to_chat(Box::new(UserMessageComponent::new(
+                    let mut user = UserMessageComponent::new(
                         &text,
                         self.output_pad,
                         self.markdown_transform_ctx.clone(),
-                    )));
+                    );
+                    user.set_osc133_markers(self.tui.alt_screen_active());
+                    self.add_to_chat(Box::new(user));
                     if populate_history {
                         self.editor_add_to_history(&text);
                     }
@@ -3464,6 +3556,7 @@ impl InteractiveMode {
                     self.markdown_transform_ctx.clone(),
                 );
                 component.update_content(assistant, false);
+                component.set_osc133_markers(self.tui.alt_screen_active());
                 self.add_to_chat(Box::new(component));
                 let aborted = assistant.stop_reason == pi_ai::types::StopReason::Aborted;
                 let failed = aborted || assistant.stop_reason == pi_ai::types::StopReason::Error;
@@ -3529,6 +3622,7 @@ impl InteractiveMode {
                         },
                         false,
                     );
+                    component.update_images(tool_result_images(&blocks));
                 }
             }
             AgentMessage::BranchSummary(summary) => {
@@ -3542,20 +3636,42 @@ impl InteractiveMode {
                 row.set_expanded(self.tool_output_expanded);
                 self.add_to_chat(Box::new(row));
             }
+            // `case "bashExecution"` (`interactive-mode.ts:4010-4027`): a
+            // persisted `!` run resumes as a completed bash row, not a tool
+            // row (the previous port silently dropped it on `/resume`).
+            AgentMessage::BashExecution(bash) => {
+                let mut component = BashExecutionComponent::new(
+                    &bash.command,
+                    bash.exclude_from_context.unwrap_or(false),
+                    self.output_pad,
+                );
+                component.set_expanded(self.tool_output_expanded);
+                if !bash.output.is_empty() {
+                    component.append_output(&bash.output);
+                }
+                component.set_complete(
+                    bash.exit_code,
+                    bash.cancelled,
+                    bash.truncated,
+                    bash.full_output_path.clone(),
+                );
+                self.add_to_chat(Box::new(component));
+            }
             // System messages render nothing upstream either
-            // (`case "system": break`); custom/bash/compaction-summary
-            // messages have no ported component.
+            // (`case "system": break`); custom/compaction-summary messages
+            // have no ported component.
             _ => {}
         }
     }
 
     fn start_assistant_stream(&mut self) {
-        let component = AssistantMessageComponent::new(
+        let mut component = AssistantMessageComponent::new(
             self.hide_thinking_block,
             &self.hidden_thinking_label,
             self.output_pad,
             self.markdown_transform_ctx.clone(),
         );
+        component.set_osc133_markers(self.tui.alt_screen_active());
         self.streaming_index = Some(self.add_to_chat(Box::new(component)));
         self.tui.request_render();
     }
@@ -3802,6 +3918,7 @@ impl InteractiveMode {
                                 },
                                 false,
                             );
+                            component.update_images(tool_result_images(&blocks));
                         }
                     }
                     let _ = self.session.append_message(message.clone());
@@ -3840,6 +3957,7 @@ impl InteractiveMode {
                             },
                             true,
                         );
+                        component.update_images(tool_result_images(&partial_result.content));
                     }
                 }
                 self.tui.request_render();
@@ -5503,6 +5621,14 @@ impl InteractiveMode {
     fn refresh_image_settings(&mut self) {
         *self.live_images.lock().expect("image settings") =
             ImageSettings::from_settings(&self.settings);
+        // Upstream pushes `setShowImages`/`setImageWidthCells` into every
+        // row (`interactive-mode.ts:5153-5168`); the port's rows share the
+        // cell but still rebuild their `Image` components on a change.
+        for index in 0..self.chat_len() {
+            if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
+                component.refresh_images();
+            }
+        }
     }
 
     /// The `/settings` dialog's event handlers
@@ -5596,6 +5722,9 @@ impl InteractiveMode {
                         component.set_output_pad(output_pad);
                     }
                     if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
+                        component.set_output_pad(output_pad);
+                    }
+                    if let Some(component) = self.downcast_chat::<BashExecutionComponent>(index) {
                         component.set_output_pad(output_pad);
                     }
                     if let Some(component) = self.downcast_chat::<
@@ -6620,20 +6749,12 @@ impl InteractiveMode {
                 return;
             }
         };
-        let component = ToolExecutionComponent::with_image_settings(
-            "bash",
-            &format!("bash-{}", self.chat_len()),
-            serde_json::json!({ "command": command }),
-            self.output_pad,
-            &self.session.get_cwd().to_string_lossy(),
-            crate::tools::renderers::renderers_for("bash"),
-            None,
-            Arc::clone(&self.live_images),
-        );
+        // Upstream mounts a `BashExecutionComponent` (not a tool row): the
+        // `$ command` header, bashMode border and spinner are its own surface
+        // (`interactive-mode.ts:7225-7230`).
+        let mut component = BashExecutionComponent::new(command, excluded, self.output_pad);
+        component.set_expanded(self.tool_output_expanded);
         let index = self.add_to_chat(Box::new(component));
-        if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
-            component.mark_execution_started();
-        }
         let BashPtyRun {
             control,
             events,
@@ -6642,9 +6763,7 @@ impl InteractiveMode {
         self.bash_run = Some(BashRun {
             command: command.to_string(),
             excluded,
-            started,
             index,
-            streamed: String::new(),
             // `executeBash`'s `options.id` is absent for the interactive `!`
             // path, so pi emits idless `bash_execution_update` events.
             deltas: BashExecutionDeltaCollector::new(None),
@@ -6673,23 +6792,15 @@ impl InteractiveMode {
         loop {
             match run.events.try_recv() {
                 Ok(BashPtyEvent::Chunk(text)) => {
-                    run.streamed.push_str(&text);
                     // Upstream's `executeBash` emits one
                     // `bash_execution_update` per `onChunk` delivery before
                     // the row paints the new text (`agent-session.ts:4003-4035`).
                     emit_bash_execution_delta(&mut run.deltas, &text, |value| {
                         self.emit_extension_event(&value);
                     });
-                    if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(run.index)
+                    if let Some(component) = self.downcast_chat::<BashExecutionComponent>(run.index)
                     {
-                        component.update_result(
-                            ToolResultView {
-                                text: run.streamed.clone(),
-                                is_error: false,
-                                duration_ms: Some(run.started.elapsed().as_millis() as u64),
-                            },
-                            true,
-                        );
+                        component.append_output(&text);
                     }
                     self.tui.request_render();
                 }
@@ -6707,14 +6818,15 @@ impl InteractiveMode {
             self.bash_run = Some(run);
             return;
         };
-        if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(run.index) {
-            component.update_result(
-                ToolResultView {
-                    text: result.output.clone(),
-                    is_error: result.exit_code.is_none_or(|code| code != 0),
-                    duration_ms: Some(run.started.elapsed().as_millis() as u64),
-                },
-                false,
+        if let Some(component) = self.downcast_chat::<BashExecutionComponent>(run.index) {
+            component.set_complete(
+                result.exit_code.map(i64::from),
+                result.cancelled,
+                result.truncated,
+                result
+                    .full_output_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
             );
         }
         let _ = self.session.append_message(AgentMessage::BashExecution(
@@ -6764,7 +6876,7 @@ impl InteractiveMode {
         exit_code: Option<i64>,
         truncated: bool,
         full_output_path: Option<String>,
-        started: Instant,
+        _started: Instant,
     ) {
         // Extension-decided and early-error paths have no PTY stream, but
         // upstream still emits one `bash_execution_update` with the whole
@@ -6773,28 +6885,13 @@ impl InteractiveMode {
         emit_bash_execution_delta(&mut deltas, &text, |value| {
             self.emit_extension_event(&value);
         });
-        let component = ToolExecutionComponent::with_image_settings(
-            "bash",
-            &format!("bash-{}", self.chat_len()),
-            serde_json::json!({ "command": command }),
-            self.output_pad,
-            &self.session.get_cwd().to_string_lossy(),
-            crate::tools::renderers::renderers_for("bash"),
-            None,
-            Arc::clone(&self.live_images),
-        );
-        let index = self.add_to_chat(Box::new(component));
-        if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
-            component.mark_execution_started();
-            component.update_result(
-                ToolResultView {
-                    text: text.clone(),
-                    is_error: exit_code.is_none_or(|code| code != 0),
-                    duration_ms: Some(started.elapsed().as_millis() as u64),
-                },
-                false,
-            );
+        let mut component = BashExecutionComponent::new(command, excluded, self.output_pad);
+        component.set_expanded(self.tool_output_expanded);
+        if !text.is_empty() {
+            component.append_output(&text);
         }
+        component.set_complete(exit_code, false, truncated, full_output_path.clone());
+        self.add_to_chat(Box::new(component));
         let _ = self.session.append_message(AgentMessage::BashExecution(
             pi_agent::agent_message::BashExecutionMessage {
                 command: command.to_string(),
@@ -7699,6 +7796,17 @@ impl InteractiveMode {
             TuiMode::Regular => self.exit_fullscreen(),
         }
         self.tui_mode = mode;
+        // `tui-main-screen.ts:266-269` strips the markers; the alt screen
+        // needs them for previousPrompt/nextPrompt (`tui-alt-screen.ts:515`).
+        let markers = mode == TuiMode::Fullscreen;
+        for index in 0..self.chat_len() {
+            if let Some(component) = self.downcast_chat::<UserMessageComponent>(index) {
+                component.set_osc133_markers(markers);
+            }
+            if let Some(component) = self.downcast_chat::<AssistantMessageComponent>(index) {
+                component.set_osc133_markers(markers);
+            }
+        }
         self.tui.render_now(true);
         true
     }
@@ -8276,6 +8384,11 @@ impl InteractiveMode {
             theme::app_keys::TOOLS_EXPAND => Some(AppAction::ToolsExpand),
             theme::app_keys::MESSAGE_FOLLOW_UP => Some(AppAction::FollowUp),
             theme::app_keys::MESSAGE_DEQUEUE => Some(AppAction::Dequeue),
+            theme::app_keys::SUSPEND => Some(AppAction::Suspend),
+            theme::app_keys::MODEL_SELECT => Some(AppAction::ModelSelect),
+            theme::app_keys::EDITOR_EXTERNAL => Some(AppAction::ExternalEditor),
+            theme::app_keys::MESSAGE_COPY => Some(AppAction::CopyMessage),
+            theme::app_keys::CLIPBOARD_PASTE_IMAGE => Some(AppAction::PasteImage),
             _ => None,
         }
     }
@@ -11425,7 +11538,7 @@ impl InteractiveMode {
                     match action.as_str() {
                         "escape" => self.handle_action(&AppAction::Interrupt),
                         "ctrlD" => self.handle_action(&AppAction::Exit),
-                        "pasteImage" => {}
+                        "pasteImage" => self.handle_action(&AppAction::PasteImage),
                         "extensionShortcut" => {
                             let data = request
                                 .get("data")
@@ -12929,6 +13042,14 @@ impl InteractiveMode {
             if let Some(indicator) = self.status_handle.lock().expect("status").as_mut() {
                 dirty |= indicator.tick();
             }
+            // The live bash row's own loader (`bash-execution.ts:49-56`) is
+            // host-ticked like the working-status indicator.
+            let bash_index = self.bash_run.as_ref().map(|run| run.index);
+            if let Some(index) = bash_index
+                && let Some(component) = self.downcast_chat::<BashExecutionComponent>(index)
+            {
+                dirty |= component.tick_loader();
+            }
             if dirty {
                 self.tui.request_render();
             }
@@ -12999,6 +13120,225 @@ impl InteractiveMode {
             AppAction::Dequeue => self.dequeue_queued(),
             // `toggleToolOutputExpansion` (`interactive-mode.ts:4741-4743`).
             AppAction::ToolsExpand => self.set_tools_expanded(!self.tool_output_expanded),
+            // `app.suspend`/`app.model.select`/`app.editor.external`/
+            // `app.message.copy`/`app.clipboard.pasteImage`
+            // (`interactive-mode.ts:3224-3243`).
+            AppAction::Suspend => self.suspend_to_shell(),
+            AppAction::ModelSelect => self.open_model_selector(None),
+            AppAction::ExternalEditor => self.open_external_editor(),
+            AppAction::CopyMessage => self.handle_copy_command(),
+            AppAction::PasteImage => self.paste_from_clipboard(),
+        }
+    }
+
+    /// `handleCtrlZ` (`interactive-mode.ts:4622-4658`): stop the TUI (which
+    /// restores the terminal), SIGTSTP the process group, then restart the
+    /// TUI when the shell returns the process to the foreground.
+    ///
+    /// Deviation: upstream keeps the event loop alive with a timer and
+    /// installs a `SIGCONT` listener because Node stops on a signal
+    /// callback. Here `kill(0, SIGTSTP)` is synchronous: the thread stops
+    /// inside the child wait and continues when the shell sends SIGCONT, so
+    /// no listener is needed. The `kill(1)` child stands in for libc's
+    /// `kill(2)` (this crate forbids unsafe code); it delivers the same
+    /// signal to the same process group. On Windows pi only shows a notice.
+    fn suspend_to_shell(&mut self) {
+        #[cfg(windows)]
+        {
+            self.show_status("Suspend to background is not supported on Windows");
+        }
+        #[cfg(unix)]
+        {
+            let preserve_screen = self.tui.alt_screen_active();
+            if let Err(error) = self.tui.stop(TuiStopOptions { preserve_screen }) {
+                self.show_error(&format!("Failed to suspend: {error}"));
+                return;
+            }
+            let suspended = std::process::Command::new("kill")
+                .args(["-TSTP", "0"])
+                .status()
+                .is_ok_and(|status| status.success());
+            // On resume, reissue the start queries (size, cell size); pi's
+            // `ui.start()` does the same (`tui.ts:916-929`).
+            if let Err(error) = self.tui.start() {
+                self.show_error(&format!("Failed to resume: {error}"));
+                return;
+            }
+            self.tui.request_render();
+            if !suspended {
+                self.show_status("Suspend to background failed");
+            }
+        }
+    }
+
+    /// `handleOpenExternalEditor` (`interactive-mode.ts:4780-4802`): write
+    /// the draft to a temp `prompt.md`, run `$VISUAL`/`$EDITOR` on it with
+    /// the terminal restored, then adopt the file back into the editor.
+    /// Upstream's configured `externalEditor` setting has no Rust settings
+    /// field yet, so env + platform default (`settings-manager.ts:974-985`)
+    /// is the command source.
+    fn open_external_editor(&mut self) {
+        let command = std::env::var("VISUAL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::env::var("EDITOR")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or_else(|| {
+                if cfg!(windows) {
+                    "notepad".to_string()
+                } else {
+                    "nano".to_string()
+                }
+            });
+        let content = self.editor_mut().editor.get_text();
+        let directory = std::env::temp_dir().join(format!(
+            "pi-rs-editor-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        let file = directory.join("prompt.md");
+        if let Err(error) =
+            std::fs::create_dir_all(&directory).and_then(|()| std::fs::write(&file, &content))
+        {
+            self.show_error(&format!("Failed to open external editor: {error}"));
+            return;
+        }
+        let preserve_screen = self.tui.alt_screen_active();
+        if let Err(error) = self.tui.stop(TuiStopOptions { preserve_screen }) {
+            let _ = std::fs::remove_dir_all(&directory);
+            self.show_error(&format!("Failed to open external editor: {error}"));
+            return;
+        }
+        println!("Launching external editor: {command}\nPi will resume when the editor exits.");
+        let mut parts = command.split_whitespace();
+        let program = parts.next().unwrap_or_default();
+        let mut child = std::process::Command::new(program);
+        child.args(parts).arg(&file);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            child.creation_flags(0x0800_0000);
+        }
+        let outcome = child
+            .status()
+            .map_err(|error| format!("Failed to launch external editor: {command}: {error}"));
+        let _ = self.tui.start();
+        self.tui.request_render();
+        let result = outcome.and_then(|status| {
+            if !status.success() {
+                return Err(format!(
+                    "External editor exited with code {}; prompt unchanged",
+                    status.code().unwrap_or(-1)
+                ));
+            }
+            let bytes = std::fs::read(&file)
+                .map_err(|error| format!("Failed to read external editor file: {error}"))?;
+            let decoded = String::from_utf8_lossy(&bytes);
+            let without_bom = decoded.strip_prefix('\u{feff}').unwrap_or(&decoded);
+            Ok(without_bom
+                .strip_suffix('\n')
+                .unwrap_or(without_bom)
+                .to_string())
+        });
+        let _ = std::fs::remove_dir_all(&directory);
+        match result {
+            Ok(text) => self.editor_mut().editor.set_text(&text),
+            Err(message) => self.show_status(&message),
+        }
+    }
+
+    /// `handleClipboardPaste` (`interactive-mode.ts:3277-3323`): paste
+    /// clipboard file paths, images or plain text at the editor cursor.
+    ///
+    /// Deviation: pi reads images/files through pi-tui's native clipboard
+    /// bindings (`getNativeClipboard`), which have no Rust equivalent. The
+    /// image arm tries the Wayland/X11 image-paste programs and writes the
+    /// bytes to a temp file, matching upstream's "insert its path" flow;
+    /// text uses the same command list as upstream's `readClipboardText`.
+    fn paste_from_clipboard(&mut self) {
+        let commands: &[(&str, &[&str])] = &[
+            ("termux-clipboard-get", &[]),
+            ("wl-paste", &["--no-newline", "--type", "image/png"]),
+            (
+                "xclip",
+                &["-selection", "clipboard", "-t", "image/png", "-o"],
+            ),
+        ];
+        let mut pasted = false;
+        for (program, args) in commands {
+            let Some(bytes) = crate::clipboard::run_clipboard_command(
+                program,
+                args,
+                crate::clipboard::RunOptions {
+                    input: None,
+                    timeout_ms: 5_000,
+                },
+            ) else {
+                continue;
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            // A PNG signature is the positive image signal; other programs
+            // may answer with text (Termux) which falls through to the text
+            // arm below.
+            if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+                let file = std::env::temp_dir().join(format!(
+                    "pi-rs-clipboard-{}-{}.png",
+                    std::process::id(),
+                    now_millis()
+                ));
+                if std::fs::write(&file, &bytes).is_ok() {
+                    self.editor_mut()
+                        .editor
+                        .insert_text_at_cursor(&file.to_string_lossy());
+                    pasted = true;
+                    break;
+                }
+            } else if *program == "termux-clipboard-get" {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                if !text.is_empty() {
+                    self.editor_mut().editor.insert_text_at_cursor(&text);
+                    pasted = true;
+                    break;
+                }
+            }
+        }
+        if !pasted {
+            let text_commands: &[(&str, &[&str])] = &[
+                ("termux-clipboard-get", &[]),
+                ("wl-paste", &["--no-newline", "--type", "text"]),
+                ("xclip", &["-selection", "clipboard", "-out"]),
+                ("xsel", &["--clipboard", "--output"]),
+                ("pbpaste", &[]),
+            ];
+            for (program, args) in text_commands {
+                let Some(bytes) = crate::clipboard::run_clipboard_command(
+                    program,
+                    args,
+                    crate::clipboard::RunOptions {
+                        input: None,
+                        timeout_ms: 5_000,
+                    },
+                ) else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                if text.is_empty() {
+                    continue;
+                }
+                self.editor_mut().editor.insert_text_at_cursor(&text);
+                pasted = true;
+                break;
+            }
+        }
+        if pasted {
+            self.tui.request_render();
+        } else {
+            self.show_status("Clipboard is empty or unavailable");
         }
     }
 
@@ -13027,6 +13367,11 @@ impl InteractiveMode {
         let len = self.chat_len();
         for index in 0..len {
             if let Some(component) = self.downcast_chat::<ToolExecutionComponent>(index) {
+                component.set_expanded(expanded);
+            }
+            // `bash-execution.ts:63-67`: the bash row's `setExpanded` is
+            // part of the same ctrl+o sweep (`interactive-mode.ts:4753-4758`).
+            if let Some(component) = self.downcast_chat::<BashExecutionComponent>(index) {
                 component.set_expanded(expanded);
             }
             if let Some(component) =
@@ -16042,7 +16387,7 @@ export default function (pi) {
         let plain = strip_terminal_sequences(&capture.output());
         // The startup header with its compact hints.
         assert!(
-            plain.contains("Press ctrl+o to show full startup help."),
+            plain.contains("Press ctrl+o to show full startup help"),
             "{plain}"
         );
         // The user prompt and both assistant turns.
@@ -16893,6 +17238,100 @@ export default function (pi) {
             .push(EditorEventOut::Action(AppAction::Exit));
         mode.pump();
         assert!(mode.exiting, "ctrl+d did not set the exit flag");
+    }
+
+    /// The five keys advertised in `/hotkeys` but previously dead
+    /// (`interactive-mode.ts:3224-3243`): the editor now publishes the
+    /// matching `AppAction` for the orchestrator.
+    #[test]
+    fn advertised_app_keybindings_dispatch_actions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture(dir.path(), "/nonexistent");
+        let cases = [
+            ("\x1a", AppAction::Suspend, "ctrl+z"),
+            ("\x0c", AppAction::ModelSelect, "ctrl+l"),
+            ("\x07", AppAction::ExternalEditor, "ctrl+g"),
+            ("\x18", AppAction::CopyMessage, "ctrl+x"),
+            ("\x16", AppAction::PasteImage, "ctrl+v"),
+        ];
+        for (key, expected, label) in cases {
+            mode.editor_events.lock().expect("editor events").clear();
+            Component::handle_input(mode.editor_mut(), key);
+            let events = mode.editor_events.lock().expect("editor events").clone();
+            assert!(
+                events.contains(&EditorEventOut::Action(expected)),
+                "{label} did not dispatch: {events:?}"
+            );
+        }
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// Esc with an open autocomplete only dismisses the menu
+    /// (`custom-editor.ts:109-120`): it must not interrupt the agent run
+    /// through `AppAction::Interrupt` nor clear the draft.
+    #[test]
+    fn escape_with_autocomplete_dismisses_without_interrupting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, _capture) = fixture(dir.path(), "/nonexistent");
+        Component::handle_input(mode.editor_mut(), "/");
+        assert!(
+            mode.editor_mut().editor.is_showing_autocomplete(),
+            "the slash menu opened"
+        );
+        mode.editor_events.lock().expect("editor events").clear();
+        Component::handle_input(mode.editor_mut(), "\x1b");
+        let events = mode.editor_events.lock().expect("editor events").clone();
+        assert!(
+            !events.contains(&EditorEventOut::Action(AppAction::Interrupt)),
+            "escape must not abort: {events:?}"
+        );
+        assert!(
+            !mode.editor_mut().editor.is_showing_autocomplete(),
+            "the menu closed"
+        );
+        assert_eq!(mode.editor_mut().editor.get_text(), "/", "draft preserved");
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// A persisted `bashExecution` replayed on resume mounts the dedicated
+    /// component (`interactive-mode.ts:4010-4027`); the previous port
+    /// silently dropped that row.
+    #[test]
+    fn persisted_bash_execution_renders_on_resume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut mode, capture) = fixture(dir.path(), "/nonexistent");
+        mode.tui.start().expect("tui start");
+        let before = mode.chat_len();
+        let entry = crate::session::records::SessionMessageEntry {
+            base: crate::session::records::EntryBase {
+                id: "bash-1".to_string(),
+                parent_id: None,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            },
+            message: AgentMessage::BashExecution(pi_agent::agent_message::BashExecutionMessage {
+                command: "echo resumed".to_string(),
+                output: "resumed output\n".to_string(),
+                exit_code: Some(0),
+                cancelled: false,
+                truncated: false,
+                full_output_path: None,
+                exclude_from_context: Some(false),
+                timestamp: 1,
+            }),
+            unknown: serde_json::Map::default(),
+        };
+        mode.render_session_entries(&[SessionEntry::Message(entry)], false);
+        assert_eq!(mode.chat_len(), before + 1);
+        assert!(
+            mode.downcast_chat::<BashExecutionComponent>(before)
+                .is_some(),
+            "the resumed row is a bash component"
+        );
+        mode.tui.render_now(false);
+        let plain = strip_terminal_sequences(&capture.output());
+        assert!(plain.contains("$ echo resumed"), "{plain}");
+        assert!(plain.contains("resumed output"), "{plain}");
+        mode.shutdown().expect("shutdown");
     }
 
     /// The fullscreen switch over the capture terminal: the viewport mounts

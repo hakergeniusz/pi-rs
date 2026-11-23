@@ -1,16 +1,36 @@
 //! `UserMessageComponent` — a user message rendered as markdown on the
 //! `userMessageBg` background.
 //!
-//! Ground truth: `modes/interactive/components/user-message.ts`. Upstream also
-//! prefixes the rendered lines with OSC 133 shell-prompt zone markers; the
-//! main-screen renderer strips those before drawing, and this port's renderer
-//! does not strip them yet, so they are omitted (documented deviation).
+//! Ground truth: `modes/interactive/components/user-message.ts:73-82` and
+//! `tui-main-screen.ts:266-269`. Upstream prefixes the rendered lines with
+//! OSC 133 shell-prompt zone markers; the alt screen's
+//! `previousPrompt`/`nextPrompt` scan for `\x1b]133;A` (`tui-alt-screen.ts:75,
+//! 515-529`). The main screen strips the marker before drawing, so this port
+//! only emits the markers while the fullscreen renderer is active: the mode
+//! flips [`UserMessageComponent::set_osc133_markers`] on a TUI-mode switch.
 
 use pi_tui::component::Component;
 use pi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownOptions};
 
 use super::super::theme;
 use super::markdown_transform::MarkdownTransformCtx;
+
+/// `OSC133_ZONE_START`/`END`/`FINAL` (`user-message.ts:6-8`).
+const OSC133_START: &str = "\x1b]133;A\x07";
+const OSC133_END: &str = "\x1b]133;B\x07";
+const OSC133_FINAL: &str = "\x1b]133;C\x07";
+
+/// Wrap rendered lines in OSC 133 zone markers (`user-message.ts:73-82`).
+pub(crate) fn with_osc133_markers(mut lines: Vec<String>) -> Vec<String> {
+    if let Some(first) = lines.first_mut() {
+        first.insert_str(0, OSC133_START);
+    }
+    if let Some(last) = lines.last_mut() {
+        last.push_str(OSC133_END);
+        last.push_str(OSC133_FINAL);
+    }
+    lines
+}
 
 /// The user message: markdown padded by one column, on the message
 /// background (`user-message.ts:44-71`).
@@ -22,6 +42,8 @@ pub struct UserMessageComponent {
     markdown_theme: pi_tui::components::markdown::MarkdownTheme,
     transform_ctx: MarkdownTransformCtx,
     markdown: Markdown,
+    /// Alt-screen-only prompt zone markers (see the module doc).
+    osc133: bool,
 }
 
 impl UserMessageComponent {
@@ -54,7 +76,13 @@ impl UserMessageComponent {
             markdown_theme,
             transform_ctx,
             markdown,
+            osc133: false,
         }
+    }
+
+    /// Enable the markers only on the alt screen (`tui-main-screen.ts:268`).
+    pub fn set_osc133_markers(&mut self, enabled: bool) {
+        self.osc133 = enabled;
     }
 
     fn build_markdown(
@@ -103,7 +131,12 @@ impl UserMessageComponent {
 
 impl Component for UserMessageComponent {
     fn render(&self, width: usize) -> Vec<String> {
-        self.markdown.render(width)
+        let lines = self.markdown.render(width);
+        if self.osc133 && !lines.is_empty() {
+            with_osc133_markers(lines)
+        } else {
+            lines
+        }
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -115,6 +148,28 @@ impl Component for UserMessageComponent {
 mod tests {
     use super::*;
     use pi_tui::ansi::strip_terminal_sequences;
+
+    /// The markers that drive alt-screen previousPrompt/nextPrompt are
+    /// opt-in: main-screen rendering must never emit `133;A`
+    /// (`tui-main-screen.ts:266-269`).
+    #[test]
+    fn osc133_markers_are_opt_in() {
+        let mut component = UserMessageComponent::new("hello", 1, MarkdownTransformCtx::default());
+        assert!(!component.render(40).join("\n").contains("\x1b]133;A"));
+        component.set_osc133_markers(true);
+        let lines = component.render(40);
+        assert!(
+            lines.first().expect("lines").starts_with("\x1b]133;A\x07"),
+            "zone starts on the first line: {lines:?}"
+        );
+        assert!(
+            lines
+                .last()
+                .expect("lines")
+                .ends_with("\x1b]133;B\x07\x1b]133;C\x07"),
+            "zone ends on the last line: {lines:?}"
+        );
+    }
 
     #[test]
     fn renders_markdown_on_the_message_background() {

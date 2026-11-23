@@ -138,14 +138,10 @@ pub const DEFAULTS: &[(&str, &[&str])] = &[
         action::EDITOR_CURSOR_WORD_RIGHT,
         &["alt+right", "ctrl+right", "alt+f"],
     ),
-    (
-        action::EDITOR_CURSOR_LINE_START,
-        &["home", "ctrl+home", "ctrl+a"],
-    ),
-    (
-        action::EDITOR_CURSOR_LINE_END,
-        &["end", "ctrl+end", "ctrl+e"],
-    ),
+    // `keybindings.ts:83-88`: plain `home`/`end` move the editor cursor;
+    // Ctrl+Home/Ctrl+End belong to the alt-screen viewport (`:216-222`).
+    (action::EDITOR_CURSOR_LINE_START, &["home", "ctrl+a"]),
+    (action::EDITOR_CURSOR_LINE_END, &["end", "ctrl+e"]),
     (action::EDITOR_JUMP_FORWARD, &["ctrl+]"]),
     (action::EDITOR_JUMP_BACKWARD, &["ctrl+alt+]"]),
     (action::EDITOR_PAGE_UP, &["pageUp", "ctrl+pageUp"]),
@@ -194,8 +190,8 @@ pub const DEFAULTS: &[(&str, &[&str])] = &[
         &["shift+enter", "ctrl+shift+g"],
     ),
     (action::ALT_SCREEN_SEARCH_CLOSE, &["escape"]),
-    (action::ALT_SCREEN_TOP, &["home"]),
-    (action::ALT_SCREEN_BOTTOM, &["end"]),
+    (action::ALT_SCREEN_TOP, &["ctrl+home"]),
+    (action::ALT_SCREEN_BOTTOM, &["ctrl+end"]),
 ];
 
 /// The keys bound to `action` in pi's defaults. `keybindings.ts:60-70`
@@ -316,8 +312,16 @@ mod tests {
             matches("\x1b", action::ALT_SCREEN_SEARCH_CLOSE),
             "escape closes search"
         );
-        assert!(matches("\x1b[H", action::ALT_SCREEN_TOP));
-        assert!(matches("\x1b[F", action::ALT_SCREEN_BOTTOM));
+        // `keybindings.ts:83-88,216-222`: plain home/end move the editor
+        // cursor; the viewport's top/bottom use the ctrl-modified variants.
+        assert!(matches("\x1b[H", action::EDITOR_CURSOR_LINE_START));
+        assert!(!matches("\x1b[H", action::ALT_SCREEN_TOP));
+        assert!(matches("\x1b[7^", action::ALT_SCREEN_TOP));
+        assert!(!matches("\x1b[7^", action::EDITOR_CURSOR_LINE_START));
+        assert!(matches("\x1b[F", action::EDITOR_CURSOR_LINE_END));
+        assert!(!matches("\x1b[F", action::ALT_SCREEN_BOTTOM));
+        assert!(matches("\x1b[8^", action::ALT_SCREEN_BOTTOM));
+        assert!(!matches("\x1b[8^", action::EDITOR_CURSOR_LINE_END));
         // The viewport ids shadow the editor's, so a key resolves to the first
         // table entry (the editor) and the caller picks the alt-screen one.
         assert!(matches("\x1b[5~", action::EDITOR_PAGE_UP));

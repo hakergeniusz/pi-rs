@@ -7,6 +7,7 @@
 pub mod armin;
 pub mod assistant_message;
 pub mod auth_selector;
+pub mod bash_execution;
 pub mod branch_summary;
 pub mod compaction_summary;
 #[cfg(feature = "ext-js")]
