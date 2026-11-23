@@ -67,17 +67,18 @@ deliberate scope decision, not a claim of full 1:1 parity.
   tool/MCP image normalization are wired in interactive mode only.
 - **MCP mechanism tails:** `StartupWait` is still one-shot once its bound
   elapses (late connections now survive via a per-server readiness queue), and
-  the stdio stderr tail still uses a temp-file sink; the blocking
-  `poll_notifications` form is retained for hosts that need a barrier.
+  the stdio stderr tail still uses a temp-file sink. Log/progress/cancellation
+  notifications and `needs-auth` state are now forwarded; `/mcp` selector UI
+  call sites for sign-in remain unwired.
 - **Session deltas are partly wired:** `SessionListProgress` is consumed by the
   interactive session selector and `ReadonlySessionManager` by `session/cwd.rs`;
   `bash_execution_update` is emitted on the interactive extension event stream; persisting accumulated deltas into the session store is not wired.
 - **`pi-env` is host-driven by design:** `pi remote` consumes the crate, but
   keepalive/watch ticks, PTY input on the process Tokio runtime and SSH
   host-key onboarding require the host to drive them (no internal timers).
-- **OAuth refresh scope:** wire-time refresh now covers the three built-in flows
-  (Anthropic/Codex/Copilot) including Copilot's 429 back-off and enterprise base
-  URL; other providers keep the honest error. `sha2`+`base64` replace Web
+- **OAuth refresh scope:** wire-time refresh covers eight built-in flows
+  (Anthropic/Codex/Copilot/ChatGPT/Kimi/Meta/xAI/OpenRouter) including Copilot's
+  429 back-off and enterprise base URL; Radius stays unadvertised. `sha2`+`base64` replace Web
   Crypto, and a cancelled wait cannot roll back a refresh another process made.
 - **Policy / environment:** `/share` and `/bug` omitted (Radius upload policy).
 - **Out of scope:** `chord`, `pi-durable`, `evals`, `apps/p2`.

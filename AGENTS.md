@@ -199,6 +199,15 @@ Still open (genuine mechanism tails or deliberate scope decisions):
    `session/cwd.rs`; `bash_execution_update` is emitted on the interactive
    extension event stream, but persisting accumulated deltas into the session
    store is not wired. `pi-env` ticks/PTY/SSH onboarding are host-driven by design.
+2a. Closed in the 2026-11-23 parity-tail wave: fresh-write session golden bytes
+   (including upstream exotic-float fixtures and all entry types), agent-loop
+   extension events (`input`, `before_agent_start`, `message_end`, `boundary`)
+   in print/JSON/RPC, user-configurable `keybindings.json` with `/reload`,
+   markdown syntax highlighting + LaTeX subset + OSC8 links, live terminal
+   colour query for the easter egg, classifier (`models.classify`) and
+   `generateImages` wire APIs, and MCP log/progress/cancellation/needs-auth
+   forwarding. Interactive-mode call sites for the four agent-loop events
+   remain unwired; `pi setModel` host emission is still JS-bus-only.
 3. Out of scope: `chord`, `pi-durable`, `evals`, `apps/p2`. `/share` and `/bug`
    stay omitted (Radius upload policy). All five release targets publish from
    the tag workflow.
