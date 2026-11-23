@@ -4218,6 +4218,17 @@ full gate green (2646 passed, 0 failed, 3 ignored), binary reports
 checksums. Also in this cut: zero-winsize fallback for terminal emulators that
 report a tiny PTY size, and the CI-only tree-summary test flake fix.
 
+The repo is **public** (verified via `gh api`: `private: false`). Release
+assets are anonymously downloadable and `GITHUB_TOKEN` is optional in
+`scripts/install.sh`; README, `docs/RELEASE.md`, installer comments and the
+workflow comments were updated accordingly. The v0.1.1 release was published
+manually because the macOS-13 row stayed queued with no hosted capacity;
+attached assets: `pi-linux-x86_64`, `pi-linux-aarch64`, `pi-windows-x86_64`
+plus `.sha256` files (all verified). The Windows build needed crossterm's
+`windows` feature enabled (`winapi` + `crossterm_winapi`) - fixed in
+`ad358d8`. macOS rows remain in the matrix and will attach assets when a
+runner is available.
+
 ### Terminal-exit noise fix (`3cb7659`)
 Reproduced in tmux: after Ctrl+D the scrollback showed a raw `ESC[?1;2;4c`
 (DA1 reply) and the resume hint overprinting the preserved footer. Root cause:

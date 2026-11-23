@@ -9,22 +9,19 @@ v0.1.0") and `AGENTS.md` (git/release policy). The installer contract
 The `v0.1.0` tag was pushed on the green version commit `7bb47d6` and the
 GitHub Release was created with **two Linux assets** (`pi-linux-x86_64`,
 `pi-linux-aarch64`) plus their `.sha256` files; all checksums verified. The
-tag workflow's macOS jobs sat queued indefinitely (no hosted macOS capacity
-for this private repo), so the run was cancelled and the release published
-with the two completed Linux artifacts via `gh release create` — the manual
-fallback described below.
+tag workflow's macOS jobs sat queued indefinitely at the time (no hosted
+macOS capacity), so the run was cancelled and the release published with the
+two completed Linux artifacts via `gh release create` — the manual fallback
+described below.
 
-Consequently the release workflow was amended to build only the two Linux
-targets; re-add `macos-13` / `macos-14` matrix rows and restore the four-asset
-verification in `publish-release` if hosted macOS runners become available.
-Until then macOS users get a clear "asset not found" error from the installer,
-and `gh release upload v0.1.0 <darwin assets…>` is the documented way to add
-them.
+The repository is now **public** and the release matrix again includes
+`macos-13` / `macos-14` and `windows-latest`. If a macOS row is still queued
+when a release is cut, publish the available assets manually with
+`gh release create` and add Darwin assets later with `gh release upload`.
 
-> **Privacy/access note:** `hakergeniusz/pi-rs` is currently **private**. A
-> private repo's Release assets are not anonymously downloadable, so the
-> installer needs `GITHUB_TOKEN` (read access to Releases) until the repo or
-> its releases are made public. Decide that explicitly at the release cut.
+> **Access note:** `hakergeniusz/pi-rs` is **public**. Release assets are
+> anonymously downloadable and `GITHUB_TOKEN` is optional (the installer uses
+> the API fallback only when a token is supplied).
 
 ## 1. Version discipline
 
@@ -187,15 +184,15 @@ a cleaned-up `TMPDIR` scratch dir), and uses `sudo` only with `--sudo`.
 
 ## 7. Verify a release locally with the installer
 
-Because the repo is private, set a token with read access to Releases first.
-Download the script as a *file* — do not pipe it into a shell:
+The repo is public, so no token is needed. Download the script as a *file*
+(the piped one-liner is also supported):
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh
 sh ./install.sh --help                    # options/usage
 sh ./install.sh --version                 # installer version
 DEST=$(mktemp -d)
-GITHUB_TOKEN=... sh ./install.sh --prefix "$DEST" v0.1.0
+sh ./install.sh --prefix "$DEST" v0.1.0
 "$DEST/pi" --help
 "$DEST/pi" --version                      # must report 0.1.0
 ```

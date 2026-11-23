@@ -5,13 +5,6 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh | sh
 #
-#   # Private repo: put the token in the *shell's* environment. A bare
-#   # `GITHUB_TOKEN=... curl ... | sh` would export it to curl only, not to sh.
-#   GITHUB_TOKEN=... sh -c 'curl -fsSL https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh | sh'
-#   # ...or simply export it first:
-#   export GITHUB_TOKEN=...
-#   curl -fsSL https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh | sh
-#
 #   # Options still work when piped; use `-s --` so `sh` does not eat them:
 #   curl -fsSL https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh \
 #     | sh -s -- --prefix "$HOME/bin" --force
@@ -22,7 +15,6 @@
 #   curl -fsSLO https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh
 #   sh ./install.sh                       # latest -> ~/.local/bin/pi
 #   sh ./install.sh --prefix "$HOME/bin"  # custom prefix
-#   GITHUB_TOKEN=... sh ./install.sh      # private repo
 #
 # Portability rules (this single file is the whole installer; no siblings):
 #   * Strict POSIX sh: no arrays, no `[[ ]]`, no process substitution, no
@@ -83,14 +75,13 @@ Options:
 Environment:
   PI_INSTALL_DIR   Default install prefix.
   PI_VERSION       Default release tag.
-  GITHUB_TOKEN     Bearer token for the GitHub API; REQUIRED while the
-                   repository is private (needs read access to Releases).
+  GITHUB_TOKEN     Optional token for the GitHub API fallback (public repo
+                   needs no token).
   PI_GITHUB_TOKEN  Alias for GITHUB_TOKEN.
   TMPDIR           Where the temporary download directory is created.
 
 Piped one-liner (sh, bash or zsh; Linux and macOS):
   ${ONE_LINER}
-  # Private repo: export GITHUB_TOKEN in the shell before piping.
   # Pass options with: ... | sh -s -- --prefix DIR --force
 
 Safer alternative (download, review, then run - no network bytes piped to a shell):
@@ -247,7 +238,7 @@ download() {
 }
 
 # Resolve an asset by its deterministic name. Public repos use the direct
-# releases/download URL; private repos need the API (token) fallback.
+# releases/download URL; a token enables the API fallback.
 fetch_asset() {
   filename=$1 dest=$2
   if [ "$TAG" = latest ]; then
@@ -272,7 +263,7 @@ fetch_asset() {
 printf 'install.sh: fetching %s for %s/%s (release %s)\n' "$BINARY" "$os" "$arch" "$TAG"
 
 fetch_asset "$asset" "$bin_tmp" \
-  || die "could not download '$asset' for release '$TAG'. The repository is private: set GITHUB_TOKEN to a token with read access to Releases, or pass a valid TAG."
+  || die "could not download '$asset' for release '$TAG'. Check the tag and your network connection; a GITHUB_TOKEN with Releases read access enables the API fallback."
 [ -s "$bin_tmp" ] || die "downloaded binary is empty"
 
 if fetch_asset "$checksum_asset" "$sum_tmp"; then

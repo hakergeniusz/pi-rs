@@ -42,20 +42,19 @@ deviations, not missing headline features:
 
 ### One-liner (Linux x86-64 / ARM64)
 
-The repo is **private**, so the installer needs a `GITHUB_TOKEN` with read
-access to Releases. Download the script as a file, then run that file. Never
-pipe `curl` into a shell.
+The repo is **public**, so no token is needed. One-liner (works in `sh`, `bash`
+and `zsh` on Linux and macOS):
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh && GITHUB_TOKEN=... sh ./install.sh v0.1.1
+curl -fsSL https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh | sh
 ```
 
-The same steps, expanded:
+Safer alternative - download, review, then run:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh
 sh ./install.sh --help
-GITHUB_TOKEN=... sh ./install.sh v0.1.1
+sh ./install.sh v0.1.1
 ```
 
 The binary lands at `~/.local/bin/pi` by default; override with `--prefix DIR`
