@@ -1,6 +1,8 @@
 //! MCP wire types: JSON-RPC 2.0 envelope plus the protocol messages the
 //! client needs (spec: `modelcontextprotocol.io`, protocol version
-//! [`crate::PROTOCOL_VERSION`]).
+//! [`crate::PROTOCOL_VERSION`]). Ids are [`JsonRpcId`] (`string | number`,
+//! upstream `protocol/jsonrpc.ts:1`, `:89-91`) so servers that number their
+//! requests with strings reply coherently.
 //!
 //! Extension points beyond pi's immediate needs — `_meta` and block
 //! `annotations` on tool results, and the `*` tool-name patterns of
@@ -12,11 +14,61 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// A JSON-RPC id: `string | number` (upstream `JsonRpcId`,
+/// `protocol/jsonrpc.ts:1`, `:89-91`). Integers stay on the wire as numbers so
+/// numeric-id servers keep working; strings round-trip verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum JsonRpcId {
+    /// An integral JSON number id (the port allocates these).
+    Number(i64),
+    /// A string id, which upstream allows and some servers send.
+    String(String),
+}
+
+impl From<i64> for JsonRpcId {
+    fn from(id: i64) -> Self {
+        Self::Number(id)
+    }
+}
+
+impl Serialize for JsonRpcId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Number(id) => serializer.serialize_i64(*id),
+            Self::String(id) => serializer.serialize_str(id),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonRpcId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::String(text) => Ok(Self::String(text)),
+            Value::Number(number) => number
+                .as_i64()
+                .map(Self::Number)
+                .ok_or_else(|| serde::de::Error::custom("JSON-RPC number id out of range")),
+            _ => Err(serde::de::Error::custom(
+                "JSON-RPC id must be a string or number",
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for JsonRpcId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Number(id) => write!(f, "{id}"),
+            Self::String(id) => f.write_str(id),
+        }
+    }
+}
+
 /// JSON-RPC 2.0 request going to a server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JsonRpcRequest {
     pub jsonrpc: JsonRpcVersion,
-    pub id: i64,
+    pub id: JsonRpcId,
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
@@ -35,7 +87,7 @@ pub struct JsonRpcNotification {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JsonRpcResponse {
     pub jsonrpc: JsonRpcVersion,
-    pub id: i64,
+    pub id: JsonRpcId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -447,13 +499,45 @@ mod tests {
     fn requests_serialize_with_jsonrpc_2_0() {
         let request = JsonRpcRequest {
             jsonrpc: JsonRpcVersion,
-            id: 1,
+            id: JsonRpcId::Number(1),
             method: "tools/list".to_string(),
             params: None,
         };
         let line = serde_json::to_string(&request).expect("serialize");
         assert!(line.contains(r#""jsonrpc":"2.0""#), "{line}");
         assert!(line.contains(r#""method":"tools/list""#), "{line}");
+    }
+
+    #[test]
+    fn ids_accept_strings_and_numbers_upstream_shape() {
+        // `JsonRpcId = string | number` (`protocol/jsonrpc.ts:1`).
+        let string: JsonRpcId = serde_json::from_value(json!("req-7")).expect("string id");
+        assert_eq!(string, JsonRpcId::String("req-7".to_string()));
+        assert_eq!(
+            serde_json::to_value(&string).expect("serialize"),
+            json!("req-7")
+        );
+        let number: JsonRpcId = serde_json::from_value(json!(42)).expect("number id");
+        assert_eq!(number, JsonRpcId::Number(42));
+        assert_eq!(serde_json::to_value(&number).expect("serialize"), json!(42));
+        let response: JsonRpcResponse = serde_json::from_value(json!({
+            "jsonrpc": "2.0", "id": "req-7", "result": {}
+        }))
+        .expect("string-id response");
+        assert_eq!(response.id, string);
+        // Non string/number ids are malformed, like upstream's isJsonRpcId.
+        assert!(serde_json::from_value::<JsonRpcId>(json!(true)).is_err());
+        let classified = classify_line(r#"{"jsonrpc":"2.0","id":"req-7","result":{}}"#);
+        assert!(matches!(classified, InboundMessage::Response(_)));
+    }
+
+    #[test]
+    fn protocol_version_is_upstream_latest() {
+        // `LATEST_PROTOCOL_VERSION` (`protocol/types.ts:4`) is the default
+        // request version (`client.ts:223`).
+        assert_eq!(crate::PROTOCOL_VERSION, "2025-11-25");
+        assert_eq!(crate::PROTOCOL_VERSION, crate::LATEST_PROTOCOL_VERSION);
+        assert!(crate::SUPPORTED_PROTOCOL_VERSIONS.contains(&crate::PROTOCOL_VERSION));
     }
 
     #[test]

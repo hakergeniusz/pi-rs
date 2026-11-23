@@ -40,16 +40,17 @@ pub mod transport;
 /// JSON-RPC 2.0 envelope + MCP message types.
 pub mod types;
 
-/// MCP protocol version this port sends in the `initialize` handshake
-/// (upstream sends [`LATEST_PROTOCOL_VERSION`]; the port pins its own — a
-/// recorded deviation — and accepts whatever version the server picks from
-/// [`SUPPORTED_PROTOCOL_VERSIONS`]).
-pub const PROTOCOL_VERSION: &str = "2025-06-18";
+/// MCP protocol version this port sends in the `initialize` handshake. It is
+/// [`LATEST_PROTOCOL_VERSION`], matching upstream's
+/// `this.options.protocolVersion ?? LATEST_PROTOCOL_VERSION` (`client.ts:223`,
+/// `protocol/types.ts:4`). Servers that do not support it answer with their
+/// own latest, accepted from [`SUPPORTED_PROTOCOL_VERSIONS`].
+pub const PROTOCOL_VERSION: &str = LATEST_PROTOCOL_VERSION;
 
 /// The newest version upstream advertises
 /// (`LATEST_PROTOCOL_VERSION`, `protocol/types.ts:4`). OAuth discovery
-/// carries it in `MCP-Protocol-Version`; unlike [`PROTOCOL_VERSION`] it is
-/// not a deviation — only the `initialize` handshake is pinned.
+/// carries it in `MCP-Protocol-Version`, and the `initialize` handshake
+/// requests it by default (`client.ts:223`).
 pub const LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Versions the client accepts from a server
@@ -75,5 +76,5 @@ pub use resources::{
     TextResourceContents,
 };
 pub use types::{
-    CallToolResult, ContentBlock, McpTool, ToolsListResult, normalize_mcp_input_schema,
+    CallToolResult, ContentBlock, JsonRpcId, McpTool, ToolsListResult, normalize_mcp_input_schema,
 };

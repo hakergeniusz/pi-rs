@@ -45,12 +45,14 @@
 //! library API with no production call site (upstream's RPC isolate is out of
 //! scope); see `pi-codemode/WIRING.md`.
 //!
-//! Two upstream features are deliberately out of scope here and documented in
-//! `WIRING.md`: the `models.*` globals (no classifier/image model registry seam
-//! exists in this port yet) and streaming `onUpdate` progress (the in-process
-//! VM is synchronous). The `models` option only affects the declared globals
-//! and is off by default in this host. Worker-pool admission is available to
-//! callers that supply a `CodemodeTransport::ThreadWorker`.
+//! Streaming `onUpdate` progress is deliberately out of scope here and
+//! documented in `WIRING.md` (the in-process VM is synchronous). Worker-pool
+//! admission is available to callers that supply a
+//! [`CodemodeTransport::ThreadWorker`]. The `models.*` globals are declared by
+//! default, matching upstream (`index.ts:19-20`, `:37`): the declarations only
+//! affect what the model may reference, and the host supplies them through
+//! [`discovery_globals`]. [`declarative_tool_definition`] registers the tool
+//! with the built-in registry using inert defaults (`index.ts:32-46`).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -325,8 +327,8 @@ pub struct CodemodeOptions {
     pub mode: CodemodeMode,
     /// `codemode.inlineBudget`, in estimated tokens.
     pub inline_budget: Option<u64>,
-    /// Declare `models.*` globals. Off here: no model runtime seam in the
-    /// agent host yet (documented deviation).
+    /// Declare `models.*` globals. On by default, matching upstream
+    /// (`index.ts:19-20`, `:37`: `models: options.models ?? true`).
     pub models: bool,
     /// Per-script default from `// @options:`.
     pub max_output_tokens: u64,
@@ -338,7 +340,7 @@ impl Default for CodemodeOptions {
             enabled: true,
             mode: CodemodeMode::On,
             inline_budget: Some(DEFAULT_INLINE_BUDGET),
-            models: false,
+            models: true,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
         }
     }
@@ -1055,6 +1057,34 @@ impl std::fmt::Debug for CodemodeHost {
     }
 }
 
+/// The `codemode` tool declaration with inert defaults, registered in the
+/// built-in tool registry (`extensions/codemode/index.ts:32-46`). The live host
+/// is bound at the coordinator; this copy carries no callable nested tools and
+/// the upstream default options (`models: true`), so it is safe to declare
+/// before any session or invoker exists.
+#[must_use]
+pub fn declarative_tool_definition() -> crate::tools::index::ToolDefinition {
+    /// The registry copy never executes nested tools: the coordinator
+    /// dispatches `codemode` calls to a live [`CodemodeHost`].
+    struct InertInvoker;
+
+    impl ToolInvoker for InertInvoker {
+        fn invoke(
+            &self,
+            name: &str,
+            _args: Json,
+            _call_id: &str,
+            _signal: &AbortFlag,
+        ) -> Result<AgentToolResult, String> {
+            Err(format!(
+                "codemode: nested tool {name} is unavailable in the declarative definition"
+            ))
+        }
+    }
+
+    CodemodeHost::new(Vec::new(), InertInvoker).tool_definition()
+}
+
 impl CodemodeHost {
     /// Create a host over the callable tools and a blocking tool invoker.
     #[must_use]
@@ -1168,10 +1198,12 @@ impl CodemodeHost {
             prompt_guidelines: vec![
                 "Use codemode to batch independent tool calls (Promise.allSettled), chain them, or filter large output, instead of many separate calls.".to_string(),
             ],
-            // `constrainedSampling`: the Lark source grammar cannot be
-            // represented by the port's `ConstrainedSampling` enum without an
-            // upstream wire-format change; documented as a deviation.
-            constrained_sampling: None,
+            // `constrainedSampling` (`tool.ts:437`): pi-ai's
+            // `ConstrainedSampling::openai_lark` serializes to exactly
+            // `{"type":"grammar","variants":{"openai_lark":…}}`.
+            constrained_sampling: Some(pi_ai::ConstrainedSampling::openai_lark(
+                pi_codemode::CODEMODE_SOURCE_GRAMMAR,
+            )),
             prepare_arguments: None,
             // Scripts are one tool call that issues many nested calls.
             execution_mode: Some(pi_agent::types::ToolExecutionMode::Sequential),
@@ -1699,6 +1731,42 @@ mod tests {
             "{description}"
         );
         assert!(description.contains("Promise<"), "{description}");
+    }
+
+    #[test]
+    fn models_default_to_true_and_the_declaration_is_registerable() {
+        // Upstream `createCodemodeExtension` defaults `models` to true
+        // (`index.ts:19-20`, `:37`).
+        assert!(CodemodeOptions::default().models);
+        let definition = declarative_tool_definition();
+        assert_eq!(definition.name, CODEMODE_TOOL_NAME);
+        assert_eq!(
+            definition.parameters["properties"]["code"]["type"],
+            json!("string")
+        );
+        assert_eq!(
+            definition.execution_mode,
+            Some(pi_agent::types::ToolExecutionMode::Sequential)
+        );
+        // The live registry can look the tool up by name.
+        let registered = crate::tools::create_tool_definition(CODEMODE_TOOL_NAME)
+            .expect("codemode is registered");
+        assert_eq!(registered.name, CODEMODE_TOOL_NAME);
+    }
+
+    #[test]
+    fn tool_declaration_uses_the_upstream_lark_grammar() {
+        let definition = declarative_tool_definition();
+        let sampling = definition
+            .constrained_sampling
+            .expect("codemode declares constrained sampling");
+        assert_eq!(
+            serde_json::to_value(&sampling).expect("serialize"),
+            json!({
+                "type": "grammar",
+                "variants": { "openai_lark": pi_codemode::CODEMODE_SOURCE_GRAMMAR }
+            })
+        );
     }
 
     #[test]

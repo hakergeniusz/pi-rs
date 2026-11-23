@@ -76,8 +76,9 @@ use serde_json::{Value as Json, json};
 use pi_mcp::auth_provider::AuthProvider;
 use pi_mcp::oauth::auth_provider::{McpAuthProvider, McpAuthProviderOptions};
 use pi_mcp::oauth::{MCP_AUTH_FILE_NAME, McpOAuthCredentialStore, McpOAuthSettings};
+use pi_mcp::resources::READ_MCP_RESOURCE_TOOL;
 use pi_mcp::types::{ContentBlock, InboundMessage};
-use pi_mcp::{CallToolResult, McpClient, McpError, McpServerConfig, McpTransportConfig};
+use pi_mcp::{CallToolResult, McpClient, McpError, McpServerConfig, McpTool, McpTransportConfig};
 
 /// Upstream's per-connection default timeout (`DEFAULT_TIMEOUT_SECONDS`,
 /// `runtime.ts:50`).
@@ -1119,6 +1120,13 @@ fn collect_tool_changes(
                 {
                     changed = true;
                 }
+                // `notifications/message` is still discarded here. Upstream
+                // forwards it to the `mcp.log` file in the agent directory
+                // (`extensions/mcp/log.ts:1-69`, `:43-60`), but the MCP worker
+                // has no log-event host seam: the only log sink in this crate
+                // is the JS host's `ui_log` (engine.rs:313), out of this
+                // module's reach. Wiring it needs a host op or log event in
+                // runner.rs/glue.rs (outside this slice's ownership).
             }
             changed.then(|| name.clone())
         })
@@ -1143,11 +1151,7 @@ fn collect_tool_changes(
         let timeout = *timeout;
         match runtime.block_on(client.tools_list_with_timeout(timeout)) {
             Ok(list) => {
-                *tools = list
-                    .tools
-                    .iter()
-                    .map(|tool| serde_json::to_value(tool).unwrap_or(Json::Null))
-                    .collect();
+                *tools = list.tools.iter().map(mcp_tool_definition_json).collect();
                 changes.push(ToolChange {
                     server: name,
                     tools: tools.clone(),
@@ -1303,7 +1307,7 @@ fn connect_with_spawn(
         };
         let tools = tools
             .iter()
-            .map(|tool| serde_json::to_value(tool).unwrap_or(Json::Null))
+            .map(mcp_tool_definition_json)
             .collect::<Vec<_>>();
         let has_resources = client.capabilities.resources.is_some();
         let instructions = client.instructions.clone();
@@ -1967,9 +1971,10 @@ fn to_llm_content_fallback(result: &CallToolResult) -> Vec<Json> {
 /// Model-facing content of one block (`blockToLlmContent`,
 /// `content.ts:76-107`, overridden by `blockToContent`).
 ///
-/// `server` only feeds the `read_mcp_resource` suffix of resource links,
-/// which the port does not register yet — the arms never read it.
-fn block_to_content(_server: &str, block: &ContentBlock) -> Vec<Json> {
+/// `server` feeds the `read_mcp_resource` suffix of resource links; that
+/// tool is registered once a connected server advertises resources, so the
+/// hint is always available (`tools.ts:178-188`).
+fn block_to_content(server: &str, block: &ContentBlock) -> Vec<Json> {
     match block {
         ContentBlock::Text { text, .. } => vec![json!({ "type": "text", "text": text })],
         ContentBlock::Image {
@@ -1989,9 +1994,9 @@ fn block_to_content(_server: &str, block: &ContentBlock) -> Vec<Json> {
             size,
             ..
         } => {
-            // `blockToContent`'s resource_link arm (`tools.ts:178-188`);
-            // `readableResources` is false without the resource tools, so
-            // no `read` suffix is appended.
+            // `blockToContent`'s resource_link arm (`tools.ts:178-188`),
+            // including the `read_mcp_resource` suffix when resources can be
+            // read (upstream's `options.readableResources`).
             let mut details = Vec::new();
             if let Some(mime_type) = mime_type {
                 details.push(mime_type.clone());
@@ -2007,10 +2012,11 @@ fn block_to_content(_server: &str, block: &ContentBlock) -> Vec<Json> {
             let description = description
                 .as_ref()
                 .map_or_else(String::new, |text| format!(": {text}"));
+            let read = format!(". Read it with {READ_MCP_RESOURCE_TOOL} (server \"{server}\")");
             let label = title.clone().unwrap_or_else(|| name.clone());
             vec![json!({
                 "type": "text",
-                "text": format!("[Resource {uri} \"{label}\"{details}{description}]"),
+                "text": format!("[Resource {uri} \"{label}\"{details}{description}{read}]"),
             })]
         }
         ContentBlock::Resource { resource, .. } => {
@@ -2213,6 +2219,118 @@ fn unique_suffix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0u64, |elapsed| elapsed.as_nanos() as u64);
     counter.rotate_left(32) ^ nanos
+}
+
+/// The boolean annotation hints upstream forwards to a tool declaration
+/// (`ANNOTATION_HINTS` / `toToolAnnotations`, `tools.ts:237-247`).
+const ANNOTATION_HINTS: [&str; 4] = [
+    "readOnlyHint",
+    "destructiveHint",
+    "idempotentHint",
+    "openWorldHint",
+];
+
+/// `relocateSchema` (`tools.ts:111-129`): rewrite a subschema's local `$ref`s
+/// so they keep resolving to the same nodes once nested under `pointer`.
+fn relocate_schema(schema: &Json, pointer: &str) -> Json {
+    match schema {
+        Json::Array(items) => items
+            .iter()
+            .map(|item| relocate_schema(item, pointer))
+            .collect(),
+        Json::Object(map) => {
+            let mut relocated = serde_json::Map::new();
+            for (key, value) in map {
+                let rewritten = match (key.as_str(), value) {
+                    ("$ref", Json::String(reference))
+                        if reference == "#" || reference.starts_with("#/") =>
+                    {
+                        json!(format!("{pointer}{}", &reference[1..]))
+                    }
+                    ("const" | "enum" | "default" | "examples", _) => value.clone(),
+                    (
+                        "properties" | "patternProperties" | "dependentSchemas" | "dependencies"
+                        | "$defs" | "definitions",
+                        Json::Object(names),
+                    ) => Json::Object(
+                        names
+                            .iter()
+                            .map(|(name, subschema)| {
+                                (name.clone(), relocate_schema(subschema, pointer))
+                            })
+                            .collect(),
+                    ),
+                    _ => relocate_schema(value, pointer),
+                };
+                relocated.insert(key.clone(), rewritten);
+            }
+            Json::Object(relocated)
+        }
+        other => other.clone(),
+    }
+}
+
+/// `createMcpResultSchema` (`tools.ts:135-150`): the declaration schema of the
+/// `CallToolResult` scripts receive, with the server's own output schema under
+/// `structuredContent` and its local references relocated.
+fn create_mcp_result_schema(structured_content: Option<&Json>) -> Json {
+    json!({
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": { "enum": ["text", "image", "audio", "resource_link", "resource"] },
+                        "text": { "type": "string" },
+                        "data": { "type": "string" },
+                        "mimeType": { "type": "string" }
+                    },
+                    "required": ["type"],
+                    "additionalProperties": true
+                }
+            },
+            "structuredContent": structured_content.map_or_else(
+                || json!({}),
+                |schema| relocate_schema(schema, "#/properties/structuredContent"),
+            ),
+            "isError": { "type": "boolean" }
+        },
+        "required": ["content"],
+        "additionalProperties": true
+    })
+}
+
+/// The published declaration of one `tools/list` tool, adding the fields
+/// upstream's `createMcpToolDefinition` computes (`tools.ts:261-274`): the
+/// `CallToolResult`-shaped `outputSchema`, the boolean annotation hints, and
+/// the `title` fallback from `annotations.title`.
+#[must_use]
+fn mcp_tool_definition_json(tool: &McpTool) -> Json {
+    let mut value = serde_json::to_value(tool).unwrap_or(Json::Null);
+    value["outputSchema"] = create_mcp_result_schema(tool.output_schema.as_ref());
+    let mut hints = serde_json::Map::new();
+    if let Some(annotations) = tool.annotations.as_ref().and_then(Json::as_object) {
+        for hint in ANNOTATION_HINTS {
+            if let Some(flag) = annotations.get(hint).and_then(Json::as_bool) {
+                hints.insert(hint.to_string(), json!(flag));
+            }
+        }
+        if tool.title.is_none()
+            && let Some(title) = annotations.get("title").and_then(Json::as_str)
+        {
+            value["title"] = json!(title);
+        }
+    }
+    if let Some(object) = value.as_object_mut() {
+        if hints.is_empty() {
+            object.remove("annotations");
+        } else {
+            object.insert("annotations".to_string(), Json::Object(hints));
+        }
+    }
+    value
 }
 
 /// Exposure of one tool of a server (`getMcpToolExposure`,
@@ -2467,7 +2585,7 @@ mod tests {
         let content = mapped["content"].as_array().expect("content");
         assert_eq!(
             content[0]["text"],
-            "[Resource file:///a.txt \"a\" (text/plain, 30B)]"
+            "[Resource file:///a.txt \"a\" (text/plain, 30B). Read it with read_mcp_resource (server \"synth\")]"
         );
         assert_eq!(content[1]["text"], "body");
         assert_eq!(content[2]["type"], "image");
@@ -2851,6 +2969,46 @@ done
         );
         assert!(script.get("_meta").is_none(), "top-level _meta dropped");
         assert_eq!(script["structuredContent"], json!({"ok": true}));
+    }
+
+    #[test]
+    fn published_tool_definitions_carry_output_schema_and_boolean_hints() {
+        let tool: McpTool = serde_json::from_value(json!({
+            "name": "search",
+            "description": "Search docs",
+            "annotations": {
+                "title": "Search title",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "priority": 0.9
+            },
+            "inputSchema": {"type": "object"},
+            "outputSchema": {
+                "type": "object",
+                "properties": {"item": {"$ref": "#/$defs/Item"}},
+                "$defs": {"Item": {"type": "string"}}
+            }
+        }))
+        .expect("tool");
+        let definition = mcp_tool_definition_json(&tool);
+        // Upstream `createMcpResultSchema` (`tools.ts:135-150`).
+        assert_eq!(definition["outputSchema"]["type"], json!("object"));
+        assert_eq!(definition["outputSchema"]["required"], json!(["content"]));
+        assert_eq!(
+            definition["outputSchema"]["additionalProperties"],
+            json!(true)
+        );
+        assert_eq!(
+            definition["outputSchema"]["properties"]["structuredContent"]["properties"]["item"]["$ref"],
+            json!("#/properties/structuredContent/$defs/Item")
+        );
+        // Only boolean hints survive (`tools.ts:237-247`).
+        assert_eq!(
+            definition["annotations"],
+            json!({"readOnlyHint": true, "destructiveHint": false})
+        );
+        // `title` falls back to `annotations.title` (`tools.ts:261`).
+        assert_eq!(definition["title"], json!("Search title"));
     }
 
     #[test]

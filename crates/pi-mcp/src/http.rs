@@ -31,8 +31,8 @@ use tokio::task::JoinHandle;
 use crate::auth_provider::{AuthProvider, McpFetch, UnauthorizedContext};
 use crate::error::McpError;
 use crate::types::{
-    InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, JsonRpcVersion,
-    classify_value, json_rpc_error_codes,
+    InboundMessage, JsonRpcId, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    JsonRpcVersion, classify_value, json_rpc_error_codes,
 };
 
 /// Body bytes an error response keeps (`MAX_ERROR_BODY_BYTES`,
@@ -725,8 +725,8 @@ impl StreamableHttpTransport {
         Ok(())
     }
 
-    fn allocate_id(&self) -> i64 {
-        self.next_id.fetch_add(1, Ordering::Relaxed) + 1
+    fn allocate_id(&self) -> JsonRpcId {
+        JsonRpcId::Number(self.next_id.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
     fn reconnect_delay(&self, attempt: u32, server_delay_ms: Option<u64>) -> u64 {
@@ -770,7 +770,7 @@ impl StreamableHttpTransport {
         let id = self.allocate_id();
         let request = JsonRpcRequest {
             jsonrpc: JsonRpcVersion,
-            id,
+            id: id.clone(),
             method: method.to_string(),
             params,
         };
@@ -819,7 +819,7 @@ impl StreamableHttpTransport {
                     single => vec![single],
                 };
                 for item in &items {
-                    if let Some(reply) = self.route_json_item(item, id)? {
+                    if let Some(reply) = self.route_json_item(item, &id)? {
                         return if let Some(error) = reply.error {
                             Err(McpError::Rpc {
                                 code: error.code,
@@ -859,11 +859,11 @@ impl StreamableHttpTransport {
     fn route_json_item(
         &self,
         item: &Value,
-        request_id: i64,
+        request_id: &JsonRpcId,
     ) -> Result<Option<JsonRpcResponse>, McpError> {
         let raw = serde_json::to_string(item).unwrap_or_default();
         match classify_value(item, &raw) {
-            InboundMessage::Response(reply) if reply.id == request_id => Ok(Some(reply)),
+            InboundMessage::Response(reply) if &reply.id == request_id => Ok(Some(reply)),
             InboundMessage::Response(_) => Ok(None),
             InboundMessage::Request(request) => {
                 let _ = self
@@ -952,7 +952,7 @@ impl StreamableHttpTransport {
     async fn consume_response_stream(
         &self,
         body: reqwest::Response,
-        request_id: i64,
+        request_id: JsonRpcId,
     ) -> Result<Value, McpError> {
         let mut cursor = StreamCursor::default();
         let mut failure: Option<McpError> = None;
@@ -966,7 +966,7 @@ impl StreamableHttpTransport {
                         response,
                         SseParser::new(self.shared.max_message_bytes),
                         &mut cursor,
-                        Some(request_id),
+                        Some(&request_id),
                     )
                     .await
                 {
@@ -1038,7 +1038,7 @@ impl StreamableHttpTransport {
         body: reqwest::Response,
         mut parser: SseParser,
         cursor: &mut StreamCursor,
-        request_id: Option<i64>,
+        request_id: Option<&JsonRpcId>,
     ) -> Result<Option<JsonRpcResponse>, McpError> {
         let mut stream = Box::pin(body.bytes_stream());
         while let Some(chunk) = stream.as_mut().next().await {
@@ -1091,7 +1091,7 @@ impl StreamableHttpTransport {
         &self,
         item: SseItem,
         cursor: &mut StreamCursor,
-        request_id: Option<i64>,
+        request_id: Option<&JsonRpcId>,
     ) -> Option<JsonRpcResponse> {
         match item {
             SseItem::Id(id) => cursor.last_event_id = Some(id),
@@ -1111,7 +1111,7 @@ impl StreamableHttpTransport {
                     return None;
                 };
                 match classify_value(&parsed, &event.data) {
-                    InboundMessage::Response(reply) if request_id == Some(reply.id) => {
+                    InboundMessage::Response(reply) if request_id == Some(&reply.id) => {
                         return Some(reply);
                     }
                     InboundMessage::Response(_) => {}

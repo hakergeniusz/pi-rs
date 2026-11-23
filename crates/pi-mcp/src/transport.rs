@@ -13,11 +13,12 @@ use tokio::task::JoinHandle;
 
 use crate::error::McpError;
 use crate::types::{
-    InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcVersion, classify_line,
+    InboundMessage, JsonRpcId, JsonRpcNotification, JsonRpcRequest, JsonRpcVersion, classify_line,
 };
 
-/// Awaiting responses: id -> one-shot reply channel.
-type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<crate::types::JsonRpcResponse>>>>;
+/// Awaiting responses: id -> one-shot reply channel. Keyed by [`JsonRpcId`] so
+/// string-id replies correlate too (upstream `JsonRpcId`, `protocol/jsonrpc.ts:1`).
+type PendingMap = Arc<Mutex<HashMap<JsonRpcId, oneshot::Sender<crate::types::JsonRpcResponse>>>>;
 
 /// Live connection to one server process.
 pub struct StdioTransport {
@@ -117,21 +118,22 @@ impl StdioTransport {
             *next += 1;
             id
         };
+        let rpc_id = JsonRpcId::Number(id);
         let request = JsonRpcRequest {
             jsonrpc: JsonRpcVersion,
-            id,
+            id: rpc_id.clone(),
             method: method.to_string(),
             params,
         };
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, reply_tx);
+        self.pending.lock().await.insert(rpc_id.clone(), reply_tx);
         let sent = self
             .outgoing
             .send(Outgoing::Request(request))
             .await
             .map_err(|_| McpError::ConnectionClosed("writer task gone".to_string()));
         if let Err(error) = sent {
-            self.pending.lock().await.remove(&id);
+            self.pending.lock().await.remove(&rpc_id);
             return Err(error);
         }
 
@@ -206,7 +208,7 @@ async fn reader_loop(
                 for (_, reply) in pending.lock().await.drain() {
                     let _ = reply.send(crate::types::JsonRpcResponse {
                         jsonrpc: JsonRpcVersion,
-                        id: 0,
+                        id: JsonRpcId::Number(0),
                         result: None,
                         error: Some(crate::types::JsonRpcError {
                             code: -32000,

@@ -19,7 +19,10 @@
 //!
 //! `powershell` is registered in [`UNSUPPORTED_TOOLS`] rather than silently
 //! dropped: pi ships it for Windows shells, this port targets the same
-//! platforms as the bash tool.
+//! platforms as the bash tool. The `codemode` extension tool is reachable by
+//! name through [`create_tool_definition`] with inert defaults
+//! (`extensions/codemode/index.ts:32-46`); it is deliberately absent from the
+//! default tool set, matching upstream's `defaultActive: false`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -458,7 +461,11 @@ pub fn ls_definition() -> ToolDefinition {
     }
 }
 
-/// pi's `createToolDefinition`, by name (`index.ts:118-139`).
+/// pi's `createToolDefinition`, by name (`index.ts:118-139`), extended with the
+/// `codemode` extension tool (`extensions/codemode/index.ts:32-46`). Codemode
+/// is looked up by name here so the coordinator can register its declaration
+/// with inert defaults; unlike the core tools it is not in the default tool
+/// set (upstream registers it `defaultActive: false`).
 pub fn create_tool_definition(name: &str) -> Option<ToolDefinition> {
     match name {
         "read" => Some(read_definition()),
@@ -468,6 +475,7 @@ pub fn create_tool_definition(name: &str) -> Option<ToolDefinition> {
         "grep" => Some(grep_definition()),
         "find" => Some(find_definition()),
         "ls" => Some(ls_definition()),
+        "codemode" => Some(crate::codemode_host::declarative_tool_definition()),
         _ => None,
     }
 }
