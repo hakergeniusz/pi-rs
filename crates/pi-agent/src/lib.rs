@@ -37,6 +37,8 @@ pub mod agent_loop;
 pub mod agent_message;
 /// The [`AgentEvent`] union every consumer observes.
 pub mod events;
+/// Host-installed extension seams for `message_end` and boundaries.
+pub mod extension_hooks;
 /// Serde for the crate's value types, in pi's wire shapes.
 pub mod json;
 /// Per-request model/thinking overrides and the [`SettingsHandle`] write seam.
@@ -58,6 +60,10 @@ pub use agent_loop::{
     run_agent_loop_continue,
 };
 pub use events::{AgentEvent, AgentEventSink, CollectingSink, event_kinds};
+pub use extension_hooks::{
+    BoundaryKind, BoundaryOutcome, BoundaryRequest, ExtensionHooks, ExtensionHooksGuard,
+    install_extension_hooks,
+};
 pub use live_settings::SettingsHandle;
 pub use queues::{ContinueDrain, QueueHandle, Queues};
 pub use state::AgentState;

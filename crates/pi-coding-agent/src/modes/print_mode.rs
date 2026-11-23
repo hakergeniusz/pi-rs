@@ -22,6 +22,8 @@
 
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(feature = "ext-js")]
+use std::sync::Mutex;
 
 use pi_agent::agent_loop::AgentLoopConfig;
 use pi_agent::agent_message::AgentMessage;
@@ -103,6 +105,339 @@ impl PrintRuntime {
     }
 }
 
+/// What the `input` chain did to a submission (`agent-session.ts:2111-2130`).
+pub(crate) enum InputOutcome {
+    /// Run with this text and these images.
+    Continue {
+        text: String,
+        images: Vec<ImageContent>,
+    },
+    /// A handler consumed the input: no run starts.
+    Handled,
+}
+
+/// Run the extension `input` chain for one submission. The runner owns the
+/// transform/handled semantics (`pi-ext-js/src/runner.rs:2746-2807`); this is
+/// the production call site the modes share.
+pub(crate) fn apply_input_handlers(
+    runtime: &PrintRuntime,
+    text: &str,
+    images: &[ImageContent],
+    source: &str,
+) -> Result<InputOutcome, String> {
+    apply_input_handlers_with_behavior(runtime, text, images, source, None)
+}
+
+/// Same chain with the `streamingBehavior` field RPC sends for queued inputs
+/// (`agent-session.ts:2335-2352`).
+pub(crate) fn apply_input_handlers_with_behavior(
+    runtime: &PrintRuntime,
+    text: &str,
+    images: &[ImageContent],
+    source: &str,
+    streaming_behavior: Option<&str>,
+) -> Result<InputOutcome, String> {
+    #[cfg(not(feature = "ext-js"))]
+    {
+        let _ = (runtime, source, streaming_behavior);
+        return Ok(InputOutcome::Continue {
+            text: text.to_string(),
+            images: images.to_vec(),
+        });
+    }
+    #[cfg(feature = "ext-js")]
+    let Some(runner) = runtime.extension_runner.as_ref() else {
+        return Ok(InputOutcome::Continue {
+            text: text.to_string(),
+            images: images.to_vec(),
+        });
+    };
+    let mut runner = runner.lock().expect("extension runner mutex poisoned");
+    if !runner.has_handlers("input") {
+        return Ok(InputOutcome::Continue {
+            text: text.to_string(),
+            images: images.to_vec(),
+        });
+    }
+    let mut event = pi_ext_js::events::input(text, source, streaming_behavior);
+    if !images.is_empty() {
+        event["images"] = serde_json::to_value(images).map_err(|error| error.to_string())?;
+    }
+    match runner
+        .emit_input(event)
+        .map_err(|error| error.to_string())?
+    {
+        pi_ext_js::events::InputResult::Handled { .. } => Ok(InputOutcome::Handled),
+        pi_ext_js::events::InputResult::Transform {
+            text,
+            images: transformed,
+        } => {
+            let images = match transformed {
+                Some(value) if !value.is_null() => {
+                    serde_json::from_value(value).unwrap_or_else(|_| images.to_vec())
+                }
+                _ => images.to_vec(),
+            };
+            Ok(InputOutcome::Continue { text, images })
+        }
+        pi_ext_js::events::InputResult::Continue => Ok(InputOutcome::Continue {
+            text: text.to_string(),
+            images: images.to_vec(),
+        }),
+    }
+}
+
+/// The `before_agent_start` result applied to a run (`agent-session.ts:1999-2055`).
+#[derive(Debug, Default)]
+pub(crate) struct BeforeAgentStartOutcome {
+    /// An exact full-prompt override a handler set.
+    pub system_prompt: Option<String>,
+    /// Custom messages to inject ahead of the user prompt.
+    pub messages: Vec<AgentMessage>,
+}
+
+/// The `buildSystemPromptOptions` snapshot the runner hands handlers
+/// (`agent-session.ts:1845-1851,2005`). The port's runtime already carries the
+/// rendered prompt, so the snapshot exposes the fields extensions edit plus
+/// the live cwd and tool loadout.
+#[cfg(feature = "ext-js")]
+pub(crate) fn system_prompt_options(runtime: &PrintRuntime) -> serde_json::Value {
+    let tools: Vec<String> = runtime
+        .executor
+        .tools()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    serde_json::json!({
+        "cwd": runtime.session.get_cwd().to_string_lossy(),
+        "customPrompt": runtime.system_prompt,
+        "selectedTools": tools,
+        "forceSystemPrompt": serde_json::Value::Null,
+    })
+}
+
+/// The `render(options)` callback given to `emitBeforeAgentStart`
+/// (`runner.rs:2836`). A forced prompt is opaque and wins verbatim; otherwise
+/// the run replays the system message the host already built.
+#[cfg(feature = "ext-js")]
+pub(crate) fn render_system_prompt(options: &serde_json::Value, fallback: &str) -> String {
+    options
+        .get("forceSystemPrompt")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| fallback.to_string(), str::to_string)
+}
+
+/// Dispatch `before_agent_start` for a user prompt and collect its mutations.
+pub(crate) fn emit_before_agent_start(
+    runtime: &PrintRuntime,
+    text: &str,
+    images: &[ImageContent],
+) -> Result<BeforeAgentStartOutcome, String> {
+    #[cfg(not(feature = "ext-js"))]
+    {
+        let _ = (runtime, text, images);
+        return Ok(BeforeAgentStartOutcome::default());
+    }
+    #[cfg(feature = "ext-js")]
+    let Some(runner) = runtime.extension_runner.as_ref() else {
+        return Ok(BeforeAgentStartOutcome::default());
+    };
+    let images = if images.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_value(images).map_err(|error| error.to_string())?)
+    };
+    let mut runner = runner.lock().expect("extension runner mutex poisoned");
+    if !runner.has_handlers("before_agent_start") {
+        return Ok(BeforeAgentStartOutcome::default());
+    }
+    let combined = runner
+        .emit_before_agent_start(
+            &pi_ext_js::events::BeforeAgentStartTrigger::User {
+                prompt: text.to_string(),
+                images,
+            },
+            system_prompt_options(runtime),
+            &|options| render_system_prompt(options, &runtime.system_prompt),
+        )
+        .map_err(|error| error.to_string())?;
+    let system_prompt = combined
+        .system_prompt_options
+        .get("forceSystemPrompt")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let mut outcome = BeforeAgentStartOutcome {
+        system_prompt,
+        ..BeforeAgentStartOutcome::default()
+    };
+    let timestamp = now_millis();
+    for message in combined.messages {
+        if let Ok(custom) =
+            serde_json::from_value::<pi_agent::agent_message::CustomMessage>(message.clone())
+        {
+            outcome.messages.push(AgentMessage::Custom(custom));
+        } else {
+            // Untyped handlers can return a bare `{customType, content}`;
+            // synthesize the session message shape upstream normalizes to.
+            let custom_type = message
+                .get("customType")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("custom")
+                .to_string();
+            let content = message
+                .get("content")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let Ok(content) = serde_json::from_value(content) else {
+                continue;
+            };
+            outcome.messages.push(AgentMessage::Custom(
+                pi_agent::agent_message::CustomMessage {
+                    custom_type,
+                    content,
+                    display: message
+                        .get("display")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    details: message.get("details").cloned(),
+                    timestamp,
+                },
+            ));
+        }
+    }
+    Ok(outcome)
+}
+
+/// The host half of the loop's `message_end` and boundary seams
+/// (`agent-session.ts:1399-1413,907-943,2086-2107`). It locks the runner for
+/// each dispatch and records boundary drafts for the mode to commit.
+#[cfg(feature = "ext-js")]
+pub(crate) struct ExtensionLoopHooks {
+    runner: Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+    drafts: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[cfg(feature = "ext-js")]
+impl ExtensionLoopHooks {
+    pub(crate) fn new(
+        runner: Arc<Mutex<pi_ext_js::ExtensionRunner>>,
+        drafts: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> Self {
+        Self { runner, drafts }
+    }
+}
+
+#[cfg(feature = "ext-js")]
+impl pi_agent::ExtensionHooks for ExtensionLoopHooks {
+    fn rewrite_message_end(&self, message: &AgentMessage) -> Option<AgentMessage> {
+        let value = serde_json::to_value(message).ok()?;
+        let mut runner = self.runner.lock().expect("extension runner mutex poisoned");
+        if !runner.has_handlers("message_end") {
+            return None;
+        }
+        let replacement = runner.emit_message_end(value).ok()??;
+        AgentMessage::from_value(&replacement).ok()
+    }
+
+    fn dispatch_boundary(
+        &self,
+        request: pi_agent::BoundaryRequest<'_>,
+    ) -> pi_agent::BoundaryOutcome {
+        let event_name = request.kind.event_name();
+        let mut runner = self.runner.lock().expect("extension runner mutex poisoned");
+        if !runner.has_handlers(event_name) {
+            return pi_agent::BoundaryOutcome::default();
+        }
+        let Ok(result) = runner.emit_boundary(&request.event, &mut |entries| {
+            Ok((request.build_context)(entries))
+        }) else {
+            return pi_agent::BoundaryOutcome::default();
+        };
+        if let Ok(entries) =
+            serde_json::from_value::<Vec<serde_json::Value>>(result.entries.clone())
+        {
+            self.drafts
+                .lock()
+                .expect("boundary drafts mutex poisoned")
+                .extend(entries);
+        }
+        pi_agent::BoundaryOutcome {
+            continue_run: result.continue_run,
+            valid: result.valid,
+        }
+    }
+}
+
+/// Commit the custom-message drafts a boundary handler produced
+/// (`_commitBoundaryDrafts`, `agent-session.ts:1055-1074`), so they ride in the
+/// session context of the next run.
+#[cfg(feature = "ext-js")]
+pub(crate) fn commit_boundary_drafts(
+    runtime: &mut PrintRuntime,
+    drafts: &Arc<Mutex<Vec<serde_json::Value>>>,
+) {
+    let entries = std::mem::take(&mut *drafts.lock().expect("boundary drafts mutex poisoned"));
+    for value in entries {
+        let Ok(custom) = serde_json::from_value::<pi_agent::agent_message::CustomMessage>(value)
+        else {
+            continue;
+        };
+        let _ = runtime.session.append_message(AgentMessage::Custom(custom));
+    }
+}
+
+/// The prompts and prompt override a print/JSON submission resolves to.
+/// Upstream's order is input handlers first, then `before_agent_start` on the
+/// transformed text (`agent-session.ts:2206-2217,1999-2055`).
+pub(crate) struct PromptPlan {
+    pub prompts: Vec<AgentMessage>,
+    pub forced_system_prompt: Option<String>,
+}
+
+/// Build the start messages for print/JSON, threading both extension chains.
+pub(crate) fn plan_prompts(
+    runtime: &PrintRuntime,
+    options: &PrintModeOptions,
+    source: &str,
+) -> Result<PromptPlan, String> {
+    let mut prompts = Vec::new();
+    let mut forced_system_prompt = None;
+    let now = now_millis();
+    if let Some(initial) = &options.initial_message {
+        let (text, images) =
+            match apply_input_handlers(runtime, initial, &options.initial_images, source)? {
+                InputOutcome::Continue { text, images } => (text, images),
+                InputOutcome::Handled => {
+                    return Ok(PromptPlan {
+                        prompts,
+                        forced_system_prompt,
+                    });
+                }
+            };
+        let before = emit_before_agent_start(runtime, &text, &images)?;
+        forced_system_prompt = before.system_prompt;
+        prompts.extend(before.messages);
+        if images.is_empty() {
+            prompts.push(pi_agent::transcript::user_message(&text, now));
+        } else {
+            prompts.push(pi_agent::transcript::user_message_with_images(
+                &text, &images, now,
+            ));
+        }
+    }
+    for message in &options.messages {
+        let text = match apply_input_handlers(runtime, message, &[], source)? {
+            InputOutcome::Continue { text, .. } => text,
+            InputOutcome::Handled => continue,
+        };
+        prompts.push(pi_agent::transcript::user_message(&text, now));
+    }
+    Ok(PromptPlan {
+        prompts,
+        forced_system_prompt,
+    })
+}
+
 /// `runPrintMode` (`print-mode.ts:33-181`), minus signal handling (P7)
 /// and extension binding (P5). Returns the process exit code.
 ///
@@ -125,6 +460,15 @@ pub fn run_print_mode(
     let executor = runtime.executor.clone();
     let specs: Vec<ToolSpec> = executor.tools();
 
+    // Input handlers and `before_agent_start` resolve before the context is
+    // built (`agent-session.ts:2206-2217,1999-2055`): an exact prompt override
+    // must reach the system message the run replays.
+    let plan = plan_prompts(runtime, options, "interactive")?;
+    let effective_prompt = plan
+        .forced_system_prompt
+        .as_deref()
+        .unwrap_or(&runtime.system_prompt);
+
     // Session context: the transcript so far, or a fresh system message.
     let leaf_id = runtime.session.get_leaf_id().map(str::to_string);
     let session_context =
@@ -132,7 +476,7 @@ pub fn run_print_mode(
     let mut context_messages = session_context.messages;
     if context_messages.is_empty()
         && let Some(system) = pi_agent::transcript::create_initial_system_message(
-            Some(&runtime.system_prompt),
+            Some(effective_prompt),
             &specs.iter().map(tool_declaration).collect::<Vec<_>>(),
         )
     {
@@ -163,23 +507,8 @@ pub fn run_print_mode(
             .map_err(|error| error.to_string())?;
     }
 
-    // Prompts (`print-mode.ts:138-144`).
-    let mut prompts: Vec<AgentMessage> = Vec::new();
-    let now = now_millis();
-    if let Some(initial) = &options.initial_message {
-        if options.initial_images.is_empty() {
-            prompts.push(pi_agent::transcript::user_message(initial, now));
-        } else {
-            prompts.push(pi_agent::transcript::user_message_with_images(
-                initial,
-                &options.initial_images,
-                now,
-            ));
-        }
-    }
-    for message in &options.messages {
-        prompts.push(pi_agent::transcript::user_message(message, now));
-    }
+    // Prompts (`print-mode.ts:138-144`), after both extension chains.
+    let prompts = plan.prompts;
 
     let mut queues = Queues::new();
     let mut sink = CollectingSink { events: Vec::new() };
@@ -228,6 +557,17 @@ pub fn run_print_mode(
     };
     #[cfg(not(feature = "ext-js"))]
     let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = Arc::clone(&runtime.stream_fn);
+    // Install the runner-backed `message_end` / boundary seams for this run.
+    #[cfg(feature = "ext-js")]
+    let boundary_drafts = Arc::new(Mutex::new(Vec::new()));
+    #[cfg(feature = "ext-js")]
+    let _extension_hooks = runtime.extension_runner.as_ref().map(|runner| {
+        pi_agent::install_extension_hooks(Arc::new(ExtensionLoopHooks::new(
+            Arc::clone(runner),
+            Arc::clone(&boundary_drafts),
+        )))
+    });
+
     // The auto-retry machine (`agent-session.ts` `_handlePostAgentRun`): a
     // retryable error within budget re-runs the same prompt after a backoff;
     // the failed response is never persisted.
@@ -401,6 +741,11 @@ pub fn run_print_mode(
             );
         }
     }
+
+    // `_commitBoundaryDrafts` (`agent-session.ts:1055-1074`): custom messages
+    // collected by `turn_end`/`agent_before_settle` handlers join the session.
+    #[cfg(feature = "ext-js")]
+    commit_boundary_drafts(runtime, &boundary_drafts);
 
     // Persist the turn (`print-mode.ts` persists via MessageEnd events; the
     // completed-run bytes are identical).

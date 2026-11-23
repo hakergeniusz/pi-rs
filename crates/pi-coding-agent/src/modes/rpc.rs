@@ -117,6 +117,9 @@ use serde_json::Value;
 
 use crate::modes::interactive::components::footer::UsageTotals;
 use crate::modes::print_mode::ModelPattern;
+use crate::modes::print_mode::emit_before_agent_start;
+#[cfg(feature = "ext-js")]
+use crate::modes::print_mode::{ExtensionLoopHooks, commit_boundary_drafts};
 use crate::modes::print_mode::{PrintRuntime, now_millis};
 use crate::modes::print_mode::{resolve_model, thinking_level_from_str};
 use crate::session::compaction::{
@@ -395,6 +398,7 @@ pub trait RpcHost: Send {
         _text: &str,
         _images: &[pi_ai::types::ImageContent],
         _source: &str,
+        _streaming_behavior: Option<&str>,
     ) -> Result<RpcInputDisposition, String> {
         Ok(RpcInputDisposition::Continue(None))
     }
@@ -648,6 +652,33 @@ impl RpcHost for LocalRpcHost {
 
     fn get_commands(&self, runtime: &PrintRuntime) -> Result<Vec<Value>, String> {
         Ok(extension_commands(runtime))
+    }
+
+    /// The production `input` call site (`agent-session.ts:2206-2217`,
+    /// `runner.rs:2746`): the default host owns the runner, so the chain is
+    /// no longer a pass-through. `handled` consumes the submission; a
+    /// transform feeds its text into expansion and the run.
+    fn run_input_handlers(
+        &self,
+        runtime: &mut PrintRuntime,
+        text: &str,
+        images: &[pi_ai::types::ImageContent],
+        source: &str,
+        streaming_behavior: Option<&str>,
+    ) -> Result<RpcInputDisposition, String> {
+        let outcome = crate::modes::print_mode::apply_input_handlers_with_behavior(
+            runtime,
+            text,
+            images,
+            source,
+            streaming_behavior,
+        )?;
+        Ok(match outcome {
+            crate::modes::print_mode::InputOutcome::Handled => RpcInputDisposition::Handled,
+            crate::modes::print_mode::InputOutcome::Continue { text, .. } => {
+                RpcInputDisposition::Continue(Some(text))
+            }
+        })
     }
 
     fn check_auth(&self, runtime: &PrintRuntime, provider: &str) -> Result<RpcAuthCheck, String> {
@@ -1036,7 +1067,7 @@ fn prompt_preflight(
     }
 
     // `_runInputHandlers` (`:2206-2217`) receives `source: "rpc"`.
-    match host.run_input_handlers(runtime, &text, images, "rpc")? {
+    match host.run_input_handlers(runtime, &text, images, "rpc", None)? {
         RpcInputDisposition::Handled => {
             return Ok(PromptPreflight {
                 disposition: PromptDisposition::Handled,
@@ -1085,6 +1116,7 @@ fn prepare_queued_input(
     host: &dyn RpcHost,
     message: &str,
     images: &[pi_ai::types::ImageContent],
+    streaming_behavior: &str,
 ) -> Result<Option<String>, String> {
     // `_throwIfExtensionCommand` (`:2435-2447`) uses the same command table.
     if message.starts_with('/') {
@@ -1099,11 +1131,12 @@ fn prepare_queued_input(
             ));
         }
     }
-    let text = match host.run_input_handlers(runtime, message, images, "rpc")? {
-        RpcInputDisposition::Handled => return Ok(None),
-        RpcInputDisposition::Continue(Some(replacement)) => replacement,
-        RpcInputDisposition::Continue(None) => message.to_string(),
-    };
+    let text =
+        match host.run_input_handlers(runtime, message, images, "rpc", Some(streaming_behavior))? {
+            RpcInputDisposition::Handled => return Ok(None),
+            RpcInputDisposition::Continue(Some(replacement)) => replacement,
+            RpcInputDisposition::Continue(None) => message.to_string(),
+        };
     Ok(Some(host.expand_prompt(runtime, &text)?.unwrap_or(text)))
 }
 
@@ -2329,7 +2362,7 @@ fn handle_command(
                 );
             };
             let Some(text) =
-                prepare_queued_input(runtime, bridge.host.as_ref(), &message, &images)?
+                prepare_queued_input(runtime, bridge.host.as_ref(), &message, &images, "steer")?
             else {
                 return Ok(CommandOutcome::Success(Some(
                     serde_json::json!({ "disposition": "handled" }),
@@ -2358,7 +2391,7 @@ fn handle_command(
                 );
             };
             let Some(text) =
-                prepare_queued_input(runtime, bridge.host.as_ref(), &message, &images)?
+                prepare_queued_input(runtime, bridge.host.as_ref(), &message, &images, "followUp")?
             else {
                 return Ok(CommandOutcome::Success(Some(
                     serde_json::json!({ "disposition": "handled" }),
@@ -2980,12 +3013,43 @@ fn run_agent_turn(
     let executor = runtime.executor.clone();
     let specs: Vec<ToolSpec> = executor.tools();
 
+    // `_prepareRun` (`agent-session.ts:1999-2055`): handlers observe the
+    // starting prompt, may inject custom messages and may force the system
+    // prompt for this run.
+    let (trigger_text, trigger_images) = match prompts.first() {
+        Some(AgentMessage::User(user)) => {
+            let images = match &user.content {
+                pi_ai::types::UserContent::Text(_) => Vec::new(),
+                pi_ai::types::UserContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        pi_ai::types::InputContent::Image(image) => Some(image.clone()),
+                        pi_ai::types::InputContent::Text(_) => None,
+                    })
+                    .collect(),
+            };
+            (user_content_text(&user.content), images)
+        }
+        _ => (String::new(), Vec::new()),
+    };
+    let before = emit_before_agent_start(runtime, &trigger_text, &trigger_images)?;
+    let mut context_messages = session_messages(runtime);
+    if let Some(forced) = &before.system_prompt {
+        context_messages.retain(|message| !matches!(message, AgentMessage::System(_)));
+        if let Some(system) = pi_agent::transcript::create_initial_system_message(
+            Some(forced),
+            &specs.iter().map(tool_declaration).collect::<Vec<_>>(),
+        ) {
+            context_messages.insert(0, AgentMessage::System(system));
+        }
+    }
     let context = AgentContext {
-        messages: session_messages(runtime),
+        messages: context_messages,
         tools: specs.clone(),
     };
 
-    let user_prompts = prompts;
+    let mut user_prompts = before.messages;
+    user_prompts.extend(prompts);
     let mut sink = RpcEventSink {
         writer: output,
         queued_texts,
@@ -3034,6 +3098,16 @@ fn run_agent_turn(
     };
     #[cfg(not(feature = "ext-js"))]
     let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = Arc::clone(&runtime.stream_fn);
+    #[cfg(feature = "ext-js")]
+    let boundary_drafts = Arc::new(Mutex::new(Vec::new()));
+    #[cfg(feature = "ext-js")]
+    let _extension_hooks = runtime.extension_runner.as_ref().map(|runner| {
+        pi_agent::install_extension_hooks(Arc::new(ExtensionLoopHooks::new(
+            Arc::clone(runner),
+            Arc::clone(&boundary_drafts),
+        )))
+    });
+
     // The auto-retry machine (`agent-session.ts` `_handlePostAgentRun`); the
     // RPC sink forwards the events like any other.
     let mut retry = crate::modes::retry::AgentRetry::new(runtime.retry_settings);
@@ -3204,6 +3278,9 @@ fn run_agent_turn(
             );
         }
     }
+
+    #[cfg(feature = "ext-js")]
+    commit_boundary_drafts(runtime, &boundary_drafts);
 
     for message in &new_messages {
         runtime
@@ -4935,6 +5012,7 @@ mod tests {
             text: &str,
             _images: &[pi_ai::types::ImageContent],
             source: &str,
+            _streaming_behavior: Option<&str>,
         ) -> Result<RpcInputDisposition, String> {
             assert_eq!(source, "rpc", "RPC passes source: rpc (rpc-mode.ts:419)");
             self.log
@@ -5707,5 +5785,106 @@ mod tests {
             assert_eq!(mirror.steering.len(), 0);
             assert_eq!(mirror.follow_up.len(), 0);
         }
+    }
+
+    /// Extension source registering every tail event. `appendEntry` is the
+    /// headless observer the runner exposes to tests.
+    #[cfg(feature = "ext-js")]
+    const TAIL_EVENTS_EXT: &str = r#"
+export default function (pi) {
+  pi.on("input", (event) => {
+    pi.appendEntry("input-seen", event.text);
+    return { action: "transform", text: event.text.trim() + "!" };
+  });
+  pi.on("before_agent_start", (event, ctx) => {
+    ctx.ui.notify("before:" + event.prompt);
+    return { systemPrompt: "forced-by-extension" };
+  });
+  pi.on("message_end", (event) => {
+    pi.appendEntry("message-end-seen", event.message.role);
+    if (event.message.role === "assistant" && event.message.stopReason === "stop") {
+      return { message: { ...event.message, content: [{ type: "text", text: "rewritten-reply" }] } };
+    }
+  });
+  pi.on("turn_end", (event) => {
+    pi.appendEntry("turn-end-seen", event.type);
+    return { entries: [{ customType: "draft", content: "x" }], continue: false };
+  });
+  pi.on("agent_before_settle", (event) => {
+    pi.appendEntry("before-settle-seen", event.type);
+  });
+}
+"#;
+
+    /// All four tail events reach registered handlers through the real RPC
+    /// prompt path (preflight -> run -> settle), not by calling the runner
+    /// directly. The input transform and message rewrite are observable on
+    /// the wire and in the persisted transcript.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn tail_events_reach_registered_handlers_in_the_rpc_prompt_path() {
+        let mut fixture = BridgeFixture::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut runtime = test_runtime(
+            dir.path(),
+            Arc::new(TextScript {
+                calls: AtomicUsize::new(0),
+            }),
+        );
+        let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
+            cwd: dir.path().to_string_lossy().into_owned(),
+            mode: "rpc".to_string(),
+            settings: serde_json::json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        runner
+            .load_extension("<tail-events>", Some(TAIL_EVENTS_EXT))
+            .expect("load");
+        runner.bind().expect("bind");
+        let runner = Arc::new(Mutex::new(runner));
+        runtime.extension_runner = Some(Arc::clone(&runner));
+
+        let mode = ModeThread::start(runtime, fixture.take_bridge());
+        fixture.write_line(r#"{"type":"prompt","id":"tail","message":"  hello  "}"#);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let lines = loop {
+            let lines = fixture.output_lines();
+            if lines.iter().any(|line| line.contains("agent_settled")) {
+                break lines;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for settle: {lines:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        drop(fixture.writer);
+        mode.join();
+
+        let (entries, ui_log) = {
+            let runner = runner.lock().expect("runner");
+            let core = runner.core().lock().expect("core");
+            (core.entries.clone(), core.ui_log.clone())
+        };
+        let seen = |kind: &str| entries.iter().any(|(custom_type, _)| custom_type == kind);
+        assert!(seen("input-seen"), "input handler did not run: {entries:?}");
+        assert!(
+            ui_log.iter().any(|line| line == "before:hello!"),
+            "before_agent_start did not see the transformed prompt: {ui_log:?}"
+        );
+        assert!(
+            seen("message-end-seen"),
+            "message_end handler did not run: {entries:?}"
+        );
+        assert!(seen("turn-end-seen"), "turn_end handler did not run");
+        assert!(
+            seen("before-settle-seen"),
+            "agent_before_settle handler did not run"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("rewritten-reply")),
+            "message_end rewrite did not reach the event stream: {lines:?}"
+        );
     }
 }

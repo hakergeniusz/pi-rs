@@ -18,6 +18,8 @@
 //! re-read on every conversion rather than captured at startup.
 
 use std::sync::Arc;
+#[cfg(feature = "ext-js")]
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
 use pi_agent::agent_loop::AgentLoopConfig;
@@ -28,7 +30,9 @@ use pi_agent::transcript::tool_declaration;
 use pi_agent::types::{AbortSignal, AgentContext, ToolExecutionMode, ToolSpec};
 use pi_ai::types::{JsonObject, StopReason};
 
-use crate::modes::print_mode::{PrintModeOptions, PrintRuntime, now_millis};
+#[cfg(feature = "ext-js")]
+use crate::modes::print_mode::{ExtensionLoopHooks, commit_boundary_drafts};
+use crate::modes::print_mode::{PrintModeOptions, PrintRuntime, plan_prompts};
 use crate::session::store::build_session_context_from;
 
 /// Serializes one [`AgentEvent`] into its wire object: `type` plus the
@@ -307,13 +311,19 @@ pub fn run_json_mode(
     let executor = runtime.executor.clone();
     let specs: Vec<ToolSpec> = executor.tools();
 
+    let plan = plan_prompts(runtime, options, "interactive")?;
+    let effective_prompt = plan
+        .forced_system_prompt
+        .as_deref()
+        .unwrap_or(&runtime.system_prompt);
+
     let leaf_id = runtime.session.get_leaf_id().map(str::to_string);
     let session_context =
         build_session_context_from(&runtime.session.get_entries(), leaf_id.as_deref());
     let mut context_messages = session_context.messages;
     if context_messages.is_empty()
         && let Some(system) = pi_agent::transcript::create_initial_system_message(
-            Some(&runtime.system_prompt),
+            Some(effective_prompt),
             &specs.iter().map(tool_declaration).collect::<Vec<_>>(),
         )
     {
@@ -342,22 +352,7 @@ pub fn run_json_mode(
             .map_err(|error| error.to_string())?;
     }
 
-    let mut prompts: Vec<AgentMessage> = Vec::new();
-    let now = now_millis();
-    if let Some(initial) = &options.initial_message {
-        if options.initial_images.is_empty() {
-            prompts.push(pi_agent::transcript::user_message(initial, now));
-        } else {
-            prompts.push(pi_agent::transcript::user_message_with_images(
-                initial,
-                &options.initial_images,
-                now,
-            ));
-        }
-    }
-    for message in &options.messages {
-        prompts.push(pi_agent::transcript::user_message(message, now));
-    }
+    let prompts = plan.prompts;
 
     let mut queues = Queues::new();
     let mut sink = JsonEventSink;
@@ -414,6 +409,16 @@ pub fn run_json_mode(
     };
     #[cfg(not(feature = "ext-js"))]
     let loop_stream_fn: Arc<dyn pi_agent::types::StreamFn> = Arc::clone(&runtime.stream_fn);
+    #[cfg(feature = "ext-js")]
+    let boundary_drafts = Arc::new(Mutex::new(Vec::new()));
+    #[cfg(feature = "ext-js")]
+    let _extension_hooks = runtime.extension_runner.as_ref().map(|runner| {
+        pi_agent::install_extension_hooks(Arc::new(ExtensionLoopHooks::new(
+            Arc::clone(runner),
+            Arc::clone(&boundary_drafts),
+        )))
+    });
+
     // The auto-retry machine (`agent-session.ts` `_handlePostAgentRun`),
     // emitting `auto_retry_start`/`auto_retry_end` lines like upstream's
     // event stream (`agent-session.ts:235-237`).
@@ -585,6 +590,9 @@ pub fn run_json_mode(
             );
         }
     }
+
+    #[cfg(feature = "ext-js")]
+    commit_boundary_drafts(runtime, &boundary_drafts);
 
     for message in &new_messages {
         runtime

@@ -32,6 +32,7 @@ use pi_ai::types::{JsonObject, StopReason, UserContent};
 use serde_json::Value;
 
 use crate::events::{AgentEvent, AgentEventSink};
+use crate::extension_hooks::{BoundaryKind, dispatch_boundary, rewrite_message_end};
 use crate::transcript;
 use crate::types::{
     AbortSignal, AfterToolCallOverride, AgentContext, AgentToolCall, AgentToolResult,
@@ -324,7 +325,12 @@ pub async fn run_agent_loop(
     signal: &AbortSignal,
     stream_fn: &dyn StreamFn,
 ) -> Vec<AgentMessage> {
-    let initial_messages = transcript::declare_tool_changes(&context, executor, prompts);
+    let mut initial_messages = transcript::declare_tool_changes(&context, executor, prompts);
+    // `_replaceMessageInPlace` (`agent-session.ts:1351-1366`): a `message_end`
+    // rewrite lands before the message is recorded anywhere else in the run.
+    for message in &mut initial_messages {
+        rewrite_message_end(message);
+    }
     let mut new_messages = initial_messages.clone();
     let mut current_context = AgentContext {
         messages: context.messages.clone(),
@@ -417,6 +423,9 @@ async fn run_loop(
     let mut thinking_level = config.thinking_level;
     let mut last_completed_turn: Option<PrepareNextTurnContext> = None;
     let mut explicit_continuation = false;
+    // `_runBeforeSettleBoundary` can keep the run alive while its context can
+    // continue; the budget keeps a misbehaving host from spinning forever.
+    let mut settle_continuation_budget = 8_u32;
     // Steering may already be queued: the user can type while the agent waits.
     let mut pending_messages: Vec<AgentMessage> = queues.drain_steering();
 
@@ -468,8 +477,10 @@ async fn run_loop(
             to_declare.append(&mut pending_messages);
             // Prepared and queued messages are declared into the transcript
             // before the next request, so the model sees the tool set change.
-            for message in transcript::declare_tool_changes(&current_context, executor, to_declare)
+            for mut message in
+                transcript::declare_tool_changes(&current_context, executor, to_declare)
             {
+                rewrite_message_end(&mut message);
                 emit.emit(AgentEvent::MessageStart {
                     message: message.clone(),
                 })
@@ -534,6 +545,10 @@ async fn run_loop(
                         .call(&last_completed_turn.as_ref().expect("turn").turn)
                         .await;
                 }
+                // `_dispatchTurnEndBoundary` (agent-session.ts:907-943) is
+                // installed as a `finishTurn` wrapper upstream, so it runs on
+                // the error path too.
+                dispatch_turn_end_boundary(&current_context, &message, &[]);
                 emit.emit(AgentEvent::TurnEnd {
                     message: message.clone(),
                     tool_results: Vec::new(),
@@ -571,10 +586,15 @@ async fn run_loop(
                 tool_results: tool_results.clone(),
                 new_messages: new_messages.clone(),
             };
-            let decision = match config.finish_turn.as_ref() {
+            let mut decision = match config.finish_turn.as_ref() {
                 Some(finish) => finish.call(&turn).await,
                 None => None,
             };
+            // The boundary vote is folded into `finishTurn`'s decision, like
+            // `_installAgentBoundaryHooks` (`agent-session.ts:945-958`).
+            if dispatch_turn_end_boundary(&current_context, &message, &tool_results).continue_run {
+                decision = Some(TurnDecision::Continue);
+            }
             emit.emit(AgentEvent::TurnEnd {
                 message: message.clone(),
                 tool_results,
@@ -606,6 +626,29 @@ async fn run_loop(
             continue;
         }
 
+        // `_runBeforeSettleBoundary` (`agent-session.ts:2086-2107`): the host
+        // sees the run just before it settles and may vote to continue.
+        if settle_continuation_budget > 0 {
+            let outcome = dispatch_boundary(
+                BoundaryKind::AgentBeforeSettle,
+                serde_json::json!({
+                    "type": "agent_before_settle",
+                    "outcome": last_outcome(new_messages),
+                }),
+                &|entries| {
+                    serde_json::json!({
+                        "contextMessages": current_context.messages.len(),
+                        "entries": entries,
+                        "canContinue": true,
+                    })
+                },
+            );
+            if outcome.continue_run && outcome.valid {
+                settle_continuation_budget -= 1;
+                explicit_continuation = true;
+            }
+        }
+
         // Nothing natural was selected, so fulfil the continuation decision with
         // one context-only turn.
         if explicit_continuation {
@@ -621,6 +664,56 @@ async fn run_loop(
         will_retry: false,
     })
     .await;
+}
+
+/// Dispatch `turn_end` through the host's boundary seam
+/// (`agent-session.ts:907-943`). The base event carries the same fields
+/// upstream hands to `emitBoundary`; the rebuild callback previews the loop's
+/// live context for whatever draft entries a handler accumulated.
+fn dispatch_turn_end_boundary(
+    context: &AgentContext,
+    message: &AgentMessage,
+    tool_results: &[AgentMessage],
+) -> crate::extension_hooks::BoundaryOutcome {
+    let event = serde_json::json!({
+        "type": "turn_end",
+        "turnIndex": 0,
+        "message": serde_json::to_value(message).unwrap_or(Value::Null),
+        "toolResults": serde_json::to_value(tool_results).unwrap_or(Value::Null),
+        "outcome": if let AgentMessage::Assistant(assistant) = message {
+            match assistant.stop_reason {
+                StopReason::Aborted => "aborted",
+                StopReason::Error => "error",
+                _ => "completed",
+            }
+        } else {
+            "completed"
+        },
+    });
+    dispatch_boundary(BoundaryKind::TurnEnd, event, &|entries| {
+        serde_json::json!({
+            "contextMessages": context.messages.len(),
+            "entries": entries,
+            "canContinue": true,
+        })
+    })
+}
+
+/// The `outcome` upstream puts on `agent_before_settle`
+/// (`agent-session.ts:909-912`).
+fn last_outcome(new_messages: &[AgentMessage]) -> &'static str {
+    new_messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            AgentMessage::Assistant(assistant) => Some(match assistant.stop_reason {
+                StopReason::Aborted => "aborted",
+                StopReason::Error => "error",
+                _ => "completed",
+            }),
+            _ => None,
+        })
+        .unwrap_or("completed")
 }
 
 /// Stream one assistant response. `streamAssistantResponse` in `agent-loop.ts`.
@@ -760,6 +853,14 @@ async fn finish_assistant(
     final_message: AssistantMessage,
     added_partial: bool,
 ) -> AgentMessage {
+    // The finalized object is what agent-core stores before `message_end`
+    // (`agent-session.ts:1352-1366`): rewrite it once, here, so agent state,
+    // later events and session persistence all see the same message.
+    let mut finalized = AgentMessage::Assistant(final_message);
+    rewrite_message_end(&mut finalized);
+    let AgentMessage::Assistant(final_message) = finalized else {
+        unreachable!("message_end rewrite cannot change the role");
+    };
     if added_partial {
         replace_last_assistant(context, &final_message);
     } else {
@@ -861,8 +962,8 @@ async fn fail_tool_calls_from_truncated_message(
             duration_ms: None,
         };
         emit_tool_execution_end(&finalized, emit).await;
-        let message = create_tool_result_message(&finalized);
-        emit_tool_result_message(&message, emit).await;
+        let mut message = create_tool_result_message(&finalized);
+        emit_tool_result_message(&mut message, emit).await;
         messages.push(message);
     }
     ExecutedToolCallBatch {
@@ -966,8 +1067,8 @@ async fn execute_tool_calls_sequential(
             emit_tool_execution_update(tool_call, update, emit).await;
         }
         emit_tool_execution_end(&finalized, emit).await;
-        let message = create_tool_result_message(&finalized);
-        emit_tool_result_message(&message, emit).await;
+        let mut message = create_tool_result_message(&finalized);
+        emit_tool_result_message(&mut message, emit).await;
         finalized_calls.push(finalized);
         messages.push(message);
 
@@ -1072,8 +1173,8 @@ async fn execute_tool_calls_parallel(
     let finalized_calls: Vec<FinalizedToolCall> = ordered.into_iter().flatten().collect();
     let mut messages = Vec::new();
     for finalized in &finalized_calls {
-        let message = create_tool_result_message(finalized);
-        emit_tool_result_message(&message, emit).await;
+        let mut message = create_tool_result_message(finalized);
+        emit_tool_result_message(&mut message, emit).await;
         messages.push(message);
     }
 
@@ -1311,7 +1412,8 @@ fn create_tool_result_message(finalized: &FinalizedToolCall) -> AgentMessage {
     })
 }
 
-async fn emit_tool_result_message(message: &AgentMessage, emit: &mut dyn AgentEventSink) {
+async fn emit_tool_result_message(message: &mut AgentMessage, emit: &mut dyn AgentEventSink) {
+    rewrite_message_end(message);
     emit.emit(AgentEvent::MessageStart {
         message: message.clone(),
     })
