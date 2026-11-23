@@ -33,7 +33,7 @@ pi-tui = { workspace = true }
 # The embedded JS extensions host; build without it via `--no-default-features`.
 pi-ext-js = { workspace = true, optional = true }
 # Interactive mode polls terminal events directly, like the tui-demo host.
-crossterm = { version = "0.29", default-features = false, features = ["events"] }
+crossterm = { version = "0.29", default-features = false, features = ["events", "windows"] }
 clap = { workspace = true }
 futures = { workspace = true }
 # Real HTTP for the opt-in telemetry transports; mirrors pi-ai/pi-mcp.

@@ -123,6 +123,9 @@ jobs:
   # macOS/Windows row from cancelling the Linux builds.
   build-release-assets:
     if: startsWith(github.ref, 'refs/tags/v')
+    # A private repo may have no hosted macOS capacity; bound the wait so a
+    # permanently-queued macOS row cannot hold the release open forever.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
