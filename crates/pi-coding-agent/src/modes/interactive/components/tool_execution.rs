@@ -934,7 +934,7 @@ mod tests {
         );
         let raw = component.render(60).join("\n");
         assert!(
-            raw.contains("[Image: image/png") || raw.contains("\x1b_G") || raw.contains("\x1b]_"),
+            raw.contains("[Image: [image/png]") || raw.contains("\x1b_G") || raw.contains("\x1b]_"),
             "an image (or its fallback) rendered: {raw:?}"
         );
 
