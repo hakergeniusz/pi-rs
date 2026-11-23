@@ -114,7 +114,8 @@ host overrides. The interactive TUI needs a real PTY (tmux works):
    - `pi-env` ticks/PTY/SSH onboarding are host-driven by design.
 2. **Out of scope / policy — do not "fix" without explicit user approval:**
    `chord`, `pi-durable`, `evals`, `apps/p2`; `/share` and `/bug` (Radius
-   upload policy); macOS release assets (need a hosted runner).
+   upload policy). All five release targets (Linux x86_64/aarch64, macOS
+   x86_64/aarch64, Windows x86_64) build and publish from the tag workflow.
 3. For any new work: create worktrees under `/var/tmp/opencode/wt-<name>`
    (`git worktree add -b task/<name> …`), run the gate recipe above, commit
    with conventional message + `Assisted-by: OpenCode (hy4-flash-free)`,
@@ -4222,12 +4223,12 @@ The repo is **public** (verified via `gh api`: `private: false`). Release
 assets are anonymously downloadable and `GITHUB_TOKEN` is optional in
 `scripts/install.sh`; README, `docs/RELEASE.md`, installer comments and the
 workflow comments were updated accordingly. The v0.1.1 release was published
-manually because the macOS-13 row stayed queued with no hosted capacity;
-attached assets: `pi-linux-x86_64`, `pi-linux-aarch64`, `pi-windows-x86_64`
-plus `.sha256` files (all verified). The Windows build needed crossterm's
-`windows` feature enabled (`winapi` + `crossterm_winapi`) - fixed in
-`ad358d8`. macOS rows remain in the matrix and will attach assets when a
-runner is available.
+manually at first because the retired `macos-13` row stayed queued. Switching
+the matrix to current labels (`macos-15-intel` x86_64, `macos-15` aarch64) in
+`b6c5e5b` made all five rows build successfully; the tag workflow's
+`publish-release` job attached **all 10 assets** (five binaries + five
+`.sha256`) to v0.1.1. The Windows build needed crossterm's `windows` feature
+enabled (`winapi` + `crossterm_winapi`) - fixed in `ad358d8`.
 
 ### Terminal-exit noise fix (`3cb7659`)
 Reproduced in tmux: after Ctrl+D the scrollback showed a raw `ESC[?1;2;4c`

@@ -62,10 +62,10 @@ The binary lands at `~/.local/bin/pi` by default; override with `--prefix DIR`
 `curl | sh`, no writes outside the prefix, and `sudo` only with `--sudo`. Use
 `--force` to replace an existing install.
 
-Current release: **v0.1.1**. Assets are `pi-linux-x86_64` and
-`pi-linux-aarch64`, each with a `.sha256`. macOS assets are pending a hosted
-runner, so macOS users currently get an "asset not found" error from the
-installer.
+Current release: **v0.1.1**. Assets: `pi-linux-x86_64`, `pi-linux-aarch64`,
+`pi-darwin-x86_64`, `pi-darwin-aarch64` and `pi-windows-x86_64`, each with a
+`.sha256`. The tag workflow builds and verifies all five targets - the repo is
+public, so the installer downloads anonymously.
 
 ### npm / Bun (planned, not published yet)
 
