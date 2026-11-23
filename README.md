@@ -180,7 +180,10 @@ cargo fmt --all -- --check
 
 The workspace gate (fmt, clippy with all targets and pedantic `-D warnings`,
 full test suite) runs in CI on every push to `main`. Heavy builds should run
-with low parallelism on memory-capped machines. Interactive-mode tests need
+with low parallelism on memory-capped machines. The cargo build cache lives
+under `/var/cache/zstd5` (`CARGO_TARGET_DIR=/var/cache/zstd5/cargo-target`);
+`scripts/host-build.sh` defaults to it so recompiles stay fast without
+polluting the repo. Interactive-mode tests need
 `fd` and `rg` on `PATH` (installed by CI, resolved via `which()` like upstream's
 `ensureTool`).
 

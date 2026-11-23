@@ -96,11 +96,13 @@ there (and only there), these limits apply:
 The full gate as run on that machine:
 
 ```sh
-cd /home/hakergeniusz/Projects/pi-rs && TMPDIR=/var/tmp PI_CACHE_DIR=/var/tmp/opencode/pi-rs-cache PI_TARGET_DIR=/var/tmp/opencode/pt/ca JOBS=2 sh scripts/host-build.sh gate
+cd /home/hakergeniusz/Projects/pi-rs && TMPDIR=/var/tmp PI_CACHE_DIR=/var/cache/zstd5/cache PI_TARGET_DIR=/var/cache/zstd5/cargo-target JOBS=2 sh scripts/host-build.sh gate
 ```
 
 `PI_TARGET_DIR`, `JOBS` and `PI_CACHE_DIR` are the knobs the script reads
-(defaults: `.build-cache/target`, `4`, and `/tmp/opencode/pi-rs-cache`).
+(defaults: `/var/cache/zstd5/cargo-target`, `4`, and `/var/cache/zstd5/cache`).
+The cargo build cache must live under `/var/cache/zstd5` - do not move it back
+under the repo or `/tmp`.
 
 ## Git workflow
 

@@ -43,12 +43,13 @@ TypeScript pi install. Phases P0–P7 plus the E0–E4 extension arc are landed.
 ```sh
 cd /home/hakergeniusz/Projects/pi-rs
 TMPDIR=/var/tmp PI_CACHE_DIR=/var/tmp/opencode/pi-rs-cache \
-  PI_TARGET_DIR=/var/tmp/opencode/pt/ca JOBS=2 \
+  PI_CACHE_DIR=/var/cache/zstd5/cache \
+  PI_TARGET_DIR=/var/cache/zstd5/cargo-target JOBS=2 \
   sh scripts/host-build.sh gate
 ```
 `/tmp` is user-quota-blocked (files get created but writes fail) — use
 `/var/tmp` for logs, worktrees and TMPDIR. Logs go to `/var/tmp/*.log`, never
-`/tmp/opencode`. Debug binary: `/var/tmp/opencode/pt/ca/debug/pi`. Run with
+`/tmp/opencode`. Debug binary: `/var/cache/zstd5/cargo-target/debug/pi`. Run with
 `env -u PI_CODING_AGENT_DIR -u PI_CODING_AGENT_SESSION_DIR` to avoid stale
 host overrides. The interactive TUI needs a real PTY (tmux works):
 `tmux new-session -d -s test -x 120 -y 40` → `send-keys` → `capture-pane -p -e`.

@@ -17,16 +17,17 @@
 set -u
 
 # /tmp is a user-quota'd tmpfs that fills during --all-targets builds; the
-# default target dir is therefore disk-backed with DEBUGINFO=0 and no
-# incremental data, and `snapshot` still batches it into one archive.
-export CARGO_TARGET_DIR="${PI_TARGET_DIR:-$(pwd)/.build-cache/target}"
+# cargo build cache therefore lives under /var/cache/zstd5 (disk-backed,
+# survives reboots) with DEBUGINFO=0 and no incremental data, and `snapshot`
+# batches it into one archive. PI_TARGET_DIR overrides the target dir.
+export CARGO_TARGET_DIR="${PI_TARGET_DIR:-/var/cache/zstd5/cargo-target}"
 export CARGO_BUILD_JOBS="${JOBS:-4}"
 export CARGO_INCREMENTAL=0
 export CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_PROFILE_TEST_DEBUG=0
 export CARGO_PROFILE_RELEASE_DEBUG=0
 export CARGO_NET_OFFLINE=true
-export XDG_CACHE_HOME="${PI_CACHE_DIR:-/tmp/opencode/pi-rs-cache}"
+export XDG_CACHE_HOME="${PI_CACHE_DIR:-/var/cache/zstd5/cache}"
 
 # Stale host-level overrides from earlier PTY smoke tests make test fixtures
 # write to /pi; the crate's tests manage their own synthetic dirs.
