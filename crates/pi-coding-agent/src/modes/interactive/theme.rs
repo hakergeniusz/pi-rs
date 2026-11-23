@@ -5,7 +5,8 @@
 //! the theme getters, plus the "HTML Export Helpers" section `:834-897` that
 //! `crate::session::export_html` consumes), `modes/interactive/theme/theme-tokens.ts`
 //! (token names — the tokens themselves live in `pi_tui::theme`),
-//! `core/keybindings.ts` (`APP_KEYBINDINGS`), and
+//! `core/keybindings.ts` (`APP_KEYBINDINGS`; `:329-357` for the manager),
+//! `packages/tui/src/keybindings.ts:221-315` (resolution/conflicts), and
 //! `modes/interactive/components/keybinding-hints.ts`.
 
 use std::path::PathBuf;
@@ -645,12 +646,16 @@ pub mod app_keys {
         (MODELS_REORDER_DOWN, &["alt+down"]),
     ];
 
-    /// The keys bound to `action` (`keybindings.ts:60-70` getKeys).
+    /// The keys bound to `action` (`keybindings.ts:60-70` getKeys): the
+    /// installed manager's resolved keys when it defines the app action,
+    /// otherwise the static defaults (upstream's `getKeybindings` fallback).
     pub fn keys_for(action: &str) -> &'static [&'static str] {
-        DEFAULTS
-            .iter()
-            .find(|(id, _)| *id == action)
-            .map_or(&[], |(_, keys)| *keys)
+        pi_tui::keybindings::global_keys_for(action).unwrap_or_else(|| {
+            DEFAULTS
+                .iter()
+                .find(|(id, _)| *id == action)
+                .map_or(&[], |(_, keys)| *keys)
+        })
     }
 
     /// Whether raw input matches the action's first bound key.
@@ -877,6 +882,21 @@ mod tests {
         assert_eq!(app_keys::keys_for(app_keys::INTERRUPT), &["escape"]);
         assert_eq!(key_text(app_keys::INTERRUPT), "escape");
         assert_eq!(key_text("app.nonexistent"), "");
+    }
+
+    #[test]
+    fn app_key_override_reaches_matches() {
+        // The editor dispatches app actions through `app_keys::matches`; a
+        // user's keybindings.json override must reach that lookup.
+        let mut user = pi_tui::keybindings::KeybindingsConfig::new();
+        user.insert(app_keys::INTERRUPT, vec!["ctrl+shift+x".to_string()]);
+        let mut manager =
+            pi_tui::keybindings::KeybindingsManager::new(&[(app_keys::INTERRUPT, &["escape"][..])]);
+        manager.set_user_bindings(user);
+        let _guard = manager.install_on_current_thread();
+        assert_eq!(app_keys::keys_for(app_keys::INTERRUPT), &["ctrl+shift+x"]);
+        assert!(app_keys::matches("\x1b[120;6u", app_keys::INTERRUPT));
+        assert!(!app_keys::matches("\x1b", app_keys::INTERRUPT));
     }
 
     #[test]

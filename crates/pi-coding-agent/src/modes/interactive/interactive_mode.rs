@@ -49,6 +49,15 @@
 //! object on its API surface, and `emit_extension_event` is a no-op in
 //! `--no-default-features` builds, so the emitted updates are only observable
 //! where an extension runner is installed.
+//!
+//! Keybinding wiring (`core/keybindings.ts:329-357`,
+//! `interactive-mode.ts:672-673,6673,2381-2384`): the mode creates a
+//! [`KeybindingsManager`] over the full TUI + app definition table with the
+//! user's `<agentDir>/keybindings.json` overlaid and installs it as the global
+//! table every editor/selector component resolves against. Extension shortcut
+//! resolution reads the manager's effective config, so the 18 reserved ids
+//! stay reserved on their (possibly overridden) chords. `/reload` re-reads the
+//! file and refreshes both the components and the extension shortcuts.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -72,6 +81,7 @@ use pi_tui::components::editor::{Editor, EditorOptions};
 use pi_tui::components::scroll_view::ScrollView;
 use pi_tui::components::stack::VStack;
 use pi_tui::components::text::Text;
+use pi_tui::keybindings::KeybindingsManager;
 use pi_tui::mouse::{ComponentId, MouseEvent, MouseEventResult, component_id};
 use pi_tui::stdin_buffer::{StdinBuffer, StdinBufferOptions, StdinEvent};
 use pi_tui::terminal::CrosstermTerminal;
@@ -2074,6 +2084,11 @@ pub struct InteractiveMode {
     auth_path: std::path::PathBuf,
     /// The agent dir the trust selector reads and writes (`trust.json`).
     agent_dir: std::path::PathBuf,
+    /// The resolved keybindings manager (`KeybindingsManager.create(agentDir)`
+    /// at `interactive-mode.ts:672`): TUI + app definitions over the user's
+    /// `<agentDir>/keybindings.json`, installed globally for every component
+    /// and reloaded on `/reload` (`:6673`).
+    keybindings: KeybindingsManager,
     /// Whether this project is trusted in the current session.
     project_trusted: bool,
     /// The CLI `--extension` paths (`/reload` re-resolves them with the
@@ -2202,6 +2217,22 @@ impl InteractiveMode {
 
         let (agent_dir, settings, hide_thinking_block, output_pad, queues) =
             Self::startup_settings(options, runtime);
+
+        // `this.keybindings = KeybindingsManager.create(); setKeybindings(...)`
+        // (`interactive-mode.ts:672-673`): the full TUI + app table, overlaid
+        // with `<agentDir>/keybindings.json`, becomes the table every editor
+        // and selector component matches against. The manager keeps the path
+        // so `/reload` can re-read it (`:6673`).
+        let mut definitions: Vec<(&'static str, &'static [&'static str])> =
+            pi_tui::keybindings::DEFAULTS.to_vec();
+        definitions.extend_from_slice(theme::app_keys::DEFAULTS);
+        let keybindings = KeybindingsManager::with_definitions(
+            &definitions,
+            Some(agent_dir.join("keybindings.json")),
+        );
+        keybindings.install();
+        Self::report_keybinding_conflicts(keybindings.conflicts());
+
         // `shouldShowStartupDetails` (`interactive-mode.ts:1555-1557`): the
         // compact onboarding advertises loaded resources when verbose output
         // is enabled (the default `quietStartup: false`).
@@ -2371,6 +2402,7 @@ impl InteractiveMode {
                 .clone()
                 .unwrap_or_else(crate::config::get_auth_path),
             agent_dir,
+            keybindings,
             project_trusted: options.project_trusted,
             settings,
             queues,
@@ -2621,21 +2653,40 @@ impl InteractiveMode {
         mode
     }
 
-    /// Resolves the extension shortcuts against the port's default
-    /// keybindings and wires the editor dispatch
-    /// (`setupExtensionShortcuts`, `interactive-mode.ts:2381-2432`): the
-    /// chords publish to the shared editor slot, the conflict warnings
-    /// print as `Warning:` lines (the port's loader-line diagnostics
-    /// channel — upstream feeds the `[Extension issues]` banner), and the
-    /// handlers dispatch through the runner on the editor event.
+    /// Reports duplicate-key conflicts from `keybindings.json` on the same
+    /// diagnostics channel the loader uses (`getConflicts`,
+    /// `packages/tui/src/keybindings.ts:266-268`). Upstream's manager exposes
+    /// these to its config UI; the port also prints them at startup/reload so
+    /// a mistyped override is never silent.
+    fn report_keybinding_conflicts(conflicts: &[pi_tui::keybindings::KeybindingConflict]) {
+        for conflict in conflicts {
+            eprintln!(
+                "Warning: Keybinding conflict for '{}' between {}. The last binding wins.",
+                conflict.key,
+                conflict.keybindings.join(", ")
+            );
+        }
+    }
+
+    /// Resolves the extension shortcuts against the *effective* keybindings
+    /// (defaults merged with the user's `keybindings.json`) and wires the
+    /// editor dispatch (`setupExtensionShortcuts`,
+    /// `interactive-mode.ts:2381-2384,680-712`): the runner receives
+    /// `keybindings.getEffectiveConfig()`, so user overrides of the 18
+    /// reserved ids keep blocking extensions on their new chords and release
+    /// their old ones. The chords publish to the shared editor slot, the
+    /// conflict warnings print as `Warning:` lines (the port's loader-line
+    /// diagnostics channel - upstream feeds the `[Extension issues]` banner),
+    /// and the handlers dispatch through the runner on the editor event.
     #[cfg(feature = "ext-js")]
     fn setup_extension_shortcuts(&mut self) {
         let Some(runner) = &self.extension_runner else {
             return;
         };
+        let resolved = self.keybindings.get_effective_config();
         let (keys, warnings) = {
             let mut runner = runner.lock().expect("extension runner mutex poisoned");
-            runner.get_shortcuts(theme::app_keys::DEFAULTS);
+            runner.get_shortcuts(&resolved);
             let keys = runner
                 .shortcuts()
                 .iter()
@@ -8864,8 +8915,9 @@ impl InteractiveMode {
     /// no observable frame here; the default-tools delta rides a tool
     /// registry the port has not ported; the implicit project-trust save
     /// after a reload is startup-only in the port, so the status never
-    /// carries the "saved project trust" suffix; keybindings are static
-    /// constants (`theme::app_keys`), so `keybindings.reload()` is a no-op.
+    /// carries the "saved project trust" suffix. Keybindings are no longer
+    /// static: `<agentDir>/keybindings.json` is re-read and the resolved table
+    /// updated for every component (`interactive-mode.ts:6673`).
     #[allow(clippy::too_many_lines)] // mirrors the TS handleReloadCommand; split when extending
     fn handle_reload_command(&mut self) {
         if self.agent_run.is_some() {
@@ -8910,6 +8962,13 @@ impl InteractiveMode {
             eprintln!("Warning: Extension error: invalidate: {error}");
         }
         self.settings.reload();
+        // `this.keybindings.reload()` (`interactive-mode.ts:6673`): the
+        // resolved table behind every `matches`/`keys_for` call updates in
+        // place, and the extension shortcut resolution below re-resolves the
+        // reserved chords with the new file (`setupExtensionShortcuts`,
+        // `:6683`).
+        let keybinding_conflicts = self.keybindings.reload();
+        Self::report_keybinding_conflicts(&keybinding_conflicts);
         // The image settings can change on disk too (`settings.json`), so the
         // live cell follows the reload just like the in-dialog toggles.
         self.refresh_image_settings();
@@ -13610,6 +13669,9 @@ mod tests {
         let capture = terminal.capture();
         let options = InteractiveOptions {
             auth_path: Some(dir.join("auth.json")),
+            // Synthetic agent dir: never read the operator's live config in
+            // fixtures (the keybindings manager now loads keybindings.json).
+            agent_dir: Some(dir.join("agent")),
             ..InteractiveOptions::default()
         };
         let mut mode = InteractiveMode::new(&mut runtime, &options, Box::new(terminal));
@@ -14431,6 +14493,9 @@ mod tests {
         let capture = terminal.capture();
         let options = InteractiveOptions {
             auth_path: Some(dir.join("auth.json")),
+            // Synthetic agent dir: never read the operator's live config in
+            // fixtures (the keybindings manager now loads keybindings.json).
+            agent_dir: Some(dir.join("agent")),
             ..InteractiveOptions::default()
         };
         let mut runtime = test_runtime(dir, stream);
@@ -14468,6 +14533,9 @@ mod tests {
         let capture = terminal.capture();
         let options = InteractiveOptions {
             auth_path: Some(dir.join("auth.json")),
+            // Synthetic agent dir: never read the operator's live config in
+            // fixtures (the keybindings manager now loads keybindings.json).
+            agent_dir: Some(dir.join("agent")),
             ..InteractiveOptions::default()
         };
         let mut runtime = test_runtime(dir, stream);
@@ -14513,6 +14581,7 @@ mod tests {
         let capture = terminal.capture();
         let options = InteractiveOptions {
             auth_path: Some(dir.join("auth.json")),
+            agent_dir: Some(dir.join("agent")),
             extension_ui: Some(Arc::clone(&bridge)),
             ..InteractiveOptions::default()
         };
@@ -14533,6 +14602,9 @@ mod tests {
         let handle = terminal.clone();
         let options = InteractiveOptions {
             auth_path: Some(dir.join("auth.json")),
+            // Synthetic agent dir: never read the operator's live config in
+            // fixtures (the keybindings manager now loads keybindings.json).
+            agent_dir: Some(dir.join("agent")),
             ..InteractiveOptions::default()
         };
         let mut runtime = test_runtime(
@@ -14610,6 +14682,8 @@ mod tests {
         let capture = terminal.capture();
         let options = InteractiveOptions {
             auth_path: Some(dir.path().join("auth.json")),
+            // Synthetic agent dir: fixtures must not load live keybindings.
+            agent_dir: Some(dir.path().join("agent")),
             ..InteractiveOptions::default()
         };
         let stream: Arc<dyn pi_agent::types::StreamFn> = Arc::new(ScriptedStream {
@@ -14748,6 +14822,8 @@ mod tests {
 
         let options = InteractiveOptions {
             auth_path: Some(dir.path().join("auth.json")),
+            // Synthetic agent dir: fixtures must not load live keybindings.
+            agent_dir: Some(dir.path().join("agent")),
             ..InteractiveOptions::default()
         };
         let new_stream = || {
@@ -19565,6 +19641,8 @@ export default function (pi) {
         });
         let options = InteractiveOptions {
             auth_path: Some(dir.path().join("auth.json")),
+            // Synthetic agent dir: fixtures must not load live keybindings.
+            agent_dir: Some(dir.path().join("agent")),
             ..InteractiveOptions::default()
         };
         let mut runtime = test_runtime(dir.path(), stream);
@@ -19588,5 +19666,55 @@ export default function (pi) {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// `/reload` re-reads `<agentDir>/keybindings.json` and refreshes the
+    /// table behind app-key dispatch (`interactive-mode.ts:6673,672-673`).
+    /// `app.session.tree` is unbound by default and unused by other fixtures,
+    /// so this test's global override cannot disturb parallel tests.
+    #[test]
+    fn reload_command_rebinds_keybindings_from_file() {
+        let dir = tempfile::tempdir().expect("dir");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let config_path = agent_dir.join("keybindings.json");
+        let action_id = theme::app_keys::SESSION_TREE;
+        std::fs::write(
+            &config_path,
+            format!("{{\"{action_id}\": \"ctrl+shift+t\"}}"),
+        )
+        .expect("write keybindings");
+        let terminal = CaptureTerminal::with_size(TerminalSize {
+            columns: 100,
+            rows: 40,
+        });
+        let options = InteractiveOptions {
+            auth_path: Some(dir.path().join("auth.json")),
+            agent_dir: Some(agent_dir),
+            ..InteractiveOptions::default()
+        };
+        let mut runtime = test_runtime(
+            dir.path(),
+            Arc::new(ScriptedStream {
+                calls: AtomicUsize::new(0),
+                file_path: "unused".to_string(),
+            }),
+        );
+        let mut mode = InteractiveMode::new(&mut runtime, &options, Box::new(terminal));
+
+        assert!(mode.keybindings.matches("\x1b[116;6u", action_id));
+
+        std::fs::write(
+            &config_path,
+            format!("{{\"{action_id}\": \"ctrl+shift+y\"}}"),
+        )
+        .expect("rewrite keybindings");
+        mode.handle_reload_command();
+        assert!(mode.keybindings.matches("\x1b[121;6u", action_id));
+        assert!(!mode.keybindings.matches("\x1b[116;6u", action_id));
+
+        // Restore the shared table before another fixture can observe it.
+        mode.keybindings
+            .set_user_bindings(pi_tui::keybindings::KeybindingsConfig::new());
     }
 }

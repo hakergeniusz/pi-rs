@@ -1,11 +1,23 @@
-//! Key action names and pi's default key table.
+//! Key action names, pi's default key table, and the configurable manager.
 //!
-//! Ground truth: `packages/tui/src/keybindings.ts:72-158` (`TUI_KEYBINDINGS`)
-//! and `:9-43` (`TUIKeyAction`). pi resolves an action through a configurable
-//! binding map; the spike ships the defaults, which is what every component in
-//! this crate matches against (the select list hard-codes the same ids).
+//! Ground truth: `packages/tui/src/keybindings.ts:72-158` (`TUI_KEYBINDINGS`),
+//! `:9-43` (`TUIKeyAction`), `:206-315` (`KeybindingsManager`,
+//! `getKeybindings`/`setKeybindings`, conflict detection) and
+//! `packages/coding-agent/src/core/keybindings.ts:201-357` (legacy-name
+//! migration, `<agentDir>/keybindings.json` loading, `reload`).
+//!
+//! Every component in the port matches through [`matches`]/[`keys_for`], just
+//! as upstream's components match through the global manager's `matches`/
+//! `getKeys`. Installing a [`KeybindingsManager`] with [`install`] makes those
+//! functions resolve user overrides; with no manager installed they fall back
+//! to [`DEFAULTS`], exactly like upstream's lazily created default manager.
 
-use crate::keys::matches_key;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, RwLock};
+
+use crate::keys::{SYMBOL_KEYS, matches_key};
 
 /// Every action pi's editor and select list can bind. `keybindings.ts:9-43`.
 pub mod action {
@@ -194,9 +206,22 @@ pub const DEFAULTS: &[(&str, &[&str])] = &[
     (action::ALT_SCREEN_BOTTOM, &["ctrl+end"]),
 ];
 
-/// The keys bound to `action` in pi's defaults. `keybindings.ts:60-70`
-/// (`getKeys`).
+/// The keys bound to `action`: the installed manager's resolved bindings when
+/// one is installed, pi's defaults otherwise. `keybindings.ts:60-70`
+/// (`getKeys`), `:294-300` (`getKeybindings`).
 pub fn keys_for(action: &str) -> &'static [&'static str] {
+    global_keys_for(action).unwrap_or_else(|| default_keys_for(action))
+}
+
+/// One atomic read of the installed table: `Some(keys)` even when the action
+/// is deliberately unbound, `None` when no manager defines it. Hosts with
+/// their own action tables use this to avoid a check-then-read race when
+/// managers are swapped between calls.
+pub fn global_keys_for(action: &str) -> Option<&'static [&'static str]> {
+    global_resolved().and_then(|shared| shared.read().expect("keybindings").keys(action))
+}
+
+fn default_keys_for(action: &str) -> &'static [&'static str] {
     DEFAULTS
         .iter()
         .find(|(id, _)| *id == action)
@@ -209,12 +234,623 @@ pub fn matches(data: &str, action: &str) -> bool {
 }
 
 /// The action a key id is bound to, for a host that wants the reverse lookup
-/// (pi's `keybindings.ts` exposes it for its help output).
+/// (pi's `keybindings.ts` exposes it for its help output). Resolved bindings
+/// win over the defaults, in table order.
 pub fn action_for(key: &str) -> Option<&'static str> {
+    if let Some(shared) = global_resolved()
+        && let Some(action) = shared.read().expect("keybindings").action_for(key)
+    {
+        return Some(action);
+    }
     DEFAULTS
         .iter()
         .find(|(_, keys)| keys.contains(&key))
         .map(|(action, _)| *action)
+}
+
+/// Whether a manager is installed and defines `action` (even with no keys).
+/// Hosts with their own action table use this to avoid mistaking a deliberately
+/// disabled action for an unknown one.
+pub fn is_globally_bound(action: &str) -> bool {
+    global_resolved()
+        .is_some_and(|shared| shared.read().expect("keybindings").keys(action).is_some())
+}
+
+// The manager's resolved table is shared with `keys_for`/`matches` through an
+// `Arc`, so a `reload()` updates every consumer without rebinding components.
+// Upstream's `setKeybindings` holds the same process-global reference
+// (`keybindings.ts:291-300`). A thread-local layer is offered for tests so a
+// scoped override cannot race a parallel test in the same binary.
+static GLOBAL_MANAGER: OnceLock<RwLock<Option<Arc<RwLock<ResolvedBindings>>>>> = OnceLock::new();
+thread_local! {
+    static THREAD_MANAGER: RefCell<Option<Arc<RwLock<ResolvedBindings>>>> = const { RefCell::new(None) };
+}
+
+fn global_resolved() -> Option<Arc<RwLock<ResolvedBindings>>> {
+    if let Some(shared) = THREAD_MANAGER.with(|cell| cell.borrow().clone()) {
+        return Some(shared);
+    }
+    let slot = GLOBAL_MANAGER.get_or_init(|| RwLock::new(None));
+    slot.read()
+        .expect("keybindings global")
+        .as_ref()
+        .map(Arc::clone)
+}
+
+/// Key ids are interned so the `&'static [&'static str]` lookup signature can
+/// stay stable across reloads without re-leaking unchanged keys or key lists.
+fn intern(value: &str) -> &'static str {
+    static INTERNED: OnceLock<RwLock<HashMap<String, &'static str>>> = OnceLock::new();
+    let mut map = INTERNED
+        .get_or_init(|| RwLock::new(HashMap::new()))
+        .write()
+        .expect("keybindings interner");
+    if let Some(existing) = map.get(value) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(value.to_string().into_boxed_str());
+    map.insert(value.to_string(), leaked);
+    leaked
+}
+
+fn intern_keys(keys: &[&'static str]) -> &'static [&'static str] {
+    static LISTS: OnceLock<RwLock<HashMap<String, &'static [&'static str]>>> = OnceLock::new();
+    let signature = keys.join("\0");
+    let mut map = LISTS
+        .get_or_init(|| RwLock::new(HashMap::new()))
+        .write()
+        .expect("keybindings interner");
+    if let Some(existing) = map.get(&signature) {
+        return existing;
+    }
+    let leaked: &'static [&'static str] = Box::leak(keys.to_vec().into_boxed_slice());
+    map.insert(signature, leaked);
+    leaked
+}
+
+/// Legacy config names from before the `tui.`/`app.` prefixing
+/// (`core/keybindings.ts:201-261`, `KEYBINDING_NAME_MIGRATIONS`).
+const LEGACY_NAMES: &[(&str, &str)] = &[
+    ("cursorUp", "tui.editor.cursorUp"),
+    ("cursorDown", "tui.editor.cursorDown"),
+    ("cursorLeft", "tui.editor.cursorLeft"),
+    ("cursorRight", "tui.editor.cursorRight"),
+    ("cursorWordLeft", "tui.editor.cursorWordLeft"),
+    ("cursorWordRight", "tui.editor.cursorWordRight"),
+    ("cursorLineStart", "tui.editor.cursorLineStart"),
+    ("cursorLineEnd", "tui.editor.cursorLineEnd"),
+    ("jumpForward", "tui.editor.jumpForward"),
+    ("jumpBackward", "tui.editor.jumpBackward"),
+    ("pageUp", "tui.editor.pageUp"),
+    ("pageDown", "tui.editor.pageDown"),
+    ("deleteCharBackward", "tui.editor.deleteCharBackward"),
+    ("deleteCharForward", "tui.editor.deleteCharForward"),
+    ("deleteWordBackward", "tui.editor.deleteWordBackward"),
+    ("deleteWordForward", "tui.editor.deleteWordForward"),
+    ("deleteToLineStart", "tui.editor.deleteToLineStart"),
+    ("deleteToLineEnd", "tui.editor.deleteToLineEnd"),
+    ("yank", "tui.editor.yank"),
+    ("yankPop", "tui.editor.yankPop"),
+    ("undo", "tui.editor.undo"),
+    ("newLine", "tui.input.newLine"),
+    ("submit", "tui.input.submit"),
+    ("tab", "tui.input.tab"),
+    ("copy", "tui.input.copy"),
+    ("selectUp", "tui.select.up"),
+    ("selectDown", "tui.select.down"),
+    ("selectPageUp", "tui.select.pageUp"),
+    ("selectPageDown", "tui.select.pageDown"),
+    ("selectConfirm", "tui.select.confirm"),
+    ("selectCancel", "tui.select.cancel"),
+    ("interrupt", "app.interrupt"),
+    ("clear", "app.clear"),
+    ("exit", "app.exit"),
+    ("suspend", "app.suspend"),
+    ("cycleThinkingLevel", "app.thinking.cycle"),
+    ("cycleModelForward", "app.model.cycleForward"),
+    ("cycleModelBackward", "app.model.cycleBackward"),
+    ("selectModel", "app.model.select"),
+    ("expandTools", "app.tools.expand"),
+    ("toggleThinking", "app.thinking.toggle"),
+    ("toggleSessionNamedFilter", "app.session.toggleNamedFilter"),
+    ("externalEditor", "app.editor.external"),
+    ("followUp", "app.message.followUp"),
+    ("dequeue", "app.message.dequeue"),
+    ("pasteImage", "app.clipboard.pasteImage"),
+    ("newSession", "app.session.new"),
+    ("tree", "app.session.tree"),
+    ("fork", "app.session.fork"),
+    ("resume", "app.session.resume"),
+    ("treeFoldOrUp", "app.tree.foldOrUp"),
+    ("treeUnfoldOrDown", "app.tree.unfoldOrDown"),
+    ("treeEditLabel", "app.tree.editLabel"),
+    ("treeToggleLabelTimestamp", "app.tree.toggleLabelTimestamp"),
+    ("toggleSessionPath", "app.session.togglePath"),
+    ("toggleSessionSort", "app.session.toggleSort"),
+    ("renameSession", "app.session.rename"),
+    ("deleteSession", "app.session.delete"),
+    ("deleteSessionNoninvasive", "app.session.deleteNoninvasive"),
+];
+
+fn migrated_name(id: &str) -> &str {
+    LEGACY_NAMES
+        .iter()
+        .find(|(legacy, _)| *legacy == id)
+        .map_or(id, |(_, name)| *name)
+}
+
+/// The base keys accepted by `KeyIdSchema` (`core/key-id-schema.ts:5-11`):
+/// named keys from `packages/tui/src/keys.ts:165-196` plus single characters.
+const NAMED_KEYS: &[&str] = &[
+    "escape",
+    "esc",
+    "enter",
+    "return",
+    "tab",
+    "space",
+    "backspace",
+    "delete",
+    "insert",
+    "clear",
+    "home",
+    "end",
+    "pageUp",
+    "pageDown",
+    "up",
+    "down",
+    "left",
+    "right",
+    "f1",
+    "f2",
+    "f3",
+    "f4",
+    "f5",
+    "f6",
+    "f7",
+    "f8",
+    "f9",
+    "f10",
+    "f11",
+    "f12",
+    "backtick",
+    "hyphen",
+    "equals",
+    "leftbracket",
+    "rightbracket",
+    "backslash",
+    "semicolon",
+    "quote",
+    "comma",
+    "period",
+    "slash",
+    "exclamation",
+    "at",
+    "hash",
+    "dollar",
+    "percent",
+    "caret",
+    "ampersand",
+    "asterisk",
+    "leftparen",
+    "rightparen",
+    "underscore",
+    "plus",
+    "pipe",
+    "tilde",
+    "leftbrace",
+    "rightbrace",
+    "colon",
+    "lessthan",
+    "greaterthan",
+    "question",
+];
+
+/// Whether `id` is a valid key id under upstream's `KeyIdSchema`: up to four
+/// distinct modifiers (`ctrl`, `shift`, `alt`, `super`) and one base key.
+pub fn is_valid_key_id(id: &str) -> bool {
+    const MODIFIERS: &[&str] = &["ctrl", "shift", "alt", "super"];
+    if id.is_empty() {
+        return false;
+    }
+    let mut base = id;
+    let mut seen = std::collections::HashSet::new();
+    // Strip left-to-right so a symbol base like `+` (`ctrl++`) survives.
+    while let Some((modifier, rest)) = MODIFIERS.iter().find_map(|modifier| {
+        base.strip_prefix(*modifier)
+            .and_then(|rest| rest.strip_prefix('+'))
+            .map(|rest| (*modifier, rest))
+    }) {
+        if !seen.insert(modifier) {
+            return false;
+        }
+        base = rest;
+    }
+    if NAMED_KEYS.contains(&base) {
+        return true;
+    }
+    let mut chars = base.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() || SYMBOL_KEYS.contains(&c))
+        && chars.next().is_none()
+}
+
+/// User overrides by id, in load order: `{ "id": "key" | ["key", ...] }`.
+/// Invalid values are dropped like upstream's
+/// `toKeybindingsConfig` (`core/keybindings.ts:267-276`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeybindingsConfig {
+    entries: Vec<(String, Vec<String>)>,
+}
+
+impl KeybindingsConfig {
+    /// An empty override set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parse a `keybindings.json` document, including BOM stripping, legacy
+    /// name migration, `$schema` skipping, and key-id validation.
+    pub fn from_json_str(text: &str) -> Self {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(text)
+        else {
+            return Self::default();
+        };
+        let raw: Vec<(String, serde_json::Value)> = object.into_iter().collect();
+        // Upstream skips a legacy name when the migrated name is also present
+        // (`migrateKeybindingsConfig`, `core/keybindings.ts:278-298`).
+        let raw_names: std::collections::HashSet<String> =
+            raw.iter().map(|(id, _)| id.clone()).collect();
+        let mut migrated: Vec<(String, serde_json::Value)> = Vec::new();
+        for (id, value) in raw {
+            if id == "$schema" {
+                continue;
+            }
+            let name = migrated_name(&id);
+            if name != id && raw_names.contains(name) {
+                continue;
+            }
+            if let Some(slot) = migrated.iter_mut().find(|(existing, _)| existing == name) {
+                slot.1 = value;
+            } else {
+                migrated.push((name.to_string(), value));
+            }
+        }
+        let mut config = Self::new();
+        for (id, value) in migrated {
+            let keys = match value {
+                serde_json::Value::String(key) => {
+                    if is_valid_key_id(&key) {
+                        vec![key]
+                    } else {
+                        continue;
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    let mut keys = Vec::with_capacity(items.len());
+                    let mut valid = true;
+                    for item in items {
+                        let serde_json::Value::String(key) = item else {
+                            valid = false;
+                            break;
+                        };
+                        if !is_valid_key_id(&key) {
+                            valid = false;
+                            break;
+                        }
+                        keys.push(key);
+                    }
+                    if !valid {
+                        continue;
+                    }
+                    keys
+                }
+                _ => continue,
+            };
+            config.insert(id, keys);
+        }
+        config
+    }
+
+    /// Set (or replace) the keys for `id`; an empty list disables the action.
+    pub fn insert(&mut self, id: impl Into<String>, keys: impl Into<Vec<String>>) {
+        let id = id.into();
+        let keys = keys.into();
+        if let Some(slot) = self
+            .entries
+            .iter_mut()
+            .find(|(existing, _)| *existing == id)
+        {
+            slot.1 = keys;
+        } else {
+            self.entries.push((id, keys));
+        }
+    }
+
+    /// The keys for `id`, if overridden.
+    pub fn get(&self, id: &str) -> Option<&[String]> {
+        self.entries
+            .iter()
+            .find(|(existing, _)| existing == id)
+            .map(|(_, keys)| keys.as_slice())
+    }
+
+    /// Iterate over `(id, keys)` in load order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &[String])> {
+        self.entries
+            .iter()
+            .map(|(id, keys)| (id.as_str(), keys.as_slice()))
+    }
+
+    /// Number of overridden ids.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether there are no overrides.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Two or more actions claiming the same key (`KeybindingConflict` upstream,
+/// `packages/tui/src/keybindings.ts:209-212,242-250`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeybindingConflict {
+    /// The contested key id.
+    pub key: String,
+    /// The actions claiming it, in config order.
+    pub keybindings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ResolvedBindings {
+    entries: Vec<(&'static str, &'static [&'static str])>,
+    index: HashMap<&'static str, usize>,
+}
+
+impl ResolvedBindings {
+    fn keys(&self, action: &str) -> Option<&'static [&'static str]> {
+        self.index
+            .get(action)
+            .map(|&position| self.entries[position].1)
+    }
+
+    fn action_for(&self, key: &str) -> Option<&'static str> {
+        self.entries
+            .iter()
+            .find(|(_, keys)| keys.contains(&key))
+            .map(|(action, _)| *action)
+    }
+}
+
+fn normalized_keys(keys: &[String]) -> Vec<&'static str> {
+    let mut seen = std::collections::HashSet::new();
+    keys.iter()
+        .filter(|key| seen.insert(key.as_str()))
+        .map(|key| intern(key))
+        .collect()
+}
+
+/// Resolve defaults with the user's overrides and compute conflicts. Mirrors
+/// upstream's `rebuild` (`packages/tui/src/keybindings.ts:227-253`).
+fn rebuild(
+    definitions: &[(String, Vec<String>)],
+    user: &KeybindingsConfig,
+) -> (ResolvedBindings, Vec<KeybindingConflict>) {
+    let known: std::collections::HashSet<&str> =
+        definitions.iter().map(|(id, _)| id.as_str()).collect();
+    // User claims are collected in config order; each action claims a key once.
+    let mut claims: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (id, keys) in user.iter() {
+        if !known.contains(id) {
+            continue;
+        }
+        for key in normalized_keys(keys) {
+            if let Some((_, keys)) = claims.iter_mut().find(|(claimant, _)| *claimant == id) {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            } else {
+                claims.push((id, vec![key]));
+            }
+        }
+    }
+    let mut conflicts: Vec<KeybindingConflict> = Vec::new();
+    for (key, claimants) in {
+        let mut by_key: Vec<(&str, Vec<&str>)> = Vec::new();
+        for (id, keys) in &claims {
+            for key in keys {
+                if let Some((_, claimants)) = by_key.iter_mut().find(|(claimed, _)| claimed == key)
+                {
+                    claimants.push(id);
+                } else {
+                    by_key.push((key, vec![id]));
+                }
+            }
+        }
+        by_key
+    } {
+        if claimants.len() > 1 {
+            conflicts.push(KeybindingConflict {
+                key: key.to_string(),
+                keybindings: claimants.into_iter().map(str::to_string).collect(),
+            });
+        }
+    }
+
+    let mut entries: Vec<(&'static str, &'static [&'static str])> = definitions
+        .iter()
+        .map(|(id, defaults)| {
+            let keys = user.get(id).unwrap_or(defaults.as_slice());
+            (intern(id), intern_keys(&normalized_keys(keys)))
+        })
+        .collect();
+    // Extra ids are kept sorted after the known ones, mirroring upstream's
+    // `orderKeybindingsConfig` (`core/keybindings.ts:300-316`).
+    let mut extras: Vec<(&str, &[String])> =
+        user.iter().filter(|(id, _)| !known.contains(id)).collect();
+    extras.sort_by_key(|(left, _)| *left);
+    entries.extend(
+        extras
+            .into_iter()
+            .map(|(id, keys)| (intern(id), intern_keys(&normalized_keys(keys)))),
+    );
+    let index = entries
+        .iter()
+        .enumerate()
+        .map(|(position, (id, _))| (*id, position))
+        .collect();
+    (ResolvedBindings { entries, index }, conflicts)
+}
+
+/// A keybinding manager: definitions (default keys per action) plus the user's
+/// `<agentDir>/keybindings.json` overrides. Port of upstream's TUI
+/// `KeybindingsManager` and the coding agent's file-loading subclass
+/// (`packages/tui/src/keybindings.ts:221-290`,
+/// `packages/coding-agent/src/core/keybindings.ts:329-357`).
+#[derive(Debug, Clone)]
+pub struct KeybindingsManager {
+    definitions: Arc<Vec<(String, Vec<String>)>>,
+    user_bindings: KeybindingsConfig,
+    config_path: Option<PathBuf>,
+    resolved: Arc<RwLock<ResolvedBindings>>,
+    conflicts: Vec<KeybindingConflict>,
+}
+
+impl KeybindingsManager {
+    /// A manager over the given definitions with no config file (the TUI's
+    /// `new KeybindingsManager(TUI_KEYBINDINGS)`).
+    pub fn new(definitions: &[(&str, &[&str])]) -> Self {
+        Self::with_definitions(definitions, None)
+    }
+
+    /// A manager over the given definitions, loading `config_path` when set.
+    /// Hosts pass the full TUI + app table and `<agentDir>/keybindings.json`.
+    pub fn with_definitions(definitions: &[(&str, &[&str])], config_path: Option<PathBuf>) -> Self {
+        let definitions: Vec<(String, Vec<String>)> = definitions
+            .iter()
+            .map(|(id, keys)| {
+                (
+                    (*id).to_string(),
+                    keys.iter().map(|key| (*key).to_string()).collect(),
+                )
+            })
+            .collect();
+        let user_bindings = config_path
+            .as_ref()
+            .and_then(|path| Self::load_from_file(path))
+            .unwrap_or_default();
+        let (resolved, conflicts) = rebuild(&definitions, &user_bindings);
+        Self {
+            definitions: Arc::new(definitions),
+            user_bindings,
+            config_path,
+            resolved: Arc::new(RwLock::new(resolved)),
+            conflicts,
+        }
+    }
+
+    /// Upstream's `KeybindingsManager.create(agentDir)`:
+    /// `<agentDir>/keybindings.json` over the TUI defaults. Interactive mode
+    /// uses [`Self::with_definitions`] to add the app-level actions too.
+    pub fn create(agent_dir: impl AsRef<Path>) -> Self {
+        Self::with_definitions(DEFAULTS, Some(agent_dir.as_ref().join("keybindings.json")))
+    }
+
+    fn load_from_file(path: &Path) -> Option<KeybindingsConfig> {
+        let text = std::fs::read_to_string(path).ok()?;
+        Some(KeybindingsConfig::from_json_str(&text))
+    }
+
+    /// Publish this manager to every `matches`/`keys_for` caller (upstream's
+    /// `setKeybindings`, `packages/tui/src/keybindings.ts:293-295`).
+    pub fn install(&self) {
+        GLOBAL_MANAGER
+            .get_or_init(|| RwLock::new(None))
+            .write()
+            .expect("keybindings global")
+            .replace(Arc::clone(&self.resolved));
+    }
+
+    /// Install only on the current thread; the returned guard restores the
+    /// previous layer on drop. Test seam for scoped override assertions.
+    #[doc(hidden)]
+    pub fn install_on_current_thread(&self) -> ThreadBindingsGuard {
+        let previous = THREAD_MANAGER.with(|cell| {
+            let previous = cell.borrow().clone();
+            *cell.borrow_mut() = Some(Arc::clone(&self.resolved));
+            previous
+        });
+        ThreadBindingsGuard { previous }
+    }
+
+    /// Re-read the config file and update every installed consumer. Returns
+    /// the fresh conflicts (upstream's `reload`,
+    /// `core/keybindings.ts:343-346`).
+    pub fn reload(&mut self) -> Vec<KeybindingConflict> {
+        if let Some(path) = &self.config_path {
+            self.user_bindings = Self::load_from_file(path).unwrap_or_default();
+            self.rebuild_in_place();
+        }
+        self.conflicts.clone()
+    }
+
+    /// Replace the overrides directly (upstream's `setUserBindings`).
+    pub fn set_user_bindings(&mut self, user_bindings: KeybindingsConfig) {
+        self.user_bindings = user_bindings;
+        self.rebuild_in_place();
+    }
+
+    fn rebuild_in_place(&mut self) {
+        let (resolved, conflicts) = rebuild(&self.definitions, &self.user_bindings);
+        *self.resolved.write().expect("keybindings") = resolved;
+        self.conflicts = conflicts;
+    }
+
+    /// The keys currently bound to `action` (upstream's `getKeys`).
+    pub fn keys_for(&self, action: &str) -> Vec<&'static str> {
+        self.resolved
+            .read()
+            .expect("keybindings")
+            .keys(action)
+            .map_or_else(Vec::new, <[&'static str]>::to_vec)
+    }
+
+    /// Whether raw input matches `action` under this manager.
+    pub fn matches(&self, data: &str, action: &str) -> bool {
+        self.keys_for(action)
+            .iter()
+            .any(|key| matches_key(data, key))
+    }
+
+    /// All key conflicts in the user's config (upstream's `getConflicts`).
+    pub fn conflicts(&self) -> &[KeybindingConflict] {
+        &self.conflicts
+    }
+
+    /// The user's overrides (upstream's `getUserBindings`).
+    pub fn user_bindings(&self) -> &KeybindingsConfig {
+        &self.user_bindings
+    }
+
+    /// Every action and its resolved keys, in table order: the shape
+    /// extension shortcut resolution consumes (upstream's
+    /// `getResolvedBindings`, `packages/tui/src/keybindings.ts:307-312`).
+    pub fn get_effective_config(&self) -> Vec<(&'static str, &'static [&'static str])> {
+        self.resolved.read().expect("keybindings").entries.clone()
+    }
+}
+
+/// Restores the previous thread-local keybinding layer on drop.
+#[doc(hidden)]
+pub struct ThreadBindingsGuard {
+    previous: Option<Arc<RwLock<ResolvedBindings>>>,
+}
+
+impl Drop for ThreadBindingsGuard {
+    fn drop(&mut self) {
+        THREAD_MANAGER.with(|cell| *cell.borrow_mut() = self.previous.take());
+    }
 }
 
 #[cfg(test)]
@@ -348,5 +984,122 @@ mod tests {
         // `keybindings.ts:151-155`.
         assert!(matches("\x1b[5~", action::SELECT_PAGE_UP));
         assert!(matches("\x1b[6~", action::SELECT_PAGE_DOWN));
+    }
+
+    #[test]
+    fn config_parsing_validates_migrates_and_disables() {
+        // `core/keybindings.ts:267-298`, `key-id-schema.ts:5-21`.
+        let config = KeybindingsConfig::from_json_str(
+            "\u{feff}{\"$schema\": \"x\", \"submit\": \"ctrl+shift+enter\", \
+             \"yank\": [\"ctrl+y\", \"ctrl+alt+y\"], \"undo\": [], \
+             \"bogus\": 12, \"badKey\": \"ctrl+ctrl+x\", \"halfBad\": [\"ctrl+x\", 3]}",
+        );
+        assert_eq!(
+            config.get("tui.input.submit"),
+            Some(&["ctrl+shift+enter".to_string()][..])
+        );
+        assert_eq!(
+            config.get("tui.editor.yank"),
+            Some(&["ctrl+y".to_string(), "ctrl+alt+y".to_string()][..])
+        );
+        assert_eq!(
+            config.get("tui.editor.undo"),
+            Some(&[][..]),
+            "empty disables"
+        );
+        assert!(config.get("$schema").is_none());
+        assert!(config.get("bogus").is_none(), "invalid values are dropped");
+        assert!(
+            config.get("badKey").is_none(),
+            "duplicate modifiers are invalid"
+        );
+        assert!(
+            config.get("halfBad").is_none(),
+            "one invalid key drops the array"
+        );
+        assert!(!is_valid_key_id("ctrl+ctrl+x"));
+        assert!(is_valid_key_id("ctrl+-"));
+        assert!(is_valid_key_id("ctrl++"), "a symbol base may be `+`");
+        assert!(is_valid_key_id("pageUp"));
+        assert!(!is_valid_key_id("CTRL+x"), "base keys are lowercase");
+        assert!(!is_valid_key_id(""));
+    }
+
+    #[test]
+    fn config_reports_user_conflicts() {
+        // `packages/tui/src/keybindings.ts:240-250`: two ids claiming one key.
+        let mut user = KeybindingsConfig::new();
+        user.insert(action::EDITOR_YANK, vec!["ctrl+x".to_string()]);
+        user.insert(action::INPUT_COPY, vec!["ctrl+x".to_string()]);
+        let mut manager = KeybindingsManager::new(&[
+            (action::EDITOR_YANK, &["ctrl+y"][..]),
+            (action::INPUT_COPY, &["ctrl+c"][..]),
+        ]);
+        manager.set_user_bindings(user);
+        assert_eq!(
+            manager.conflicts(),
+            &[KeybindingConflict {
+                key: "ctrl+x".to_string(),
+                keybindings: vec![
+                    action::EDITOR_YANK.to_string(),
+                    action::INPUT_COPY.to_string()
+                ]
+            }]
+        );
+    }
+
+    #[test]
+    fn override_changes_dispatched_key_and_restores_after_guard() {
+        // The global `matches` used by every editor/selector component must
+        // see the manager's resolved keys (`keybindings.ts:293-300`).
+        let mut user = KeybindingsConfig::new();
+        user.insert(action::INPUT_SUBMIT, vec!["ctrl+shift+enter".to_string()]);
+        let mut manager = KeybindingsManager::new(DEFAULTS);
+        manager.set_user_bindings(user);
+        {
+            let _guard = manager.install_on_current_thread();
+            assert!(matches("\x1b[13;6u", action::INPUT_SUBMIT));
+            assert!(!matches("\r", action::INPUT_SUBMIT));
+            assert_eq!(keys_for(action::INPUT_SUBMIT), &["ctrl+shift+enter"]);
+            assert_eq!(action_for("ctrl+shift+enter"), Some(action::INPUT_SUBMIT));
+        }
+        assert!(
+            matches("\r", action::INPUT_SUBMIT),
+            "guard restores defaults"
+        );
+    }
+
+    #[test]
+    fn reload_picks_up_file_changes() {
+        // `core/keybindings.ts:337-346`: create/read/reload from agentDir.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let agent_dir = std::env::temp_dir().join(format!(
+            "pi-rs-keybindings-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let config_path = agent_dir.join("keybindings.json");
+        std::fs::write(
+            &config_path,
+            format!("{{\"{}\": \"ctrl+shift+enter\"}}", action::INPUT_SUBMIT),
+        )
+        .expect("write keybindings");
+        let mut manager = KeybindingsManager::create(&agent_dir);
+        assert!(manager.matches("\x1b[13;6u", action::INPUT_SUBMIT));
+        std::fs::write(
+            &config_path,
+            format!("{{\"{}\": \"ctrl+shift+j\"}}", action::INPUT_SUBMIT),
+        )
+        .expect("rewrite keybindings");
+        assert!(
+            manager.matches("\x1b[13;6u", action::INPUT_SUBMIT),
+            "until reload the old keys stay live"
+        );
+        assert!(manager.reload().is_empty());
+        assert!(manager.matches("\x1b[106;6u", action::INPUT_SUBMIT));
+        assert!(!manager.matches("\x1b[13;6u", action::INPUT_SUBMIT));
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir(&agent_dir);
     }
 }
