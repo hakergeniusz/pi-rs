@@ -1,32 +1,59 @@
 #!/bin/sh
-# scripts/install.sh — portable POSIX installer for pi-rs release binaries.
+# scripts/install.sh - self-contained, portable installer for pi-rs release binaries.
 #
-# Design rules (see docs/RELEASE.md):
-#   * Downloads a prebuilt binary from the GitHub Releases of
-#     hakergeniusz/pi-rs. Never pipes downloaded data into a shell.
-#   * Verifies a SHA-256 checksum before touching the install prefix.
-#   * Writes ONLY inside the chosen prefix (plus a temp dir under TMPDIR
-#     that is removed on exit). No system-wide writes by default;
-#     `--sudo` is strictly opt-in.
-#   * Asset names are deterministic, so no JSON parsing is needed for
-#     public releases. A token (GITHUB_TOKEN) enables the GitHub API
-#     fallback needed by the currently-private repository.
+# QUICK START (one-liner; works when piped into sh, bash or zsh on Linux/macOS):
 #
-# Typical use:
+#   curl -fsSL https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh | sh
+#
+#   # Private repo: put the token in the *shell's* environment. A bare
+#   # `GITHUB_TOKEN=... curl ... | sh` would export it to curl only, not to sh.
+#   GITHUB_TOKEN=... sh -c 'curl -fsSL https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh | sh'
+#   # ...or simply export it first:
+#   export GITHUB_TOKEN=...
+#   curl -fsSL https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh | sh
+#
+#   # Options still work when piped; use `-s --` so `sh` does not eat them:
+#   curl -fsSL https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh \
+#     | sh -s -- --prefix "$HOME/bin" --force
+#
+# SAFER ALTERNATIVE (recommended): download the script first, read it, then run
+# it. No bytes fetched from the network are fed directly to a shell:
+#
 #   curl -fsSLO https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh
 #   sh ./install.sh                       # latest -> ~/.local/bin/pi
 #   sh ./install.sh --prefix "$HOME/bin"  # custom prefix
 #   GITHUB_TOKEN=... sh ./install.sh      # private repo
+#
+# Portability rules (this single file is the whole installer; no siblings):
+#   * Strict POSIX sh: no arrays, no `[[ ]]`, no process substitution, no
+#     bash/zsh-only parameter expansion. Everything is quoted so zsh's
+#     different word-splitting/globbing rules cannot change behavior.
+#   * Reads no data from stdin, so `curl ... | sh` cannot consume the script.
+#   * Detects Linux/Darwin and x86_64/aarch64 with `uname`.
+#   * Verifies a SHA-256 checksum before touching the install prefix.
+#   * Writes ONLY inside the chosen prefix, plus a temp dir under TMPDIR that
+#     is removed on EXIT/INT/TERM. No system-wide writes by default;
+#     `--sudo` is strictly opt-in.
+#   * Asset names are deterministic, so no JSON parsing is needed for public
+#     releases. A token (GITHUB_TOKEN) enables the GitHub API fallback needed
+#     by the currently-private repository.
 
 set -eu
 
-INSTALLER_VERSION="0.1.0"
+INSTALLER_VERSION="0.2.0"
 REPO="hakergeniusz/pi-rs"
 BINARY="pi"
 API_BASE="https://api.github.com/repos/${REPO}"
+INSTALL_URL="https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh"
+ONE_LINER="curl -fsSL ${INSTALL_URL} | sh"
 
 # Defaults; each can be overridden (see usage()).
-PREFIX="${PI_INSTALL_DIR:-$HOME/.local/bin}"
+if [ -n "${PI_INSTALL_DIR:-}" ]; then
+  PREFIX=$PI_INSTALL_DIR
+else
+  : "${HOME:?HOME is not set; pass --prefix explicitly}"
+  PREFIX="${HOME}/.local/bin"
+fi
 TAG="${PI_VERSION:-latest}"
 TOKEN="${GITHUB_TOKEN:-${PI_GITHUB_TOKEN:-}}"
 USE_SUDO=0
@@ -61,9 +88,17 @@ Environment:
   PI_GITHUB_TOKEN  Alias for GITHUB_TOKEN.
   TMPDIR           Where the temporary download directory is created.
 
-Downloaded files are checksum-verified before installation. No 'curl | sh',
-no writes outside the prefix (and a cleaned-up temp dir), no sudo unless you
-ask for it.
+Piped one-liner (sh, bash or zsh; Linux and macOS):
+  ${ONE_LINER}
+  # Private repo: export GITHUB_TOKEN in the shell before piping.
+  # Pass options with: ... | sh -s -- --prefix DIR --force
+
+Safer alternative (download, review, then run - no network bytes piped to a shell):
+  curl -fsSLO https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh
+  sh ./install.sh
+
+Downloaded release assets are checksum-verified before installation. Only the
+prefix (and a cleaned-up temp dir) is written; sudo is used only with --sudo.
 EOF
 }
 
@@ -119,16 +154,52 @@ else
   die "need curl or wget to download the release assets"
 fi
 
+# Temp scratch lives under TMPDIR and is always removed. `0` is the POSIX
+# spelling of EXIT; HUP/INT/TERM go through on_signal so they also terminate.
+WORK=""
+cleanup() {
+  if [ -n "$WORK" ] && [ -d "$WORK" ]; then
+    rm -rf "$WORK" || :
+  fi
+  return 0
+}
+on_signal() {
+  cleanup
+  exit 130
+}
+trap 'cleanup' 0 HUP
+trap 'on_signal' INT TERM
+
 TMPDIR_BASE="${TMPDIR:-/tmp}"
 WORK=$(mktemp -d "${TMPDIR_BASE%/}/pi-rs-install.XXXXXX") \
   || die "cannot create a temporary directory in $TMPDIR_BASE"
-trap 'rm -rf "$WORK"' EXIT HUP INT TERM
 
-bin_tmp="$WORK/$asset"
-sum_tmp="$WORK/checksums"
+bin_tmp="${WORK}/${asset}"
+sum_tmp="${WORK}/checksums"
 
 # ----------------------------------------------------------------- network
 API_JSON=""
+
+# Fetch a URL to stdout using the same downloader for text and binaries.
+# (The old code hard-coded curl here and broke with wget-only setups.)
+fetch_text() {
+  url=$1
+  if [ "$DOWNLOADER" = curl ]; then
+    if [ -n "$TOKEN" ]; then
+      curl -fsSL -H "Accept: application/vnd.github+json" \
+        -H "Authorization: Bearer $TOKEN" "$url"
+    else
+      curl -fsSL -H "Accept: application/vnd.github+json" "$url"
+    fi
+  else
+    if [ -n "$TOKEN" ]; then
+      wget -qO- --header="Accept: application/vnd.github+json" \
+        --header="Authorization: Bearer $TOKEN" "$url"
+    else
+      wget -qO- --header="Accept: application/vnd.github+json" "$url"
+    fi
+  fi
+}
 
 # Fetch the release JSON once (only needed for the private-repo fallback).
 get_api_json() {
@@ -138,16 +209,8 @@ get_api_json() {
   else
     api_url="${API_BASE}/releases/tags/${TAG}"
   fi
-  if [ -n "$TOKEN" ]; then
-    API_JSON=$(curl -fsSL \
-      -H "Accept: application/vnd.github+json" \
-      -H "Authorization: Bearer $TOKEN" \
-      "$api_url") || die "cannot query GitHub API at $api_url (check GITHUB_TOKEN and repo access)"
-  else
-    API_JSON=$(curl -fsSL \
-      -H "Accept: application/vnd.github+json" \
-      "$api_url") || die "cannot query GitHub API at $api_url"
-  fi
+  API_JSON=$(fetch_text "$api_url") \
+    || die "cannot query GitHub API at $api_url (check GITHUB_TOKEN and repo access)"
 }
 
 # Print the browser_download_url whose basename equals $1, if any.
@@ -220,10 +283,13 @@ else
 fi
 
 # -------------------------------------------------------------- checksum
+# Accept both "hash  filename" (sha256sum/shasum -a 256 / SHA256SUMS) and a
+# bare "hash" on a single line (some .sha256 assets contain only the digest).
 expected=$(awk -v n="$asset" '{
+    h = $1
     name = $2
     sub(/^\*/, "", name)
-    if (name == n) { print tolower($1); exit }
+    if ((NF >= 2 && name == n) || NF == 1) { print tolower(h); exit }
   }' "$sum_tmp")
 [ -n "$expected" ] \
   || die "no checksum entry for '$asset' in the downloaded checksum file"
@@ -279,6 +345,6 @@ Next steps:
   3. Sessions/config live under XDG roots (defaults: ~/.config/pi-rs,
      ~/.local/share/pi-rs). See README.md -> Paths for details.
 
-To replace a future release: sh install.sh --force
+To replace a future release: curl -fsSL ${INSTALL_URL} | sh -s -- --force
 To uninstall: remove ${target}
 EOF
