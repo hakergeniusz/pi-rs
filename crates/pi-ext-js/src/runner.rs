@@ -88,9 +88,7 @@ use crate::events::{
     BoundaryDispatchResult, InputResult, ProjectTrustResult, SessionBeforeResult, SessionOutcome,
     ToolCallResult, ToolResultPatch, parse_session_outcome,
 };
-use crate::mcp_manager::{
-    DEFAULT_STARTUP_WAIT_MS, McpNotificationEvent, StartupTick, StartupWait,
-};
+use crate::mcp_manager::{DEFAULT_STARTUP_WAIT_MS, McpNotificationEvent, StartupTick, StartupWait};
 use crate::mcp_registry::{
     create_mcp_tool_name, get_mcp_tool_exposure, mcp_namespace, to_tool_exposure,
 };
@@ -939,6 +937,7 @@ impl ExtensionRunner {
     /// There is no timer: the host supplies `now` and decides when to call
     /// this. With no connections in flight and no tool changes it is a
     /// no-op.
+    #[allow(clippy::too_many_lines)] // mirrors runtime.ts tick; split when extending
     pub fn mcp_tick(&mut self, now: Instant) -> Result<McpTickOutcome, JsHostError> {
         let mut outcome = McpTickOutcome::default();
 

@@ -137,53 +137,55 @@ pub(crate) fn apply_input_handlers_with_behavior(
     source: &str,
     streaming_behavior: Option<&str>,
 ) -> Result<InputOutcome, String> {
+    #[cfg(feature = "ext-js")]
+    {
+        let Some(runner) = runtime.extension_runner.as_ref() else {
+            return Ok(InputOutcome::Continue {
+                text: text.to_string(),
+                images: images.to_vec(),
+            });
+        };
+        let mut runner = runner.lock().expect("extension runner mutex poisoned");
+        if !runner.has_handlers("input") {
+            return Ok(InputOutcome::Continue {
+                text: text.to_string(),
+                images: images.to_vec(),
+            });
+        }
+        let mut event = pi_ext_js::events::input(text, source, streaming_behavior);
+        if !images.is_empty() {
+            event["images"] = serde_json::to_value(images).map_err(|error| error.to_string())?;
+        }
+        match runner
+            .emit_input(event)
+            .map_err(|error| error.to_string())?
+        {
+            pi_ext_js::events::InputResult::Handled { .. } => Ok(InputOutcome::Handled),
+            pi_ext_js::events::InputResult::Transform {
+                text,
+                images: transformed,
+            } => {
+                let images = match transformed {
+                    Some(value) if !value.is_null() => {
+                        serde_json::from_value(value).unwrap_or_else(|_| images.to_vec())
+                    }
+                    _ => images.to_vec(),
+                };
+                Ok(InputOutcome::Continue { text, images })
+            }
+            pi_ext_js::events::InputResult::Continue => Ok(InputOutcome::Continue {
+                text: text.to_string(),
+                images: images.to_vec(),
+            }),
+        }
+    }
     #[cfg(not(feature = "ext-js"))]
     {
         let _ = (runtime, source, streaming_behavior);
-        return Ok(InputOutcome::Continue {
+        Ok(InputOutcome::Continue {
             text: text.to_string(),
             images: images.to_vec(),
-        });
-    }
-    #[cfg(feature = "ext-js")]
-    let Some(runner) = runtime.extension_runner.as_ref() else {
-        return Ok(InputOutcome::Continue {
-            text: text.to_string(),
-            images: images.to_vec(),
-        });
-    };
-    let mut runner = runner.lock().expect("extension runner mutex poisoned");
-    if !runner.has_handlers("input") {
-        return Ok(InputOutcome::Continue {
-            text: text.to_string(),
-            images: images.to_vec(),
-        });
-    }
-    let mut event = pi_ext_js::events::input(text, source, streaming_behavior);
-    if !images.is_empty() {
-        event["images"] = serde_json::to_value(images).map_err(|error| error.to_string())?;
-    }
-    match runner
-        .emit_input(event)
-        .map_err(|error| error.to_string())?
-    {
-        pi_ext_js::events::InputResult::Handled { .. } => Ok(InputOutcome::Handled),
-        pi_ext_js::events::InputResult::Transform {
-            text,
-            images: transformed,
-        } => {
-            let images = match transformed {
-                Some(value) if !value.is_null() => {
-                    serde_json::from_value(value).unwrap_or_else(|_| images.to_vec())
-                }
-                _ => images.to_vec(),
-            };
-            Ok(InputOutcome::Continue { text, images })
-        }
-        pi_ext_js::events::InputResult::Continue => Ok(InputOutcome::Continue {
-            text: text.to_string(),
-            images: images.to_vec(),
-        }),
+        })
     }
 }
 
@@ -233,79 +235,81 @@ pub(crate) fn emit_before_agent_start(
     text: &str,
     images: &[ImageContent],
 ) -> Result<BeforeAgentStartOutcome, String> {
+    #[cfg(feature = "ext-js")]
+    {
+        let Some(runner) = runtime.extension_runner.as_ref() else {
+            return Ok(BeforeAgentStartOutcome::default());
+        };
+        let images = if images.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(images).map_err(|error| error.to_string())?)
+        };
+        let mut runner = runner.lock().expect("extension runner mutex poisoned");
+        if !runner.has_handlers("before_agent_start") {
+            return Ok(BeforeAgentStartOutcome::default());
+        }
+        let combined = runner
+            .emit_before_agent_start(
+                &pi_ext_js::events::BeforeAgentStartTrigger::User {
+                    prompt: text.to_string(),
+                    images,
+                },
+                system_prompt_options(runtime),
+                &|options| render_system_prompt(options, &runtime.system_prompt),
+            )
+            .map_err(|error| error.to_string())?;
+        let system_prompt = combined
+            .system_prompt_options
+            .get("forceSystemPrompt")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let mut outcome = BeforeAgentStartOutcome {
+            system_prompt,
+            ..BeforeAgentStartOutcome::default()
+        };
+        let timestamp = now_millis();
+        for message in combined.messages {
+            if let Ok(custom) =
+                serde_json::from_value::<pi_agent::agent_message::CustomMessage>(message.clone())
+            {
+                outcome.messages.push(AgentMessage::Custom(custom));
+            } else {
+                // Untyped handlers can return a bare `{customType, content}`;
+                // synthesize the session message shape upstream normalizes to.
+                let custom_type = message
+                    .get("customType")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("custom")
+                    .to_string();
+                let content = message
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let Ok(content) = serde_json::from_value(content) else {
+                    continue;
+                };
+                outcome.messages.push(AgentMessage::Custom(
+                    pi_agent::agent_message::CustomMessage {
+                        custom_type,
+                        content,
+                        display: message
+                            .get("display")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                        details: message.get("details").cloned(),
+                        timestamp,
+                    },
+                ));
+            }
+        }
+        Ok(outcome)
+    }
     #[cfg(not(feature = "ext-js"))]
     {
         let _ = (runtime, text, images);
-        return Ok(BeforeAgentStartOutcome::default());
+        Ok(BeforeAgentStartOutcome::default())
     }
-    #[cfg(feature = "ext-js")]
-    let Some(runner) = runtime.extension_runner.as_ref() else {
-        return Ok(BeforeAgentStartOutcome::default());
-    };
-    let images = if images.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_value(images).map_err(|error| error.to_string())?)
-    };
-    let mut runner = runner.lock().expect("extension runner mutex poisoned");
-    if !runner.has_handlers("before_agent_start") {
-        return Ok(BeforeAgentStartOutcome::default());
-    }
-    let combined = runner
-        .emit_before_agent_start(
-            &pi_ext_js::events::BeforeAgentStartTrigger::User {
-                prompt: text.to_string(),
-                images,
-            },
-            system_prompt_options(runtime),
-            &|options| render_system_prompt(options, &runtime.system_prompt),
-        )
-        .map_err(|error| error.to_string())?;
-    let system_prompt = combined
-        .system_prompt_options
-        .get("forceSystemPrompt")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let mut outcome = BeforeAgentStartOutcome {
-        system_prompt,
-        ..BeforeAgentStartOutcome::default()
-    };
-    let timestamp = now_millis();
-    for message in combined.messages {
-        if let Ok(custom) =
-            serde_json::from_value::<pi_agent::agent_message::CustomMessage>(message.clone())
-        {
-            outcome.messages.push(AgentMessage::Custom(custom));
-        } else {
-            // Untyped handlers can return a bare `{customType, content}`;
-            // synthesize the session message shape upstream normalizes to.
-            let custom_type = message
-                .get("customType")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("custom")
-                .to_string();
-            let content = message
-                .get("content")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let Ok(content) = serde_json::from_value(content) else {
-                continue;
-            };
-            outcome.messages.push(AgentMessage::Custom(
-                pi_agent::agent_message::CustomMessage {
-                    custom_type,
-                    content,
-                    display: message
-                        .get("display")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false),
-                    details: message.get("details").cloned(),
-                    timestamp,
-                },
-            ));
-        }
-    }
-    Ok(outcome)
 }
 
 /// The host half of the loop's `message_end` and boundary seams
