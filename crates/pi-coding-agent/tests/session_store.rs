@@ -1622,6 +1622,27 @@ fn load_entries_from_file_repairs_a_missing_trailing_newline() {
     assert_eq!(fs::read_to_string(&file).unwrap(), format!("{content}\n"));
 }
 
+/// Upstream decides with `if (pending)` on the text after the last `\n`
+/// (`session-manager.ts:669`), not on `endsWith("\n")`. Trailing spaces after
+/// the final entry therefore still get a newline appended.
+#[test]
+fn load_entries_from_file_repairs_a_tail_with_only_trailing_spaces() {
+    let dir = tempfile::Builder::new()
+        .prefix("pi-rs-trailing-spaces-")
+        .tempdir()
+        .unwrap();
+    let content = concat!(
+        "{\"type\":\"session\",\"id\":\"abc\",\"timestamp\":\"2025-01-01T00:00:00Z\",\"cwd\":\"/tmp\"}\n",
+        "{\"type\":\"message\",\"id\":\"1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
+        "   \t  ",
+    );
+    let file = dir.path().join("trailing-spaces.jsonl");
+    fs::write(&file, content).unwrap();
+
+    assert_eq!(load_entries_from_file(&file).unwrap().len(), 2);
+    assert_eq!(fs::read_to_string(&file).unwrap(), format!("{content}\n"));
+}
+
 #[test]
 fn load_entries_from_file_repairs_an_unterminated_malformed_tail() {
     let dir = tempdir("malformed-tail");

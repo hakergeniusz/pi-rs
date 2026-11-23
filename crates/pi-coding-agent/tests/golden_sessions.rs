@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 use pi_agent::AgentMessage;
 use pi_ai::types::{AssistantContent, StopReason, StringOrTextBlocks, ThinkingLevel, UserContent};
 use pi_coding_agent::session::{
-    Record, SessionEntry, SessionManager, load_entries_from_file, read_session_header,
-    serialize_entries,
+    ContextReplacement, NewSessionOptions, Record, SessionEntry, SessionManager,
+    load_entries_from_file, read_session_header, serialize_entries,
 };
 
 const PLAIN: &str = "01-plain-user-assistant.jsonl";
@@ -49,6 +49,16 @@ const FIXTURES: [(&str, &str); 5] = [
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden")
+}
+
+/// Verbatim copies of the real 1.5.2 upstream fixtures
+/// `packages/coding-agent/test/fixtures/{before-compaction,large-session}.jsonl`.
+/// They are v1 sessions (no `version`, compaction uses `firstKeptEntryIndex`)
+/// and carry V8-canonical exotic cost floats such as
+/// `0.013875000000000002`. The loader only parses here, so a byte round trip
+/// pins canonicalization without a migration rewrite.
+fn upstream_fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/upstream")
 }
 
 fn fixture_text(name: &str) -> String {
@@ -502,6 +512,180 @@ fn golden_fixtures_open_in_the_manager_without_a_rewrite() {
         // Opening a current-version session must not touch the file.
         assert_eq!(fs::read_to_string(&copy).unwrap(), fixture_text(name));
     }
+}
+
+/// The two real upstream `.jsonl` fixtures pin exotic-float canonicalization
+/// across >2000 provider-written lines. `JSON.parse` -> `JSON.stringify` in V8
+/// must agree with our `float_roundtrip` parse + ECMAScript formatter: any
+/// one-ULP drift or non-canonical spelling changes a byte and fails here.
+#[test]
+fn upstream_real_fixtures_round_trip_exotic_float_bytes() {
+    let mut saw_exotic = false;
+    for name in ["before-compaction.jsonl", "large-session.jsonl"] {
+        let path = upstream_fixtures_dir().join(name);
+        let original = fs::read_to_string(&path).unwrap();
+        assert!(original.ends_with('\n'), "{name}");
+        let records = load_entries_from_file(&path).unwrap();
+        assert_eq!(records.len(), original.lines().count(), "{name}");
+        assert_eq!(serialize_entries(&records), original, "{name}");
+        saw_exotic |= original.contains("0.013875000000000002");
+    }
+    assert!(
+        saw_exotic,
+        "the upstream fixture lost its exotic cost float"
+    );
+
+    // The specific literal the audit flagged must survive its own record's
+    // canonical rewrite, not just the whole-file comparison.
+    let text = fs::read_to_string(upstream_fixtures_dir().join("before-compaction.jsonl")).unwrap();
+    let line = text
+        .lines()
+        .find(|line| line.contains("\"input\":0.013875000000000002"))
+        .unwrap();
+    let record = Record::parse_line_strict(line).unwrap();
+    assert!(record.to_line().contains("\"input\":0.013875000000000002"));
+}
+
+/// `06-entry-types.jsonl` was generated from the upstream 1.5.2 write sites
+/// (object-literal key order copied from `session-manager.ts:1215-1319`,
+/// `:1357-1416`, `:1459-1480`, `:1623-1633` and `agent-session.ts:4042-4056`,
+/// then `JSON.stringify`d by V8). It covers the entry kinds the print-mode
+/// golden fixtures never emit.
+#[test]
+#[allow(clippy::too_many_lines)] // mirrors the upstream entry-type case list; split when extending
+fn upstream_shaped_rare_entry_types_round_trip_byte_exactly() {
+    let name = "06-entry-types.jsonl";
+    let records = load_fixture(name);
+    assert_byte_round_trip(name, &records);
+    assert_typed_views_rewrite(&records);
+    let entries = typed_entries(&records);
+    assert_eq!(
+        kinds(&entries),
+        [
+            "session",
+            "custom",
+            "custom_message",
+            "compaction",
+            "branch_summary",
+            "context_edit",
+            "label",
+            "usage",
+            "message",
+        ]
+    );
+
+    let SessionEntry::Custom(custom) = &entries[1] else {
+        panic!("expected custom");
+    };
+    assert_eq!(custom.custom_type, "extensions.state");
+    assert_eq!(
+        custom
+            .data
+            .as_ref()
+            .unwrap()
+            .get("rate")
+            .unwrap()
+            .as_f64()
+            .unwrap(),
+        0.013_875_000_000_000_002 // the fixture's 0.013875000000000002 token
+    );
+
+    let SessionEntry::CustomMessage(custom) = &entries[2] else {
+        panic!("expected custom_message");
+    };
+    assert_eq!(custom.custom_type, "nudge");
+    assert!(!custom.display);
+
+    let SessionEntry::Compaction(compaction) = &entries[3] else {
+        panic!("expected compaction");
+    };
+    assert_eq!(compaction.summary, "checkpoint");
+    assert_eq!(compaction.first_kept_entry_id, "e0000001");
+    assert_eq!(compaction.tokens_before, 42.0);
+    assert_eq!(compaction.from_hook, Some(true));
+    let system = compaction.system_message.as_ref().unwrap();
+    assert_eq!(system.0.content, StringOrTextBlocks::Text(String::new()));
+    // The typed view is a BTreeMap (alphabetical); the *wire* order is kept in
+    // the captured hint and restored by `to_record()` (asserted below).
+    let sections = system.0.sections.as_ref().unwrap();
+    assert!(sections.contains_key("preamble"));
+    assert!(sections.contains_key("cwd"));
+    let compaction_wire = records[3].to_line();
+    assert!(
+        compaction_wire.find("\"preamble\":").unwrap() < compaction_wire.find("\"cwd\":").unwrap()
+    );
+    assert_eq!(
+        compaction.usage.as_ref().unwrap().cost.input,
+        0.013_875_000_000_000_002 // the fixture's 0.013875000000000002 token
+    );
+
+    let SessionEntry::BranchSummary(summary) = &entries[4] else {
+        panic!("expected branch_summary");
+    };
+    assert_eq!(summary.from_id, "e0000002");
+    assert_eq!(summary.summary, "abandoned branch");
+    assert_eq!(summary.from_hook, Some(false));
+
+    let SessionEntry::ContextEdit(edit) = &entries[5] else {
+        panic!("expected context_edit");
+    };
+    assert_eq!(edit.target_id, "e0000002");
+    assert!(matches!(
+        &edit.replacement,
+        ContextReplacement::Replace { .. }
+    ));
+
+    let SessionEntry::Label(label) = &entries[6] else {
+        panic!("expected label");
+    };
+    assert_eq!(label.target_id, "e0000002");
+    assert_eq!(label.label.as_deref(), Some("bookmark"));
+
+    let SessionEntry::Usage(usage) = &entries[7] else {
+        panic!("expected usage");
+    };
+    assert_eq!(usage.kind, "cache_warm");
+    assert_eq!(usage.note.as_deref(), Some("warmed"));
+
+    let SessionEntry::Message(message) = &entries[8] else {
+        panic!("expected the bashExecution message");
+    };
+    let AgentMessage::BashExecution(bash) = &message.message else {
+        panic!("expected a bashExecution message");
+    };
+    assert_eq!(bash.command, "printf hello");
+    assert_eq!(bash.output, "hello\n");
+    assert_eq!(bash.exit_code, Some(0));
+    assert!(bash.truncated);
+    assert_eq!(bash.full_output_path.as_deref(), Some("/tmp/full.txt"));
+    assert_eq!(bash.exclude_from_context, Some(true));
+
+    // A freshly written bashExecution message (no captured wire hint) must
+    // use upstream's order too: `excludeFromContext` comes after `timestamp`
+    // (agent-session.ts:4042-4056), not pi-agent's struct declaration order.
+    let fresh = pi_agent::BashExecutionMessage {
+        command: "true".into(),
+        output: String::new(),
+        exit_code: None,
+        cancelled: false,
+        truncated: false,
+        full_output_path: None,
+        exclude_from_context: Some(false),
+        timestamp: 42,
+    };
+    let mut manager = SessionManager::in_memory(
+        Path::new("/tmp/golden-entry-types"),
+        &NewSessionOptions::default(),
+        Vec::new(),
+    )
+    .unwrap();
+    manager
+        .append_message(AgentMessage::BashExecution(fresh))
+        .unwrap();
+    let line = manager.get_entries().last().unwrap().to_record().to_line();
+    let timestamp = line.find("\"timestamp\":").unwrap();
+    let excluded = line.find("\"excludeFromContext\":").unwrap();
+    assert!(timestamp < excluded, "{line}");
 }
 
 /// A tolerant decode must not change the wire shape: TypeScript keeps the

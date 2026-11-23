@@ -36,7 +36,8 @@
 //! into a `BTreeMap`. Every typed entry therefore implements a manual
 //! [`Serialize`] that emits fields in the exact upstream object-literal order
 //! (`session-manager.ts:1215-1312`, `1350-1367`, `1399-1407`, `1452-1464`,
-//! `:1623-1633`, `agent-session.ts:1839`, `openai-completions.ts:321-337`).
+//! `:1623-1633`, `agent-session.ts:1839`, `openai-completions.ts:321-337`);
+//! `bashExecution` messages follow `agent-session.ts:4042-4056`.
 //! Nested message keys are reordered by [`serialize_message_ordered`]; the
 //! one thing a `BTreeMap` cannot rebuild — `sections` insertion order — is
 //! captured from the wire in `unknown` under [`SECTION_ORDER_KEY`] and restored
@@ -463,6 +464,20 @@ fn serialize_message_ordered(message: &AgentMessage, section_order: Option<Vec<S
             "isError",
             "durationMs",
             "timestamp",
+        ],
+        // `agent-session.ts:4042-4056`: `excludeFromContext` is appended after
+        // `timestamp`; pi-agent's struct declaration puts it before, so a new
+        // record written by `appendMessage` would otherwise diverge.
+        "bashExecution" => &[
+            "role",
+            "command",
+            "output",
+            "exitCode",
+            "cancelled",
+            "truncated",
+            "fullOutputPath",
+            "timestamp",
+            "excludeFromContext",
         ],
         // Unknown roles have no upstream shape to mirror; keep pi-agent's order.
         _ => return value,

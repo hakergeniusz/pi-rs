@@ -1,7 +1,8 @@
 //! Session migrations v1 → v2 → v3.
 //!
 //! Ground truth: `migrateV1ToV2` / `migrateV2ToV3` / `migrateToCurrentVersion`
-//! in `packages/coding-agent/src/core/session-manager.ts:286-370`.
+//! in `packages/coding-agent/src/core/session-manager.ts:286-370` (the
+//! `firstKeptEntryIndex` target lookup is `:305-306`).
 //!
 //! Each applied migration is followed by a full compact rewrite, so an upgraded
 //! file is byte-identical to a fresh v3 write. Both migrations mutate the
@@ -42,6 +43,20 @@ pub fn migrate_to_current_version(entries: &mut [Record]) -> bool {
 fn migrate_v1_to_v2(entries: &mut [Record]) {
     let mut ids: Vec<String> = Vec::new();
     let mut previous_id: Option<String> = None;
+    // Upstream reads `entries[comp.firstKeptEntryIndex]` from the original
+    // array (`:305-306`): the header is index 0, *any* existing non-header
+    // target is accepted, and the id visible at that moment is the generated
+    // one for an already-visited entry (including the compaction itself) or
+    // the v1 file's own id for a forward reference. Snapshot kinds and any
+    // pre-existing ids before the loop mutates the records.
+    let original_kinds: Vec<String> = entries
+        .iter()
+        .map(|entry| entry.kind().to_string())
+        .collect();
+    let original_ids: Vec<Option<String>> = entries
+        .iter()
+        .map(|entry| entry.get_str("id").map(str::to_string))
+        .collect();
 
     for (index, entry) in entries.iter_mut().enumerate() {
         if entry.kind() == "session" {
@@ -59,7 +74,7 @@ fn migrate_v1_to_v2(entries: &mut [Record]) {
                 None => serde_json::Value::Null,
             },
         );
-        previous_id = Some(id);
+        previous_id = Some(id.clone());
 
         // Convert firstKeptEntryIndex to firstKeptEntryId for compaction.
         if entry.kind() == "compaction" {
@@ -68,15 +83,26 @@ fn migrate_v1_to_v2(entries: &mut [Record]) {
                 .and_then(serde_json::Value::as_i64)
                 .map(|value| value as usize);
             if let Some(index_value) = index_value {
-                // pi indexes `entries` (header included) and only converts when
-                // the target exists and is not the header. Reading the target
-                // from the array while iterating it mutably is why the id is
-                // taken from `ids` instead.
-                let target_id = (index_value > 0 && index_value < index)
-                    .then(|| ids.get(index_value - 1).cloned())
-                    .flatten();
-                if let Some(target_id) = target_id {
-                    entry.set("firstKeptEntryId", target_id);
+                // The target must exist in the original array and must not be
+                // the header. Forward references keep whatever id the v1 entry
+                // had (normally none, which upstream writes as `undefined` and
+                // JSON.stringify omits); backward references use the generated
+                // id from `ids`, and a self-reference uses the id just assigned
+                // to this compaction entry.
+                let is_non_header_target = original_kinds
+                    .get(index_value)
+                    .is_some_and(|kind| kind != "session");
+                if is_non_header_target {
+                    let target_id = match index_value.cmp(&index) {
+                        std::cmp::Ordering::Equal => Some(id.clone()),
+                        std::cmp::Ordering::Less => index_value
+                            .checked_sub(1)
+                            .and_then(|slot| ids.get(slot).cloned()),
+                        std::cmp::Ordering::Greater => original_ids[index_value].clone(),
+                    };
+                    if let Some(target_id) = target_id {
+                        entry.set("firstKeptEntryId", target_id.as_str());
+                    }
                 }
                 entry.remove("firstKeptEntryIndex");
             }
@@ -176,6 +202,46 @@ mod tests {
             Some(second.as_str())
         );
         assert!(compaction.get("firstKeptEntryIndex").is_none());
+    }
+
+    /// Upstream `entries[firstKeptEntryIndex]` accepts any existing non-header
+    /// target, including a self-reference and a forward reference. A forward
+    /// reference to a v1 entry (no id yet) becomes `undefined`, omitted on
+    /// write; one that already carries an id copies it verbatim.
+    #[test]
+    fn v1_compaction_index_accepts_any_existing_non_header_target() {
+        let mut entries = lines(concat!(
+            "{\"type\":\"session\",\"id\":\"s1\",\"timestamp\":\"t\",\"cwd\":\"/tmp\"}\n",
+            "{\"type\":\"message\",\"timestamp\":\"t\",\"message\":{\"role\":\"user\",\"content\":\"a\",\"timestamp\":1}}\n",
+            "{\"type\":\"compaction\",\"timestamp\":\"t\",\"summary\":\"self\",\"firstKeptEntryIndex\":2,\"tokensBefore\":1}\n",
+            "{\"type\":\"compaction\",\"timestamp\":\"t\",\"summary\":\"forward-no-id\",\"firstKeptEntryIndex\":4,\"tokensBefore\":2}\n",
+            "{\"type\":\"message\",\"timestamp\":\"t\",\"message\":{\"role\":\"user\",\"content\":\"b\",\"timestamp\":2}}\n",
+            "{\"type\":\"compaction\",\"timestamp\":\"t\",\"summary\":\"forward-with-id\",\"firstKeptEntryIndex\":6,\"tokensBefore\":3}\n",
+            "{\"type\":\"message\",\"id\":\"already-had-one\",\"timestamp\":\"t\",\"message\":{\"role\":\"user\",\"content\":\"c\",\"timestamp\":3}}\n",
+            "{\"type\":\"compaction\",\"timestamp\":\"t\",\"summary\":\"header\",\"firstKeptEntryIndex\":0,\"tokensBefore\":4}\n",
+            "{\"type\":\"compaction\",\"timestamp\":\"t\",\"summary\":\"out-of-range\",\"firstKeptEntryIndex\":99,\"tokensBefore\":5}\n",
+        ));
+        assert!(migrate_to_current_version(&mut entries));
+        // Index 2 is the compaction itself: upstream has already assigned its id.
+        let self_id = entries[2].id().unwrap().to_string();
+        assert_eq!(
+            entries[2].get_str("firstKeptEntryId"),
+            Some(self_id.as_str())
+        );
+        // Index 4 is a forward reference to an entry with no id yet.
+        assert!(entries[3].get("firstKeptEntryId").is_none());
+        // Index 6 is a forward reference to an entry that already had an id.
+        assert_eq!(
+            entries[5].get_str("firstKeptEntryId"),
+            Some("already-had-one")
+        );
+        // Index 0 (header) and out-of-range targets are never resolved.
+        assert!(entries[7].get("firstKeptEntryId").is_none());
+        assert!(entries[8].get("firstKeptEntryId").is_none());
+        // The index is dropped in every case.
+        for index in [2, 3, 5, 7, 8] {
+            assert!(entries[index].get("firstKeptEntryIndex").is_none());
+        }
     }
 
     #[test]

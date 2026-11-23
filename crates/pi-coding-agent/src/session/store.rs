@@ -300,7 +300,14 @@ pub fn load_entries_from_file(path: &Path) -> SessionResult<Vec<Record>> {
         }
     };
     let text = String::from_utf8_lossy(&contents);
-    let has_trailing_newline = text.ends_with('\n');
+    // Upstream repairs whenever the remainder after the last `\n` is truthy
+    // (`if (pending) appendFileSync(..., "\n")`, `:669`). Using the remainder
+    // rather than `text.ends_with('\n')` keeps trailing spaces (or any other
+    // unterminated tail) in scope: a file ending in `"...\n   "` still gets a
+    // newline appended, and a file ending in `\n` does not.
+    let pending = text
+        .rsplit_once('\n')
+        .map_or(text.as_ref(), |(_, tail)| tail);
     let entries: Vec<Record> = text.split('\n').filter_map(Record::parse_line).collect();
     if entries.is_empty() {
         return Ok(entries);
@@ -310,7 +317,7 @@ pub fn load_entries_from_file(path: &Path) -> SessionResult<Vec<Record>> {
         // Not a pi session: return nothing and leave the file untouched.
         return Ok(Vec::new());
     }
-    if !has_trailing_newline {
+    if !pending.is_empty() {
         // pi repairs the file by appending the missing newline.
         let mut file = OpenOptions::new()
             .append(true)
