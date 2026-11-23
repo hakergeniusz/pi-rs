@@ -4210,6 +4210,13 @@ pedantic lints across `pi-ai`, `pi-codemode`, `pi-ext-js` and `pi-coding-agent`
 that the parallel merge produced. Workspace check and `clippy --all-targets
 -D warnings` were green at that commit.
 
+### Release v0.1.1 (2026-11-23)
+Version bumped from 0.1.0 to 0.1.1 (workspace + seven internal deps + README),
+full gate green (2646 passed, 0 failed, 3 ignored), binary reports
+`pi 0.1.1`. Tag-triggered workflow builds Linux x86_64/aarch64 assets with
+checksums. Also in this cut: zero-winsize fallback for terminal emulators that
+report a tiny PTY size, and the CI-only tree-summary test flake fix.
+
 ### Terminal-exit noise fix (`3cb7659`)
 Reproduced in tmux: after Ctrl+D the scrollback showed a raw `ESC[?1;2;4c`
 (DA1 reply) and the resume hint overprinting the preserved footer. Root cause:

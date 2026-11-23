@@ -4,7 +4,7 @@ A Rust rewrite of [Pi](https://github.com/earendil-works/pi) — the minimal,
 extensible agent harness — aiming for behavioral and on-disk compatibility
 (session JSONL v3, print/JSON/RPC output schemas, project `.pi/` layout).
 
-**Status: `v0.1.0`.** The core pipeline is proven
+**Status: `v0.1.1`.** The core pipeline is proven
 end-to-end against a live provider (`pi -p` prompt → answer, tool round-trips,
 JSON event mode), and bare `pi` renders the interactive chat TUI ported from
 upstream, including the `/model`, `/trust`, `/settings`, and `/resume`

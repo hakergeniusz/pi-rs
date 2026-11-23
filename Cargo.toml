@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 authors = ["pi-rs contributors"]
@@ -66,13 +66,13 @@ image = { version = "0.25.10", default-features = false, features = [
 ] }
 
 # internal crates
-pi-schema = { path = "crates/pi-schema", version = "0.1.0" }
-pi-ai = { path = "crates/pi-ai", version = "0.1.0" }
-pi-agent = { path = "crates/pi-agent", version = "0.1.0" }
-pi-tui = { path = "crates/pi-tui", version = "0.1.0" }
-pi-mcp = { path = "crates/pi-mcp", version = "0.1.0" }
-pi-codemode = { path = "crates/pi-codemode", version = "0.1.0" }
-pi-ext-js = { path = "crates/pi-ext-js", version = "0.1.0" }
+pi-schema = { path = "crates/pi-schema", version = "0.1.1" }
+pi-ai = { path = "crates/pi-ai", version = "0.1.1" }
+pi-agent = { path = "crates/pi-agent", version = "0.1.1" }
+pi-tui = { path = "crates/pi-tui", version = "0.1.1" }
+pi-mcp = { path = "crates/pi-mcp", version = "0.1.1" }
+pi-codemode = { path = "crates/pi-codemode", version = "0.1.1" }
+pi-ext-js = { path = "crates/pi-ext-js", version = "0.1.1" }
 
 # extensions host (E0 spike)
 rquickjs = { version = "0.14", features = ["loader", "parallel"] }

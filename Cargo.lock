@@ -1592,7 +1592,7 @@ dependencies = [
 
 [[package]]
 name = "pi-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "pi-ai",
@@ -1605,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ai"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1623,7 +1623,7 @@ dependencies = [
 
 [[package]]
 name = "pi-codemode"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rquickjs",
  "serde",
@@ -1633,7 +1633,7 @@ dependencies = [
 
 [[package]]
 name = "pi-coding-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "pi-env"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "serde_json",
@@ -1678,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ext-js"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "nix",
@@ -1700,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "pi-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1720,7 +1720,7 @@ dependencies = [
 
 [[package]]
 name = "pi-schema"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "pi-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossterm",
  "serde",
