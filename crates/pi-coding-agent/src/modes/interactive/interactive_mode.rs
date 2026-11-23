@@ -12820,14 +12820,34 @@ impl InteractiveMode {
             return;
         };
         let outcome = runner.mcp_tick(Instant::now());
-        match outcome {
-            // A settled connection registers tools and a `list_changed`
-            // re-registration can change the visible tool list; redraw so the
-            // footer/autocomplete see the new state on this frame.
-            Ok(outcome) if !outcome.is_idle() => self.tui.request_render(),
-            Ok(_) | Err(_) => {} // Server-state failures are reported by the runner itself; the
-                                 // tick's result is deliberately dropped (extensions/mod.rs's
-                                 // transform/tool tick points do the same).
+        // The runner guard borrows `self`; collect messages first, drop it,
+        // then update the UI so the mutable borrows do not overlap.
+        let (messages, dirty) = match outcome {
+            Ok(outcome) => {
+                let mut messages: Vec<String> = outcome
+                    .needs_auth
+                    .iter()
+                    .map(|server| format!("MCP server '{server}' needs sign-in"))
+                    .collect();
+                for event in &outcome.notifications {
+                    if let pi_ext_js::mcp_manager::McpNotificationEvent::Log(log) = event {
+                        messages.push(format!("[{}] {}", log.server, log.text));
+                    }
+                }
+                // A settled connection registers tools and a `list_changed`
+                // re-registration can change the visible tool list; redraw so
+                // the footer/autocomplete see the new state on this frame.
+                (messages, !outcome.is_idle())
+            }
+            // Server-state failures are reported by the runner itself.
+            Err(_) => (Vec::new(), false),
+        };
+        drop(runner);
+        for message in messages {
+            self.show_status(&message);
+        }
+        if dirty {
+            self.tui.request_render();
         }
     }
 

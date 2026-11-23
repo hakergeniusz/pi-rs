@@ -88,7 +88,9 @@ use crate::events::{
     BoundaryDispatchResult, InputResult, ProjectTrustResult, SessionBeforeResult, SessionOutcome,
     ToolCallResult, ToolResultPatch, parse_session_outcome,
 };
-use crate::mcp_manager::{DEFAULT_STARTUP_WAIT_MS, StartupTick, StartupWait};
+use crate::mcp_manager::{
+    DEFAULT_STARTUP_WAIT_MS, McpNotificationEvent, StartupTick, StartupWait,
+};
 use crate::mcp_registry::{
     create_mcp_tool_name, get_mcp_tool_exposure, mcp_namespace, to_tool_exposure,
 };
@@ -502,6 +504,11 @@ pub struct McpTickOutcome {
     /// Servers whose tools were re-registered from a `list_changed`
     /// notification (`runtime.ts:432-442`).
     pub re_registered: Vec<String>,
+    /// Server-initiated notifications (log lines, tool progress, cancellation)
+    /// published since the last tick (`runtime.ts:370,575`).
+    pub notifications: Vec<McpNotificationEvent>,
+    /// Servers whose OAuth flow needs a sign-in (`runtime.ts:317-330`).
+    pub needs_auth: Vec<String>,
 }
 
 impl McpTickOutcome {
@@ -509,7 +516,11 @@ impl McpTickOutcome {
     /// connections, and no tool re-registrations).
     #[must_use]
     pub fn is_idle(&self) -> bool {
-        self.startup.is_none() && self.settled.is_empty() && self.re_registered.is_empty()
+        self.startup.is_none()
+            && self.settled.is_empty()
+            && self.re_registered.is_empty()
+            && self.notifications.is_empty()
+            && self.needs_auth.is_empty()
     }
 }
 
@@ -1014,6 +1025,13 @@ impl ExtensionRunner {
         // the change before its ack (`runtime.ts:382-384`, `:432-442`).
         // There is no `servers_with_resources()` barrier round-trip.
         manager.try_drain_notifications();
+        outcome.notifications = manager.take_notification_events();
+        outcome.needs_auth = manager.take_needs_auth();
+        for report in &mut outcome.settled {
+            if outcome.needs_auth.contains(&report.name) {
+                report.state = "needs-auth".to_string();
+            }
+        }
         let changes = manager.take_tool_changes();
         for change in changes {
             let Some(index) = self
