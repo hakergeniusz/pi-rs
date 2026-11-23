@@ -670,8 +670,18 @@ fn os_file(path: &str) -> String {
 /// The subset of `node:os` upstream's bundled extensions call.
 fn os_value(op: &str) -> Json {
     match op {
-        "homedir" => Json::String(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())),
-        "tmpdir" => Json::String(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string())),
+        // Node uses HOME/TMPDIR on POSIX and USERPROFILE/TEMP on Windows.
+        // Check both so native Windows extensions get real paths.
+        "homedir" => Json::String(
+            std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| "/root".to_string()),
+        ),
+        "tmpdir" => Json::String(
+            std::env::var("TMPDIR")
+                .or_else(|_| std::env::var("TEMP"))
+                .unwrap_or_else(|_| "/tmp".to_string()),
+        ),
         "platform" => Json::String(std::env::consts::OS.to_string()),
         "arch" => Json::String(
             match std::env::consts::ARCH {
