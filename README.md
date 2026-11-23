@@ -1,119 +1,153 @@
 # pi-rs
 
-A Rust rewrite of [Pi](https://github.com/earendil-works/pi) — the minimal,
-extensible agent harness — aiming for behavioral and on-disk compatibility
-(session JSONL v3, print/JSON/RPC output schemas, project `.pi/` layout).
+A Rust rewrite of [Pi](https://github.com/earendil-works/pi), the minimal,
+extensible agent harness. The goal is **almost 1:1 parity** with upstream:
+session JSONL v3, print/JSON/RPC output schemas and the project `.pi/` layout
+stay compatible. One deliberate deviation keeps pi-rs safe to run beside a real
+TypeScript Pi install: user-level files live under XDG directories with a
+`pi-rs` leaf instead of `~/.pi`.
 
-**Status: `v0.1.1`.** The core pipeline is proven
-end-to-end against a live provider (`pi -p` prompt → answer, tool round-trips,
-JSON event mode), and bare `pi` renders the interactive chat TUI ported from
-upstream, including the `/model`, `/trust`, `/settings`, and `/resume`
-selector dialogs and fullscreen mode (`--tui-mode regular` opts out).
-Not at feature parity yet: the extensions headless core has landed
-(`pi-ext-js` — embedded QuickJS host, TypeScript transpile, the extension
-runner with upstream dispatch semantics; upstream's bundled `tool-search`
-extension runs identically) together with the UI-over-protocol wiring
-(dialogs, `user_bash`, context transforms, RPC dialog subprotocol),
-virtual-model routing, models.json custom providers, and the composed
-extension-provider catalog, extension-registered keyboard shortcuts
-(`pi.registerShortcut`, resolved against the built-in keybindings like
-upstream and listed under `/hotkeys`), extension markdown
-transformers (`pi.registerMarkdownTransformer`, running per render on the
-user/assistant/summary/changelog surfaces), extension entry
-renderers (`pi.registerEntryRenderer` — custom session entries rendered
-by extension components over the handle bridge, with the live theme
-surface and keybinding hints), and extension message renderers
-(`pi.registerMessageRenderer` — custom messages with a renderer-supplied
-component or the default label+markdown box, also over the handle
-bridge), and extension tool renderers (`pi.registerToolRenderer` —
-resolver chains over the built-in renderers, custom components over
-the handle bridge with `renderShell: "self"` support), and the
-interactive `ctx.ui` dialogs with the real dialog stack
-(`ctx.ui.select`/`confirm`/`input`/`editor` mount over the bridge with
-countdowns, and `ctx.ui.custom` invokes its factory — the adopted
-component stacks in the editor slot, `done()` resolves the promise),
-the overlay arm (`ctx.ui.custom {overlay:true}` and the factory's
-`tui.showOverlay` surface with the `OverlayHandle` adapter) over the
-pi-tui overlay machinery, the OSC 7501 program-status reporter
-(working/blocked/done/error/idle with dialog and overlay sources,
-terminal titles) and `ctx.ui.setStatus` footer statuses, and the small
-`ctx.ui` surfaces — widgets above/below the editor (`setWidget` lines
-or component factories), custom footer/header factories with the live
-footer-data adapter, the working-status family (`setWorkingMessage`/
-`setWorkingVisible`/`setWorkingIndicator`/`setHiddenThinkingLabel`),
-`pasteToEditor`/`setEditorText`/`getEditorText`, tool-output expansion,
-`onTerminalInput`, and autocomplete wrappers (`addAutocompleteProvider`
-chains over the built-in provider with the trigger union), and the
-editor component (`setEditorComponent` — a factory-built component
-takes the editor slot with the submit/change/autocomplete/action
-wiring and the working status moving to the status row), and the
-`ctx.ui` themes API (`ctx.ui.theme` styling, `getAllThemes`/`getTheme`
-with by-handle styling adapters, `setTheme` by name — persisting
-`settings.theme` — or by Theme instance as `<in-memory>`) — E3 TUI
-bridging, the MCP streamable-HTTP transport and OAuth module, the npm
-package-manager arm and the P7 tail have landed. The 2026-11-22 gap wave
-added seven provider adapters (Google GenAI/Vertex, Bedrock Converse,
-OpenAI/Azure Responses, Mistral Conversations, pi-messages), built-in
-OAuth login/refresh for Anthropic/Codex/Copilot, the new `pi-env` crate,
-the telemetry ping/exporter/conformance surface and a registered image
-attachment module. A follow-up host-wiring wave made stored built-in OAuth
-credentials refresh at wire time, attached images from `read`/`@file` and the
-interactive `convertToLlm` filter, fired the telemetry ping/exporter, and drove
-MCP startup/list-changed ticks. The 2026-11-22 ten-agent gap wave added a real
-image pixel backend (Lanczos3 resize, BMP→PNG), a `pi remote` host for `pi-env`,
-opt-in reqwest telemetry transports, real local codemode transports, Copilot's
-429 back-off, `URL.canParse`/`node_modules` resolution, and RPC FIFO dispatch,
-session rebind and per-call `blockImages`. Remaining work is mechanism-level
-deviations (no full 1:1 parity); see
-[`docs/GAP-STATUS.md`](docs/GAP-STATUS.md) for the coverage matrix,
-[PLAN.md](PLAN.md) for the phased plan and [HANDOFF.md](HANDOFF.md) for the
-detailed, dated status.
+**Status: `v0.1.1`.** The core pipeline is proven end-to-end against a live
+provider (`pi -p` prompt to answer, tool round-trips, JSON event mode), and bare
+`pi` renders the upstream chat TUI, including the `/model`, `/trust`,
+`/settings` and `/resume` dialogs and fullscreen mode (`--tui-mode regular`
+opts out). The extensions arc (E0 to E4), MCP, OAuth login/refresh, telemetry,
+image handling, codemode, `pi-env`, virtual-model routing, models.json custom
+providers and the P7 tail have landed. What remains is mechanism-level
+deviations, not missing headline features:
+
+- Coverage matrix: [`docs/GAP-STATUS.md`](docs/GAP-STATUS.md)
+- Phased plan and scope: [PLAN.md](PLAN.md)
+- Dated detail and gotchas: [HANDOFF.md](HANDOFF.md)
+
+## Highlights
+
+- **A mode for every workflow:** streaming print mode (`-p`), JSONL events
+  (`--mode json`), typed RPC (`--mode rpc`) and a full interactive TUI.
+- **Upstream-shaped extensions:** JS/TS extensions run on an embedded QuickJS
+  host with upstream dispatch semantics, including UI dialogs, renderers,
+  tools, shortcuts, context transforms and the RPC dialog subprotocol.
+- **Native Rust extensions:** a pi-rs addition that lets compiled plugins
+  change almost any part of the host. See
+  [Native Rust extensions](#native-rust-extensions).
+- **Broad provider support:** Anthropic, OpenAI completions and Codex
+  Responses, Google GenAI/Vertex, Bedrock Converse, Azure Responses, Mistral
+  Conversations and pi-messages, plus built-in OAuth login/refresh for
+  Anthropic, Codex and Copilot.
+- **Compatible sessions:** JSONL v3 transcripts, byte-checked against golden
+  fixtures from the real TypeScript Pi.
+- **Safe coexistence:** XDG roots mean pi-rs never touches `~/.pi`.
+
+## Install
+
+### One-liner (Linux x86-64 / ARM64)
+
+The repo is **private**, so the installer needs a `GITHUB_TOKEN` with read
+access to Releases. Download the script as a file, then run that file. Never
+pipe `curl` into a shell.
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh && GITHUB_TOKEN=... sh ./install.sh v0.1.1
+```
+
+The same steps, expanded:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.sh
+sh ./install.sh --help
+GITHUB_TOKEN=... sh ./install.sh v0.1.1
+```
+
+The binary lands at `~/.local/bin/pi` by default; override with `--prefix DIR`
+(or `PI_INSTALL_DIR`). Each download is SHA-256 verified before install. No
+`curl | sh`, no writes outside the prefix, and `sudo` only with `--sudo`. Use
+`--force` to replace an existing install.
+
+Current release: **v0.1.1**. Assets are `pi-linux-x86_64` and
+`pi-linux-aarch64`, each with a `.sha256`. macOS assets are pending a hosted
+runner, so macOS users currently get an "asset not found" error from the
+installer.
+
+### npm / Bun (planned, not published yet)
+
+There is no pi-rs package on npm today, so these commands do **not** work yet.
+The intended forms once a package is published are:
+
+```sh
+npx pi-rs             # planned
+bunx pi-rs            # planned
+npm install -g pi-rs  # planned
+bun install -g pi-rs  # planned
+```
+
+Until then, use the installer above or [build from source](#build-from-source).
+The upstream TypeScript package `@earendil-works/pi-coding-agent` is a
+different program and is not pi-rs.
+
+## Performance
+
+Measured on the operator's box; treat these as indicative, not as a benchmark
+suite.
+
+| | pi-rs (release) | pi-rs (debug, PLT) | upstream pi (Node, v0.12.26) |
+|---|---|---|---|
+| Median time to first TUI frame | ~342 ms | ~694 ms | ~65 ms |
+| Resident set size (RSS) | ~32 MiB | ~40 MiB | ~41 MiB |
+| Binary | 26 MB, stripped | debug build | Node runtime |
+
+pi-rs uses roughly **24% less memory** than upstream Node pi, but starts about
+**5x slower**. These are different trades, not a speed win: Node benefits from
+a warm V8 startup, while pi-rs spends its first few hundred milliseconds on
+config, model catalog and session setup rather than on drawing the frame. The
+release binary is stripped and takes about five minutes to build here.
 
 ## What works
 
-- **`pi -p "prompt"`** — print mode over the real agent loop: streaming
-  providers (anthropic, openai-completions, openai-codex-responses, Google
-  GenAI/Vertex, Bedrock Converse, OpenAI/Azure Responses, Mistral
-  Conversations, pi-messages), the
-  built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) with
-  themed renderers, and the credential ladder (`--api-key` → stored `auth.json`
-  → provider env vars).
-- **`pi --mode json`** — JSONL event stream matching `json-event.ts`'s wire
-  shape; **`--mode rpc`** — a typed request/response envelope (reconciliation
-  against `rpc-entry.ts` pending).
-- **`pi` (interactive)** — the chat TUI: pi logo header with ctrl+o
-  expansion, streaming markdown, tool execution rows, footer usage/context
-  stats, editor autocomplete (`/` commands, `@file` fuzzy search via `fd`,
-  path completion), the `/model` selector dialog, ctrl+p model cycling,
-  steering/follow-up message queues (enter / alt+enter / alt+up), `!`/`!!`
-  bash mode, `/compact` context compaction (status indicator, queued
-  submissions, ctrl+o expansion, billed-tokens notice), the `/trust`
-  project-trust dialog (trust / trust parent / distrust, persisted to
-  trust.json), the full `/settings` dialog (the complete upstream row
-  list — auto-compact, image rows per terminal capability, editor/output
-  padding, autocomplete, transport, HTTP idle timeout, cache warming,
-  telemetry, trust, tree filter, warnings sub-menu, per-model thinking
-  levels, TUI/fullscreen rows, theme — persisted to settings.json), the
-  OSC
-  terminal-color theme controller (grayscale system theme while the query is
-  pending, re-theming on the reply, mode-2031 light/dark reports, `/theme`
-  switcher), the `/resume` session selector (current-folder/all scopes,
-  search with `re:` regex and `"phrase"` support, fork-tree threading,
-  rename and trash-delete) with resumed transcripts replayed into the chat,
-  the `/name`, `/session`, `/hotkeys`, `/changelog`, and `/copy` commands,
-  and session
-  persistence (shutdown prints the resume command).
-- **Sessions** — JSONL v3 transcript store under the XDG data root
-  (`~/.local/share/pi-rs/sessions` by default), byte-compatible and
-  verified against golden fixtures generated by the real TypeScript pi.
-- **Wired library slices** — stored built-in OAuth credentials (Anthropic,
-  Codex, Copilot, incl. Copilot's 429 back-off) refresh at request time;
-  `read`/`@file` attach image content with upstream's notes and resize/convert
-  oversized and BMP images; `blockImages` is re-read per provider call in
-  interactive and RPC (print/JSON snapshot it at startup); the anonymous
-  install/update ping and exporter flush run at interactive startup/shutdown
-  (real HTTP transports are opt-in); MCP startup/list-changed ticks are
-  host-driven from the interactive pump and each RPC command.
+- **`pi -p "prompt"`** prints a full agent-loop answer: streaming providers
+  (anthropic, openai-completions, openai-codex-responses, Google GenAI/Vertex,
+  Bedrock Converse, OpenAI/Azure Responses, Mistral Conversations,
+  pi-messages), built-in tools (`read`, `write`, `edit`, `bash`, `grep`,
+  `find`, `ls`) with themed renderers, and the credential ladder (`--api-key`
+  to stored `auth.json` to provider env vars).
+- **`pi --mode json`** emits an upstream-shaped JSONL event stream;
+  **`--mode rpc`** offers a typed request/response envelope.
+- **`pi` (interactive)** is the upstream chat TUI: logo header, streaming
+  markdown, tool rows, usage/context footer, editor autocomplete (`/`
+  commands, `@file` fuzzy search via `fd`, path completion), `/model`,
+  ctrl+p model cycling, steering/follow-up message queues, `!`/`!!` bash mode,
+  `/compact` context compaction, `/trust` project-trust dialog, the full
+  `/settings` dialog, the OSC terminal-color theme controller, `/resume`
+  (search, fork tree, rename, trash), `/name`, `/session`, `/hotkeys`,
+  `/changelog`, `/copy`, and session persistence (shutdown prints the resume
+  command).
+- **Sessions** are JSONL v3 under the XDG data root
+  (`~/.local/share/pi-rs/sessions` by default), byte-compatible with golden
+  fixtures from the real TypeScript pi.
+- **Wired library slices:** stored built-in OAuth credentials refresh at
+  request time; `read`/`@file` attach images and resize/convert oversized and
+  BMP images; `blockImages` is re-read per provider call in interactive and
+  RPC (print/JSON snapshot it at startup); the anonymous install/update ping
+  and exporter flush run at interactive startup/shutdown with opt-in HTTP
+  transports; MCP startup/list-changed ticks are host-driven.
+
+## Native Rust extensions
+
+A pi-rs addition on top of upstream's JS/TS extension host: compiled `cdylib`
+plugins can change almost any part of pi-rs, from tools to prompt and message
+handling. This is deliberately **additive**; upstream pi has JS/TS extensions
+only, and the stable **C ABI** is the boundary that keeps native plugins
+decoupled from Rust internals.
+
+- **Discovery:** point `PI_NATIVE_EXTENSIONS` at your plugin, or drop one in
+  the project's `.pi/native/` directory.
+- **Interface:** a small C ABI carrying JSON payloads in and out. No Rust
+  types cross the boundary.
+- **Registration:** plugins register tools and hooks, including
+  `on_session_start`, `on_message`, `on_tool_result` and `transform_prompt`,
+  so an extension can alter session startup, message flow, tool results and
+  the prompt sent to the model.
+- **Scope:** combined with the JS/TS extension host, this reaches tools, UI,
+  providers, sessions and prompts, i.e. almost every part of pi-rs.
 
 ## Crates
 
@@ -124,19 +158,18 @@ detailed, dated status.
 | `pi-agent` | `@earendil-works/pi-agent-core` | agent loop with steering/follow-up queues, transcript, events |
 | `pi-tui` | `@earendil-works/pi-tui` | differential renderer, editor, fuzzy/autocomplete, mouse, alt screen, theme, input listeners |
 | `pi-mcp` | `@earendil-works/pi-mcp` | JSON-RPC types + stdio + streamable-HTTP transport clients (session/protocol-version headers, SSE parser + resumption, GET stream), the OAuth module (discovery, PKCE flows, sign-in, loopback callback), resources and fidelity APIs (startup wait, `list_changed` tool refresh, `_meta` preservation; ticks driven by the coding-agent host) |
-| `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, UI dialogs over protocol, `user_bash`, context transforms, RPC dialog subprotocol, virtual-model routing, extension keyboard shortcuts + markdown transformers + entry/message/tool renderers and components over the handle bridge, interactive `ctx.ui.custom` + the dialog stack + overlay handles, OSC 7501 program status + `ctx.ui.setStatus`/setTitle, the small `ctx.ui` surfaces (widgets, footer/header factories, working-status family, editor text ops, toolsExpanded, onTerminalInput), autocomplete wrappers (`addAutocompleteProvider` chain + trigger union), the editor component (`setEditorComponent`/`getEditorComponent` — the delegate editor slot + the status row), the `ctx.ui` themes API (`theme`/`getAllThemes`/`getTheme`/`setTheme` — the engine-side sync half, `themeChanged` crossings for the mode-side visuals + persistence, RPC/headless stubs verbatim) (`tool-search` exit gate green; E3 TUI bridging complete) |
+| `pi-ext-js` | extensions runtime (`core/extensions`) | embedded QuickJS host: TS transpile, loader, runner, UI dialogs over protocol, `user_bash`, context transforms, RPC dialog subprotocol, virtual-model routing, extension keyboard shortcuts + markdown transformers + entry/message/tool renderers and components over the handle bridge, interactive `ctx.ui.custom` + the dialog stack + overlay handles, OSC 7501 program status + `ctx.ui.setStatus`/setTitle, the small `ctx.ui` surfaces (widgets, footer/header factories, working-status family, editor text ops, toolsExpanded, onTerminalInput), autocomplete wrappers (`addAutocompleteProvider` chain + trigger union), the editor component (`setEditorComponent`/`getEditorComponent` - the delegate editor slot + the status row), the `ctx.ui` themes API (`theme`/`getAllThemes`/`getTheme`/`setTheme` - the engine-side sync half, `themeChanged` crossings for the mode-side visuals + persistence, RPC/headless stubs verbatim) (`tool-search` exit gate green; E3 TUI bridging complete) |
 | `pi-codemode` | `@earendil-works/pi-codemode` | inline VM, deterministic runs, `models.*` globals, grammar-constrained sampling hook, real local thread/client transports; true Node/Workers/wasm transports remain typed stubs |
 | `pi-env` | `@earendil-works/pi-env` | daemon frame transport, remote env/files/process/PTY/watch, SSH; host-wired as `pi remote` (ticks/PTY/SSH onboarding are host-driven) |
 | `pi-coding-agent` (`pi` binary) | `@earendil-works/pi-coding-agent` | CLI, print/JSON/RPC/interactive modes, session store, tools, auth, images and telemetry modules |
 
 Deferred (not in the core scope): `chord`, `pi-durable`, `evals`, `apps/p2`.
-`/share` and `/bug` are omitted by policy (Radius upload); macOS release assets
-await a hosted runner.
+`/share` and `/bug` are omitted by policy (Radius upload).
 
-## Build
+## Build from source
 
-Requires Rust 1.97 (MSRV) — pinned by the oxc 0.158 transpile engine in
-`pi-ext-js` (`rust-version` in the workspace `Cargo.toml`).
+Requires Rust 1.97 (MSRV), pinned by the oxc 0.158 transpile engine in
+`pi-ext-js` (the workspace `Cargo.toml` `rust-version`).
 
 ```sh
 cargo build
@@ -145,10 +178,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The workspace gate (fmt + clippy all+pedantic `-D warnings` + full test suite)
-runs in CI on every push to `main`. Heavy builds should run in a
-memory-capped container; the interactive-mode tests need `fd` and `rg` on
-`PATH` (installed by CI, used via `which()` like upstream's `ensureTool`).
+The workspace gate (fmt, clippy with all targets and pedantic `-D warnings`,
+full test suite) runs in CI on every push to `main`. Heavy builds should run
+with low parallelism on memory-capped machines. Interactive-mode tests need
+`fd` and `rg` on `PATH` (installed by CI, resolved via `which()` like upstream's
+`ensureTool`).
 
 ## Paths
 
@@ -164,9 +198,9 @@ under a `pi-rs` leaf, so it never touches a real TypeScript pi install
 | state | `~/.local/state/pi-rs` | `pi-debug.log` |
 
 Each root honors its `XDG_*` env var when absolute. `PI_CODING_AGENT_DIR`
-(upstream's override) collapses every role into one directory — with it set,
+(upstream's override) collapses every role into one directory. With it set,
 the layout is exactly upstream's. Project-local `.pi/` directories
-(`.pi/settings.json`, `.pi/skills/`, …) are upstream-compatible and
+(`.pi/settings.json`, `.pi/skills/`, ...) are upstream-compatible and
 unaffected.
 
 ## Ground rules
@@ -177,3 +211,5 @@ unaffected.
   deliberate deviation (XDG, see [Paths](#paths)).
 - Provider integration tests run only against free or local endpoints; test
   fixtures are synthetic and never touch real `~/.pi` credentials.
+- Native Rust extensions are an additive capability; the C ABI is a deliberate
+  stable boundary, and upstream pi has no equivalent.
