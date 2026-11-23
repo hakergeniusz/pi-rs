@@ -182,6 +182,65 @@ export function symlinkSync(target, path) {
   unwrap(ops.nodeFsSymlinkSync(String(target), String(path)), "symlink", String(path));
 }
 
+// Minimal fd handles for the sweep's `fs.openSync` callers (`pi-cord/src/chat.ts:792`
+// and `src/lock.ts:52`). The fd is an opaque host id; only the four calls
+// below accept it. Flags r/r+/w/wx/a(ax) map to OpenOptions; `mode` is
+// accepted for signature fidelity but ignored (the host never chmods).
+// No file streams, async fd APIs, fchmod/fsync/ftruncate or real OS fd
+// numbers are provided - documented in `node/mod.rs`.
+export function openSync(path, flags = "r", mode) {
+  return unwrap(
+    ops.nodeFsOpenSync(String(path), String(flags), mode === undefined ? "" : String(mode)),
+    "open",
+    String(path),
+  );
+}
+
+export function closeSync(fd) {
+  unwrap(ops.nodeFsCloseSync(fd), "close", String(fd));
+}
+
+function bytesOf(data, offset, length, encoding) {
+  const start = offset == null ? 0 : offset;
+  const end = length == null ? undefined : start + length;
+  if (typeof data === "string") {
+    const raw = JSON.parse(ops.nodeBufferEncode(data, encoding || "utf8"));
+    if (raw.error) throw new Error(raw.error);
+    return raw.ok.slice(start, end);
+  }
+  const source = data instanceof Uint8Array ? data : Uint8Array.from(data);
+  return Array.from(source.subarray(start, end));
+}
+
+export function readSync(fd, buffer, offset = 0, length, position = null) {
+  const size = length === undefined ? buffer.length - offset : length;
+  const bytes = unwrap(
+    ops.nodeFsReadSync(fd, size, position === null ? -1 : position),
+    "read",
+    String(fd),
+  );
+  for (let index = 0; index < bytes.length; index++) buffer[offset + index] = bytes[index];
+  return bytes.length;
+}
+
+export function writeSync(fd, data, offset = 0, length, position = null, encoding) {
+  let encodingValue = encoding;
+  if (typeof offset === "string" || typeof length === "string") {
+    // Node's `fs.writeSync(fd, string, position?, encoding?)` overload.
+    const positionOrEncoding = offset;
+    encodingValue = typeof length === "string" ? length : typeof offset === "string" ? offset : encoding;
+    if (typeof positionOrEncoding === "number") position = positionOrEncoding;
+    offset = undefined;
+    length = undefined;
+  }
+  const bytes = bytesOf(data, offset ?? 0, length, encodingValue);
+  return unwrap(
+    ops.nodeFsWriteSync(fd, JSON.stringify(bytes), position === null ? -1 : position),
+    "write",
+    String(fd),
+  );
+}
+
 // Promise forms settle from the same host ops. Upstream is async here; the
 // embedded host has a synchronous filesystem, so the observable result is
 // the same once the engine's job queue drains.
@@ -245,6 +304,10 @@ export default {
   realpathSync,
   readlinkSync,
   symlinkSync,
+  openSync,
+  closeSync,
+  readSync,
+  writeSync,
   readFile,
   writeFile,
   appendFile,

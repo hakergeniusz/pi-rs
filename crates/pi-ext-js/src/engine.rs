@@ -21,6 +21,9 @@
 //! `StreamFunction` + `AssistantMessageEventStream`). E4 adds the
 //! `crate::resolver::node` op group: the `node:*` built-ins and host packages share
 //! this same HostCore-backed boundary rather than reaching the host process.
+//! The global `process` object is installed here at construction time from
+//! `node/process_global.js`; real-world extensions use it without importing
+//! `node:process`, so it must exist before the first extension module runs.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -345,6 +348,11 @@ impl JsHost {
         let core = Arc::new(Mutex::new(core));
         ctx.with(|ctx| Self::install_ops(&ctx, &core))?;
         ctx.with(|ctx| ctx.eval::<(), _>(crate::glue::GLUE))?;
+        // Install the global `process` before any extension module is
+        // declared: third-party extensions reference it at top level
+        // without importing `node:process`. `node:process` re-exports this
+        // same object (see `node/process_global.js`).
+        ctx.with(|ctx| ctx.eval::<(), _>(crate::resolver::node::process_global_source()))?;
         Ok(Self { ctx, rt, core })
     }
 
@@ -1084,14 +1092,24 @@ impl JsHost {
                         )
                         .map_err(|err| JsHostError::Job(err.to_string()))?
                     };
-                    let (module, _promise) =
-                        match rquickjs::Module::declare(ctx.clone(), path, source) {
-                            Ok(declared) => match declared.eval() {
-                                Ok(evaluated) => evaluated,
-                                Err(err) => return Ok(Err(Self::js_error(&ctx, err))),
-                            },
-                            Err(err) => return Ok(Err(Self::js_error(&ctx, err))),
-                        };
+                    let declaration = match rquickjs::Module::declare(ctx.clone(), path, source) {
+                        Ok(declared) => declared,
+                        Err(err) => return Ok(Err(Self::js_error(&ctx, err))),
+                    };
+                    // Node always populates `import.meta.url`; QuickJS leaves
+                    // it undefined. Extensions use it at module top level
+                    // (`pi-subagents/index.ts:109`, `pi-gemini-router/index.ts:339`),
+                    // so supply a file URL for the module's own path.
+                    if let Err(err) = declaration
+                        .meta()
+                        .and_then(|meta| meta.set("url", format!("file://{path}")))
+                    {
+                        return Ok(Err(Self::js_error(&ctx, err)));
+                    }
+                    let (module, _promise) = match declaration.eval() {
+                        Ok(evaluated) => evaluated,
+                        Err(err) => return Ok(Err(Self::js_error(&ctx, err))),
+                    };
                     let namespace = module.namespace()?;
                     let factory: Option<Function> = namespace.get("default")?;
                     let Some(factory) = factory else {
@@ -2540,6 +2558,240 @@ export default function (): void {
             .expect_err("unsupported node built-in must fail");
         assert!(err.to_string().contains("not polyfilled"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_global_is_defined_in_an_evaluated_extension() {
+        let host = host();
+        let index = host
+            .begin_extension("<test-process-global>")
+            .expect("begin");
+        host.load_extension_module(
+            index,
+            "<test-process-global>",
+            Some(
+                r#"
+import processModule from "node:process";
+export default function () {
+  globalThis.__proc = {
+    defined: typeof process !== "undefined",
+    sameModule: processModule === globalThis.process,
+    envObject: typeof process.env === "object" && process.env !== null,
+    cwd: process.cwd(),
+    platform: process.platform,
+    platformIsString: typeof process.platform === "string",
+    argv: process.argv,
+    argvIsArray: Array.isArray(process.argv),
+    hasStdout: typeof process.stdout.write === "function",
+    hasStderr: typeof process.stderr.write === "function",
+    initialCode: process.exitCode,
+  };
+  // No-exit semantics: the code is recorded, the host keeps running.
+  process.exit(7);
+  globalThis.__proc.afterExit = process.exitCode;
+  process.on("SIGTERM", () => {});
+  globalThis.__proc.signalListeners = process.listenerCount("SIGTERM");
+  process.stdout.write("from extension\n");
+}
+"#,
+            ),
+        )
+        .expect("load extension using the global process");
+        let out = host
+            .eval_for_tests("JSON.stringify(globalThis.__proc)")
+            .expect("eval");
+        let value: Json = serde_json::from_str(&out).expect("json");
+        assert_eq!(value["defined"], true);
+        assert_eq!(value["sameModule"], true);
+        assert_eq!(value["envObject"], true);
+        assert_eq!(value["cwd"], "/tmp");
+        assert_eq!(value["platform"], "linux");
+        assert_eq!(value["platformIsString"], true);
+        assert_eq!(value["argvIsArray"], true);
+        assert_eq!(
+            value["argv"],
+            serde_json::json!(["node"]),
+            "process.argv must include the runtime name: {value}"
+        );
+        assert_eq!(value["hasStdout"], true);
+        assert_eq!(value["hasStderr"], true);
+        assert_eq!(value["initialCode"], 0);
+        assert_eq!(value["afterExit"], 7);
+        assert_eq!(value["signalListeners"], 1);
+    }
+
+    #[test]
+    fn structured_clone_global_copies_plain_data_and_cycles() {
+        let host = host();
+        assert_eq!(
+            host.eval_for_tests(
+                r#"(() => {
+  const source = { nested: [1, 2], when: new Date(0) };
+  source.self = source;
+  const copy = structuredClone(source);
+  return JSON.stringify({
+    defined: typeof structuredClone === "function",
+    equal: copy.nested[1] === 2 && copy.when.getTime() === 0,
+    cycle: copy.self === copy,
+    detached: copy !== source,
+  });
+})()"#,
+            )
+            .expect("eval"),
+            r#"{"defined":true,"equal":true,"cycle":true,"detached":true}"#
+        );
+    }
+
+    #[test]
+    fn import_meta_url_is_available_to_extension_modules() {
+        let dir = std::env::temp_dir().join(format!("pi-ext-js-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let entry = dir.join("main.ts");
+        let source = r#"
+import { fileURLToPath } from "node:url";
+export default function () {
+  globalThis.__meta = { url: import.meta.url, path: fileURLToPath(import.meta.url) };
+}
+"#;
+        std::fs::write(&entry, source).expect("write");
+        let host = host();
+        let index = host
+            .begin_extension(&entry.to_string_lossy())
+            .expect("begin");
+        host.load_extension_module(index, &entry.to_string_lossy(), None)
+            .expect("import.meta.url available");
+        let out = host
+            .eval_for_tests("JSON.stringify(globalThis.__meta)")
+            .expect("eval");
+        let value: Json = serde_json::from_str(&out).expect("json");
+        assert_eq!(value["url"], format!("file://{}", entry.to_string_lossy()));
+        assert_eq!(value["path"], entry.to_string_lossy().as_ref());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_module_create_require_resolves_virtual_and_relative_modules() {
+        let dir = std::env::temp_dir().join(format!("pi-ext-js-require-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("helper.ts"),
+            "export const tag = \"from-helper\";\n",
+        )
+        .expect("write helper");
+        let entry = dir.join("main.ts");
+        std::fs::write(
+            &entry,
+            r#"
+import { createRequire } from "node:module";
+const req = createRequire(import.meta.url);
+export default function () {
+  globalThis.__require = {
+    join: req("node:path").join("a", "b"),
+    resolved: req.resolve("node:path"),
+    helper: req("./helper.ts").tag,
+  };
+}
+"#,
+        )
+        .expect("write entry");
+        let host = host();
+        let index = host
+            .begin_extension(&entry.to_string_lossy())
+            .expect("begin");
+        host.load_extension_module(index, &entry.to_string_lossy(), None)
+            .expect("node:module resolves");
+        let out = host
+            .eval_for_tests("JSON.stringify(globalThis.__require)")
+            .expect("eval");
+        let value: Json = serde_json::from_str(&out).expect("json");
+        assert_eq!(value["join"], "a/b", "{value}");
+        assert_eq!(value["resolved"], "virtual:node:path", "{value}");
+        assert_eq!(value["helper"], "from-helper", "{value}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_open_sync_handle_reads_writes_and_closes() {
+        let dir = std::env::temp_dir().join(format!("pi-ext-js-fd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("data.txt");
+        std::fs::write(&path, b"hello").expect("seed");
+        let source = r#"
+import { openSync, closeSync, readSync, writeSync, readFileSync } from "node:fs";
+export default function () {
+  const path = __PATH__;
+  const fd = openSync(path, "r+");
+  const buffer = Buffer.alloc(8);
+  const read = readSync(fd, buffer, 0, 5, 0);
+  writeSync(fd, Buffer.from("!"), 0, 1, 5);
+  closeSync(fd);
+  globalThis.__fd = {
+    fd,
+    read,
+    text: JSON.stringify(Array.prototype.slice.call(buffer, 0, read)),
+    after: readFileSync(path, "utf8"),
+  };
+}
+"#
+        .replace(
+            "__PATH__",
+            &serde_json::to_string(&path.to_string_lossy()).expect("json"),
+        );
+        let host = host();
+        let index = host.begin_extension("<test-fd>").expect("begin");
+        host.load_extension_module(index, "<test-fd>", Some(&source))
+            .expect("load fs handle extension");
+        let out = host
+            .eval_for_tests("JSON.stringify(globalThis.__fd)")
+            .expect("eval");
+        let value: Json = serde_json::from_str(&out).expect("json");
+        assert!(value["fd"].as_i64().is_some_and(|fd| fd >= 100));
+        assert_eq!(value["read"], 5);
+        assert_eq!(value["text"], "[104,101,108,108,111]");
+        assert_eq!(value["after"], "hello!");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn child_process_exec_file_settles_callback_and_promise() {
+        let host = host();
+        let index = host.begin_extension("<test-exec-file>").expect("begin");
+        host.load_extension_module(
+            index,
+            "<test-exec-file>",
+            Some(
+                r#"
+import { execFile } from "node:child_process";
+export default function () {
+  globalThis.__execFile = {};
+  execFile("/bin/echo", ["callback"], (error, stdout, stderr) => {
+    globalThis.__execFile.callback = {
+      error: error ? String(error) : null,
+      stdout: String(stdout).trim(),
+      stderr: String(stderr).trim(),
+    };
+  });
+  (async () => {
+    try {
+      const result = await execFile("/bin/echo", ["promise"]);
+      globalThis.__execFile.promise = String(result.stdout).trim();
+    } catch (error) {
+      globalThis.__execFile.promise = "ERR:" + String(error);
+    }
+  })();
+}
+"#,
+            ),
+        )
+        .expect("load execFile extension");
+        let out = host
+            .eval_for_tests("JSON.stringify(globalThis.__execFile)")
+            .expect("eval");
+        let value: Json = serde_json::from_str(&out).expect("json");
+        assert_eq!(value["callback"]["error"], Json::Null);
+        assert_eq!(value["callback"]["stdout"], "callback");
+        assert_eq!(value["callback"]["stderr"], "");
+        assert_eq!(value["promise"], "promise");
     }
 
     #[test]

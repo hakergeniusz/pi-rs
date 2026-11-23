@@ -1,7 +1,8 @@
 // `node:child_process` — a sync-first subset built on the host's `pi.exec`
-// primitive (`core/exec.ts:49-162`). Upstream extensions only use the sync
-// calls; `spawn` returns a shape-compatible object whose events fire once
-// the engine drains its job queue (see `WIRING.md` for the gap).
+// primitive (`core/exec.ts:49-162`). Upstream extensions use the sync calls
+// plus async `execFile` (`pi-guardrails/index.ts:49,567`); every call is
+// no-shell and argv-safe. `spawn` returns a shape-compatible object whose
+// events fire once the engine drains its job queue (see `WIRING.md`).
 
 import { Buffer } from "node:buffer";
 
@@ -121,8 +122,73 @@ export function spawn(file, args = [], options = {}) {
   return child;
 }
 
+// Async `execFile` (`pi-guardrails/index.ts:49,567` calls it with a
+// callback). The command still goes through the same no-shell `ops.exec`
+// seam as `execFileSync`: `file` is the executable and every argv entry is
+// passed as a separate argument, never interpolated into a shell string.
+// The callback (and the optional promise/child shape) settles on the next
+// microtask, matching Node's asynchronous callback scheduling.
+export function execFile(file, args = [], options = {}, callback) {
+  if (typeof args === "function") {
+    callback = args;
+    args = [];
+    options = {};
+  } else if (typeof options === "function") {
+    callback = options;
+    options = {};
+  }
+
+  const child = emitter();
+  child.pid = 0;
+  child.spawnfile = String(file);
+  child.spawnargs = args.map(String);
+  child.stdout = emitter();
+  child.stderr = emitter();
+  child.stdin = { write: () => true, end: () => {}, on: () => child.stdin };
+  child.kill = () => true;
+  child.connected = false;
+
+  let settle;
+  const promise = new Promise((resolve, reject) => {
+    settle = { resolve, reject };
+  });
+  // A callback caller ignores the promise; keep a rejected result from
+  // becoming an unhandled rejection in the embedded runtime.
+  void promise.catch(() => {});
+
+  Promise.resolve().then(() => {
+    try {
+      const result = run(String(file), args, options);
+      const stdout = encoded(result.stdout, options);
+      const stderr = encoded(result.stderr, options);
+      child.stdout.emit("data", stdout);
+      child.stderr.emit("data", stderr);
+      child.emit("close", result.code, result.killed ? "SIGTERM" : null);
+      child.emit("exit", result.code, result.killed ? "SIGTERM" : null);
+      const error = result.code !== 0 ? commandError(String(file), result) : null;
+      if (error) {
+        if (callback) callback(error, stdout, stderr);
+        else settle.reject(error);
+      } else {
+        if (callback) callback(null, stdout, stderr);
+        else settle.resolve({ stdout, stderr });
+      }
+    } catch (error) {
+      child.emit("error", error);
+      if (callback) callback(error, "", "");
+      else settle.reject(error);
+    }
+  });
+
+  // Thenable child: `await execFile(...)` works without a callback while
+  // event listeners and `kill()` stay available, as in Node.
+  child.then = promise.then.bind(promise);
+  child.catch = promise.catch.bind(promise);
+  return child;
+}
+
 export function fork() {
   throw new Error("child_process.fork is not available in the extensions host");
 }
 
-export default { execSync, execFileSync, spawnSync, spawn, fork };
+export default { execSync, execFileSync, execFile, spawnSync, spawn, fork };

@@ -1,107 +1,37 @@
-// `node:process` — the ambient object Node extensions expect. cwd comes from
-// the host's HostCore, not the OS process, so a session's configured cwd is
-// what `process.cwd()` reports. `platform`, `arch`, `version` and `cwd()` are
-// always strings. `process.env` is a snapshot: the host op drops empty,
-// non-shell-shaped and credential-shaped keys so a fixture can never leak a
-// live token (see `WIRING.md`).
+// `node:process` — re-exports the host-wide `process` object installed by
+// `process_global.js` at engine creation. Keeping one object (rather than a
+// second module-local copy) means an extension that imports the module sees
+// the same `env` mutations and the same recorded `exitCode` as one that just
+// uses the global. The global bootstrap owns all values; see that file for
+// the host-state boundary and the documented no-exit/no-signal deviations.
 
-const ops = globalThis.__piOps;
+const p = globalThis.process;
 
-function value(operation) {
-  return JSON.parse(ops.nodeProcess(operation));
-}
+export const env = p.env;
+export const platform = p.platform;
+export const arch = p.arch;
+export const version = p.version;
+export const versions = p.versions;
+export const title = p.title;
+export const argv = p.argv;
+export const execArgv = p.execArgv;
+export const pid = p.pid;
+export const ppid = p.ppid;
+export const execPath = p.execPath;
+export const stdout = p.stdout;
+export const stderr = p.stderr;
+export const stdin = p.stdin;
 
-export const env = JSON.parse(ops.nodeProcessEnv());
-export const platform = value("platform");
-export const arch = value("arch");
-export const version = value("version");
-export const versions = { node: version.replace(/^v/, "") };
-export const title = value("title");
-export const argv = value("argv");
-export const execArgv = [];
-export const pid = 1;
-export const ppid = 0;
+export const cwd = p.cwd;
+export const chdir = p.chdir;
+export const nextTick = p.nextTick;
+export const uptime = p.uptime;
+export const memoryUsage = p.memoryUsage;
+export const exit = p.exit;
+export const on = p.on;
+export const once = p.once;
+export const removeListener = p.removeListener;
+export const kill = p.kill;
+export const hrtime = p.hrtime;
 
-export function cwd() {
-  return value("cwd");
-}
-
-export function chdir(path) {
-  // The embedded host owns cwd; changing it would desynchronise the `pi`
-  // API and every extension context. Fail loudly instead of pretending.
-  throw new Error(`process.chdir('${path}') is not available in the extensions host`);
-}
-
-export function nextTick(callback, ...args) {
-  Promise.resolve().then(() => callback(...args));
-}
-
-export function uptime() {
-  return 0;
-}
-
-export function memoryUsage() {
-  return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0 };
-}
-
-export const stdout = {
-  write: (text) => ops.print("log", String(text)),
-  isTTY: false,
-};
-export const stderr = {
-  write: (text) => ops.print("error", String(text)),
-  isTTY: false,
-};
-
-// Node has no `exit` in an embedded host: terminating the pi process from
-// an extension would bypass every session teardown path. Keep the call
-// shape but make it a no-op, recorded as a deviation in `WIRING.md`.
-export function exit(code) {
-  void code;
-}
-
-// Node exposes `process` globally; extensions written against that assume
-// it exists without an import.
-if (globalThis.process === undefined) {
-  globalThis.process = {
-    env,
-    platform,
-    arch,
-    version,
-    versions,
-    title,
-    argv,
-    execArgv,
-    pid,
-    ppid,
-    cwd,
-    chdir,
-    nextTick,
-    uptime,
-    memoryUsage,
-    stdout,
-    stderr,
-    exit,
-  };
-}
-
-export default {
-  env,
-  platform,
-  arch,
-  version,
-  versions,
-  title,
-  argv,
-  execArgv,
-  pid,
-  ppid,
-  cwd,
-  chdir,
-  nextTick,
-  uptime,
-  memoryUsage,
-  stdout,
-  stderr,
-  exit,
-};
+export default p;

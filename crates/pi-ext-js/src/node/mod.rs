@@ -15,8 +15,22 @@
 //! - `node:os` — `extensions/mcp/runtime.ts:7`, `extensions/llama/huggingface.ts:2`.
 //! - `node:url` — `extensions/mcp/runtime.ts:10`, `core/extensions/loader.ts:9`.
 //! - `node:crypto` — `extensions/mcp/oauth.ts:13`.
+//! - `node:module` — `createRequire` for extensions that need a synchronous
+//!   require (real-world sweep: `pi-gemini-router/index.ts:55,339`).
 //! - `node:child_process`, `node:buffer`, `node:util`, `node:process` — the
-//!   remaining calls an extension commonly reaches for.
+//!   remaining calls an extension commonly reaches for. The sweep also
+//!   surfaced `execFile` (`pi-guardrails/index.ts:49,567`) and `fs.openSync`
+//!   (`pi-cord/src/{chat,lock}.ts`), so those are served by the same ops.
+//!
+//! The global `process` object is installed once at engine creation by
+//! [`process_global_source`] (`process_global.js`), because third-party
+//! extensions reference it at module top level without importing
+//! `node:process` (`pi-esc-send-queued`, `pi-output-cap`, `pi-skill-loader`,
+//! `pi-subagents`, `pi-title`, ...). `node:process` re-exports that same
+//! object. It mirrors Node's shape but never exits the host or delivers
+//! signals; all lifecycle calls are inert by design. The same bootstrap
+//! also installs `structuredClone` (used at load time by
+//! `pi-guardrails/index.ts:166`), since `QuickJS` ships no clone primitive.
 //!
 //! Host packages get real in-process surfaces where the port has state:
 //! `@earendil-works/pi-coding-agent` reads settings, session metadata and
@@ -45,6 +59,18 @@
 //!   SHA-512 block sizes),
 //! - `node:process` → `process.env` key rules and the string-valued
 //!   `cwd`/`platform`/`arch`/`version` properties.
+//! - `node:module` → `createRequire` resolving through the host's own
+//!   resolver/loader (`loader.ts:42,78-89`, `loader.ts:571-602`).
+//!
+//! The fd handle behind `fs.openSync` is deliberately minimal: positive
+//! integer fds index a process-lifetime table in this module, flags `r`,
+//! `r+`, `w`, `wx`, `a` are mapped to `OpenOptions`, and only
+//! `readSync`/`writeSync`/`closeSync` accept those fds. No file streams,
+//! `fs.open` promises, `fchmod`/`fsync`/`ftruncate`, or real OS fd numbers
+//! are provided; `mode` is accepted but ignored (the host must not chmod).
+//! Likewise `child_process.execFile` runs the file + argv through the
+//! sandbox's `exec` op (never a shell), delivering the callback on the next
+//! microtask; no argument is shell-interpolated.
 //!
 //! Platform note: native Windows has no `/dev/urandom`, so `random_uuid`
 //! takes the time-derived fallback. A `getrandom` swap needs a Cargo.lock
@@ -52,15 +78,19 @@
 //! (NEEDS-DEP). The filesystem and path shims have explicit Windows branches
 //! (`symlink_file`/`symlink_dir`, `mode = 0`), so no Unix API leaks here.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::Read as _;
+use std::fs::{File, OpenOptions};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as IoWrite};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 
 use base64::Engine as _;
+use rquickjs::loader::{Loader as _, Resolver as _};
 use rquickjs::{Ctx, Function, Object};
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256, Sha512};
@@ -75,6 +105,7 @@ pub const NODE_BUILTINS: &[&str] = &[
     "node:child_process",
     "node:crypto",
     "node:fs",
+    "node:module",
     "node:fs/promises",
     "node:os",
     "node:path",
@@ -100,6 +131,7 @@ pub(crate) fn source(specifier: &str) -> Option<&'static str> {
         "node:crypto" => include_str!("hash.js"),
         "node:fs" => include_str!("fs.js"),
         "node:fs/promises" => include_str!("fs_promises.js"),
+        "node:module" => include_str!("module.js"),
         "node:os" => include_str!("os.js"),
         "node:path" => include_str!("path.js"),
         "node:process" => include_str!("process.js"),
@@ -111,6 +143,14 @@ pub(crate) fn source(specifier: &str) -> Option<&'static str> {
         "@earendil-works/pi-mcp" | "@mariozechner/pi-mcp" => include_str!("host/pi-mcp.js"),
         _ => return None,
     })
+}
+
+/// Plain-script source that installs the global `process` object. Evaluated
+/// once by [`crate::engine::JsHost::new`] after the ops exist, before any
+/// extension module runs; it is not a virtual module because extensions use
+/// `process` without importing `node:process`.
+pub(crate) fn process_global_source() -> &'static str {
+    include_str!("process_global.js")
 }
 
 /// Encodes one host filesystem error the way Node's `fs` errors look to
@@ -132,6 +172,137 @@ fn io_error(error: &std::io::Error) -> Json {
         },
     };
     serde_json::json!({ "error": error.to_string(), "code": code })
+}
+
+/// One `fs.openSync` handle. The fd is an opaque host id (not an OS fd):
+/// extensions only pass it back to `readSync`/`writeSync`/`closeSync`.
+struct OpenFile {
+    file: File,
+}
+
+/// Process-lifetime fd table for the minimal `openSync` handle. Kept here
+/// rather than in `HostCore` so the fds survive host re-creation the same
+/// way an extension's own captured values do.
+fn fd_table() -> &'static Mutex<HashMap<i32, OpenFile>> {
+    static TABLE: OnceLock<Mutex<HashMap<i32, OpenFile>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn allocate_fd(file: File) -> i32 {
+    static NEXT: AtomicI32 = AtomicI32::new(100);
+    let fd = NEXT.fetch_add(1, Ordering::Relaxed);
+    fd_table()
+        .lock()
+        .expect("fd table mutex poisoned")
+        .insert(fd, OpenFile { file });
+    fd
+}
+
+fn bad_fd() -> Json {
+    serde_json::json!({ "error": "Bad file descriptor", "code": "EBADF" })
+}
+
+/// Maps the `fs.openSync` flag strings to `OpenOptions`. `mode` is accepted
+/// by the shim but ignored: an extension must never chmod through the host.
+fn open_fd(path: &str, flags: &str) -> Result<i32, Json> {
+    let mut options = OpenOptions::new();
+    match flags {
+        "r" => {
+            options.read(true);
+        }
+        "r+" => {
+            options.read(true).write(true);
+        }
+        "w" => {
+            options.write(true).create(true).truncate(true);
+        }
+        "wx" | "xw" => {
+            options.write(true).create_new(true);
+        }
+        "w+" => {
+            options.read(true).write(true).create(true).truncate(true);
+        }
+        "a" => {
+            options.write(true).create(true).append(true);
+        }
+        "ax" | "xa" => {
+            options.write(true).create_new(true).append(true);
+        }
+        other => {
+            return Err(serde_json::json!({
+                "error": format!("Unknown file open flag: {other}"),
+                "code": "EINVAL"
+            }));
+        }
+    }
+    let file = options.open(path).map_err(|error| io_error(&error))?;
+    Ok(allocate_fd(file))
+}
+
+/// Reads at most 16 MiB into a fresh byte vector; the JS shim copies it into
+/// the caller's Buffer. `position < 0` continues from the current cursor.
+fn read_fd(fd: i32, length: usize, position: i64) -> Result<Vec<u8>, Json> {
+    let mut table = fd_table().lock().expect("fd table mutex poisoned");
+    let open = table.get_mut(&fd).ok_or_else(bad_fd)?;
+    if position >= 0 {
+        open.file
+            .seek(SeekFrom::Start(position as u64))
+            .map_err(|error| io_error(&error))?;
+    }
+    let mut bytes = vec![0_u8; length.min(16 * 1024 * 1024)];
+    let count = open
+        .file
+        .read(&mut bytes)
+        .map_err(|error| io_error(&error))?;
+    bytes.truncate(count);
+    Ok(bytes)
+}
+
+fn write_fd(fd: i32, bytes: &[u8], position: i64) -> Result<usize, Json> {
+    let mut table = fd_table().lock().expect("fd table mutex poisoned");
+    let open = table.get_mut(&fd).ok_or_else(bad_fd)?;
+    if position >= 0 {
+        open.file
+            .seek(SeekFrom::Start(position as u64))
+            .map_err(|error| io_error(&error))?;
+    }
+    open.file
+        .write_all(bytes)
+        .map_err(|error| io_error(&error))?;
+    Ok(bytes.len())
+}
+
+fn close_fd(fd: i32) -> Result<(), Json> {
+    fd_table()
+        .lock()
+        .expect("fd table mutex poisoned")
+        .remove(&fd)
+        .map(|_| ())
+        .ok_or_else(bad_fd)
+}
+
+/// Resolves a `createRequire` specifier with the exact resolver an ESM
+/// import uses (`resolver.rs`), without adding a second resolution table.
+fn require_resolve(ctx: &Ctx<'_>, base: &str, specifier: &str) -> rquickjs::Result<String> {
+    crate::resolver::ExtensionResolver.resolve(ctx, base, specifier, None)
+}
+
+/// Evaluates a resolved module synchronously and returns its namespace. The
+/// loader owns transpilation, CJS wrapping and the virtual-module table, so
+/// `require("node:path")` and `require("./helper.ts")` behave like their ESM
+/// counterparts.
+fn require_module<'js>(
+    ctx: &Ctx<'js>,
+    base: &str,
+    specifier: &str,
+) -> rquickjs::Result<rquickjs::Value<'js>> {
+    let name = require_resolve(ctx, base, specifier)?;
+    let mut loader = crate::resolver::ExtensionLoader::default();
+    let module = loader.load(ctx, &name, None)?;
+    // Match the ESM entry path: `import.meta.url` must be present for
+    // extensions that create their require from it.
+    module.meta()?.set("url", format!("file://{name}"))?;
+    Ok(module.eval()?.0.namespace()?.into_value())
 }
 
 /// The `fs.Stats` payload shared by `statSync` (follows symlinks) and
@@ -612,7 +783,10 @@ fn fail(message: &str, code: &str) -> String {
 /// Installs the Rust half of every built-in and host-package shim on the
 /// engine's private `__piOps` object.
 #[allow(clippy::too_many_lines)] // one op per Node API group; split when extending
-pub(crate) fn install_ops(ctx: &Ctx<'_>, core: &Arc<Mutex<HostCore>>) -> Result<(), JsHostError> {
+pub(crate) fn install_ops<'js>(
+    ctx: &Ctx<'js>,
+    core: &Arc<Mutex<HostCore>>,
+) -> Result<(), JsHostError> {
     let ops: Object = ctx.globals().get("__piOps")?;
     macro_rules! op {
         ($name:literal, $capture:ident, || -> $ret:ty $body:block) => {{
@@ -850,6 +1024,87 @@ pub(crate) fn install_ops(ctx: &Ctx<'_>, core: &Arc<Mutex<HostCore>>) -> Result<
             }
         }
     });
+    // Minimal fd handles: `openSync` returns an opaque host id, and the
+    // three companion calls consume it. `mode` is accepted but ignored.
+    op!("nodeFsOpenSync", _core, |path: String,
+                                  flags: String,
+                                  _mode: String|
+     -> String {
+        match open_fd(&path, &flags) {
+            Ok(fd) => ok(Json::Number(fd.into())),
+            Err(error) => serde_json::to_string(&error).unwrap_or_else(|_| fail("io error", "EIO")),
+        }
+    });
+    op!("nodeFsReadSync", _core, |fd: i32,
+                                  length: i32,
+                                  position: i64|
+     -> String {
+        match read_fd(fd, length.max(0) as usize, position) {
+            Ok(bytes) => ok(Json::Array(bytes.into_iter().map(Json::from).collect())),
+            Err(error) => serde_json::to_string(&error).unwrap_or_else(|_| fail("io error", "EIO")),
+        }
+    });
+    op!("nodeFsWriteSync", _core, |fd: i32,
+                                   bytes: String,
+                                   position: i64|
+     -> String {
+        let values: Vec<u8> = serde_json::from_str(&bytes).unwrap_or_default();
+        match write_fd(fd, &values, position) {
+            Ok(count) => ok(Json::Number(count.into())),
+            Err(error) => serde_json::to_string(&error).unwrap_or_else(|_| fail("io error", "EIO")),
+        }
+    });
+    op!("nodeFsCloseSync", _core, |fd: i32| -> String {
+        match close_fd(fd) {
+            Ok(()) => ok(Json::Null),
+            Err(error) => serde_json::to_string(&error).unwrap_or_else(|_| fail("io error", "EIO")),
+        }
+    });
+
+    // ---- node:module (createRequire) ----
+    // `Ctx` implements `FromParam`, so rquickjs hands the call's context to
+    // the closure instead of us capturing one. Capturing a Ctx here would
+    // keep the context alive inside its own runtime and QuickJS would abort
+    // at teardown with a non-empty gc list.
+    let function = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>,
+              base: String,
+              specifier: String|
+              -> rquickjs::Result<rquickjs::Value<'js>> {
+            require_module(&ctx, &base, &specifier)
+        },
+    )?;
+    ops.set("nodeRequire", function)?;
+    let function = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, base: String, specifier: String| -> rquickjs::Result<String> {
+            require_resolve(&ctx, &base, &specifier)
+        },
+    )?;
+    ops.set("nodeRequireResolve", function)?;
+    // `import.meta.url` is not populated by the embedded module engine, so
+    // `createRequire(import.meta.url)` passes `undefined`. Ask QuickJS for
+    // the running module's name instead, skipping the shim's own virtual
+    // name so a relative require resolves against the calling extension.
+    let function = Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> String {
+        let mut name = String::new();
+        for level in 0..4 {
+            let Some(atom) = ctx.script_or_module_name(level) else {
+                break;
+            };
+            let Ok(candidate) = atom.to_string() else {
+                break;
+            };
+            if candidate.starts_with("virtual:") || candidate.is_empty() {
+                continue;
+            }
+            name = candidate;
+            break;
+        }
+        name
+    })?;
+    ops.set("nodeCurrentModule", function)?;
 
     // ---- node:path ----
     op!("nodePath", core, |operation: String,
@@ -999,6 +1254,22 @@ mod tests {
         assert_eq!(io_error(&error)["code"], "ENOENT");
         let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         assert_eq!(io_error(&error)["code"], "EACCES");
+    }
+
+    #[test]
+    fn fd_helpers_round_trip_bytes_and_reject_closed_handles() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("fd.bin");
+        std::fs::write(&path, b"abc").expect("write");
+        let path = path.to_string_lossy().into_owned();
+        let fd = open_fd(&path, "r+").expect("open");
+        assert_eq!(read_fd(fd, 2, 0).expect("read"), b"ab");
+        assert_eq!(write_fd(fd, b"Z", 1).expect("write"), 1);
+        assert_eq!(std::fs::read(&path).expect("read file"), b"aZc");
+        close_fd(fd).expect("close");
+        assert_eq!(read_fd(fd, 1, 0).unwrap_err()["code"], "EBADF");
+        assert_eq!(open_fd(&path, "wx").unwrap_err()["code"], "EEXIST");
+        assert_eq!(open_fd(&path, "bad-flag").unwrap_err()["code"], "EINVAL");
     }
 
     #[test]
