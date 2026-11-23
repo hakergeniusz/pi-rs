@@ -12,20 +12,34 @@
 //! ANSI: the theme functions are the host's, so the escapes come from
 //! [`crate::color`] in the interactive mode.
 //!
-//! Deviations, all documented in `05-deviations-deferred.md`:
+//! LaTeX tokens and display math are ported in [`markdown_extras`] from
+//! `markdown.ts:37-150` and a documented subset of `latex.ts`; links use OSC 8
+//! when the terminal advertises hyperlinks, falling back to pi's parenthesised
+//! URL, and image lines are passed through unwrapped like upstream.
 //!
-//! * LaTeX (`$$…$$`, `\(…\)`) is not tokenized; the source is rendered as
-//!   plain text. `latex.ts` needs a math layout engine pi pulls in natively.
+//! Deviations, all documented in `markdown_extras`' module docs:
+//!
+//! * The math renderer is a faithful subset of upstream's 1,506-line renderer:
+//!   no matrices, `\mathbb`, `\binom`, `\boxed`, `\not` or 2-D script layout.
 //! * Tables are ported, because their layout is deterministic; the `Space`
 //!   token that `marked` inserts for blank lines inside a list is reproduced by
 //!   the parser's `loose` detection rather than by marked's own pass.
-//! * OSC 8 hyperlinks degrade to pi's own fallback: the URL is printed in
-//!   parentheses when it differs from the link text.
+//! * Upstream's highlight.js grammars are replaced by the dependency-free
+//!   lexer in [`markdown_extras`] (json, rust, ts/js, shell, python).
 
 use std::sync::Arc;
 
 use crate::ansi::{apply_background_to_line, visible_width, wrap_text_with_ansi};
 use crate::component::Component;
+
+/// LaTeX tokenization/rendering and syntax highlighting.
+/// Declared here so the port keeps all markdown extras with the component.
+#[path = "../markdown_extras.rs"]
+pub mod markdown_extras;
+
+use markdown_extras::{
+    block_token_line_count, render_latex, tokenize_block_latex, tokenize_inline_latex,
+};
 
 type Style = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
@@ -183,6 +197,12 @@ pub enum Inline {
         text: Vec<Inline>,
         href: String,
     },
+    /// pi's `latex` token (`markdown.ts:37-41, 63-110`).
+    Latex {
+        text: String,
+        raw: String,
+        pending: bool,
+    },
     /// pi's `br`.
     Break,
 }
@@ -198,6 +218,12 @@ pub enum Block {
     Code {
         lang: String,
         text: String,
+    },
+    /// pi's `latexBlock` token (`markdown.ts:128-150`).
+    LatexBlock {
+        text: String,
+        raw: String,
+        pending: bool,
     },
     List(List),
     BlockQuote(Vec<Block>),
@@ -295,6 +321,37 @@ pub fn parse_inline(text: &str) -> Vec<Inline> {
     while index < chars.len() {
         let c = chars[index];
         match c {
+            '\\' if matches!(chars.get(index + 1), Some('(' | '[')) => {
+                // pi's inline LaTeX extension (`markdown.ts:163-172`).
+                let rest: String = chars[index..].iter().collect();
+                if let Some(token) = tokenize_inline_latex(&rest) {
+                    flush(&mut buffer, &mut tokens);
+                    tokens.push(Inline::Latex {
+                        text: token.text,
+                        raw: token.raw.clone(),
+                        pending: token.pending,
+                    });
+                    index += token.raw.chars().count();
+                    continue;
+                }
+                buffer.push(c);
+                index += 1;
+            }
+            '$' => {
+                let rest: String = chars[index..].iter().collect();
+                if let Some(token) = tokenize_inline_latex(&rest) {
+                    flush(&mut buffer, &mut tokens);
+                    tokens.push(Inline::Latex {
+                        text: token.text,
+                        raw: token.raw.clone(),
+                        pending: token.pending,
+                    });
+                    index += token.raw.chars().count();
+                    continue;
+                }
+                buffer.push(c);
+                index += 1;
+            }
             '\\' => {
                 // pi's `escape` token.
                 if index + 1 < chars.len() {
@@ -443,6 +500,7 @@ fn block_type(block: &Block) -> &'static str {
         Block::Heading { .. } => "heading",
         Block::Paragraph(_) => "paragraph",
         Block::Code { .. } => "code",
+        Block::LatexBlock { .. } => "latexBlock",
         Block::List(_) => "list",
         Block::BlockQuote(_) => "blockquote",
         Block::Table(_) => "table",
@@ -587,6 +645,25 @@ fn parse_block_lines(lines: &[&str]) -> Vec<Block> {
     let mut index = 0usize;
     while index < lines.len() {
         let line = lines[index];
+        // pi's block LaTeX extension (`markdown.ts:152-161`) runs ahead of the
+        // ordinary block tokenizer at a line boundary. The prefix guard is the
+        // extension's `start` probe; it avoids re-joining the source per line.
+        let latex_start = leading_spaces(line) <= 3
+            && (line.trim_start_matches(' ').starts_with("$$")
+                || line.trim_start_matches(' ').starts_with("\\["));
+        if latex_start {
+            let remaining = lines[index..].join("\n");
+            if let Some(token) = tokenize_block_latex(&remaining) {
+                let consumed = block_token_line_count(&token).min(lines.len() - index);
+                blocks.push(Block::LatexBlock {
+                    text: token.text,
+                    raw: token.raw,
+                    pending: token.pending,
+                });
+                index += consumed.max(1);
+                continue;
+            }
+        }
         if is_blank(line) {
             // `marked`'s lexer does not turn the blank line between two blocks
             // into a `space` token: blocks are separated by their own trailing
@@ -977,23 +1054,39 @@ impl Markdown {
                 Inline::Link { text, href } => {
                     let link_text = self.render_inline(text, style_prefix, apply_text);
                     let styled_link = (self.theme.link)(&(self.theme.underline)(&link_text));
-                    // pi's non-hyperlink fallback (`markdown.ts:697-711`): print
-                    // the URL when it differs from the label.
-                    let plain_label: String = text
-                        .iter()
-                        .filter_map(|token| match token {
-                            Inline::Text(text) => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    let href_for_comparison = href.strip_prefix("mailto:").unwrap_or(href);
-                    if plain_label == *href || plain_label == href_for_comparison {
-                        result.push_str(&styled_link);
+                    if crate::terminal_image::get_capabilities().hyperlinks {
+                        // OSC 8 (`markdown.ts:836-840`): the URL is not printed
+                        // inline; the styled label itself is made clickable.
+                        result.push_str(&crate::terminal_image::hyperlink(&styled_link, href));
                     } else {
-                        result.push_str(&styled_link);
-                        result.push_str(&(self.theme.link_url)(&format!(" ({href})")));
+                        // pi's non-hyperlink fallback (`markdown.ts:841-851`):
+                        // print the URL when it differs from the label.
+                        let plain_label: String = text
+                            .iter()
+                            .filter_map(|token| match token {
+                                Inline::Text(text) => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        let href_for_comparison = href.strip_prefix("mailto:").unwrap_or(href);
+                        if plain_label == *href || plain_label == href_for_comparison {
+                            result.push_str(&styled_link);
+                        } else {
+                            result.push_str(&styled_link);
+                            result.push_str(&(self.theme.link_url)(&format!(" ({href})")));
+                        }
                     }
                     result.push_str(style_prefix);
+                }
+                Inline::Latex { text, raw, pending } => {
+                    // `markdown.ts:789-796`: pending expressions stay as source;
+                    // unsupported/malformed math falls back to the raw token.
+                    let rendered = if *pending {
+                        raw.clone()
+                    } else {
+                        render_latex(text, false).unwrap_or_else(|| raw.clone())
+                    };
+                    result.push_str(&apply_text(&rendered));
                 }
             }
         }
@@ -1067,6 +1160,24 @@ impl Markdown {
                     }
                 }
                 lines.push((self.theme.code_block_border)("```"));
+                if next_type.is_some_and(|kind| kind != "space") {
+                    lines.push(String::new());
+                }
+            }
+            Block::LatexBlock { text, raw, pending } => {
+                // `markdown.ts:614-630`: render display math as Unicode text;
+                // if it cannot fit, show the source instead.
+                let rendered = if *pending {
+                    None
+                } else {
+                    render_latex(text, true)
+                };
+                let rendered = rendered
+                    .filter(|math| !math.lines().any(|line| visible_width(line) > width))
+                    .unwrap_or_else(|| raw.trim().to_string());
+                for line in rendered.lines() {
+                    lines.push(self.apply_default_style(line));
+                }
                 if next_type.is_some_and(|kind| kind != "space") {
                     lines.push(String::new());
                 }
@@ -1428,10 +1539,20 @@ impl Markdown {
             rendered_lines.extend(self.render_block(block, content_width, next));
         }
 
-        // Wrap, then add the margins and the background.
+        // Wrap, then add the margins and the background. Image lines carry an
+        // inline image protocol and must reach the terminal verbatim
+        // (`markdown.ts:457-461`).
         let mut wrapped_lines: Vec<String> = Vec::new();
         for line in rendered_lines {
-            wrapped_lines.extend(wrap_text_with_ansi(&line, content_width));
+            // Inline tokens can carry newlines from a multi-line paragraph;
+            // classify each physical line separately.
+            for part in line.split('\n') {
+                if crate::terminal_image::is_image_line(part) {
+                    wrapped_lines.push(part.to_string());
+                } else {
+                    wrapped_lines.extend(wrap_text_with_ansi(part, content_width));
+                }
+            }
         }
 
         let left_margin = " ".repeat(self.padding_x);
@@ -1442,6 +1563,10 @@ impl Markdown {
             .and_then(|style| style.bg_color.clone());
         let mut content_lines: Vec<String> = Vec::new();
         for line in wrapped_lines {
+            if crate::terminal_image::is_image_line(&line) {
+                content_lines.push(line);
+                continue;
+            }
             let line_with_margins = format!("{left_margin}{line}{right_margin}");
             if let Some(bg) = &background {
                 content_lines.push(apply_background_to_line(
@@ -1644,6 +1769,16 @@ mod tests {
 
     #[test]
     fn links_print_the_url_when_the_label_differs() {
+        // The fallback is capability-dependent; pin "no hyperlinks" so this
+        // layout assertion stays deterministic on every host.
+        use crate::terminal_image::{
+            ImageProtocol, TerminalCapabilities, reset_capabilities_cache, set_capabilities,
+        };
+        set_capabilities(TerminalCapabilities {
+            images: ImageProtocol::Disabled,
+            true_color: false,
+            hyperlinks: false,
+        });
         assert_eq!(
             plain_text("[pi](https://example.com/x)", 60),
             ["pi (https://example.com/x)"]
@@ -1652,6 +1787,7 @@ mod tests {
             plain_text("[https://x.dev](https://x.dev)", 60)[0],
             "https://x.dev"
         );
+        reset_capabilities_cache();
     }
 
     #[test]
@@ -1769,5 +1905,103 @@ mod tests {
         // `**bold**` is emphasis, not a list item: the plain theme renders the
         // strong run as its own text and no bullet appears.
         assert_eq!(plain_text("**bold**", 20)[0], "bold");
+    }
+
+    // --- markdown extras: LaTeX, highlighting, links, image lines -----------
+
+    #[test]
+    fn inline_latex_renders_unicode_math() {
+        assert_eq!(
+            plain_text("Euler: $x^2 + \\alpha$ done", 60),
+            ["Euler: x² + α done"]
+        );
+        assert_eq!(plain_text("cost is $5 and $6", 60), ["cost is $5 and $6"]);
+    }
+
+    #[test]
+    fn display_latex_block_renders_math_and_falls_back_to_source_when_unsupported() {
+        assert_eq!(plain_text("$$\nx^2 + y^2\n$$", 40), ["x² + y²"]);
+        // An unsupported expression falls back to the whole raw block.
+        assert_eq!(
+            plain_text("$$\n\\begin{matrix}a\\end{matrix}\n$$", 60),
+            ["$$", "\\begin{matrix}a\\end{matrix}", "$$"]
+        );
+    }
+
+    #[test]
+    fn code_blocks_are_syntax_highlighted_with_sgr_segments() {
+        let theme = MarkdownTheme {
+            highlight_code: Some(Arc::new(|code: &str, lang: Option<&str>| {
+                markdown_extras::highlight_segments(code, lang)
+                    .into_iter()
+                    .map(|segments| {
+                        segments
+                            .into_iter()
+                            .map(|(kind, text)| {
+                                if kind == markdown_extras::SyntaxKind::Keyword {
+                                    format!("\x1b[35m{text}\x1b[0m")
+                                } else {
+                                    text
+                                }
+                            })
+                            .collect::<String>()
+                    })
+                    .collect()
+            })),
+            ..MarkdownTheme::plain()
+        };
+        let lines = Markdown::new(
+            "```rust\nfn main() {}\n```",
+            0,
+            0,
+            theme,
+            None,
+            MarkdownOptions::default(),
+        )
+        .render_lines(40);
+        assert!(lines[1].contains("\x1b[35mfn\x1b[0m"));
+        assert_eq!(
+            strip_terminal_sequences(&lines[1]).trim_end(),
+            "  fn main() {}"
+        );
+    }
+
+    #[test]
+    fn links_use_osc8_when_the_terminal_supports_hyperlinks() {
+        use crate::terminal_image::{
+            ImageProtocol, TerminalCapabilities, reset_capabilities_cache, set_capabilities,
+        };
+        set_capabilities(TerminalCapabilities {
+            images: ImageProtocol::Disabled,
+            true_color: false,
+            hyperlinks: true,
+        });
+        let lines = plain_at("[label](https://example.com/x)", 60);
+        assert!(lines[0].contains("\x1b]8;;https://example.com/x\x1b\\"));
+        assert!(!lines[0].contains("(https://example.com/x)"));
+        reset_capabilities_cache();
+
+        set_capabilities(TerminalCapabilities {
+            images: ImageProtocol::Disabled,
+            true_color: false,
+            hyperlinks: false,
+        });
+        assert_eq!(
+            strip_terminal_sequences(&plain_at("[label](https://example.com/x)", 60)[0]).trim_end(),
+            "label (https://example.com/x)"
+        );
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    fn image_lines_pass_through_unwrapped_and_unpadded() {
+        let image = "\x1b]1337;File=inline=1:AAAA\x07";
+        let source = format!("before\n{image}\nafter");
+        let lines = plain_at(&source, 10);
+        assert!(
+            lines.iter().any(|line| line == image),
+            "the image line must reach the terminal verbatim: {lines:?}"
+        );
+        assert_eq!(strip_terminal_sequences(&lines[0]).trim_end(), "before");
     }
 }

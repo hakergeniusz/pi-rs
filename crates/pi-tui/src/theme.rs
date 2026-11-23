@@ -36,6 +36,9 @@ use crate::color::{
     foreground_ansi, indexed_color, mix_colors, rgb_color, style_text_with_ansi,
 };
 use crate::components::markdown::MarkdownTheme;
+use crate::components::markdown::markdown_extras::{
+    SyntaxKind, highlight_segments, is_supported_language,
+};
 use crate::oklab::{Rgb, rgb_to_oklab};
 use crate::system_theme::{SystemThemeColors, SystemThemeInput, generate_system_theme_colors};
 
@@ -1005,6 +1008,40 @@ impl Theme {
             underline: true,
             ..TextAttributes::default()
         });
+        // pi's `highlightCode` (`.../interactive/theme/theme.ts:935-954,
+        // 1081`): token kinds map onto the `syntax*` theme colours. Unknown
+        // languages fall back to the plain `mdCodeBlock` colour.
+        let highlight_theme = Arc::clone(self);
+        let highlight_code: Arc<crate::components::markdown::CodeHighlighter> =
+            Arc::new(move |code: &str, lang: Option<&str>| {
+                let fg = |token: ThemeColor, text: &str| highlight_theme.fg(token, text);
+                if !is_supported_language(lang) {
+                    return code
+                        .split('\n')
+                        .map(|line| fg(ThemeColor::MdCodeBlock, line))
+                        .collect();
+                }
+                highlight_segments(code, lang)
+                    .into_iter()
+                    .map(|segments| {
+                        segments
+                            .into_iter()
+                            .map(|(kind, text)| match kind {
+                                SyntaxKind::Keyword => fg(ThemeColor::SyntaxKeyword, &text),
+                                SyntaxKind::Type => fg(ThemeColor::SyntaxType, &text),
+                                SyntaxKind::Number => fg(ThemeColor::SyntaxNumber, &text),
+                                SyntaxKind::String => fg(ThemeColor::SyntaxString, &text),
+                                SyntaxKind::Comment => fg(ThemeColor::SyntaxComment, &text),
+                                SyntaxKind::Function => fg(ThemeColor::SyntaxFunction, &text),
+                                SyntaxKind::Variable => fg(ThemeColor::SyntaxVariable, &text),
+                                SyntaxKind::Operator => fg(ThemeColor::SyntaxOperator, &text),
+                                SyntaxKind::Punctuation => fg(ThemeColor::SyntaxPunctuation, &text),
+                                SyntaxKind::Plain => text,
+                            })
+                            .collect::<String>()
+                    })
+                    .collect()
+            });
         MarkdownTheme {
             heading: self.fg_styler(ThemeColor::MdHeading),
             link: self.fg_styler(ThemeColor::MdLink),
@@ -1020,7 +1057,7 @@ impl Theme {
             italic,
             strikethrough,
             underline,
-            highlight_code: None,
+            highlight_code: Some(highlight_code),
             code_block_indent: "  ".to_string(),
         }
     }
@@ -2386,6 +2423,7 @@ mod tests {
         let markdown = theme.markdown_theme();
         assert!((markdown.heading)("h").contains('\u{1b}'));
         assert!((markdown.bold)("b").contains("\u{1b}[1m"));
+        assert!(markdown.highlight_code.is_some());
     }
 
     // --- watcher -----------------------------------------------------------
