@@ -43,21 +43,32 @@ The repo is public, so no token is required.
 
 ### Windows
 
-Download `pi-windows-x86_64.exe` from the
-[latest release](https://github.com/hakergeniusz/pi-rs/releases/latest), rename
-it to `pi-rs.exe`, and put it on your `PATH`. A PowerShell installer is not
-published yet.
+PowerShell one-liner (per-user, no admin):
 
-### npm / Bun (planned, not published yet)
-
-```sh
-npx pi-rs             # planned
-bunx pi-rs            # planned
-npm install -g pi-rs  # planned
-bun install -g pi-rs  # planned
+```powershell
+irm https://raw.githubusercontent.com/hakergeniusz/pi-rs/main/scripts/install.ps1 | iex
 ```
 
-There is no pi-rs package on npm today. The upstream
+It downloads `pi-windows-x86_64.exe`, verifies its SHA-256, and installs
+`pi-rs.exe` to `%LOCALAPPDATA%\Programs\pi-rs` by default. Or download the
+asset from the [latest release](https://github.com/hakergeniusz/pi-rs/releases/latest)
+and put it on your `PATH`.
+
+### npm / Bun (package ready, publishing pending)
+
+The wrapper package lives in [`npm/`](npm/) and is validated with
+`npm pack --dry-run`. Once published, these will work:
+
+```sh
+npx pi-rs
+bunx pi-rs
+npm install -g pi-rs
+bun install -g pi-rs
+```
+
+It downloads the matching release binary and verifies its SHA-256 during
+postinstall; set `PI_RS_SKIP_DOWNLOAD=1` to skip the download during local
+development. The npm package is not published yet. The upstream
 `@earendil-works/pi-coding-agent` package is a different program.
 
 ---
