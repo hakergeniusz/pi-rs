@@ -1,28 +1,32 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="230" viewBox="0 0 760 230" role="img" aria-label="Startup and memory comparison">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="270" viewBox="0 0 760 270" role="img" aria-label="Startup and memory comparison against real upstream pi 1.5.2">
   <style>
     text { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; fill: #cdd6f4; }
     .title { font-size: 15px; fill: #a6adc8; }
     .bar { fill: #89b4fa; }
-    .bar2 { fill: #a6e3a1; }
+    .bar2 { fill: #f9e2af; }
+    .bar3 { fill: #a6e3a1; }
     .label { fill: #bac2de; }
     .value { fill: #f9e2af; }
   </style>
-  <rect width="760" height="230" fill="#11111b"/>
+  <rect width="760" height="270" fill="#11111b"/>
   <text x="20" y="28" class="title">First TUI frame (ms) - lower is better</text>
-  <text x="20" y="58" class="label">pi-rs release</text>
-  <rect x="170" y="46" width="205" height="16" class="bar" rx="3"/>
-  <text x="382" y="58" class="value">~342 ms</text>
-  <text x="20" y="84" class="label">pi-rs debug</text>
-  <rect x="170" y="72" width="416" height="16" class="bar" rx="3"/>
-  <text x="593" y="84" class="value">~694 ms</text>
-  <text x="20" y="110" class="label">upstream pi (Node)</text>
-  <rect x="170" y="98" width="39" height="16" class="bar2" rx="3"/>
-  <text x="216" y="110" class="value">~65 ms</text>
-  <text x="20" y="150" class="title">Resident set size (MiB) - lower is better</text>
-  <text x="20" y="180" class="label">pi-rs release</text>
-  <rect x="170" y="168" width="188" height="16" class="bar" rx="3"/>
-  <text x="365" y="180" class="value">~32 MiB</text>
-  <text x="20" y="206" class="label">upstream pi (Node)</text>
-  <rect x="170" y="194" width="243" height="16" class="bar2" rx="3"/>
-  <text x="420" y="206" class="value">~41 MiB</text>
+  <text x="20" y="58" class="label">pi-rs, fresh config</text>
+  <rect x="210" y="46" width="11" height="16" class="bar" rx="3"/>
+  <text x="228" y="58" class="value">~28 ms</text>
+  <text x="20" y="86" class="label">upstream pi 1.5.2</text>
+  <rect x="210" y="74" width="74" height="16" class="bar3" rx="3"/>
+  <text x="291" y="86" class="value">~184 ms</text>
+  <text x="20" y="114" class="label">pi-rs, populated config</text>
+  <rect x="210" y="102" width="422" height="16" class="bar2" rx="3"/>
+  <text x="639" y="114" class="value">~1.05 s</text>
+  <text x="20" y="158" class="title">Resident set size (MiB) - lower is better</text>
+  <text x="20" y="188" class="label">pi-rs, fresh config</text>
+  <rect x="210" y="176" width="72" height="16" class="bar" rx="3"/>
+  <text x="289" y="188" class="value">~30 MiB</text>
+  <text x="20" y="216" class="label">pi-rs, populated config</text>
+  <rect x="210" y="204" width="79" height="16" class="bar2" rx="3"/>
+  <text x="296" y="216" class="value">~33 MiB</text>
+  <text x="20" y="244" class="label">upstream pi 1.5.2</text>
+  <rect x="210" y="232" width="300" height="16" class="bar3" rx="3"/>
+  <text x="517" y="244" class="value">~125 MiB</text>
 </svg>

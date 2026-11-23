@@ -104,33 +104,36 @@ platform gates live in the crates; see
 
 ## 📊 Performance
 
-Measured on the operator's box; indicative, not a benchmark suite.
+Measured on the operator's box against the **real upstream pi 1.5.2**
+(`@earendil-works/pi-coding-agent`, Node/bun), not another Rust build. Indicative,
+not a benchmark suite.
 
-![Startup and memory comparison: pi-rs ~342 ms / 32 MiB, upstream pi ~65 ms / 41 MiB](docs/bench.svg)
+![Startup and memory: pi-rs 28 ms fresh / 1.05 s populated / 33 MiB vs upstream pi 184 ms / 125 MiB](docs/bench.svg)
 
-| Metric            | pi-rs (release) | pi-rs (debug) | upstream pi (Node 0.12.26) |
-| ----------------- | --------------: | ------------: | -------------------------: |
-| First TUI frame   | ~342 ms         | ~694 ms       | ~65 ms                     |
-| Resident set size | ~32 MiB         | ~40 MiB       | ~41 MiB                    |
-| Binary            | 26 MB, stripped | debug build   | Node runtime               |
+| Metric | pi-rs (fresh config) | pi-rs (populated config) | upstream pi 1.5.2 |
+| --- | ---: | ---: | ---: |
+| First TUI frame | **~28 ms** | ~1.05 s | ~184 ms |
+| Resident set size | ~30 MiB | ~33 MiB | ~125 MiB |
+| Binary | 26 MB, stripped | same | Node runtime |
 
-pi-rs uses about **24% less memory** but starts roughly **5x slower**. Node
-benefits from a warm V8 startup; pi-rs spends its first few hundred milliseconds
-on config, model catalog and session setup rather than drawing the frame.
+Startup is config-dependent: with a fresh XDG config pi-rs is roughly **6x
+faster** than upstream, while a heavily populated config on this machine makes
+it about **5x slower** (model catalog and extension setup dominate). Memory is
+consistently around **4x lower** than the Node runtime.
 
 ---
 
 ## 🚀 Usage
 
 ```bash
-pi                          # interactive TUI
-pi -p "Say hello"           # one-shot print mode
-pi --mode json -p "Hi"      # JSONL event stream
-pi --mode rpc               # typed request/response over stdio
-pi --tui-mode regular       # opt out of fullscreen
-pi -e ./my-ext.ts           # load a JS/TS extension
-pi remote status            # pi-env remote environment
-pi --list-models [search]   # model catalog
+pi-rs                          # interactive TUI
+pi-rs -p "Say hello"           # one-shot print mode
+pi-rs --mode json -p "Hi"      # JSONL event stream
+pi-rs --mode rpc               # typed request/response over stdio
+pi-rs --tui-mode regular       # opt out of fullscreen
+pi-rs -e ./my-ext.ts           # load a JS/TS extension
+pi-rs remote status            # pi-env remote environment
+pi-rs --list-models [search]   # model catalog
 ```
 
 Inside the TUI: `/` commands, `@file` fuzzy search, `!`/`!!` bash mode,
