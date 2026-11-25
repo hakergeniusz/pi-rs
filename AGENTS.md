@@ -17,7 +17,11 @@ When upstream and "what would be cleaner" disagree, upstream wins; every
 deliberate deviation is documented in `HANDOFF.md`. There is exactly one
 headline deviation: the user-level directory root is XDG (`~/.config/pi-rs`,
 `~/.local/share/pi-rs`, …) instead of `~/.pi`, so the port can never touch a
-real TypeScript pi install.
+real TypeScript pi install. A second, narrower deviation landed on 2026-11-25:
+the embedded model catalog (`crates/pi-ai/data/models.json`) was **additively**
+synced from the live pi.dev catalog served to upstream v1.6.0 clients (+286
+entries, including `google/gemini-4-hydrogen`). Engine, wire and CLI semantics
+remain pinned to 1.5.2; see [`docs/MODEL-CATALOG-DIFF.md`](docs/MODEL-CATALOG-DIFF.md).
 
 ### Ground truth and the privacy rule
 
@@ -179,6 +183,12 @@ thread-worker transport. The
 sync tokio runtime is thread-local (removes parallel-test flakes) and the
 E4 `require` fold was repaired. Final gate: 2646 passed, 0 failed, 3 ignored;
 CI all jobs green.
+
+The 2026-11-25 catalog wave added 286 models from the live pi.dev catalog
+(v1.6.0 clients, revision `sha256-b1871c25…`) without changing any engine
+semantics: 139 chat, 72 image, 75 classifier; 1,918 entries total. The diff,
+source URL and deliberate scope limits are in
+[`docs/MODEL-CATALOG-DIFF.md`](docs/MODEL-CATALOG-DIFF.md).
 
 Still open (genuine mechanism tails or deliberate scope decisions):
 

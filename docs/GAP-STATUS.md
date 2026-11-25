@@ -8,6 +8,15 @@
 > each module's `//!` docs cite the upstream lines it ports, and the `WIRING.md`
 > notes next to the newer crates record the exact deviations and host call sites.
 
+**2026-11-25 catalog note:** the embedded model catalog is no longer a pure
+1.5.2 snapshot. It keeps every 1.5.2 entry and adds 286 missing entries from
+the live pi.dev catalog served to upstream v1.6.0 clients (139 chat, 72 image,
+75 classifier; 1,918 total), including `google/gemini-4-hydrogen`. No engine,
+wire or CLI semantics were changed, no existing entry was edited, and 95
+port-only legacy entries stay. This is a catalog-data deviation only; source,
+scope limits and the full entry list are in
+[`MODEL-CATALOG-DIFF.md`](MODEL-CATALOG-DIFF.md).
+
 Legend:
 
 - **Ported** — implemented, registered and reachable from the `pi` binary.

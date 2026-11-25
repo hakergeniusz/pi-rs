@@ -96,6 +96,10 @@ platform gates live in the crates; see
   schemas and the project `.pi/` layout stay compatible. Differences are
   mechanism-level and documented in
   [`docs/GAP-STATUS.md`](docs/GAP-STATUS.md).
+- **Live-shaped model catalog:** 1,918 entries (1,763 chat, 74 image, 81
+  classifier). The 1.5.2 baseline is kept intact and 286 newer models from the
+  live pi.dev catalog are added, including `google/gemini-4-hydrogen`. Full
+  diff: [`docs/MODEL-CATALOG-DIFF.md`](docs/MODEL-CATALOG-DIFF.md).
 - **Four modes:** streaming print (`-p`), JSONL events (`--mode json`), typed
   RPC (`--mode rpc`) and the full interactive TUI (`pi`).
 - **Provider coverage:** Anthropic, OpenAI completions and Codex Responses,

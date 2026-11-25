@@ -11,6 +11,30 @@
 > (`~/.config/pi`, `~/.local/state/pi`, legacy `~/.pi`) — credentials and chat
 > history live there. All fixtures are synthetic.**
 
+## 2026-11-25: model catalog sync (additive)
+
+The reported `Model not found: openrouter/google/gemini-4-hydrogen` was not a
+CLI bug: that id is absent from both the pinned 1.5.2 snapshot and the v1.6.0
+source tree (upstream generates catalog data at build time, gitignored). The
+live catalog that released v1.6.0 clients fetch from `pi.dev` does contain it.
+
+- Downloaded upstream **v1.6.0** to `/var/cache/zstd5/pi-160` (the pinned 1.5.2
+  copy is untouched) and fetched
+  `https://pi.dev/api/models?types=chat,image,classifier`.
+- Revision: `sha256-b1871c2556e73bf17c0fb4898fc22a77b71a61af118ddd1a6d932478a3dadded`
+  (minimum client version 1.5.3), fetched 2026-11-25.
+- Added every missing entry **additively**: +139 chat, +72 image, +75
+  classifier = **286 new models**; embedded totals now 1,763 / 74 / 81 =
+  **1,918** entries. `google/gemini-4-hydrogen` now resolves on Google, Google
+  Vertex, OpenCode, GitHub Copilot and Radius; the prefixed
+  `openrouter/google/gemini-4-hydrogen` and `:batch` variants resolve too.
+- No existing entry was edited: 665 upstream field changes (mostly `compat`
+  defaults) and 95 port-only legacy entries are deliberately left alone. Wire
+  and engine semantics stay pinned to 1.5.2; System One classifiers are
+  catalog-only, as documented in `docs/MODEL-CATALOG-DIFF.md`.
+- `catalog.rs` tests updated for the new counts and a hydrogen resolution test
+  added. Full diff inventory: [`docs/MODEL-CATALOG-DIFF.md`](docs/MODEL-CATALOG-DIFF.md).
+
 ## Goal
 Rewrite upstream pi (TypeScript coding-agent harness, ~236K LOC) in Rust with
 **1:1 behavioral and on-disk fidelity** (session JSONL v3, print/JSON/RPC

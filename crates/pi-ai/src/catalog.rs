@@ -19,6 +19,14 @@
 //! chat-only (matching upstream's chat-only `getModel`), with
 //! [`ModelCatalog::image_models`] / [`ModelCatalog::classifier_models`] for
 //! the other types.
+//!
+//! 2026-11-25 extension: 286 entries from the live catalog pi.dev serves to
+//! upstream v1.6.0 clients (`https://pi.dev/api/models?types=chat,image,classifier`,
+//! revision `sha256-b1871c25…`) were merged **additively** into the JSON, with
+//! every existing 1.5.2-pinned entry untouched. Upstream v1.6.0 generates its
+//! data at build time (`packages/ai/catalog/README.md`, gitignored
+//! `src/providers/data/*.json`), so the served catalog is the ground truth for
+//! model data. See `docs/MODEL-CATALOG-DIFF.md` for the full diff and scope.
 
 use crate::types::{ClassifierModel, ImageModel, Model, ModelType};
 use std::collections::HashMap;
@@ -239,6 +247,23 @@ mod tests {
     }
 
     #[test]
+    fn latest_catalog_additions_are_resolvable() {
+        let cat = catalog();
+        // Added in the 2026-11-25 sync from the live pi.dev catalog; the
+        // 1.5.2-pinned snapshot did not know either id.
+        let hydrogen = cat.get("openrouter", "google/gemini-4-hydrogen").unwrap();
+        assert_eq!(hydrogen.provider, "openrouter");
+        assert_eq!(hydrogen.api, "openai-completions");
+        assert!(hydrogen.reasoning);
+        assert_eq!(
+            cat.get("google", "gemini-4-hydrogen").unwrap().api,
+            "google-generative-ai"
+        );
+        // Five providers use the bare id; OpenRouter/Vercel prefix it.
+        assert_eq!(cat.find("gemini-4-hydrogen").len(), 5);
+    }
+
+    #[test]
     fn catalog_models_have_known_apis() {
         let cat = catalog();
         let known = [
@@ -277,8 +302,10 @@ mod tests {
     fn non_chat_models_are_retained_with_correct_kinds() {
         let cat = catalog();
         let (chat_count, image_count, classifier_count) = cat.counts();
-        assert_eq!(image_count, 2);
-        assert_eq!(classifier_count, 6);
+        // 2026-11-25 catalog sync: +72 image and +75 classifier entries from
+        // the latest published pi.dev catalog (the 0.1.1 snapshot had 2/6).
+        assert_eq!(image_count, 74);
+        assert_eq!(classifier_count, 81);
         assert!(
             chat_count > 1600,
             "chat catalog unexpectedly small: {chat_count}"
@@ -287,8 +314,8 @@ mod tests {
         // OpenRouter lists both classifier and image models under its own
         // provider, with the upstream API ids preserved.
         let openrouter_images = cat.image_models("openrouter");
-        assert_eq!(openrouter_images.len(), 2);
-        assert_eq!(openrouter_images[0].id, "black-forest-labs/flux.2-pro");
+        assert_eq!(openrouter_images.len(), 74);
+        assert_eq!(openrouter_images[0].id, "black-forest-labs/flux-3-image");
         assert_eq!(openrouter_images[0].api, "openrouter-images");
         assert_eq!(openrouter_images[0].r#type, "image");
         assert_eq!(openrouter_images[0].output.len(), 1);
