@@ -213,22 +213,18 @@ jobs:
             arch: riscv64
             target: riscv64gc-unknown-linux-gnu
             rustflags: -C link-arg=-latomic
-            bindgen_args: ""
           - os: freebsd
             arch: x86_64
             target: x86_64-unknown-freebsd
             rustflags: ""
-            bindgen_args: --sysroot=/usr/local/x86_64-unknown-freebsd13 -I/usr/local/x86_64-unknown-freebsd13/include
           - os: freebsd
             arch: aarch64
             target: aarch64-unknown-freebsd
             rustflags: ""
-            bindgen_args: --sysroot=/usr/local/aarch64-unknown-freebsd13 -I/usr/local/aarch64-unknown-freebsd13/include
           - os: netbsd
             arch: x86_64
             target: x86_64-unknown-netbsd
             rustflags: -C link-arg=-L/usr/local/x86_64-unknown-netbsd/lib
-            bindgen_args: --sysroot=/usr/local/x86_64-unknown-netbsd -I/usr/local/x86_64-unknown-netbsd/include
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_RELEASE_DEBUG: 0
@@ -239,13 +235,21 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@cross
+      # rquickjs ships no BSD bindings and the cross images lack BSD libc
+      # headers for bindgen. The 64-bit BSD ABIs match Linux's System V ABI,
+      # so reuse the vendored Linux binding files (quickjs exposes only
+      # opaque FILE and plain integer/pointer fields).
+      - name: Seed BSD bindings for rquickjs
+        shell: bash
+        run: |
+          set -eu
+          bindings=$(echo "$HOME"/.cargo/registry/src/*/rquickjs-sys-0.14.0/src/bindings)
+          cp "$bindings/x86_64-unknown-linux-gnu.rs" "$bindings/x86_64-unknown-freebsd.rs"
+          cp "$bindings/x86_64-unknown-linux-gnu.rs" "$bindings/x86_64-unknown-netbsd.rs"
+          cp "$bindings/aarch64-unknown-linux-gnu.rs" "$bindings/aarch64-unknown-freebsd.rs"
       - name: Build release binary with cross
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-          BINDGEN_EXTRA_CLANG_ARGS: ${{ matrix.bindgen_args }}
-          BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_freebsd: ${{ matrix.bindgen_args }}
-          BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_freebsd: ${{ matrix.bindgen_args }}
-          BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_netbsd: ${{ matrix.bindgen_args }}
         run: cross build --release --target "${{ matrix.target }}"
       - name: Stage binary and checksum
         shell: bash
