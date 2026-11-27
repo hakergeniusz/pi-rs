@@ -218,17 +218,17 @@ jobs:
             arch: x86_64
             target: x86_64-unknown-freebsd
             rustflags: ""
-            bindgen_args: --sysroot=/usr/local/x86_64-unknown-freebsd13
+            bindgen_args: --sysroot=/usr/local/x86_64-unknown-freebsd13 -I/usr/local/x86_64-unknown-freebsd13/include
           - os: freebsd
             arch: aarch64
             target: aarch64-unknown-freebsd
             rustflags: ""
-            bindgen_args: --sysroot=/usr/local/aarch64-unknown-freebsd13
+            bindgen_args: --sysroot=/usr/local/aarch64-unknown-freebsd13 -I/usr/local/aarch64-unknown-freebsd13/include
           - os: netbsd
             arch: x86_64
             target: x86_64-unknown-netbsd
-            rustflags: -C link-arg=-L/usr/local/x86_64-unknown-netbsd/usr/lib
-            bindgen_args: --sysroot=/usr/local/x86_64-unknown-netbsd
+            rustflags: -C link-arg=-L/usr/local/x86_64-unknown-netbsd/lib
+            bindgen_args: --sysroot=/usr/local/x86_64-unknown-netbsd -I/usr/local/x86_64-unknown-netbsd/include
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_RELEASE_DEBUG: 0
@@ -243,6 +243,9 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
           BINDGEN_EXTRA_CLANG_ARGS: ${{ matrix.bindgen_args }}
+          BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_freebsd: ${{ matrix.bindgen_args }}
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_freebsd: ${{ matrix.bindgen_args }}
+          BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_netbsd: ${{ matrix.bindgen_args }}
         run: cross build --release --target "${{ matrix.target }}"
       - name: Stage binary and checksum
         shell: bash
