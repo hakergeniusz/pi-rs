@@ -1,10 +1,4 @@
-# cross by default forwards only a small allowlist of environment variables.
-# BSD bindgen needs the target sysroot argument inside the build container.
+# cross forwards only a small environment allowlist into build containers.
+# NetBSD's cross gcc needs LIBRARY_PATH to find libexecinfo in its sysroot.
 [build.env]
-passthrough = [
-    "BINDGEN_EXTRA_CLANG_ARGS",
-    "BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_freebsd",
-    "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_freebsd",
-    "BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_netbsd",
-    "RUSTFLAGS",
-]
+passthrough = ["LIBRARY_PATH"]
