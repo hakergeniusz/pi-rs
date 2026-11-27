@@ -14,7 +14,7 @@
 //! yet). `!!` rows use the `dim` color token instead of `bashMode`
 //! (`bash-execution.ts:42`).
 
-use pi_tui::ansi::{strip_terminal_sequences, truncate_to_width};
+use pi_tui::ansi::strip_terminal_sequences;
 use pi_tui::component::Component;
 use pi_tui::components::loader::Loader;
 use pi_tui::components::text::Text;
@@ -55,7 +55,9 @@ impl ColorKey {
 
 /// Width-aware collapsed preview (`visual-truncate.ts:17-52`): the tail of
 /// the styled output, folded through `Text` so a long wrapped line counts as
-/// several visual lines, with one `...` hint line when rows were skipped.
+/// several visual lines. Upstream keeps only `result.visualLines`; skipped
+/// visual lines are not reported here, and the status row carries the logical
+/// hidden-line count (`bash-execution.ts:154-158`).
 struct VisualLinePreview {
     text: String,
     max_lines: usize,
@@ -85,11 +87,8 @@ impl Component for VisualLinePreview {
         let lines = if all.len() <= self.max_lines {
             all
         } else {
-            let skipped = all.len() - self.max_lines;
-            let mut kept = all[all.len() - self.max_lines..].to_vec();
-            let hint = format!("... {skipped} more lines");
-            kept.insert(0, truncate_to_width(&hint, width.max(1), "...", false));
-            kept
+            // `truncateToVisualLines(...).visualLines`: no hint row.
+            all[all.len() - self.max_lines..].to_vec()
         };
         *self.cached.borrow_mut() = Some((width, lines.clone()));
         lines
@@ -414,15 +413,43 @@ mod tests {
             lines.iter().any(|line| line.contains("(cancelled)")),
             "{lines:?}"
         );
-        assert!(
-            lines.iter().any(|line| line.contains("more lines")),
-            "{lines:?}"
+        let hints: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("more lines"))
+            .collect();
+        assert_eq!(
+            hints.len(),
+            1,
+            "one status hint, no preview hint: {lines:?}"
         );
+        assert!(hints[0].contains("6 more lines"), "{lines:?}");
         component.set_expanded(true);
         let expanded = plain(&component, 80);
         assert!(
             expanded.iter().any(|line| line.contains("to collapse")),
             "{expanded:?}"
+        );
+    }
+
+    /// `truncateToVisualLines` reports skipped visual lines but
+    /// `bash-execution.ts` uses only `visualLines`; a single wrapping line must
+    /// not produce the old extra `... N more lines` preview row. Upstream's
+    /// status count is logical lines hidden, which is zero here.
+    #[test]
+    fn wrapped_preview_keeps_only_visual_lines_without_a_hint_row() {
+        let mut component = BashExecutionComponent::new("wrap", false, 1);
+        component.append_output(&format!("{}\n", "x".repeat(400)));
+        component.set_complete(Some(0), false, false, None);
+        let lines = plain(&component, 20);
+        assert!(
+            !lines.iter().any(|line| line.contains("more lines")),
+            "wrapped visual lines add no hint or status row: {lines:?}"
+        );
+        // spacer + top border + header + 20 visual preview rows + bottom border
+        assert_eq!(
+            lines.len(),
+            24,
+            "exactly PREVIEW_LINES visual rows: {lines:?}"
         );
     }
 }

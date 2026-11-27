@@ -2,8 +2,9 @@
 //! `packages/tui/src/components/input.ts` (494 lines).
 //!
 //! pi-tui had no `Input` before 5c: the search overlay (`alt-screen-search.ts`)
-//! and the settings submenu both wrap one. Keys come from the same `tui.*`
-//! defaults the editor uses, matched with [`crate::keys::matches_key`].
+//! and the settings submenu both wrap one. Keys resolve through
+//! [`crate::keybindings::matches`], so `keybindings.json` overrides reach this
+//! component exactly as upstream's `kb.matches(data, "tui.*")` does.
 
 use std::sync::Arc;
 
@@ -11,7 +12,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::ansi::{slice_by_column, truncate_to_width, visible_width};
 use crate::component::{Component, ComponentMutation, Focusable};
-use crate::keys::{decode_kitty_printable, matches_key};
+use crate::keybindings::{self, action};
+use crate::keys::decode_kitty_printable;
 use crate::kill_ring::KillRing;
 use crate::mouse::{MouseButton, MouseEvent, MouseEventKind, MouseEventResult};
 use crate::undo_stack::UndoStack;
@@ -331,84 +333,85 @@ impl Input {
         self.cursor += clean.len();
     }
 
-    /// `handleInput`, `input.ts:67-231`.
+    /// `handleInput`, `input.ts:67-231`. Dispatch order mirrors upstream so a
+    /// user who rebinds two actions onto one key gets the same winner.
     pub fn handle_key(&mut self, data: &str) -> InputAction {
         if data.contains("\x1b[200~") || self.in_paste {
             return self.handle_paste_stream(data);
         }
 
-        if select_keys_cancel(data) {
+        if keybindings::matches(data, action::SELECT_CANCEL) {
             return InputAction::Escaped;
         }
-        if matches_key(data, "ctrl+-") {
+        if keybindings::matches(data, action::EDITOR_UNDO) {
             self.undo();
             return InputAction::None;
         }
-        if matches_key(data, "enter") || data == "\n" {
+        if keybindings::matches(data, action::INPUT_SUBMIT) || data == "\n" {
             return InputAction::Submitted(self.value.clone());
         }
-        if matches_key(data, "left") {
+        if keybindings::matches(data, action::EDITOR_DELETE_CHAR_BACKWARD) {
+            self.backspace();
+            return InputAction::None;
+        }
+        if keybindings::matches(data, action::EDITOR_DELETE_CHAR_FORWARD) {
+            self.forward_delete();
+            return InputAction::None;
+        }
+        if keybindings::matches(data, action::EDITOR_DELETE_WORD_BACKWARD) {
+            self.delete_word_backwards();
+            return InputAction::None;
+        }
+        if keybindings::matches(data, action::EDITOR_DELETE_WORD_FORWARD) {
+            self.delete_word_forward();
+            return InputAction::None;
+        }
+        if keybindings::matches(data, action::EDITOR_DELETE_TO_LINE_START) {
+            self.delete_to_line_start();
+            return InputAction::None;
+        }
+        if keybindings::matches(data, action::EDITOR_DELETE_TO_LINE_END) {
+            self.delete_to_line_end();
+            return InputAction::None;
+        }
+        if keybindings::matches(data, action::EDITOR_YANK) {
+            self.yank();
+            return InputAction::None;
+        }
+        if keybindings::matches(data, action::EDITOR_YANK_POP) {
+            self.yank_pop();
+            return InputAction::None;
+        }
+        if keybindings::matches(data, action::EDITOR_CURSOR_LEFT) {
             self.last_action = None;
             if self.cursor > 0 {
                 self.cursor = grapheme_start(&self.value, self.cursor);
             }
             return InputAction::None;
         }
-        if matches_key(data, "right") {
+        if keybindings::matches(data, action::EDITOR_CURSOR_RIGHT) {
             self.last_action = None;
             if self.cursor < self.value.len() {
                 self.cursor = grapheme_end(&self.value, self.cursor);
             }
             return InputAction::None;
         }
-        if matches_key(data, "home") {
+        if keybindings::matches(data, action::EDITOR_CURSOR_LINE_START) {
             self.last_action = None;
             self.cursor = 0;
             return InputAction::None;
         }
-        if matches_key(data, "end") {
+        if keybindings::matches(data, action::EDITOR_CURSOR_LINE_END) {
             self.last_action = None;
             self.cursor = self.value.len();
             return InputAction::None;
         }
-        if matches_key(data, "alt+left") || matches_key(data, "ctrl+left") {
+        if keybindings::matches(data, action::EDITOR_CURSOR_WORD_LEFT) {
             self.move_word_backwards();
             return InputAction::None;
         }
-        if matches_key(data, "alt+right") || matches_key(data, "ctrl+right") {
+        if keybindings::matches(data, action::EDITOR_CURSOR_WORD_RIGHT) {
             self.move_word_forwards();
-            return InputAction::None;
-        }
-        if matches_key(data, "backspace") {
-            self.backspace();
-            return InputAction::None;
-        }
-        if matches_key(data, "delete") {
-            self.forward_delete();
-            return InputAction::None;
-        }
-        if matches_key(data, "ctrl+w") || matches_key(data, "alt+backspace") {
-            self.delete_word_backwards();
-            return InputAction::None;
-        }
-        if matches_key(data, "alt+d") || matches_key(data, "alt+delete") {
-            self.delete_word_forward();
-            return InputAction::None;
-        }
-        if matches_key(data, "ctrl+u") {
-            self.delete_to_line_start();
-            return InputAction::None;
-        }
-        if matches_key(data, "ctrl+k") {
-            self.delete_to_line_end();
-            return InputAction::None;
-        }
-        if matches_key(data, "ctrl+y") {
-            self.yank();
-            return InputAction::None;
-        }
-        if matches_key(data, "alt+y") {
-            self.yank_pop();
             return InputAction::None;
         }
 
@@ -445,11 +448,6 @@ impl Input {
         }
         self.handle_key(&remaining)
     }
-}
-
-/// `tui.select.cancel` default keys. `keybindings.ts:155-159`.
-fn select_keys_cancel(data: &str) -> bool {
-    matches_key(data, "escape") || matches_key(data, "ctrl+c")
 }
 
 /// `hasControlChars`, `input.ts:213-217`.
@@ -609,6 +607,7 @@ impl Component for Input {
 mod tests {
     use super::*;
     use crate::ansi::strip_terminal_sequences;
+    use crate::keybindings::{DEFAULTS, KeybindingsConfig, KeybindingsManager};
 
     /// pi's `setValue` keeps the cursor where it was (clamped); the tests below
     /// always want it at the end, like a freshly typed field.
@@ -732,7 +731,7 @@ mod tests {
 
     #[test]
     fn mouse_press_places_the_cursor() {
-        // mouse-components.test.ts:110-118 — "hello", press at x=4.
+        // mouse-components.test.ts:110-118 - "hello", press at x=4.
         let mut field = input("hello");
         let rendered = field.render(20);
         assert_eq!(rendered.len(), 1);
@@ -785,5 +784,38 @@ mod tests {
         assert_eq!(field.cursor(), 0);
         field.handle_key("X");
         assert_eq!(field.value(), "X日本");
+    }
+
+    /// Upstream resolves `tui.*` actions through `kb.matches`; a user's
+    /// `keybindings.json` must replace the component's default keys.
+    #[test]
+    fn user_keybindings_override_the_input_keys() {
+        let mut config = KeybindingsConfig::new();
+        config.insert(action::INPUT_SUBMIT, vec!["ctrl+shift+enter".to_string()]);
+        config.insert(
+            action::EDITOR_DELETE_CHAR_BACKWARD,
+            vec!["ctrl+h".to_string()],
+        );
+        let mut manager = KeybindingsManager::new(DEFAULTS);
+        manager.set_user_bindings(config);
+        let _guard = manager.install_on_current_thread();
+
+        let mut field = input("abc");
+        assert_eq!(
+            field.handle_key("\r"),
+            InputAction::None,
+            "enter is unbound"
+        );
+        assert_eq!(field.value(), "abc");
+        assert_eq!(
+            field.handle_key("\x08"),
+            InputAction::None,
+            "ctrl+h is the new backspace"
+        );
+        assert_eq!(field.value(), "ab");
+        assert_eq!(
+            field.handle_key("\x1b[13;6u"),
+            InputAction::Submitted("ab".to_string())
+        );
     }
 }

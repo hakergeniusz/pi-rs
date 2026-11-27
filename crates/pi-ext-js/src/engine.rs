@@ -139,6 +139,39 @@ pub struct HostActions {
     /// `ctx.ui.setTheme(instance)`'s synchronous half: install the
     /// stashed theme; `false` = unknown handle.
     pub theme_set_instance: Box<dyn Fn(u32) -> bool + Send>,
+    /// `modelRegistry.classify(model, context, options)` host wire call.
+    /// All three arguments and the reply are JSON; an embedder without a
+    /// classifier backend leaves the default, which returns an honest
+    /// upstream-shaped error result.
+    #[allow(clippy::type_complexity)] // JSON wire boundary for the host classifier
+    pub classify: Box<dyn Fn(&Json, &Json, &Json) -> Json + Send>,
+    /// `modelRegistry.generateImages(model, context, options)` host wire
+    /// call, with the same JSON boundary and an error-result default.
+    #[allow(clippy::type_complexity)] // JSON wire boundary for the host image backend
+    pub generate_images: Box<dyn Fn(&Json, &Json, &Json) -> Json + Send>,
+}
+
+/// The JSON result a host returns for a non-chat model operation that has
+/// no backend installed. The shape matches `ClassifierResult` /
+/// `AssistantImages` so extensions can read `errorMessage` uniformly.
+fn model_operation_error(model: &Json, message: &str) -> Json {
+    let object = model.as_object();
+    let field = |name: &str| -> &str {
+        object
+            .and_then(|object| object.get(name))
+            .and_then(Json::as_str)
+            .unwrap_or("unknown")
+    };
+    serde_json::json!({
+        "api": field("api"),
+        "provider": field("provider"),
+        "model": field("id"),
+        "answers": {},
+        "output": [],
+        "stopReason": "error",
+        "errorMessage": message,
+        "timestamp": 0_i64,
+    })
 }
 
 /// The synchronous mode-state reads the `footerData`/`editorText`/
@@ -220,8 +253,27 @@ impl Default for HostActions {
             theme_appearance: Box::new(|| "dark".to_string()),
             theme_set_name: Box::new(|_name| Err("UI not available".to_string())),
             theme_set_instance: Box::new(|_handle| false),
+            classify: Box::new(|model, _context, _options| {
+                model_operation_error(model, "classify has no host classifier backend")
+            }),
+            generate_images: Box::new(|model, _context, _options| {
+                model_operation_error(model, "generateImages has no host image backend")
+            }),
         }
     }
+}
+
+/// The session snapshot the host refreshes before extension dispatch so the
+/// read-only `ctx.sessionManager` view can answer without a second engine
+/// boundary crossing. `None` fields mirror upstream's `undefined`.
+#[derive(Debug, Default, Clone)]
+pub struct SessionState {
+    pub session_id: Option<String>,
+    pub leaf_id: Option<String>,
+    /// `id -> session record JSON` for the entries the host synced.
+    pub entries: BTreeMap<String, Json>,
+    /// Model-visible messages of the current session, in context order.
+    pub messages: Vec<Json>,
 }
 
 /// The Rust-side state every op reads and writes. The runner keeps this
@@ -303,6 +355,23 @@ pub struct HostCore {
     pub entries: Vec<(String, Json)>,
     /// `pi.sendMessage` calls, in order.
     pub outbox: Vec<(String, Json, Json)>,
+    /// `runtime.setModel` events queued by the `setModel` op; the host
+    /// drains them after extension dispatch, mutates the live runtime model
+    /// and emits `model_select` (`loader.ts:453-455`, `agent-session.ts:2644`).
+    pub model_select_events: Vec<Json>,
+    /// Fallback for `ctx.model` when no embedder installed `actions.get_model`;
+    /// updated by the `setModel` op so a selection is visible to later reads
+    /// in the same dispatch.
+    pub current_model: Option<Json>,
+    /// Read-only session snapshot for `ctx.sessionManager`, refreshed by the
+    /// host before dispatch (`session-manager.ts:245`).
+    pub session_state: SessionState,
+    /// Messages queued by `ctx.sessionManager.appendMessage`; the host
+    /// drains and appends them to the real session store.
+    pub pending_session_messages: Vec<Json>,
+    /// Monotonic source for placeholder ids returned by `appendMessage`
+    /// until the host assigns the real entry id.
+    pub session_message_counter: u64,
     /// `pi.setSessionName` value.
     pub session_name: Option<String>,
     /// `pi.setLabel` calls, in order.
@@ -391,6 +460,16 @@ impl JsHost {
     /// returns to Rust (the E0 pattern; the job-error type is not publicly
     /// nameable in `rquickjs`, so the error is flattened to its message).
     pub fn drive_jobs(&self) -> Result<(), JsHostError> {
+        // Global `setTimeout` is a deterministic, host-pumped queue: due
+        // callbacks fire here, once per entry, before their promises' jobs
+        // settle. There is no background timer thread or leaked handle; the
+        // queue lives in the JS context and dies with the runner.
+        self.ctx.with(|ctx| -> Result<(), JsHostError> {
+            if let Ok(service) = ctx.globals().get::<_, Function>("__piServiceTimers") {
+                let _: u32 = service.call(()).map_err(|err| Self::js_error(&ctx, err))?;
+            }
+            Ok(())
+        })?;
         while self
             .rt
             .execute_pending_job()
@@ -943,9 +1022,109 @@ impl JsHost {
             }
             String::new()
         });
+        // `runtime.setModel`: record the model_select event for the host,
+        // update the in-engine fallback immediately so later ctx.model reads
+        // in the same dispatch see the selection, and let the host mutate the
+        // live runtime + emit the extension event when it drains the queue.
+        op!("setModel", core, |event: String| -> String {
+            let event: Json = serde_json::from_str(&event).unwrap_or(Json::Null);
+            let mut core = core.lock().expect("host core mutex poisoned");
+            if let Some(model) = event.get("model") {
+                core.current_model = Some(model.clone());
+            }
+            core.model_select_events.push(event);
+            String::new()
+        });
+        // Non-chat model operations cross as JSON and run on the host's wire
+        // paths; the embedder installs the closures, the defaults return an
+        // upstream-shaped error result rather than throwing into the JS.
+        op!("classify", core, |model: String,
+                               context: String,
+                               options: String|
+         -> String {
+            let model: Json = serde_json::from_str(&model).unwrap_or(Json::Null);
+            let context: Json = serde_json::from_str(&context).unwrap_or(Json::Null);
+            let options: Json = serde_json::from_str(&options).unwrap_or(Json::Null);
+            let core = core.lock().expect("host core mutex poisoned");
+            serde_json::to_string(&(core.actions.classify)(&model, &context, &options))
+                .unwrap_or_else(|_| {
+                    model_operation_error(&model, "classify result serialization failed")
+                        .to_string()
+                })
+        });
+        op!("generateImages", core, |model: String,
+                                     context: String,
+                                     options: String|
+         -> String {
+            let model: Json = serde_json::from_str(&model).unwrap_or(Json::Null);
+            let context: Json = serde_json::from_str(&context).unwrap_or(Json::Null);
+            let options: Json = serde_json::from_str(&options).unwrap_or(Json::Null);
+            let core = core.lock().expect("host core mutex poisoned");
+            serde_json::to_string(&(core.actions.generate_images)(&model, &context, &options))
+                .unwrap_or_else(|_| {
+                    model_operation_error(&model, "generateImages result serialization failed")
+                        .to_string()
+                })
+        });
+        // The read-only `ctx.sessionManager` view over the host-synced
+        // snapshot. An unsynced snapshot answers upstream's `undefined` /
+        // empty shapes instead of throwing; writes queue for the host.
+        op!("sessionGetId", core, || -> String {
+            core.lock()
+                .expect("host core mutex poisoned")
+                .session_state
+                .session_id
+                .clone()
+                .unwrap_or_default()
+        });
+        op!("sessionGetLeafId", core, || -> String {
+            core.lock()
+                .expect("host core mutex poisoned")
+                .session_state
+                .leaf_id
+                .clone()
+                .unwrap_or_default()
+        });
+        op!("sessionGetEntry", core, |id: String| -> String {
+            core.lock()
+                .expect("host core mutex poisoned")
+                .session_state
+                .entries
+                .get(&id)
+                .map(std::string::ToString::to_string)
+                .unwrap_or_default()
+        });
+        op!("sessionGetEntries", core, || -> String {
+            let core = core.lock().expect("host core mutex poisoned");
+            let entries: Vec<&Json> = core.session_state.entries.values().collect();
+            serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+        });
+        op!("sessionGetMessages", core, || -> String {
+            let core = core.lock().expect("host core mutex poisoned");
+            serde_json::to_string(&core.session_state.messages).unwrap_or_else(|_| "[]".to_string())
+        });
+        op!("sessionAppendMessage", core, |message: String| -> String {
+            let mut core = core.lock().expect("host core mutex poisoned");
+            let message: Json = serde_json::from_str(&message).unwrap_or(Json::Null);
+            core.session_message_counter += 1;
+            let id = format!("pending-{}", core.session_message_counter);
+            core.pending_session_messages.push(message.clone());
+            serde_json::json!({
+                "type": "message",
+                "id": id,
+                "parentId": core.session_state.leaf_id,
+                "message": message,
+            })
+            .to_string()
+        });
         op!("getModel", core, || -> String {
             let core = core.lock().expect("host core mutex poisoned");
             let model = (core.actions.get_model)();
+            let model = if model.is_null() {
+                core.current_model.clone().unwrap_or(model)
+            } else {
+                model
+            };
             serde_json::to_string(&model).unwrap_or_default()
         });
         op!("getThinkingLevel", core, || -> String {
@@ -3577,6 +3756,93 @@ globalThis.__nsdoc = [__mkdoc("mcp__x__run", "Run it.", {}, { name: "mcp__x", de
                 r##"JSON.stringify(__doctext("mcp__ledger__inspect", "Inspect records", { type: "object", properties: { remote: { $ref: "https://example.com/schema.json#/$defs/x" }, missing: { $ref: "#/$defs/missing" }, malformed: { $ref: "#/$defs/%E0%A4%A" } }, $defs: { unused: { description: "reconciliation" } } }))"##
             ),
             json!("Inspect records remote missing malformed")
+        );
+    }
+
+    #[test]
+    fn non_chat_model_ops_default_to_error_results() {
+        let actions = HostActions::default();
+        let model = json!({"api": "x", "provider": "p", "id": "m"});
+        let classified = (actions.classify)(&model, &json!({}), &json!({}));
+        assert_eq!(classified["stopReason"], "error");
+        assert_eq!(
+            classified["errorMessage"],
+            "classify has no host classifier backend"
+        );
+        assert_eq!(classified["model"], "m");
+        let images = (actions.generate_images)(&model, &json!({}), &json!({}));
+        assert_eq!(images["stopReason"], "error");
+        assert_eq!(images["output"], json!([]));
+        assert_eq!(
+            images["errorMessage"],
+            "generateImages has no host image backend"
+        );
+    }
+
+    #[test]
+    fn global_timers_fire_on_job_drive_and_can_be_cleared() {
+        let host = host();
+        host.eval_for_tests(
+            r"globalThis.__fired = 0;
+               globalThis.__timerB = setTimeout(() => { globalThis.__fired += 2; }, 0);
+               setTimeout(() => { globalThis.__fired = 99; }, 60000);
+               clearTimeout(globalThis.__timerB);
+               setTimeout(() => { globalThis.__fired += 1; }, 0);",
+        )
+        .expect("schedule");
+        // The cleared timer is gone; the 60s timer and the new 0ms timer remain.
+        assert_eq!(
+            host.eval_for_tests("globalThis.__piTimers.size").unwrap(),
+            "2"
+        );
+        host.drive_jobs().expect("drive");
+        assert_eq!(
+            host.eval_for_tests("String(globalThis.__fired)").unwrap(),
+            "1"
+        );
+        // Only the 60s timer survives this drive.
+        assert_eq!(
+            host.eval_for_tests("globalThis.__piTimers.size").unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn set_model_op_queues_event_and_updates_ctx_model() {
+        let host = host();
+        host.eval_for_tests(
+            r#"__piOps.setModel(JSON.stringify({ type: "model_select", model: { provider: "acme", id: "tiny", api: "anthropic-messages" }, source: "set" }))"#,
+        )
+        .expect("op");
+        let core = host.core().lock().expect("core");
+        assert_eq!(core.model_select_events.len(), 1);
+        assert_eq!(core.model_select_events[0]["model"]["id"], "tiny");
+        drop(core);
+        assert_eq!(
+            host.eval_for_tests("__piOps.getModel()").unwrap(),
+            r#"{"provider":"acme","id":"tiny","api":"anthropic-messages"}"#
+        );
+    }
+
+    #[test]
+    fn session_manager_reads_host_synced_snapshot() {
+        let host = host();
+        {
+            let mut core = host.core().lock().expect("core");
+            core.session_state.session_id = Some("sess-1".to_string());
+            core.session_state.leaf_id = Some("leaf-1".to_string());
+            core.session_state.entries.insert(
+                "leaf-1".to_string(),
+                json!({"type": "message", "id": "leaf-1"}),
+            );
+            core.session_state.messages = vec![json!({"role": "user", "content": "hi"})];
+        }
+        assert_eq!(
+            host.eval_for_tests(
+                r#"JSON.stringify([__piCreateSessionManagerView().getSessionId(), __piCreateSessionManagerView().getLeafId(), __piCreateSessionManagerView().getEntry("leaf-1"), __piCreateSessionManagerView().getMessages()])"#
+            )
+            .unwrap(),
+            r#"["sess-1","leaf-1",{"type":"message","id":"leaf-1"},[{"role":"user","content":"hi"}]]"#
         );
     }
 }

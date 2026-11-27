@@ -258,9 +258,45 @@ pub fn theme_by_name(name: &str) -> Option<Arc<Theme>> {
 /// `getMarkdownTheme` (`theme.ts:1065-1083`): token stylers for the Markdown
 /// component.
 pub fn markdown_theme() -> pi_tui::components::markdown::MarkdownTheme {
-    use pi_tui::components::markdown::MarkdownTheme;
+    use pi_tui::components::markdown::markdown_extras::{
+        SyntaxKind, highlight_segments, is_supported_language,
+    };
+    use pi_tui::components::markdown::{CodeHighlighter, MarkdownTheme};
     use pi_tui::theme::ThemeColor as C;
     let theme = theme();
+    // `highlightCode` (`theme.ts:887-900`, `:1079`): token kinds map onto the
+    // `syntax*` colours; an unsupported language keeps the plain `mdCodeBlock`
+    // colour. Without this hook every code fence renders unhighlighted.
+    let highlight_theme = Arc::clone(&theme);
+    let highlight_code: Arc<CodeHighlighter> = Arc::new(move |code: &str, lang: Option<&str>| {
+        let fg = |token: C, text: &str| highlight_theme.fg(token, text);
+        if !is_supported_language(lang) {
+            return code
+                .split('\n')
+                .map(|line| fg(C::MdCodeBlock, line))
+                .collect();
+        }
+        highlight_segments(code, lang)
+            .into_iter()
+            .map(|segments| {
+                segments
+                    .into_iter()
+                    .map(|(kind, text)| match kind {
+                        SyntaxKind::Keyword => fg(C::SyntaxKeyword, &text),
+                        SyntaxKind::Type => fg(C::SyntaxType, &text),
+                        SyntaxKind::Number => fg(C::SyntaxNumber, &text),
+                        SyntaxKind::String => fg(C::SyntaxString, &text),
+                        SyntaxKind::Comment => fg(C::SyntaxComment, &text),
+                        SyntaxKind::Function => fg(C::SyntaxFunction, &text),
+                        SyntaxKind::Variable => fg(C::SyntaxVariable, &text),
+                        SyntaxKind::Operator => fg(C::SyntaxOperator, &text),
+                        SyntaxKind::Punctuation => fg(C::SyntaxPunctuation, &text),
+                        SyntaxKind::Plain => text,
+                    })
+                    .collect::<String>()
+            })
+            .collect()
+    });
     MarkdownTheme {
         heading: theme.fg_styler(C::MdHeading),
         link: theme.fg_styler(C::MdLink),
@@ -276,7 +312,7 @@ pub fn markdown_theme() -> pi_tui::components::markdown::MarkdownTheme {
         italic: Arc::new(move |text: &str| italic(text)),
         strikethrough: Arc::new(move |text: &str| strikethrough(text)),
         underline: Arc::new(move |text: &str| underline(text)),
-        highlight_code: None,
+        highlight_code: Some(highlight_code),
         code_block_indent: "  ".to_string(),
     }
 }
@@ -944,6 +980,24 @@ mod tests {
             theme
                 .fg(pi_tui::theme::ThemeColor::Accent, "x")
                 .contains('x')
+        );
+    }
+
+    #[test]
+    fn markdown_theme_colours_supported_code_fences() {
+        let highlighter = markdown_theme()
+            .highlight_code
+            .expect("getMarkdownTheme.highlightCode");
+        let lines = highlighter("let answer = 42;", Some("rust"));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("answer"), "the source is preserved");
+        assert!(lines[0].contains("\x1b["), "tokens carry theme colours");
+
+        // `highlightCode` falls back to the plain code-block colour when the
+        // language is unknown, exactly like upstream's `supportsLanguage` guard.
+        assert_eq!(
+            highlighter("hello", Some("brainfuck")),
+            vec![theme().fg(pi_tui::theme::ThemeColor::MdCodeBlock, "hello")]
         );
     }
 }

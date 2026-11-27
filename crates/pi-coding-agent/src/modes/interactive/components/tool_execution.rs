@@ -14,14 +14,17 @@
 //! falling back to the text paths (`tool-execution.ts:299-344`).
 //!
 //! Image blocks of a result render inline after the box
-//! (`tool-execution.ts:283-336,364-389`): a `Spacer(1)` then an [`Image`]
-//! per block, with pi's `toolOutput` fallback color and `imageWidthCells`
-//! cap. Sources are compared before rebuilding so an unchanged image keeps
-//! its Kitty id/cached lines across result updates. The `showImages` flag
-//! (`tool-execution.ts:122-144`, fed by `onShowImagesChange` at
-//! `interactive-mode.ts:5153-5160`) is read from a shared live
-//! [`ImageSettings`] cell, so a mid-session settings change reaches every
-//! row on its next frame.
+//! (`tool-execution.ts:283-336,364-389`) only when the terminal has an image
+//! protocol and `showImages` is on: a `Spacer(1)` then an [`Image`] per block,
+//! with pi's `toolOutput` fallback color and `imageWidthCells` cap. Sources
+//! are compared before rebuilding so an unchanged image keeps its Kitty
+//! id/cached lines across result updates. Otherwise upstream's
+//! `getTextOutput(result, false)` (`render-utils.ts:53-78`) puts one
+//! `[Image: <mime> WxH]` label per block into the result text *inside* the
+//! box instead. The `showImages` flag (`tool-execution.ts:122-144`, fed by
+//! `onShowImagesChange` at `interactive-mode.ts:5153-5160`) is read from a
+//! shared live [`ImageSettings`] cell, so a mid-session settings change
+//! reaches every row on its next frame.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -34,6 +37,9 @@ use pi_tui::components::image::{Image, ImageOptions, ImageTheme};
 use pi_tui::components::mouse_region::MouseRegion;
 use pi_tui::components::text::Text;
 use pi_tui::mouse::{MouseButton, MouseEvent, MouseEventKind, MouseEventResult};
+use pi_tui::terminal_image::{
+    ImageProtocol, get_capabilities, get_image_dimensions, image_fallback,
+};
 
 use crate::images::ImageSettings;
 use crate::tools::renderers::ToolRenderers;
@@ -331,22 +337,23 @@ impl ToolExecutionComponent {
         self.update_display();
     }
 
-    /// The result's image blocks (`tool-execution.ts:366-383`): only blocks
-    /// carrying both base64 data and a mime type are displayed, matching
-    /// upstream's `img.data && img.mimeType` guard.
+    /// The result's image blocks (`tool-execution.ts:366-383`). All blocks are
+    /// kept: upstream's `getTextOutput` labels every image block, while only
+    /// blocks with both data and a mime type become inline `Image`s
+    /// (`img.data && img.mimeType`).
     pub fn update_images(&mut self, images: Vec<ToolResultImage>) {
-        self.image_sources = images
-            .into_iter()
-            .filter(|image| !image.data.is_empty() && !image.mime_type.is_empty())
-            .collect();
+        self.image_sources = images;
         self.rebuild_images();
+        self.update_display();
     }
 
     /// `setShowImages`/`setImageWidthCells` sweep
     /// (`interactive-mode.ts:5153-5168`): the live cell has changed, so
-    /// rebuild this row's image components from the current snapshot.
+    /// rebuild this row's image components and the text-body fallback labels
+    /// from the current snapshot.
     pub fn refresh_images(&mut self) {
         self.rebuild_images();
+        self.update_display();
     }
 
     /// Build one [`Image`] per source, reusing the previous component (and
@@ -363,6 +370,7 @@ impl ToolExecutionComponent {
         self.image_components = self
             .image_sources
             .iter()
+            .filter(|source| !source.data.is_empty() && !source.mime_type.is_empty())
             .enumerate()
             .map(|(index, source)| {
                 if previous
@@ -400,10 +408,11 @@ impl ToolExecutionComponent {
         self.update_display();
     }
 
-    /// `setOutputPad` (`tool-execution.ts:216-219`); the next render rebuilds
-    /// the content box from the field.
+    /// `setOutputPad` (`tool-execution.ts:216-219`): upstream rebuilds the
+    /// box immediately; the port's `render` is immutable, so do the same here.
     pub fn set_output_pad(&mut self, output_pad: usize) {
         self.output_pad = output_pad;
+        self.update_display();
     }
 
     pub fn expanded(&self) -> bool {
@@ -415,6 +424,58 @@ impl ToolExecutionComponent {
         if self.started_at.is_some() && self.is_partial {
             self.update_display();
         }
+    }
+
+    /// `getTextOutput(result, false)` (`render-utils.ts:53-78`): when images
+    /// are hidden or the terminal has no image protocol, upstream puts one
+    /// `[Image: <mime> WxH]` label per image block in the result text instead
+    /// of mounting an `Image` component after the box.
+    fn image_fallback_labels(&self) -> String {
+        if self.result.is_none() {
+            return String::new();
+        }
+        let show_images = self
+            .image_settings
+            .lock()
+            .expect("image settings")
+            .show_images;
+        if show_images && get_capabilities().images != ImageProtocol::Disabled {
+            return String::new();
+        }
+        self.image_sources
+            .iter()
+            .map(|image| {
+                let mime = if image.mime_type.is_empty() {
+                    "image/unknown"
+                } else {
+                    image.mime_type.as_str()
+                };
+                let dimensions = if image.data.is_empty() || image.mime_type.is_empty() {
+                    None
+                } else {
+                    get_image_dimensions(&image.data, &image.mime_type)
+                };
+                image_fallback(mime, dimensions.as_ref(), None)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The body the renderers see: the host's joined text plus the labels
+    /// upstream's `getTextOutput` adds when it will not draw the images.
+    fn combined_result_text(&self) -> String {
+        let mut text = self
+            .result
+            .as_ref()
+            .map_or_else(String::new, |result| result.text.clone());
+        let labels = self.image_fallback_labels();
+        if !labels.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&labels);
+        }
+        text
     }
 
     /// `updateDisplay` (`tool-execution.ts:281-402`): rebuild the box with
@@ -551,12 +612,11 @@ impl ToolExecutionComponent {
                         self.sliced_result_fallback(&theme).unwrap_or_default()
                     }
                     None => {
-                        if result.text.is_empty() {
+                        let text = self.combined_result_text();
+                        if text.is_empty() {
                             String::new()
                         } else {
-                            result
-                                .text
-                                .split('\n')
+                            text.split('\n')
                                 .map(|line| theme.fg(pi_tui::theme::ThemeColor::ToolOutput, line))
                                 .collect::<Vec<_>>()
                                 .join("\n")
@@ -583,7 +643,7 @@ impl ToolExecutionComponent {
                 pi_tui::theme::ThemeBg::ToolSuccessBg
             };
             let bg = theme.bg_styler(bg_token);
-            BoxComponent::with_bg(self.output_pad.max(1), 1, move |text: &str| bg(text))
+            BoxComponent::with_bg(self.output_pad, 1, move |text: &str| bg(text))
         };
         // Every displayed child rides a `MouseRegion` whose left click
         // toggles the row's expansion (`tool-execution.ts:116-124`; the
@@ -681,7 +741,7 @@ impl ToolExecutionComponent {
         let agent_result = pi_agent::types::AgentToolResult {
             content: vec![pi_ai::types::ContentBlock::Text(
                 pi_ai::types::TextContent {
-                    text: result.text.clone(),
+                    text: self.combined_result_text(),
                     text_signature: None,
                 },
             )],
@@ -707,11 +767,11 @@ impl ToolExecutionComponent {
     /// nothing.
     fn sliced_result_fallback(&self, theme: &pi_tui::theme::Theme) -> Option<String> {
         const FALLBACK_PREVIEW_LINES: usize = 10;
-        let result = self.result.as_ref()?;
-        if result.text.is_empty() {
+        let text = self.combined_result_text();
+        if text.is_empty() {
             return None;
         }
-        let lines: Vec<&str> = result.text.split('\n').collect();
+        let lines: Vec<&str> = text.split('\n').collect();
         let display_len = if self.expanded {
             lines.len()
         } else {
@@ -774,15 +834,17 @@ impl Component for ToolExecutionComponent {
         // `tool-execution.ts:87`: the row opens with a blank line.
         let mut lines = vec![String::new()];
         lines.extend(self.content_box.render(width));
-        // `tool-execution.ts:375-388`: each image gets a `Spacer(1)` then
-        // the component's own rows. `showImages` is read live so a settings
-        // change takes effect without rebuilding the row.
-        if self
+        // `tool-execution.ts:375-388`: each inline image gets a `Spacer(1)`
+        // then the component's own rows. Upstream mounts these only when the
+        // terminal has an image protocol; otherwise `getTextOutput(result,
+        // false)` puts the labels inside the box instead. `showImages` is read
+        // live so a settings change reaches an already-mounted row.
+        let show_images = self
             .image_settings
             .lock()
             .expect("image settings")
-            .show_images
-        {
+            .show_images;
+        if show_images && get_capabilities().images != ImageProtocol::Disabled {
             for (_, image) in &self.image_components {
                 lines.push(String::new());
                 lines.extend(image.render(width));
@@ -812,6 +874,7 @@ impl Component for ToolExecutionComponent {
 mod tests {
     use super::*;
     use pi_tui::ansi::strip_terminal_sequences;
+    use pi_tui::terminal_image::TerminalCapabilities;
 
     fn plain(component: &ToolExecutionComponent, width: usize) -> Vec<String> {
         component
@@ -899,12 +962,116 @@ mod tests {
         );
     }
 
-    /// A result's image blocks render inline (`tool-execution.ts:366-389`),
-    /// after a spacer, and respect the live `showImages` flag.
+    /// `outputPad` reaches `Box.setPaddingX` verbatim (`tool-execution.ts:294`):
+    /// zero means no leading space, and a live pad change rebuilds the box.
     #[test]
-    fn result_images_render_below_the_box_and_follow_show_images() {
-        // 1x1 PNG, the smallest payload `Image::new` can sniff.
+    fn output_pad_zero_renders_without_leading_space() {
+        let mut component = ToolExecutionComponent::new(
+            "read",
+            "call-1",
+            serde_json::json!({ "path": "/tmp/example.txt" }),
+            1,
+            "/tmp",
+            crate::tools::renderers::renderers_for("read"),
+            None,
+        );
+        assert!(
+            plain(&component, 40)
+                .iter()
+                .any(|line| line.starts_with(' ') && line.contains("read")),
+            "pad 1 indents the call"
+        );
+        component.set_output_pad(0);
+        let lines = plain(&component, 40);
+        assert!(
+            lines.iter().any(|line| line.starts_with("read")),
+            "pad 0 starts at column zero: {lines:?}"
+        );
+        let zero = ToolExecutionComponent::new(
+            "read",
+            "call-1",
+            serde_json::json!({ "path": "/tmp/example.txt" }),
+            0,
+            "/tmp",
+            crate::tools::renderers::renderers_for("read"),
+            None,
+        );
+        assert!(
+            plain(&zero, 40).iter().any(|line| line.starts_with("read")),
+            "pad 0 at construction starts at column zero"
+        );
+    }
+
+    /// Without image capabilities upstream's `getTextOutput(result, false)`
+    /// puts the fallback label in the result text inside the box
+    /// (`render-utils.ts:53-78`), with no spacer/image rows after it.
+    #[test]
+    fn hidden_or_unsupported_images_label_the_text_body() {
+        // 1x1 PNG, the smallest payload `getImageDimensions` can sniff.
         const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+        pi_tui::terminal_image::set_capabilities(TerminalCapabilities {
+            images: ImageProtocol::Disabled,
+            ..TerminalCapabilities::default()
+        });
+        let mut component = ToolExecutionComponent::new(
+            "read",
+            "call-1",
+            serde_json::json!({ "path": "/tmp/pic.png" }),
+            1,
+            "/tmp",
+            None,
+            None,
+        );
+        component.update_result(
+            ToolResultView {
+                text: "done".to_string(),
+                is_error: false,
+                duration_ms: None,
+            },
+            false,
+        );
+        component.update_images(vec![ToolResultImage {
+            data: PNG.to_string(),
+            mime_type: "image/png".to_string(),
+        }]);
+        let lines = plain(&component, 60);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.trim() == "[Image: [image/png] 1x1]"),
+            "the label sits in the boxed text: {lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(""),
+            "no spacer/image rows follow the box"
+        );
+
+        component
+            .image_settings
+            .lock()
+            .expect("image settings")
+            .show_images = false;
+        component.refresh_images();
+        let lines = plain(&component, 60);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.trim() == "[Image: [image/png] 1x1]"),
+            "showImages=false keeps the text label: {lines:?}"
+        );
+        assert_eq!(lines.last().map(String::as_str), Some(""));
+    }
+
+    /// Capable terminals keep upstream's inline path: a spacer per image and
+    /// the component's own rows after the box.
+    #[test]
+    fn capable_terminals_still_draw_images_below_the_box() {
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+        pi_tui::terminal_image::set_capabilities(TerminalCapabilities {
+            images: ImageProtocol::Kitty,
+            ..TerminalCapabilities::default()
+        });
         let mut component = ToolExecutionComponent::new(
             "read",
             "call-1",
@@ -932,21 +1099,16 @@ mod tests {
             lines.len() >= baseline + 2,
             "spacer + image rows were added: {lines:?}"
         );
-        let raw = component.render(60).join("\n");
-        assert!(
-            raw.contains("[Image: [image/png]") || raw.contains("\x1b_G") || raw.contains("\x1b]_"),
-            "an image (or its fallback) rendered: {raw:?}"
-        );
-
         component
             .image_settings
             .lock()
             .expect("image settings")
             .show_images = false;
+        component.refresh_images();
         assert_eq!(
             plain(&component, 60).len(),
-            baseline,
-            "showImages=false hides the inline rows"
+            baseline + 1,
+            "showImages=false replaces the inline rows with one in-box label"
         );
     }
 

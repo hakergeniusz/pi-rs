@@ -139,45 +139,13 @@ pub(crate) fn apply_input_handlers_with_behavior(
 ) -> Result<InputOutcome, String> {
     #[cfg(feature = "ext-js")]
     {
-        let Some(runner) = runtime.extension_runner.as_ref() else {
-            return Ok(InputOutcome::Continue {
-                text: text.to_string(),
-                images: images.to_vec(),
-            });
-        };
-        let mut runner = runner.lock().expect("extension runner mutex poisoned");
-        if !runner.has_handlers("input") {
-            return Ok(InputOutcome::Continue {
-                text: text.to_string(),
-                images: images.to_vec(),
-            });
-        }
-        let mut event = pi_ext_js::events::input(text, source, streaming_behavior);
-        if !images.is_empty() {
-            event["images"] = serde_json::to_value(images).map_err(|error| error.to_string())?;
-        }
-        match runner
-            .emit_input(event)
-            .map_err(|error| error.to_string())?
-        {
-            pi_ext_js::events::InputResult::Handled { .. } => Ok(InputOutcome::Handled),
-            pi_ext_js::events::InputResult::Transform {
-                text,
-                images: transformed,
-            } => {
-                let images = match transformed {
-                    Some(value) if !value.is_null() => {
-                        serde_json::from_value(value).unwrap_or_else(|_| images.to_vec())
-                    }
-                    _ => images.to_vec(),
-                };
-                Ok(InputOutcome::Continue { text, images })
-            }
-            pi_ext_js::events::InputResult::Continue => Ok(InputOutcome::Continue {
-                text: text.to_string(),
-                images: images.to_vec(),
-            }),
-        }
+        apply_input_handlers_with_runner(
+            runtime.extension_runner.as_ref(),
+            text,
+            images,
+            source,
+            streaming_behavior,
+        )
     }
     #[cfg(not(feature = "ext-js"))]
     {
@@ -186,6 +154,58 @@ pub(crate) fn apply_input_handlers_with_behavior(
             text: text.to_string(),
             images: images.to_vec(),
         })
+    }
+}
+
+/// Runner-backed twin of [`apply_input_handlers_with_behavior`] for hosts
+/// that own their session and runner separately (interactive mode). The
+/// payload is shared with print/JSON/RPC, so handlers see the same event.
+#[cfg(feature = "ext-js")]
+pub(crate) fn apply_input_handlers_with_runner(
+    runner: Option<&Arc<Mutex<pi_ext_js::ExtensionRunner>>>,
+    text: &str,
+    images: &[ImageContent],
+    source: &str,
+    streaming_behavior: Option<&str>,
+) -> Result<InputOutcome, String> {
+    let Some(runner) = runner else {
+        return Ok(InputOutcome::Continue {
+            text: text.to_string(),
+            images: images.to_vec(),
+        });
+    };
+    let mut runner = runner.lock().expect("extension runner mutex poisoned");
+    if !runner.has_handlers("input") {
+        return Ok(InputOutcome::Continue {
+            text: text.to_string(),
+            images: images.to_vec(),
+        });
+    }
+    let mut event = pi_ext_js::events::input(text, source, streaming_behavior);
+    if !images.is_empty() {
+        event["images"] = serde_json::to_value(images).map_err(|error| error.to_string())?;
+    }
+    match runner
+        .emit_input(event)
+        .map_err(|error| error.to_string())?
+    {
+        pi_ext_js::events::InputResult::Handled { .. } => Ok(InputOutcome::Handled),
+        pi_ext_js::events::InputResult::Transform {
+            text,
+            images: transformed,
+        } => {
+            let images = match transformed {
+                Some(value) if !value.is_null() => {
+                    serde_json::from_value(value).unwrap_or_else(|_| images.to_vec())
+                }
+                _ => images.to_vec(),
+            };
+            Ok(InputOutcome::Continue { text, images })
+        }
+        pi_ext_js::events::InputResult::Continue => Ok(InputOutcome::Continue {
+            text: text.to_string(),
+            images: images.to_vec(),
+        }),
     }
 }
 
@@ -201,18 +221,17 @@ pub(crate) struct BeforeAgentStartOutcome {
 /// The `buildSystemPromptOptions` snapshot the runner hands handlers
 /// (`agent-session.ts:1845-1851,2005`). The port's runtime already carries the
 /// rendered prompt, so the snapshot exposes the fields extensions edit plus
-/// the live cwd and tool loadout.
+/// the live cwd and tool loadout. Hosts that own those pieces separately
+/// (interactive mode) build the same snapshot here.
 #[cfg(feature = "ext-js")]
-pub(crate) fn system_prompt_options(runtime: &PrintRuntime) -> serde_json::Value {
-    let tools: Vec<String> = runtime
-        .executor
-        .tools()
-        .into_iter()
-        .map(|tool| tool.name)
-        .collect();
+pub(crate) fn system_prompt_options(
+    system_prompt: &str,
+    cwd: &Path,
+    tools: &[String],
+) -> serde_json::Value {
     serde_json::json!({
-        "cwd": runtime.session.get_cwd().to_string_lossy(),
-        "customPrompt": runtime.system_prompt,
+        "cwd": cwd.to_string_lossy(),
+        "customPrompt": system_prompt,
         "selectedTools": tools,
         "forceSystemPrompt": serde_json::Value::Null,
     })
@@ -237,79 +256,107 @@ pub(crate) fn emit_before_agent_start(
 ) -> Result<BeforeAgentStartOutcome, String> {
     #[cfg(feature = "ext-js")]
     {
-        let Some(runner) = runtime.extension_runner.as_ref() else {
-            return Ok(BeforeAgentStartOutcome::default());
-        };
-        let images = if images.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_value(images).map_err(|error| error.to_string())?)
-        };
-        let mut runner = runner.lock().expect("extension runner mutex poisoned");
-        if !runner.has_handlers("before_agent_start") {
-            return Ok(BeforeAgentStartOutcome::default());
-        }
-        let combined = runner
-            .emit_before_agent_start(
-                &pi_ext_js::events::BeforeAgentStartTrigger::User {
-                    prompt: text.to_string(),
-                    images,
-                },
-                system_prompt_options(runtime),
-                &|options| render_system_prompt(options, &runtime.system_prompt),
-            )
-            .map_err(|error| error.to_string())?;
-        let system_prompt = combined
-            .system_prompt_options
-            .get("forceSystemPrompt")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let mut outcome = BeforeAgentStartOutcome {
-            system_prompt,
-            ..BeforeAgentStartOutcome::default()
-        };
-        let timestamp = now_millis();
-        for message in combined.messages {
-            if let Ok(custom) =
-                serde_json::from_value::<pi_agent::agent_message::CustomMessage>(message.clone())
-            {
-                outcome.messages.push(AgentMessage::Custom(custom));
-            } else {
-                // Untyped handlers can return a bare `{customType, content}`;
-                // synthesize the session message shape upstream normalizes to.
-                let custom_type = message
-                    .get("customType")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("custom")
-                    .to_string();
-                let content = message
-                    .get("content")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let Ok(content) = serde_json::from_value(content) else {
-                    continue;
-                };
-                outcome.messages.push(AgentMessage::Custom(
-                    pi_agent::agent_message::CustomMessage {
-                        custom_type,
-                        content,
-                        display: message
-                            .get("display")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false),
-                        details: message.get("details").cloned(),
-                        timestamp,
-                    },
-                ));
-            }
-        }
-        Ok(outcome)
+        let tools: Vec<String> = runtime
+            .executor
+            .tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        emit_before_agent_start_with(
+            runtime.extension_runner.as_ref(),
+            &runtime.system_prompt,
+            runtime.session.get_cwd(),
+            &tools,
+            text,
+            images,
+        )
     }
     #[cfg(not(feature = "ext-js"))]
     {
         let _ = (runtime, text, images);
         Ok(BeforeAgentStartOutcome::default())
     }
+}
+
+/// Runner-backed twin of [`emit_before_agent_start`] for hosts that own the
+/// session and prompt separately (interactive mode). The options snapshot and
+/// the result normalization are the ones print/JSON/RPC use.
+#[cfg(feature = "ext-js")]
+pub(crate) fn emit_before_agent_start_with(
+    runner: Option<&Arc<Mutex<pi_ext_js::ExtensionRunner>>>,
+    system_prompt: &str,
+    cwd: &Path,
+    tools: &[String],
+    text: &str,
+    images: &[ImageContent],
+) -> Result<BeforeAgentStartOutcome, String> {
+    let Some(runner) = runner else {
+        return Ok(BeforeAgentStartOutcome::default());
+    };
+    let images = if images.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_value(images).map_err(|error| error.to_string())?)
+    };
+    let mut runner = runner.lock().expect("extension runner mutex poisoned");
+    if !runner.has_handlers("before_agent_start") {
+        return Ok(BeforeAgentStartOutcome::default());
+    }
+    let combined = runner
+        .emit_before_agent_start(
+            &pi_ext_js::events::BeforeAgentStartTrigger::User {
+                prompt: text.to_string(),
+                images,
+            },
+            system_prompt_options(system_prompt, cwd, tools),
+            &|options| render_system_prompt(options, system_prompt),
+        )
+        .map_err(|error| error.to_string())?;
+    let system_prompt = combined
+        .system_prompt_options
+        .get("forceSystemPrompt")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let mut outcome = BeforeAgentStartOutcome {
+        system_prompt,
+        ..BeforeAgentStartOutcome::default()
+    };
+    let timestamp = now_millis();
+    for message in combined.messages {
+        if let Ok(custom) =
+            serde_json::from_value::<pi_agent::agent_message::CustomMessage>(message.clone())
+        {
+            outcome.messages.push(AgentMessage::Custom(custom));
+        } else {
+            // Untyped handlers can return a bare `{customType, content}`;
+            // synthesize the session message shape upstream normalizes to.
+            let custom_type = message
+                .get("customType")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("custom")
+                .to_string();
+            let content = message
+                .get("content")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let Ok(content) = serde_json::from_value(content) else {
+                continue;
+            };
+            outcome.messages.push(AgentMessage::Custom(
+                pi_agent::agent_message::CustomMessage {
+                    custom_type,
+                    content,
+                    display: message
+                        .get("display")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    details: message.get("details").cloned(),
+                    timestamp,
+                },
+            ));
+        }
+    }
+    Ok(outcome)
 }
 
 /// The host half of the loop's `message_end` and boundary seams
@@ -381,13 +428,24 @@ pub(crate) fn commit_boundary_drafts(
     drafts: &Arc<Mutex<Vec<serde_json::Value>>>,
 ) {
     let entries = std::mem::take(&mut *drafts.lock().expect("boundary drafts mutex poisoned"));
-    for value in entries {
-        let Ok(custom) = serde_json::from_value::<pi_agent::agent_message::CustomMessage>(value)
-        else {
-            continue;
-        };
-        let _ = runtime.session.append_message(AgentMessage::Custom(custom));
+    for message in boundary_draft_messages(entries) {
+        let _ = runtime.session.append_message(message);
     }
+}
+
+/// Normalize boundary drafts into session messages. Interactive mode's run
+/// thread sends the normalized messages through its event channel because
+/// the session store stays on the UI thread.
+#[cfg(feature = "ext-js")]
+pub(crate) fn boundary_draft_messages(entries: Vec<serde_json::Value>) -> Vec<AgentMessage> {
+    entries
+        .into_iter()
+        .filter_map(|value| {
+            serde_json::from_value::<pi_agent::agent_message::CustomMessage>(value)
+                .ok()
+                .map(AgentMessage::Custom)
+        })
+        .collect()
 }
 
 /// The prompts and prompt override a print/JSON submission resolves to.

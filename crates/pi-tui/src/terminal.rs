@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{
@@ -22,6 +23,11 @@ use crossterm::event::{
 pub const ENABLE_MOUSE_TRACKING: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h";
 /// The inverse, written in the same order pi disables them.
 pub const DISABLE_MOUSE_TRACKING: &str = "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+/// Pop the Kitty keyboard protocol flags. `terminal.ts` upstream `stop()` /
+/// `drainInput()`; both write `\x1b[<u` when a protocol push is outstanding.
+pub const DISABLE_KITTY_KEYBOARD: &str = "\x1b[<u";
+/// Turn xterm's `modifyOtherKeys` reporting back off (`\x1b[>4;0m` upstream).
+pub const DISABLE_MODIFY_OTHER_KEYS: &str = "\x1b[>4;0m";
 
 /// SGR button code for a crossterm button. `tui-alt-screen.ts:786-799`.
 fn button_code(button: CtMouseButton) -> u32 {
@@ -91,8 +97,8 @@ pub struct TerminalSize {
 
 /// Everything the TUI needs from a terminal.
 pub trait Terminal: Send {
-    /// Start: raw mode, mouse capture, bracketed paste, alt screen, hide
-    /// cursor. `terminal.ts:222-233`.
+    /// Start: raw mode, mouse capture, bracketed paste, hide cursor, and the
+    /// alternate screen only when the backend was asked for it. `terminal.ts:222-233`.
     fn start(&mut self) -> io::Result<()>;
     /// Stop: the inverse of [`Terminal::start`]. `terminal.ts:235-247`.
     fn stop(&mut self) -> io::Result<()>;
@@ -550,14 +556,25 @@ impl FrameCapture {
 }
 
 /// The sequences that put a terminal back the way the TUI found it, in the
-/// order [`CrosstermTerminal::stop`] writes them: show the cursor, leave the
-/// alternate screen, drop mouse tracking, drop bracketed paste.
+/// order a last-resort restore writes them: show the cursor, leave the
+/// alternate screen, drop every mouse mode (focus reporting and all-motion
+/// included), drop bracketed paste, pop the Kitty keyboard protocol and
+/// disable `modifyOtherKeys`.
 ///
-/// Exposed because a panic cannot hand the terminal back — the panic hook that
+/// Exposed because a panic cannot hand the terminal back: the panic hook that
 /// runs after the unwind has no `Tui` to ask, and the mutex guarding one may
-/// even be poisoned by the panic that is unwinding.
-pub const RESTORE_SEQUENCES: &str =
-    "\x1b[?25h\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?2004l";
+/// even be poisoned by the panic that is unwinding. Upstream writes the same
+/// modes in `restoreOnExit` (`terminal.ts`) and its `uncaughtException`
+/// handler (`interactive-mode.ts:4260-4289`).
+pub const RESTORE_SEQUENCES: &str = "\x1b[?25h\x1b[?1049l\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[<u\x1b[>4;0m";
+
+/// The subset [`CrosstermTerminal::stop`] writes: the same modes as
+/// [`RESTORE_SEQUENCES`] except the alternate-screen exit. Regular mode never
+/// enters the alt screen and fullscreen's exit is written by
+/// `Tui::after_alt_screen_stop`, so a second `?1049l` here would be a double
+/// exit (and would leave an alt screen in regular mode the TUI never entered).
+pub const TERMINAL_STOP_SEQUENCES: &str =
+    "\x1b[?25h\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[<u\x1b[>4;0m";
 
 /// Write [`RESTORE_SEQUENCES`] and flush, over any sink. Split out from
 /// [`restore_terminal`] so a test can pin the bytes without a terminal.
@@ -566,18 +583,62 @@ pub fn write_restore_sequences(out: &mut dyn std::io::Write) -> std::io::Result<
     out.flush()
 }
 
+/// Write [`TERMINAL_STOP_SEQUENCES`] and flush. The alt-screen exit belongs to
+/// the renderer that entered it; see [`CrosstermTerminal::stop`].
+pub fn write_stop_sequences(out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    out.write_all(TERMINAL_STOP_SEQUENCES.as_bytes())?;
+    out.flush()
+}
+
+/// Whether a real `CrosstermTerminal` is currently started. The host's exit
+/// hook uses this to avoid writing restore bytes in headless modes that never
+/// took over the terminal.
+static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether a newly constructed [`CrosstermTerminal`] asks for the alternate
+/// screen at `start`. Regular mode renders on the main screen; fullscreen
+/// enters the alt screen through `Tui::enter_alt_screen`. The host sets this
+/// from the resolved `TuiMode` before interactive startup constructs the
+/// terminal.
+static DEFAULT_USE_ALTERNATE_SCREEN: AtomicBool = AtomicBool::new(false);
+
+/// Read [`TERMINAL_ACTIVE`].
+pub fn terminal_active() -> bool {
+    TERMINAL_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Set the terminal-level alternate-screen preference for terminals
+/// constructed after this call (the host calls it from the resolved mode).
+pub fn set_default_use_alternate_screen(value: bool) {
+    DEFAULT_USE_ALTERNATE_SCREEN.store(value, Ordering::SeqCst);
+}
+
+/// Read the alternate-screen preference a new terminal will start with.
+pub fn default_use_alternate_screen() -> bool {
+    DEFAULT_USE_ALTERNATE_SCREEN.load(Ordering::SeqCst)
+}
+
 /// The last-resort restore: pi's `uncaughtException` handler
 /// (`interactive-mode.ts:4260-4289`), which calls `ui.stop()` when the terminal
 /// is still alive and writes the restore out directly when it is not.
 ///
 /// This is the half that needs no `Tui`: cooked mode, the cursor, and the
-/// bracketed-paste / mouse / alternate-screen modes, in that order. Both halves
-/// are idempotent, so running this after `Tui::stop` has already succeeded
-/// costs nothing and covers the case where `Tui::stop` never ran.
+/// bracketed-paste / mouse / keyboard-protocol / alternate-screen modes, in
+/// that order. Idempotent, so running this after `Tui::stop` has already
+/// succeeded costs nothing and covers the case where `Tui::stop` never ran.
 pub fn restore_terminal() {
     let mut out = std::io::stdout();
     let _ = write_restore_sequences(&mut out);
     let _ = crossterm::terminal::disable_raw_mode();
+    TERMINAL_ACTIVE.store(false, Ordering::SeqCst);
+}
+
+/// The exit-hook seam: restore only when a real TUI was started and has not
+/// stopped cleanly, so a headless run writes nothing to stdout.
+pub fn restore_terminal_if_active() {
+    if terminal_active() {
+        restore_terminal();
+    }
 }
 
 /// Keys `Terminal.start` installs. Mouse capture, bracketed paste and raw
@@ -612,7 +673,9 @@ impl CrosstermTerminal {
             size,
             mouse_mode: false,
             stdin_raw: true,
-            use_alternate_screen: true,
+            // Regular mode stays on the main screen; the host sets the
+            // preference from the resolved mode before startup.
+            use_alternate_screen: default_use_alternate_screen(),
             hide_cursor: true,
             last_frame: None,
         })
@@ -626,7 +689,7 @@ impl CrosstermTerminal {
             size,
             mouse_mode: false,
             stdin_raw: true,
-            use_alternate_screen: true,
+            use_alternate_screen: default_use_alternate_screen(),
             hide_cursor: true,
             last_frame: None,
         }
@@ -723,6 +786,9 @@ impl TerminalWrite for CrosstermTerminal {
 
 impl Terminal for CrosstermTerminal {
     fn start(&mut self) -> io::Result<()> {
+        // Mark the terminal live before the first write: a panic part-way
+        // through `start` must still be restored by the host's exit hook.
+        TERMINAL_ACTIVE.store(true, Ordering::SeqCst);
         self.capture.start();
         let mut out = io::stdout();
         if self.stdin_raw {
@@ -747,11 +813,14 @@ impl Terminal for CrosstermTerminal {
     fn stop(&mut self) -> io::Result<()> {
         self.capture.stop();
         let mut out = io::stdout();
-        write_restore_sequences(&mut out)?;
+        // No `?1049l` here: `Tui::after_alt_screen_stop` writes the alt-screen
+        // exit when fullscreen was active, and regular mode never entered it.
+        write_stop_sequences(&mut out)?;
         if self.stdin_raw {
             crossterm::terminal::disable_raw_mode()?;
         }
         self.responses.clear();
+        TERMINAL_ACTIVE.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1425,9 +1494,9 @@ mod tests {
         let mut out = Vec::new();
         write_restore_sequences(&mut out).expect("the sink accepts bytes");
         assert_eq!(out, RESTORE_SEQUENCES.as_bytes());
-        // Each is the inverse of what `CrosstermTerminal::start` wrote, which is
-        // the whole point: a terminal left raw with no cursor is the failure
-        // this exists to prevent. An inverted sequence would leave the mode on.
+        // Each is the inverse of a mode a TUI may have turned on, which is the
+        // whole point: a terminal left raw with no cursor is the failure this
+        // exists to prevent. An inverted sequence would leave the mode on.
         for (on, off) in [
             ("\x1b[?25l", "\x1b[?25h"),
             ("\x1b[?1049h", "\x1b[?1049l"),
@@ -1445,6 +1514,79 @@ mod tests {
                 "{off:?} is missing from the restore"
             );
         }
+        // The last-resort half also covers modes the TUI queries and enables
+        // after `start`: focus reporting, all-motion mouse, Kitty and
+        // modifyOtherKeys. Their inverses are upstream's `restoreOnExit`.
+        for off in [
+            "\x1b[?1004l",
+            "\x1b[?1003l",
+            DISABLE_KITTY_KEYBOARD,
+            DISABLE_MODIFY_OTHER_KEYS,
+        ] {
+            assert!(
+                RESTORE_SEQUENCES.contains(off),
+                "{off:?} is missing from the restore"
+            );
+        }
+        assert_eq!(
+            RESTORE_SEQUENCES,
+            format!(
+                "\x1b[?25h\x1b[?1049l{DISABLE_MOUSE_TRACKING}\x1b[?2004l{DISABLE_KITTY_KEYBOARD}{DISABLE_MODIFY_OTHER_KEYS}"
+            )
+        );
+    }
+
+    #[test]
+    fn normal_stop_never_writes_a_second_alternate_screen_exit() {
+        let mut out = Vec::new();
+        write_stop_sequences(&mut out).expect("the sink accepts bytes");
+        assert_eq!(out, TERMINAL_STOP_SEQUENCES.as_bytes());
+        assert!(
+            !TERMINAL_STOP_SEQUENCES.contains("\x1b[?1049l"),
+            "the renderer owns the alt-screen exit"
+        );
+        assert!(
+            !TERMINAL_STOP_SEQUENCES.contains("\x1b[?1049h"),
+            "stop must not enter the alt screen either"
+        );
+        for off in [
+            "\x1b[?25h",
+            "\x1b[?2004l",
+            "\x1b[?1004l",
+            "\x1b[?1003l",
+            DISABLE_KITTY_KEYBOARD,
+            DISABLE_MODIFY_OTHER_KEYS,
+        ] {
+            assert!(
+                TERMINAL_STOP_SEQUENCES.contains(off),
+                "{off:?} is missing from normal stop cleanup"
+            );
+        }
+        assert_eq!(
+            RESTORE_SEQUENCES,
+            format!(
+                "\x1b[?25h\x1b[?1049l{}",
+                TERMINAL_STOP_SEQUENCES.trim_start_matches("\x1b[?25h")
+            )
+        );
+    }
+
+    #[test]
+    fn a_new_terminal_defaults_to_the_main_screen() {
+        // The host sets the preference from the resolved TuiMode before
+        // startup; the default has to keep regular mode on the main screen.
+        let terminal = CrosstermTerminal::with_size(TerminalSize {
+            columns: 80,
+            rows: 24,
+        });
+        assert!(!terminal.use_alternate_screen);
+        assert!(!default_use_alternate_screen());
+        assert!(!terminal_active());
+        restore_terminal_if_active();
+        assert!(
+            !terminal_active(),
+            "no TUI was started, so nothing to restore"
+        );
     }
 
     #[test]

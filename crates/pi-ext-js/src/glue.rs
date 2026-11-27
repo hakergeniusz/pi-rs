@@ -50,9 +50,13 @@
 //! read-only `sessionManager` (`session-manager.ts:245`) and `modelRegistry`
 //! (`model-registry.ts`) views over the host ops, so adapters such as
 //! pi-guardrails can call `ctx.modelRegistry.classify` without throwing.
-//! `pi.setModel` (`loader.ts:453-455`) now records the change and notifies
-//! `model_select` listeners; the Rust host emission path in `modes/rpc.rs`
-//! needs a dedicated op to be reachable from here.
+//! `pi.setModel` (`loader.ts:453-455`) records the change, notifies the JS
+//! bus, and crosses the `setModel` op so the host can mutate the live runtime
+//! model and emit `model_select` (`modes/rpc.rs`). The read-only
+//! `ctx.sessionManager` and `ctx.modelRegistry` views cross their own ops for
+//! real session reads and non-chat model wire calls; with no bound host they
+//! keep upstream's empty/error shapes instead of throwing. A bounded
+//! `setTimeout`/`clearTimeout` shim is pumped by `JsHost::drive_jobs`.
 
 /// The per-host bootstrap: state, contexts, sessions, bus, `pi` API.
 pub const GLUE: &str = r#"
@@ -63,6 +67,47 @@ globalThis.console = {
   log: (...args) => globalThis.__piOps.print("log", args.map(String).join(" ")),
   warn: (...args) => globalThis.__piOps.print("warn", args.map(String).join(" ")),
   error: (...args) => globalThis.__piOps.print("error", args.map(String).join(" ")),
+};
+
+// A minimal global timer shim. QuickJS has no event loop, so timers are a
+// host-pumped queue: `__piServiceTimers` is called once from drive_jobs after
+// each engine entry, fires at most 32 due callbacks, and returns the number
+// of live timers. State lives on globalThis, so dropping the runner drops the
+// queue with no background thread or leaked timer handle. Delay is clamped to
+// a non-negative finite number and the queue is capped at 64 entries; ids are
+// monotonic positive integers. `setInterval` is deliberately not provided.
+globalThis.__piTimers = new Map();
+globalThis.__piTimerSeq = 1;
+globalThis.setTimeout = function (callback, delay, ...args) {
+  if (typeof callback !== "function") {
+    throw new TypeError("setTimeout callback must be a function");
+  }
+  const requested = Number(delay);
+  const ms = isFinite(requested) ? Math.max(0, Math.floor(requested)) : 0;
+  if (globalThis.__piTimers.size >= 64) return 0;
+  const id = globalThis.__piTimerSeq++;
+  globalThis.__piTimers.set(id, { at: Date.now() + ms, callback, args });
+  return id;
+};
+globalThis.clearTimeout = function (id) {
+  globalThis.__piTimers.delete(Number(id));
+};
+globalThis.__piServiceTimers = function () {
+  const now = Date.now();
+  const due = [];
+  for (const [id, timer] of globalThis.__piTimers) {
+    if (timer.at <= now) due.push([id, timer]);
+    if (due.length >= 32) break;
+  }
+  for (const [id, timer] of due) {
+    globalThis.__piTimers.delete(id);
+    try {
+      timer.callback(...timer.args);
+    } catch (error) {
+      globalThis.console.error("Timer callback error:", error);
+    }
+  }
+  return globalThis.__piTimers.size;
 };
 
 // `Intl.Segmenter` shim: QuickJS-NG ships no `Intl`, but the bundled
@@ -361,7 +406,6 @@ globalThis.__piSetModel = function (model) {
   if (previous && previous.provider === model.provider && previous.id === model.id) {
     return Promise.resolve(true);
   }
-  runtime.currentModel = model;
   const event = {
     type: "model_select",
     model,
@@ -369,56 +413,93 @@ globalThis.__piSetModel = function (model) {
     source: "set",
   };
   if (typeof globalThis.__piOps.setModel === "function") {
-    try {
-      globalThis.__piOps.setModel(JSON.stringify(event));
-    } catch (_error) {
-      // The host op is best-effort: the in-JS notification still stands.
-    }
+    const error = globalThis.__piOps.setModel(JSON.stringify(event));
+    if (error !== "") throw new Error(error);
   }
+  runtime.currentModel = model;
   globalThis.__piBus.emit("model_select", event);
   return Promise.resolve(true);
 };
 
 // Read-only `sessionManager` view (`types.ts:356`,
-// `session-manager.ts:245` `ReadonlySessionManager`). Backed by the
-// `getSessionMetadata`/`getSessionName`/`cwd` ops already installed on the
-// host; methods whose state does not cross the engine boundary return the
-// upstream empty shape rather than throwing.
+// `session-manager.ts:245` `ReadonlySessionManager`). The host refreshes a
+// snapshot before dispatch; the five cheap reads and the append below cross
+// their own ops so real sessions are observable and writable. Everything
+// else keeps upstream's empty/undefined shape until a host binds it.
 globalThis.__piCreateSessionManagerView = function () {
-  const meta = () => {
+  const raw = (op) => {
+    globalThis.__piAssertRuntimeActive();
+    return globalThis.__piOps[op]();
+  };
+  const maybeJson = (op) => {
+    try {
+      const value = JSON.parse(raw(op));
+      return value && typeof value === "object" ? value : undefined;
+    } catch (_error) {
+      return undefined;
+    }
+  };
+  const maybeJsonArg = (op, arg) => {
     globalThis.__piAssertRuntimeActive();
     try {
-      return JSON.parse(globalThis.__piOps.getSessionMetadata());
+      const value = JSON.parse(globalThis.__piOps[op](arg));
+      return value && typeof value === "object" ? value : undefined;
     } catch (_error) {
-      return {};
+      return undefined;
     }
   };
   return {
-    getCwd: () => meta().cwd ?? globalThis.__piOps.cwd(),
+    getCwd: () => globalThis.__piOps.cwd(),
     getSessionDir: () => undefined,
-    getSessionId: () => undefined,
+    getSessionId: () => {
+      const id = raw("sessionGetId");
+      return id === "" ? undefined : id;
+    },
     getSessionFile: () => undefined,
-    getLeafId: () => undefined,
-    getLeafEntry: () => undefined,
-    getEntry: () => undefined,
+    getLeafId: () => {
+      const id = raw("sessionGetLeafId");
+      return id === "" ? undefined : id;
+    },
+    getLeafEntry: function () {
+      const id = this.getLeafId();
+      return id === undefined ? undefined : this.getEntry(id);
+    },
+    getEntry: (id) =>
+      id === undefined || id === null ? undefined : maybeJsonArg("sessionGetEntry", String(id)),
     getLabel: () => undefined,
     getBranch: () => [],
     buildContextEntries: () => ({ entries: [] }),
     buildSessionProjection: () => ({ messages: [] }),
     getHeader: () => undefined,
-    getEntries: () => [],
+    getEntries: () => {
+      const value = maybeJson("sessionGetEntries");
+      return Array.isArray(value) ? value : [];
+    },
     getTree: () => [],
     getSessionName: () => {
-      const name = globalThis.__piOps.getSessionName();
+      const name = raw("getSessionName");
       return name === "" ? undefined : name;
+    },
+    // `ReadonlySessionManager` has no writes; the bundled extensions use
+    // `ctx.sessionManager.appendMessage` through the command context's
+    // wider manager, which is the same snapshot view here.
+    appendMessage: (message) => {
+      const entry = maybeJsonArg("sessionAppendMessage", JSON.stringify(message ?? null));
+      return entry === undefined
+        ? { type: "message", id: "", parentId: undefined, message }
+        : entry;
+    },
+    getMessages: () => {
+      const value = maybeJson("sessionGetMessages");
+      return Array.isArray(value) ? value : [];
     },
   };
 };
 
 // Read-only `modelRegistry` view (`types.ts:357`, `model-registry.ts`).
-// Synchronous lookups use the current model from `getModel`; request-time
-// methods resolve non-throwing defaults (upstream's `classify` never
-// rejects) so adapters such as pi-guardrails can call `classify` safely.
+// Synchronous lookups use the current model from `getModel`; `classify` and
+// `generateImages` cross the host's wire ops and return upstream's normalized
+// error result on failure (upstream's request-time methods never reject).
 globalThis.__piCreateModelRegistryView = function () {
   const current = () => {
     globalThis.__piAssertRuntimeActive();
@@ -462,14 +543,46 @@ globalThis.__piCreateModelRegistryView = function () {
     getModelsOfType: () => [],
     getAvailableOfType: () => resolved([]),
     getModelOfType: () => undefined,
-    classify: (model) => resolved(errorResult(model, "classify has no host classifier backend")),
-    generateImages: (model) =>
-      resolved({
-        images: [],
-        stopReason: "error",
-        errorMessage: "generateImages has no host image backend",
-        model: model?.id ?? "unknown",
-      }),
+    classify: (model, context, options) => {
+      globalThis.__piAssertRuntimeActive();
+      try {
+        return resolved(
+          JSON.parse(
+            globalThis.__piOps.classify(
+              JSON.stringify(model ?? null),
+              JSON.stringify(context ?? {}),
+              JSON.stringify(options ?? {}),
+            ),
+          ),
+        );
+      } catch (error) {
+        return resolved(errorResult(model, `classify failed: ${String(error)}`));
+      }
+    },
+    generateImages: (model, context, options) => {
+      globalThis.__piAssertRuntimeActive();
+      try {
+        return resolved(
+          JSON.parse(
+            globalThis.__piOps.generateImages(
+              JSON.stringify(model ?? null),
+              JSON.stringify(context ?? {}),
+              JSON.stringify(options ?? {}),
+            ),
+          ),
+        );
+      } catch (error) {
+        return resolved({
+          api: model?.api ?? "unknown",
+          provider: model?.provider ?? "unknown",
+          model: model?.id ?? "unknown",
+          output: [],
+          stopReason: "error",
+          errorMessage: `generateImages failed: ${String(error)}`,
+          timestamp: Date.now(),
+        });
+      }
+    },
     getProviderDisplayName: (provider) => provider,
     getProviderAuth: () => resolved(undefined),
     getApiKeyForProvider: () => resolved(undefined),

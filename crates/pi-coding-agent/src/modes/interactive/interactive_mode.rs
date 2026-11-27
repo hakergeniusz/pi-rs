@@ -58,6 +58,16 @@
 //! resolution reads the manager's effective config, so the 18 reserved ids
 //! stay reserved on their (possibly overridden) chords. `/reload` re-reads the
 //! file and refreshes both the components and the extension shortcuts.
+//!
+//! Agent-loop extension wiring (`agent-session.ts:1999-2055,2111-2130,
+//! 2268-2292,2630-2635`): `submit()` runs the shared `input` and
+//! `before_agent_start` chains before a new prompt, dispatches registered
+//! `registerCommand` handlers without starting a run, and `/model` changes
+//! emit the same `model_select` payload RPC sends. The `message_end` rewrite
+//! and boundary (`turn_end`/`agent_before_settle`) hooks are installed
+//! **inside** the worker thread, because pi-agent's hook registry is
+//! thread-local; boundary drafts cross back on the loop event channel and
+//! commit to the session on the UI thread.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -99,6 +109,11 @@ use crate::config::settings::{
 };
 use crate::images::{ImageSettings, ImageTransformer, ResizeOptions};
 use crate::modes::print_mode::PrintRuntime;
+#[cfg(feature = "ext-js")]
+use crate::modes::print_mode::{
+    ExtensionLoopHooks, InputOutcome, apply_input_handlers_with_runner, boundary_draft_messages,
+    emit_before_agent_start_with,
+};
 use crate::session::store::{NewSessionOptions, SessionManager};
 use crate::session::{BashExecutionDeltaCollector, BashExecutionEvent, ReadonlySessionManager};
 
@@ -1063,6 +1078,9 @@ impl Component for ChatEditor {
 /// Events flowing from the agent thread to the UI loop.
 enum LoopEvent {
     Event(AgentEvent),
+    /// Boundary drafts normalized on the worker thread and committed to the
+    /// session store on the UI thread (`_commitBoundaryDrafts`).
+    BoundaryDrafts(Vec<AgentMessage>),
     Done,
 }
 
@@ -1076,6 +1094,58 @@ impl AgentEventSink for ChannelSink {
         let _ = self.tx.send(LoopEvent::Event(event));
         Box::pin(async {})
     }
+}
+
+/// What `submit()`'s extension preflight resolved to before the run starts.
+/// The `input` chain may rewrite or consume the prompt; `before_agent_start`
+/// may inject messages and force the run's system prompt.
+struct InteractivePromptHooks {
+    text: String,
+    images: Vec<pi_ai::types::ImageContent>,
+    messages: Vec<AgentMessage>,
+    forced_system_prompt: Option<String>,
+}
+
+impl InteractivePromptHooks {
+    #[allow(dead_code)] // kept as the explicit no-hooks constructor for host call sites
+    fn passthrough(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            images: Vec::new(),
+            messages: Vec::new(),
+            forced_system_prompt: None,
+        }
+    }
+}
+
+/// `_emitModelSelect`'s payload (`agent-session.ts:2630-2635`), byte-shaped
+/// like RPC's `model_select_event`: `previousModel` is absent for a no-op
+/// selection, which the caller skips anyway.
+fn model_select_event(
+    model: &pi_ai::types::Model,
+    previous_model: Option<&pi_ai::types::Model>,
+    source: &str,
+) -> serde_json::Value {
+    let mut event = serde_json::Map::new();
+    event.insert(
+        "type".to_string(),
+        serde_json::Value::String("model_select".to_string()),
+    );
+    event.insert(
+        "model".to_string(),
+        serde_json::to_value(model).unwrap_or_default(),
+    );
+    if let Some(previous) = previous_model {
+        event.insert(
+            "previousModel".to_string(),
+            serde_json::to_value(previous).unwrap_or_default(),
+        );
+    }
+    event.insert(
+        "source".to_string(),
+        serde_json::Value::String(source.to_string()),
+    );
+    serde_json::Value::Object(event)
 }
 
 /// One agent run on a worker thread.
@@ -2250,6 +2320,7 @@ impl InteractiveMode {
             FooterComponent::new(Self::footer_data(runtime)),
             &easter_egg_requests,
             show_startup_details,
+            settings.get_clear_on_shrink(),
         );
 
         let theme_query_start = Self::arm_theme_queries(
@@ -2806,6 +2877,7 @@ impl InteractiveMode {
     /// The regular renderer's flat mount: the eight hosts in [`HostSlot`]
     /// order (`interactive-mode.ts` init's `mountInteractiveTui` flat path,
     /// with the widget hosts E3 slice 7 adds), focus on the editor.
+    #[allow(clippy::too_many_arguments)] // mirrors upstream mount_flat_tree; split when extending
     fn mount_flat_tree(
         terminal: Box<dyn pi_tui::terminal::Terminal>,
         version: &str,
@@ -2814,9 +2886,10 @@ impl InteractiveMode {
         footer: FooterComponent,
         easter_egg_requests: &Arc<Mutex<Vec<(i64, i64)>>>,
         show_startup_details: bool,
+        clear_on_shrink: bool,
     ) -> (Tui, ComponentId) {
         let mut tui = Tui::new(terminal);
-        tui.set_clear_on_shrink(true);
+        tui.set_clear_on_shrink(clear_on_shrink);
         let mut header = Self::build_header(version, model_id, show_startup_details);
         // `header.onLogoClick = …` (`interactive-mode.ts:792`): the 3D pi
         // logo lifts off the logo's screen position. The callback cannot
@@ -3881,12 +3954,16 @@ impl InteractiveMode {
                         pi_ai::types::UserContent::Text(text) => Some(text.clone()),
                         pi_ai::types::UserContent::Blocks(_) => None,
                     };
-                    let is_active_prompt = text.is_some()
-                        && self
-                            .active_prompt
+                    // An image-bearing prompt has no plain text block here,
+                    // so its timestamp alone identifies the submit-time
+                    // append (same-millisecond steering still needs the
+                    // text check for text-only messages).
+                    let is_active_prompt =
+                        self.active_prompt
                             .as_ref()
                             .is_some_and(|(timestamp, prompt)| {
-                                *timestamp == user.timestamp && Some(prompt) == text.as_ref()
+                                *timestamp == user.timestamp
+                                    && text.as_ref().is_none_or(|text| text == prompt)
                             });
                     if is_active_prompt {
                         self.active_prompt = None;
@@ -4165,6 +4242,109 @@ impl InteractiveMode {
     // Submission (`setupEditorSubmitHandler`, `interactive-mode.ts:3324`)
     // --------------------------------------------------------------
 
+    /// `_tryExecuteExtensionCommand` (`agent-session.ts:2268-2292`): a
+    /// registered `registerCommand` handler consumes the submission. Built-in
+    /// slash commands have already been dispatched by `submit`; an unknown
+    /// `/name` still reaches the agent as a prompt, like upstream. Handler
+    /// output crosses `ctx.ui.notify` into the bridge and is rendered by the
+    /// pump (`show_status`/custom message) - `run_command` itself has no
+    /// return value to display.
+    #[cfg(feature = "ext-js")]
+    fn try_extension_command(&mut self, text: &str) -> Option<bool> {
+        let runner = self.extension_runner.clone()?;
+        if !text.starts_with('/') {
+            return None;
+        }
+        // Upstream's name/args split (`:2268-2272`): stop at the first
+        // space, hand the rest verbatim (leading spaces included) to the
+        // handler.
+        let (name, args) = match text.find(' ') {
+            Some(index) => (&text[1..index], &text[index + 1..]),
+            None => (&text[1..], ""),
+        };
+        let outcome = {
+            let mut runner = runner.lock().expect("extension runner mutex poisoned");
+            runner.run_command(name, args)
+        };
+        match outcome {
+            Ok(true) => {
+                self.pump_extension_ui();
+                Some(true)
+            }
+            Ok(false) => None,
+            Err(error) => {
+                self.show_error(&format!("Error running command /{name}: {error}"));
+                Some(true)
+            }
+        }
+    }
+
+    /// Engine-free twin: no command registry, nothing consumed.
+    #[cfg(not(feature = "ext-js"))]
+    #[allow(clippy::unused_self)]
+    fn try_extension_command(&mut self, _text: &str) -> Option<bool> {
+        None
+    }
+
+    /// The shared input/before-agent-start chains for one submission
+    /// (`agent-session.ts:2206-2217,1999-2055`). `starting_run` is false for
+    /// steering or compaction-queued text: upstream runs the input chain at
+    /// prompt time, but a system-prompt override can only apply to a run that
+    /// has not started yet. `None` means a handler consumed the input.
+    #[cfg(feature = "ext-js")]
+    fn prompt_hooks(
+        &self,
+        text: &str,
+        starting_run: bool,
+    ) -> Result<Option<InteractivePromptHooks>, String> {
+        let runner = self.extension_runner.as_ref();
+        let images: Vec<pi_ai::types::ImageContent> = Vec::new();
+        let (text, images) =
+            match apply_input_handlers_with_runner(runner, text, &images, "interactive", None)? {
+                InputOutcome::Handled => return Ok(None),
+                InputOutcome::Continue { text, images } => (text, images),
+            };
+        if !starting_run {
+            return Ok(Some(InteractivePromptHooks {
+                text,
+                images,
+                messages: Vec::new(),
+                forced_system_prompt: None,
+            }));
+        }
+        let tools: Vec<String> = self
+            .executor
+            .tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let before = emit_before_agent_start_with(
+            runner,
+            &self.system_prompt,
+            self.session.get_cwd(),
+            &tools,
+            &text,
+            &images,
+        )?;
+        Ok(Some(InteractivePromptHooks {
+            text,
+            images,
+            messages: before.messages,
+            forced_system_prompt: before.system_prompt,
+        }))
+    }
+
+    /// Headless twin: no handlers, unchanged text.
+    #[cfg(not(feature = "ext-js"))]
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    fn prompt_hooks(
+        &self,
+        text: &str,
+        _starting_run: bool,
+    ) -> Result<Option<InteractivePromptHooks>, String> {
+        Ok(Some(InteractivePromptHooks::passthrough(text)))
+    }
+
     #[allow(clippy::too_many_lines)] // mirrors the TS submit chain; split when extending
     fn submit(&mut self, text: &str) {
         let text = text.trim().to_string();
@@ -4303,6 +4483,11 @@ impl InteractiveMode {
             self.handle_theme_command(rest.trim());
             return;
         }
+        // Extension commands (`agent-session.ts:2268-2292`) run after the
+        // built-ins so a built-in slash command always wins a name clash.
+        if self.try_extension_command(&text) == Some(true) {
+            return;
+        }
         // `!` bash mode (`interactive-mode.ts:3471-3487`).
         if let Some(rest) = text.strip_prefix('!') {
             let excluded = rest.starts_with('!');
@@ -4322,9 +4507,23 @@ impl InteractiveMode {
                 return;
             }
         }
+        // The extension input chain (`agent-session.ts:2206-2216`) runs for
+        // every submitted prompt, including a steer/compaction queue. A
+        // `before_agent_start` override is only collected for a new run: a
+        // run already streaming has a fixed system message and context.
+        let starting_run = !self.is_compacting() && self.agent_run.is_none();
+        let hooks = match self.prompt_hooks(&text, starting_run) {
+            Ok(Some(hooks)) => hooks,
+            Ok(None) => return,
+            Err(error) => {
+                self.show_error(&error);
+                return;
+            }
+        };
+        let text = hooks.text.clone();
         // Queue input during compaction or a branch summary
         // (`interactive-mode.ts:3489-3499`, `session.isCompacting` covering
-        // both — `agent-session.ts:1719-1726`): built-in commands already
+        // both: `agent-session.ts:1719-1726`). Built-in commands were already
         // dispatched above.
         if self.is_compacting() {
             self.queue_compaction_message(&text, false);
@@ -4336,7 +4535,7 @@ impl InteractiveMode {
             self.queue_message(&text, false);
             return;
         }
-        self.start_agent_run(&text);
+        self.start_agent_run_with(&text, hooks);
     }
 
     /// Queue a user message for the running agent (`session.prompt` with
@@ -4988,6 +5187,17 @@ impl InteractiveMode {
     /// `streamSimple` handler wins per request (`streamWith`,
     /// provider-composer.ts:588-613).
     fn apply_model(&mut self, model: pi_ai::types::Model) -> Result<(), String> {
+        self.apply_model_with_source(model, "set")
+    }
+
+    /// The shared model switch with the `model_select` source tag
+    /// (`"set"` for `/model` and the selector, `"cycle"` for ctrl+p).
+    fn apply_model_with_source(
+        &mut self,
+        model: pi_ai::types::Model,
+        source: &str,
+    ) -> Result<(), String> {
+        let previous = self.model.clone();
         if crate::virtual_models::is_virtual_model(&model) {
             self.stream_fn = Arc::new(crate::virtual_models::RoutedStreamFn {
                 selected_provider: model.provider.clone(),
@@ -5022,6 +5232,11 @@ impl InteractiveMode {
             let _ = self
                 .session
                 .append_model_change(&self.model.provider, &self.model.id);
+        }
+        // `_emitModelSelect` (`agent-session.ts:2624-2636`): extension
+        // listeners only, and a no-op selection (modelsAreEqual) is skipped.
+        if !models_are_equal(&previous, &self.model) {
+            self.emit_extension_event(&model_select_event(&self.model, Some(&previous), source));
         }
         self.refresh_footer();
         self.update_editor_border_color();
@@ -5130,7 +5345,7 @@ impl InteractiveMode {
             self.show_status("Only one model available");
             return;
         };
-        if let Err(error) = self.apply_model(next) {
+        if let Err(error) = self.apply_model_with_source(next, "cycle") {
             self.show_error(&error);
             return;
         }
@@ -5175,7 +5390,7 @@ impl InteractiveMode {
                 .and_then(|level| crate::modes::print_mode::thinking_level_from_str(&level).ok())
                 .unwrap_or(self.thinking_level)
         });
-        if let Err(error) = self.apply_model(next_model) {
+        if let Err(error) = self.apply_model_with_source(next_model, "cycle") {
             self.show_error(&error);
             return;
         }
@@ -5209,12 +5424,23 @@ impl InteractiveMode {
             return;
         }
         let events = Arc::new(Mutex::new(Vec::new()));
+        let scoped = self
+            .scoped_models
+            .iter()
+            .map(|scoped| scoped.model.clone())
+            .collect();
+        let default = self
+            .settings
+            .get_default_provider()
+            .zip(self.settings.get_default_model());
         let selector = ModelSelectorComponent::new(
             &self.model,
             self.available_models(),
             initial_search,
             Arc::clone(&events),
-        );
+        )
+        .with_scoped_models(scoped)
+        .with_default_model(default);
         self.model_selector_events = Some(events);
         self.suspend_editor_with(Box::new(selector));
     }
@@ -7087,8 +7313,18 @@ impl InteractiveMode {
     // Agent run control
     // --------------------------------------------------------------
 
-    /// Start one agent run on a worker thread (`session.prompt`).
+    /// Start one agent run on a worker thread (`session.prompt`). The
+    /// no-hooks entry point keeps the direct call sites (and tests) simple.
+    #[allow(dead_code)] // legacy entry point; new call sites pass resolved hooks
     fn start_agent_run(&mut self, text: &str) {
+        self.start_agent_run_with(text, InteractivePromptHooks::passthrough(text));
+    }
+
+    /// The run-start half of `submit`, with the resolved `input` /
+    /// `before_agent_start` outcome (`:1999-2055,2206-2217`). Injected custom
+    /// messages lead the prompts so the loop declares them before the user
+    /// message; a forced prompt replaces the context's system message.
+    fn start_agent_run_with(&mut self, text: &str, hooks: InteractivePromptHooks) {
         self.editor_add_to_history(text);
 
         // Session context from the persisted entries (before the new prompt).
@@ -7098,21 +7334,31 @@ impl InteractiveMode {
             leaf_id.as_deref(),
         );
         let mut context_messages = session_context.messages;
+        let declarations: Vec<_> = self.executor.tools().iter().map(tool_declaration).collect();
         if context_messages.is_empty()
             && let Some(system) = pi_agent::transcript::create_initial_system_message(
                 Some(&self.system_prompt),
-                &self
-                    .executor
-                    .tools()
-                    .iter()
-                    .map(tool_declaration)
-                    .collect::<Vec<_>>(),
+                &declarations,
             )
         {
             context_messages.push(AgentMessage::System(system));
         }
+        // A `before_agent_start` handler's exact prompt override wins over
+        // the host's rendered prompt (RPC's `_prepareRun` does the same).
+        if let Some(forced) = &hooks.forced_system_prompt {
+            context_messages.retain(|message| !matches!(message, AgentMessage::System(_)));
+            if let Some(system) =
+                pi_agent::transcript::create_initial_system_message(Some(forced), &declarations)
+            {
+                context_messages.insert(0, AgentMessage::System(system));
+            }
+        }
 
-        let user_message = pi_agent::transcript::user_message(text, now_millis());
+        let user_message = if hooks.images.is_empty() {
+            pi_agent::transcript::user_message(text, now_millis())
+        } else {
+            pi_agent::transcript::user_message_with_images(text, &hooks.images, now_millis())
+        };
         let _ = self.session.append_message(user_message.clone());
         let AgentMessage::User(user) = &user_message else {
             unreachable!("user_message builds a user message");
@@ -7124,7 +7370,9 @@ impl InteractiveMode {
             tools: self.executor.tools(),
         };
 
-        self.spawn_run(vec![user_message], context);
+        let mut prompts = hooks.messages;
+        prompts.push(user_message);
+        self.spawn_run(prompts, context);
     }
 
     /// The turn's run thread: one `run_agent_loop` pass; the retry and
@@ -7222,7 +7470,23 @@ impl InteractiveMode {
         let retry_settings = self.settings.get_retry_settings();
         let thread_prompts = prompts.clone();
         let thread_context = context.clone();
+        // The hook registry is thread-local (`extension_hooks.rs:78-99`), so
+        // `message_end` and the boundaries must be installed ON the worker,
+        // not on the UI thread that owns this mode. Boundary drafts travel
+        // back on `tx` because the session store is UI-thread state.
+        #[cfg(feature = "ext-js")]
+        let boundary_drafts = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(feature = "ext-js")]
+        let thread_hooks: Option<Arc<dyn pi_agent::ExtensionHooks>> =
+            self.extension_runner.as_ref().map(|runner| {
+                Arc::new(ExtensionLoopHooks::new(
+                    Arc::clone(runner),
+                    Arc::clone(&boundary_drafts),
+                )) as Arc<dyn pi_agent::ExtensionHooks>
+            });
         let handle = std::thread::spawn(move || {
+            #[cfg(feature = "ext-js")]
+            let _extension_hooks = thread_hooks.map(pi_agent::install_extension_hooks);
             let mut inner_sink = ChannelSink { tx: tx.clone() };
             let mut sink = crate::modes::retry::RetryAwareSink {
                 inner: &mut inner_sink,
@@ -7240,6 +7504,18 @@ impl InteractiveMode {
                 &run_signal,
                 stream_fn.as_ref(),
             ));
+            #[cfg(feature = "ext-js")]
+            {
+                let drafts = std::mem::take(
+                    &mut *boundary_drafts
+                        .lock()
+                        .expect("boundary drafts mutex poisoned"),
+                );
+                let messages = boundary_draft_messages(drafts);
+                if !messages.is_empty() {
+                    let _ = tx.send(LoopEvent::BoundaryDrafts(messages));
+                }
+            }
             let _ = tx.send(LoopEvent::Done);
         });
         self.agent_run = Some(AgentRun {
@@ -12979,11 +13255,13 @@ impl InteractiveMode {
         // Agent events, without blocking the input loop: collect first,
         // then handle, so the run borrow ends before the handlers run.
         let mut incoming: Vec<AgentEvent> = Vec::new();
+        let mut boundary_drafts: Vec<AgentMessage> = Vec::new();
         let mut agent_done = false;
         if let Some(run) = &mut self.agent_run {
             loop {
                 match run.events.try_recv() {
                     Ok(LoopEvent::Event(event)) => incoming.push(event),
+                    Ok(LoopEvent::BoundaryDrafts(messages)) => boundary_drafts.extend(messages),
                     Ok(LoopEvent::Done) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         agent_done = true;
                         break;
@@ -12994,6 +13272,12 @@ impl InteractiveMode {
         }
         for event in &incoming {
             self.handle_agent_event(event);
+        }
+        // `_commitBoundaryDrafts` (`agent-session.ts:1055-1074`): custom
+        // messages a `turn_end`/`agent_before_settle` handler produced join
+        // the session before the post-run machine re-runs or compacts.
+        for message in boundary_drafts {
+            let _ = self.session.append_message(message);
         }
         if agent_done {
             if let Some(run) = self.agent_run.take() {
@@ -19736,5 +20020,224 @@ export default function (pi) {
         // Restore the shared table before another fixture can observe it.
         mode.keybindings
             .set_user_bindings(pi_tui::keybindings::KeybindingsConfig::new());
+    }
+
+    /// `_emitModelSelect`'s shape (`agent-session.ts:2630-2635`): the
+    /// previous model is absent for a first selection, as RPC emits it.
+    #[test]
+    fn model_select_event_shape_matches_rpc() {
+        let model = pi_ai::types::Model {
+            id: "b".to_string(),
+            provider: "p".to_string(),
+            api: "test".to_string(),
+            ..pi_ai::types::Model::default()
+        };
+        let previous = pi_ai::types::Model {
+            id: "a".to_string(),
+            ..model.clone()
+        };
+        let set = model_select_event(&model, None, "set");
+        assert_eq!(set["type"], serde_json::json!("model_select"));
+        assert_eq!(set["model"]["id"], serde_json::json!("b"));
+        assert_eq!(set["source"], serde_json::json!("set"));
+        assert!(set.get("previousModel").is_none());
+        let cycle = model_select_event(&model, Some(&previous), "cycle");
+        assert_eq!(cycle["previousModel"]["id"], serde_json::json!("a"));
+        assert_eq!(cycle["source"], serde_json::json!("cycle"));
+    }
+
+    /// A model switch notifies extension listeners with the RPC payload,
+    /// including the source tag and the displaced model.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn apply_model_emits_model_select_to_extension_listeners() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("model_select", (event, ctx) => {
+    ctx.ui.notify("selected:" + event.model.id + ":" + event.source + ":" + event.previousModel.id);
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        mode.tui.start().expect("tui start");
+        mode.apply_model_with_source(
+            pi_ai::types::Model {
+                id: "b".to_string(),
+                name: "B".to_string(),
+                api: "test".to_string(),
+                provider: "fixtureb".to_string(),
+                ..pi_ai::types::Model::default()
+            },
+            "cycle",
+        )
+        .expect("apply");
+        let mut rendered = String::new();
+        for _ in 0..50 {
+            mode.pump();
+            mode.tui.render_now(false);
+            rendered = strip_terminal_sequences(&capture.output());
+            if rendered.contains("selected:b:cycle:test-model") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            rendered.contains("selected:b:cycle:test-model"),
+            "{rendered}"
+        );
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// `input` rewrites the submitted text and `before_agent_start` forces
+    /// the run's system prompt (`:2206-2217,1999-2055`), with the same event
+    /// fields print/JSON/RPC hand the runner.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn submit_runs_input_and_before_agent_start_handlers() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("input", (event) => ({ action: "transform", text: event.text + "!" }));
+  pi.on("before_agent_start", () => ({ systemPrompt: "FORCED PROMPT" }));
+}
+"#;
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, _capture) = fixture_with_extension(dir.path(), EXT);
+        mode.submit("hello");
+        let run = mode.agent_run.as_ref().expect("a run started");
+        let context = serde_json::to_value(&run.context.messages)
+            .expect("context messages")
+            .to_string();
+        let prompts = serde_json::to_value(&run.prompts)
+            .expect("run prompts")
+            .to_string();
+        assert!(
+            context.contains("FORCED PROMPT"),
+            "the handler's exact prompt wins: {context}"
+        );
+        assert!(
+            prompts.contains("hello!"),
+            "the rewritten text is the prompt: {prompts}"
+        );
+        assert!(
+            !prompts.contains("\"text\":\"hello\""),
+            "the original text never reaches the run: {prompts}"
+        );
+    }
+
+    /// A `handled` input consumes the submission with no run or session
+    /// append (`agent-session.ts:2111-2130`).
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn submit_honors_handled_input() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("input", () => ({ action: "handled" }));
+}
+"#;
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, _capture) = fixture_with_extension(dir.path(), EXT);
+        mode.submit("hello");
+        assert!(mode.agent_run.is_none(), "no run starts");
+        assert!(
+            mode.session.get_entries().is_empty(),
+            "nothing is persisted"
+        );
+    }
+
+    /// A registered `registerCommand` handler consumes the slash text and
+    /// its `ctx.ui.notify` output renders as a status line; no agent run
+    /// starts and a built-in command still wins the name.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn submit_dispatches_extension_commands_before_prompts() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.registerCommand("hello", {
+    description: "say hello",
+    handler: (args, ctx) => { ctx.ui.notify("ran:" + args); },
+  });
+  pi.registerCommand("model", {
+    description: "conflicts with the built-in",
+    handler: (_args, ctx) => { ctx.ui.notify("extension model ran"); },
+  });
+}
+"#;
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, capture, _bridge) = fixture_with_extension_ui(dir.path(), EXT);
+        mode.tui.start().expect("tui start");
+        mode.submit("/hello world");
+        assert!(mode.agent_run.is_none(), "the command is not a prompt");
+        let mut rendered = String::new();
+        for _ in 0..50 {
+            mode.pump();
+            mode.tui.render_now(false);
+            rendered = strip_terminal_sequences(&capture.output());
+            if rendered.contains("ran:world") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(rendered.contains("ran:world"), "{rendered}");
+        assert!(
+            mode.session.get_entries().is_empty(),
+            "the command text is not a user message"
+        );
+        mode.submit("/model");
+        assert!(
+            mode.suspended_editor.is_some(),
+            "the built-in /model selector wins the name clash"
+        );
+        assert!(!rendered.contains("extension model ran"), "{rendered}");
+        mode.shutdown().expect("shutdown");
+    }
+
+    /// The loop's `message_end` rewrite and `turn_end` boundary hooks are
+    /// installed on the worker thread (pi-agent's registry is thread-local),
+    /// and the boundary draft is committed to the UI-thread session store.
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn worker_hooks_rewrite_message_end_and_commit_boundary_drafts() {
+        const EXT: &str = r#"
+export default function (pi) {
+  pi.on("message_end", (event) => {
+    const message = JSON.parse(JSON.stringify(event.message));
+    if (message.role !== "assistant" || !Array.isArray(message.content)) return;
+    message.content = message.content.map((block) =>
+      block.type === "text" ? { ...block, text: block.text + " [rewritten]" } : block
+    );
+    return { message };
+  });
+  pi.on("turn_end", () => ({
+    entries: [{ customType: "draft", content: "draft text", timestamp: 7 }],
+  }));
+}
+"#;
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut mode, _capture) = fixture_with_extension(dir.path(), EXT);
+        mode.submit("hello");
+        for _ in 0..300 {
+            mode.pump();
+            if mode.agent_run.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(mode.agent_run.is_none(), "the run retired");
+        let entries: Vec<String> = mode
+            .session
+            .get_entries()
+            .iter()
+            .map(|entry| serde_json::Value::Object(entry.to_record().into_object()).to_string())
+            .collect();
+        let entries = entries.join("\n");
+        assert!(
+            entries.contains("[rewritten]"),
+            "message_end rewrite: {entries}"
+        );
+        assert!(
+            entries.contains("\"customType\":\"draft\""),
+            "boundary draft commit: {entries}"
+        );
     }
 }

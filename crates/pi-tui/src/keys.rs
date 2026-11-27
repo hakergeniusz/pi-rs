@@ -1191,7 +1191,10 @@ mod tests {
         assert!(matches_key("\x1b[A", "up"));
         assert!(matches_key("\x1bOD", "left"));
         assert!(matches_key("\x1b[3~", "delete"));
+        assert!(matches_key("\x1b[5~", "pageUp"));
         assert!(matches_key("\x1b[6~", "pageDown"));
+        assert!(matches_key("\x1b[5;5~", "ctrl+pageUp"));
+        assert!(matches_key("\x1b[6;5~", "ctrl+pageDown"));
         assert!(matches_key("\x1bOP", "f1"));
         assert!(!matches_key("\x1b[1;5A", "enter"));
         assert!(!matches_key("\x1b[Z", "tab"));

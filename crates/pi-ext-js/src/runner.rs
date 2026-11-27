@@ -676,6 +676,32 @@ impl ExtensionRunner {
         &self.core
     }
 
+    /// Drains the model selections queued by `pi.setModel` (`loader.ts:453-
+    /// 455`). The host applies each to the live runtime model and emits the
+    /// `model_select` extension event; the runner deliberately does not own
+    /// the runtime model.
+    pub fn take_model_selects(&self) -> Vec<Json> {
+        std::mem::take(
+            &mut self
+                .core
+                .lock()
+                .expect("host core mutex poisoned")
+                .model_select_events,
+        )
+    }
+
+    /// Drains messages queued through `ctx.sessionManager.appendMessage` so
+    /// the host can write them to the real session store.
+    pub fn take_session_messages(&self) -> Vec<Json> {
+        std::mem::take(
+            &mut self
+                .core
+                .lock()
+                .expect("host core mutex poisoned")
+                .pending_session_messages,
+        )
+    }
+
     /// Registers an error listener (`onError`); every handler error and
     /// load-time failure reaches it. Listeners must be `Send` so the runner
     /// can live behind a mutex shared with the agent loop.

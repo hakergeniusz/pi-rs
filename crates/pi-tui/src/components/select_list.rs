@@ -1,13 +1,15 @@
 //! `SelectList`: a keyboard-navigable list with a scrolling window.
 //! `packages/tui/src/components/select-list.ts`.
 //!
-//! Key ids come from pi's `tui.select.*` defaults (`keybindings.ts:147-158`)
-//! and are matched with [`crate::keys::matches_key`]. The keybindings manager
-//! itself is 4b; this component hard-codes the defaults pi ships.
+//! Key ids come from pi's `tui.select.*` defaults (`keybindings.ts:147-158`),
+//! but matching goes through [`crate::keybindings::matches`] so a user's
+//! `keybindings.json` overrides reach the list just like upstream's
+//! `kb.matches(data, "tui.select.*")`. [`select_keys`] keeps the default ids
+//! for hosts that display hints and for components that own their own table.
 
 use crate::ansi::{truncate_to_width, visible_width};
 use crate::component::Component;
-use crate::keys::matches_key;
+use crate::keybindings::{self, action};
 use crate::mouse::{MouseButton, MouseEvent, MouseEventKind, MouseEventResult};
 
 /// `tui.select.*` defaults. `keybindings.ts:147-158`.
@@ -434,7 +436,7 @@ impl SelectList {
     /// The action a key produced, for hosts that drive their own loop.
     /// `select-list.ts:151-167`.
     pub fn handle_key(&mut self, data: &str) -> SelectListAction {
-        if matches_key(data, select_keys::UP) {
+        if keybindings::matches(data, action::SELECT_UP) {
             if !self.filtered_items.is_empty() {
                 self.selected_index = if self.selected_index == 0 {
                     self.filtered_items.len() - 1
@@ -444,7 +446,7 @@ impl SelectList {
             }
             return SelectListAction::SelectionChanged;
         }
-        if matches_key(data, select_keys::DOWN) {
+        if keybindings::matches(data, action::SELECT_DOWN) {
             if !self.filtered_items.is_empty() {
                 self.selected_index = if self.selected_index == self.filtered_items.len() - 1 {
                     0
@@ -454,28 +456,30 @@ impl SelectList {
             }
             return SelectListAction::SelectionChanged;
         }
-        if matches_key(data, select_keys::PAGE_UP) || matches_key(data, select_keys::PAGE_DOWN) {
+        if keybindings::matches(data, action::SELECT_PAGE_UP)
+            || keybindings::matches(data, action::SELECT_PAGE_DOWN)
+        {
             if self.filtered_items.is_empty() {
                 return SelectListAction::None;
             }
             let step = self.max_visible.max(1);
-            let delta = if matches_key(data, select_keys::PAGE_UP) {
+            let delta = if keybindings::matches(data, action::SELECT_PAGE_UP) {
                 -(step as i64)
             } else {
                 step as i64
             };
-            // `getSelectPageIndex` (`keybindings.ts:323-338`) CLAMPS at the
-            // ends — paging past the first/last item parks the selection
+            // `getSelectPageIndex` (`keybindings.ts:323-338`) clamps at the
+            // ends: paging past the first/last item parks the selection
             // there; it does not wrap around.
             let next =
                 (self.selected_index as i64 + delta).clamp(0, self.filtered_items.len() as i64 - 1);
             self.selected_index = next as usize;
             return SelectListAction::SelectionChanged;
         }
-        if matches_key(data, select_keys::CONFIRM) {
+        if keybindings::matches(data, action::SELECT_CONFIRM) {
             return SelectListAction::Confirmed;
         }
-        if select_keys::CANCEL.iter().any(|key| matches_key(data, key)) {
+        if keybindings::matches(data, action::SELECT_CANCEL) {
             return SelectListAction::Cancelled;
         }
         SelectListAction::None
@@ -486,6 +490,7 @@ impl SelectList {
 mod tests {
     use super::*;
     use crate::ansi::strip_terminal_sequences;
+    use crate::keybindings::{DEFAULTS, KeybindingsConfig, KeybindingsManager};
 
     fn items() -> Vec<SelectItem> {
         vec![
@@ -560,7 +565,7 @@ mod tests {
         assert_eq!(list.handle_key("z"), SelectListAction::None);
     }
 
-    /// Paging past either end PARKS the selection there — `getSelectPageIndex`
+    /// Paging past either end PARKS the selection there - `getSelectPageIndex`
     /// clamps (`keybindings.ts:323-338`); it does not wrap around.
     #[test]
     fn page_keys_clamp_at_the_ends() {
@@ -628,5 +633,32 @@ mod tests {
         assert!(visible_width(&line) <= 10);
         list.set_filter("nope");
         assert_eq!(list.filtered_len(), 0);
+    }
+
+    /// Upstream resolves every `tui.select.*` action through `kb.matches`;
+    /// a `keybindings.json` override must replace the hard-coded default.
+    #[test]
+    fn user_keybindings_override_the_list_keys() {
+        let mut config = KeybindingsConfig::new();
+        config.insert(action::SELECT_DOWN, vec!["ctrl+n".to_string()]);
+        config.insert(action::SELECT_CANCEL, vec!["ctrl+x".to_string()]);
+        let mut manager = KeybindingsManager::new(DEFAULTS);
+        manager.set_user_bindings(config);
+        let _guard = manager.install_on_current_thread();
+
+        let mut list = list(5);
+        assert_eq!(
+            list.handle_key("\x1b[B"),
+            SelectListAction::None,
+            "the default down arrow is no longer bound"
+        );
+        assert_eq!(
+            list.handle_key("\x0e"),
+            SelectListAction::SelectionChanged,
+            "ctrl+n is the new down"
+        );
+        assert_eq!(list.selected_index(), 1);
+        assert_eq!(list.handle_key("\x1b"), SelectListAction::None);
+        assert_eq!(list.handle_key("\x18"), SelectListAction::Cancelled);
     }
 }

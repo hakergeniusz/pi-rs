@@ -199,7 +199,8 @@ Still open (genuine mechanism tails or deliberate scope decisions):
 2. True Node `worker_threads`/Cloudflare/wasm transports are typed stubs; the
    wasm `Stats`/`HMAC`/URL shims are unported and codemode tools stay
    synchronous. `blockImages` is still snapshotted once at startup in print/JSON
-   (interactive/RPC re-read per call); clipboard-image paste needs a host hook.
+   (interactive/RPC re-read per call); clipboard-image paste is wired in
+   interactive mode via `wl-paste`/`xclip`/Termux.
    Telemetry's real transports are installed at startup via
    `install_from_env_with_settings` (`bac3519`), still gated so no socket opens
    by default. MCP stderr uses a temp-file
@@ -216,10 +217,14 @@ Still open (genuine mechanism tails or deliberate scope decisions):
    markdown syntax highlighting + LaTeX subset + OSC8 links, live terminal
    colour query for the easter egg, classifier (`models.classify`) and
    `generateImages` wire APIs, and MCP log/progress/cancellation/needs-auth
-   forwarding. Interactive-mode call sites for the four agent-loop events
-   remain unwired; `pi setModel` host emission is still JS-bus-only.
+   forwarding. The 2026-11-27 parity wave then wired the four agent-loop
+   events inside interactive mode's worker thread, extension `/command` dispatch,
+   a real `setModel` host op, `mcp.json` connections, `setTimeout`,
+   `ctx.sessionManager` ops, and real classify/image wire calls. Remaining
+   caveats: model changes apply at RPC boundaries, `appendMessage` returns a
+   placeholder id until the next host sync, and there is no `setInterval`.
 3. Out of scope: `chord`, `pi-durable`, `evals`, `apps/p2`. `/share` and `/bug`
-   stay omitted (Radius upload policy). All five release targets publish from
-   the tag workflow.
+   stay omitted (Radius upload policy). Release targets publish from the tag
+   workflow; see [`docs/PLATFORM-BUILDS.md`](docs/PLATFORM-BUILDS.md).
    No full 1:1 parity is claimed — remaining differences are mechanism-level
    and documented in module docs and [`docs/GAP-STATUS.md`](docs/GAP-STATUS.md).

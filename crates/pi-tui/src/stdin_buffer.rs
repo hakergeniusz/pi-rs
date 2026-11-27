@@ -457,6 +457,15 @@ mod tests {
         );
     }
 
+    /// Pasting is a transport concern here: the editor applies upstream's
+    /// `charCodeAt(0) >= 32` filter, so DEL/C1 must survive the buffer.
+    #[test]
+    fn paste_content_is_delivered_verbatim_including_del_and_c1() {
+        let mut buffer = StdinBuffer::default_in();
+        let events = feed(&mut buffer, &["\x1b[200~a\u{7f}\u{80}\x1b[201~"]);
+        assert_eq!(events, vec![StdinEvent::Paste("a\u{7f}\u{80}".to_string())]);
+    }
+
     #[test]
     fn input_after_the_paste_terminator_is_processed() {
         let mut buffer = StdinBuffer::default_in();

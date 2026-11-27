@@ -367,19 +367,23 @@ pub trait RpcHost: Send {
     fn check_auth(&self, runtime: &PrintRuntime, provider: &str) -> Result<RpcAuthCheck, String>;
 
     /// `_tryExecuteExtensionCommand` (`:2268-2292`): the leading `/name` and
-    /// its args. The default only checks the command table (so a known
-    /// extension command stays `"handled"`); a full host executes the handler
-    /// here and lets it drive the session before answering.
+    /// its args. The default runs a registered handler through the extension
+    /// runner, so its session mutations and errors reach the host exactly as
+    /// upstream's `executeCommand` does; it still reports `"handled"` when no
+    /// runner is bound but the name is in the command table.
     fn execute_extension_command(
         &self,
         runtime: &mut PrintRuntime,
         name: &str,
-        _args: &str,
+        args: &str,
     ) -> Result<RpcExtensionCommandOutcome, String> {
         let registered = self.get_commands(runtime)?.into_iter().any(|command| {
             command.get("name").and_then(Value::as_str) == Some(name)
                 && command.get("source").and_then(Value::as_str) == Some("extension")
         });
+        if registered && run_extension_command(runtime, name, args)? {
+            return Ok(RpcExtensionCommandOutcome::Handled);
+        }
         Ok(if registered {
             RpcExtensionCommandOutcome::Handled
         } else {
@@ -809,6 +813,120 @@ fn extension_user_bash(
 ) -> Option<Result<crate::extensions::UserBashOutcome, String>> {
     let _ = (runtime, command, exclude, cwd);
     None
+}
+
+/// Runs a registered extension command handler (`runner.run_command`,
+/// `runner.ts:1050-1062`) and reports whether a handler actually ran. This is
+/// the default `execute_extension_command` arm: upstream returns `true` both
+/// after a handler completes and after it throws (its error goes to the
+/// extension error channel), never merely because the name was in the table.
+#[cfg(feature = "ext-js")]
+fn run_extension_command(runtime: &PrintRuntime, name: &str, args: &str) -> Result<bool, String> {
+    let Some(runner) = runtime.extension_runner.as_ref() else {
+        return Ok(false);
+    };
+    runner
+        .lock()
+        .expect("extension runner mutex poisoned")
+        .run_command(name, args)
+        .map_err(|error| error.to_string())
+}
+
+/// Headless twin: no runner, no handler.
+#[cfg(not(feature = "ext-js"))]
+#[allow(clippy::unnecessary_wraps)] // mirrors the ext-js twin's signature
+fn run_extension_command(runtime: &PrintRuntime, name: &str, args: &str) -> Result<bool, String> {
+    let _ = (runtime, name, args);
+    Ok(false)
+}
+
+/// Applies the `pi.setModel` selections the engine queued during the last
+/// dispatch: mutate the live runtime model, append the transcript record,
+/// and emit `model_select` through the host (`agent-session.ts:2644-2663`).
+/// A selection for a model the catalog cannot resolve falls back to the
+/// current model with the requested provider/id/api, so a custom virtual
+/// model is still selectable by an extension.
+#[cfg(feature = "ext-js")]
+fn apply_extension_model_selects(
+    runtime: &mut PrintRuntime,
+    bridge: &RpcBridge,
+) -> Result<(), String> {
+    let Some(runner) = runtime.extension_runner.as_ref() else {
+        return Ok(());
+    };
+    let events = runner
+        .lock()
+        .expect("extension runner mutex poisoned")
+        .take_model_selects();
+    for event in events {
+        let Some(requested) = event.get("model") else {
+            continue;
+        };
+        let provider = requested
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let id = requested
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let model = crate::models_state::lookup(&provider, &id)
+            .or_else(|| serde_json::from_value(requested.clone()).ok())
+            .unwrap_or_else(|| {
+                let mut model = runtime.model.clone();
+                model.provider = provider;
+                model.id = id;
+                if let Some(api) = requested.get("api").and_then(serde_json::Value::as_str) {
+                    model.api = api.to_string();
+                }
+                model
+            });
+        if models_are_equal(&runtime.model, &model) {
+            continue;
+        }
+        let previous = std::mem::replace(&mut runtime.model, model.clone());
+        let _ = runtime
+            .session
+            .append_model_change(&model.provider, &model.id);
+        let wire = model_select_event(
+            &serde_json::to_value(&model).unwrap_or_default(),
+            Some(&serde_json::to_value(&previous).unwrap_or_default()),
+            "set",
+        );
+        bridge.host.emit_model_select(runtime, &wire)?;
+    }
+    Ok(())
+}
+
+/// Headless twin: no queued selections.
+#[cfg(not(feature = "ext-js"))]
+#[allow(clippy::unnecessary_wraps)] // mirrors the ext-js twin's signature
+fn apply_extension_model_selects(
+    runtime: &mut PrintRuntime,
+    bridge: &RpcBridge,
+) -> Result<(), String> {
+    let _ = (runtime, bridge);
+    Ok(())
+}
+
+/// Refreshes the extension session snapshot before command dispatch (and
+/// writes back queued `appendMessage` calls). Headless builds have nothing
+/// to sync.
+#[cfg(feature = "ext-js")]
+fn sync_session_for_extensions(runtime: &mut PrintRuntime) -> Result<(), String> {
+    crate::extensions::sync_extension_session(
+        runtime.extension_runner.as_ref(),
+        &mut runtime.session,
+    )
+}
+
+#[cfg(not(feature = "ext-js"))]
+#[allow(clippy::unnecessary_wraps)] // mirrors the ext-js twin's signature
+fn sync_session_for_extensions(runtime: &mut PrintRuntime) -> Result<(), String> {
+    let _ = runtime;
+    Ok(())
 }
 
 /// The local `bash -c` operation (`createLocalBashOperations`,
@@ -2293,6 +2411,11 @@ fn handle_command(
     block_flag: &Arc<AtomicBool>,
     abort_state: &RpcAbortState,
 ) -> Result<CommandOutcome, String> {
+    // Refresh extension state before every command: session reads see the
+    // current transcript, and a `pi.setModel` from an earlier handler is
+    // applied to the live runtime before the next command's auth/model gates.
+    sync_session_for_extensions(runtime)?;
+    apply_extension_model_selects(runtime, bridge)?;
     let out = Arc::clone(&bridge.out);
     match command {
         RpcCommand::Prompt {
@@ -2309,6 +2432,9 @@ fn handle_command(
                 );
             };
             let preflight = prompt_preflight(runtime, bridge.host.as_ref(), &message, &images)?;
+            // A command/input handler may have called `pi.setModel`; fold its
+            // selection in before the model/auth gate and the run.
+            apply_extension_model_selects(runtime, bridge)?;
             write_line(
                 &out,
                 &RpcResponse::success(
@@ -2350,6 +2476,9 @@ fn handle_command(
             {
                 // Swallowed, like the TS.
             }
+            // A tool/message handler in the run may have selected a model;
+            // apply it before the next command's gates.
+            apply_extension_model_selects(runtime, bridge)?;
             Ok(CommandOutcome::Replied)
         }
         RpcCommand::Steer { message, images } => {
@@ -5093,6 +5222,41 @@ mod tests {
         assert!(models_are_equal(&a, &b));
         a.id = "n".to_string();
         assert!(!models_are_equal(&a, &b));
+    }
+
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn extension_command_runs_and_pi_set_model_queues_a_host_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut runtime = test_runtime(dir.path(), Arc::new(NeverStream));
+        let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
+            cwd: dir.path().to_string_lossy().into_owned(),
+            mode: "rpc".to_string(),
+            settings: json!({}),
+            ..Default::default()
+        })
+        .expect("runner");
+        runner
+            .load_extension(
+                "<set-model-command>",
+                Some(
+                    r#"export default function (pi) {
+  pi.registerCommand("switch", { handler: async () => {
+    await pi.setModel({ provider: "acme", id: "tiny", api: "anthropic-messages" });
+  } });
+}"#,
+                ),
+            )
+            .expect("load");
+        runner.bind().expect("bind");
+        let runner = Arc::new(Mutex::new(runner));
+        runtime.extension_runner = Some(Arc::clone(&runner));
+
+        assert!(run_extension_command(&runtime, "switch", "").expect("run"));
+        // The engine queued one host event (and none were applied yet).
+        let selections = runner.lock().expect("runner").take_model_selects();
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0]["model"]["id"], "tiny");
     }
 
     #[test]

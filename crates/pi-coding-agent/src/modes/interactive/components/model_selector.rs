@@ -1,11 +1,12 @@
-//! `ModelSelectorComponent` — the `/model` search dialog.
+//! `ModelSelectorComponent` - the `/model` search dialog.
 //!
-//! Ground truth: `modes/interactive/components/model-selector.ts`. Deviations
-//! for this phase: the model catalog is embedded and static, so there is no
-//! background catalog refresh or refresh status; scoped models
-//! (`/scoped-models`) and the save-as-default binding land with the settings
-//! work, so the scope toggle, default badge, and `app.models.save` binding
-//! are absent and the hint line shows the unscoped notice.
+//! Ground truth: `modes/interactive/components/model-selector.ts`. The model
+//! catalog is embedded and static, so there is no background catalog refresh
+//! or refresh status and no `app.models.save` binding. The scope toggle and
+//! default badge are implemented behind [`ModelSelectorComponent::with_scoped_models`]
+//! and [`ModelSelectorComponent::with_default_model`]: the owning interactive
+//! mode supplies the session's scoped models and configured default, so a
+//! selector built without them keeps the unscoped notice.
 
 use std::sync::{Arc, Mutex};
 
@@ -20,12 +21,26 @@ use crate::modes::interactive::theme;
 /// The window of models shown at once (`MAX_VISIBLE`, `model-selector.ts:38`).
 const MAX_VISIBLE: usize = 10;
 
+/// `ModelScope` (`model-selector.ts:32`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelScope {
+    All,
+    Scoped,
+}
+
+fn scope_label(scope: ModelScope) -> &'static str {
+    match scope {
+        ModelScope::All => "all",
+        ModelScope::Scoped => "scoped",
+    }
+}
+
 /// Events the selector publishes to the orchestrator.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelSelectorEvent {
-    /// `onSelect` — the highlighted model was confirmed.
+    /// `onSelect` - the highlighted model was confirmed.
     Selected(pi_ai::types::Model),
-    /// `onCancel` — escape/ctrl+c.
+    /// `onCancel` - escape/ctrl+c.
     Cancelled,
 }
 
@@ -94,10 +109,15 @@ fn get_model_selector_search_text(id: &str, provider: &str, name: &str) -> Strin
 pub struct ModelSelectorComponent {
     search_input: Input,
     all_models: Vec<pi_ai::types::Model>,
+    /// The session's scoped models (`scopedModels`), supplied by the host.
+    scoped_models: Vec<pi_ai::types::Model>,
     filtered: Vec<pi_ai::types::Model>,
     selected_index: usize,
     current_provider: String,
     current_id: String,
+    /// The configured default (`defaultModel`), supplied by the host.
+    default_model: Option<(String, String)>,
+    scope: ModelScope,
     /// The rendered list rows, rebuilt by `update_list`.
     list_lines: Vec<String>,
     events: Arc<Mutex<Vec<ModelSelectorEvent>>>,
@@ -115,15 +135,22 @@ impl ModelSelectorComponent {
         let mut selector = ModelSelectorComponent {
             search_input: Input::new(InputOptions::default()),
             all_models: Vec::new(),
+            scoped_models: Vec::new(),
             filtered: Vec::new(),
             selected_index: 0,
             current_provider: current.provider.clone(),
             current_id: current.id.clone(),
+            default_model: None,
+            scope: ModelScope::All,
             list_lines: Vec::new(),
             events,
         };
-        selector.all_models =
-            sort_models(available, &selector.current_provider, &selector.current_id);
+        selector.all_models = sort_models(
+            available,
+            &selector.current_provider,
+            &selector.current_id,
+            None,
+        );
         // The current model starts selected (`model-selector.ts:183-185`).
         selector.selected_index = selector
             .all_models
@@ -138,6 +165,107 @@ impl ModelSelectorComponent {
         selector
     }
 
+    /// Supply the session's scoped models. With any present, the selector
+    /// starts in the scoped scope like upstream (`model-selector.ts:71`).
+    #[must_use]
+    pub fn with_scoped_models(mut self, models: Vec<pi_ai::types::Model>) -> Self {
+        self.scoped_models = models;
+        self.scope = if self.scoped_models.is_empty() {
+            ModelScope::All
+        } else {
+            ModelScope::Scoped
+        };
+        self.reselect_and_filter();
+        self
+    }
+
+    /// Supply the configured default model (`defaultModel`).
+    #[must_use]
+    pub fn with_default_model(mut self, default: Option<(String, String)>) -> Self {
+        self.default_model = default;
+        self.all_models = sort_models(
+            std::mem::take(&mut self.all_models),
+            &self.current_provider,
+            &self.current_id,
+            self.default_model.as_ref(),
+        );
+        self.reselect_and_filter();
+        self
+    }
+
+    /// The active scope, exposed for hosts and tests.
+    pub fn scope(&self) -> ModelScope {
+        self.scope
+    }
+
+    fn reselect_and_filter(&mut self) {
+        let active = self.active_models();
+        self.selected_index = active
+            .iter()
+            .position(|model| {
+                model.provider == self.current_provider && model.id == self.current_id
+            })
+            .unwrap_or(0);
+        let query = self.search_input.value().to_string();
+        self.filter_models(&query, None);
+    }
+
+    fn active_models(&self) -> &[pi_ai::types::Model] {
+        match self.scope {
+            ModelScope::All => &self.all_models,
+            ModelScope::Scoped => &self.scoped_models,
+        }
+    }
+
+    fn is_default_model(&self, model: &pi_ai::types::Model) -> bool {
+        self.default_model
+            .as_ref()
+            .is_some_and(|(provider, id)| *provider == model.provider && *id == model.id)
+    }
+
+    fn is_default_search(query: &str) -> bool {
+        let normalized = query.trim().to_lowercase();
+        !normalized.is_empty() && "default".starts_with(&normalized)
+    }
+
+    fn set_scope(&mut self, scope: ModelScope) {
+        if self.scope == scope {
+            return;
+        }
+        self.scope = scope;
+        self.reselect_and_filter();
+    }
+
+    /// The two scope rows (`getScopeText`/`getScopeHintText`,
+    /// `model-selector.ts:190-205`).
+    fn scope_lines(&self) -> Vec<String> {
+        let theme = theme::theme();
+        let active = |scope| {
+            if self.scope == scope {
+                theme.fg(ThemeColor::Accent, scope_label(scope))
+            } else {
+                theme.fg(ThemeColor::Muted, scope_label(scope))
+            }
+        };
+        let key = keybindings::keys_for(action::INPUT_TAB)
+            .first()
+            .copied()
+            .unwrap_or("tab");
+        vec![
+            format!(
+                "{}{}{}",
+                theme.fg(ThemeColor::Muted, "Scope: "),
+                active(ModelScope::All),
+                format!(
+                    "{}{}",
+                    theme.fg(ThemeColor::Muted, " | "),
+                    active(ModelScope::Scoped)
+                ),
+            ),
+            theme.fg(ThemeColor::Muted, &format!("  {key} scope (all/scoped)")),
+        ]
+    }
+
     /// Take the queued events (the orchestrator drains after each pump).
     pub fn take_events(&mut self) -> Vec<ModelSelectorEvent> {
         std::mem::take(self.events.lock().expect("selector events").as_mut())
@@ -146,13 +274,40 @@ impl ModelSelectorComponent {
     /// `filterModels` (`model-selector.ts:285-313`) without the refresh
     /// preference (the catalog never refreshes here).
     fn filter_models(&mut self, query: &str, preferred: Option<&pi_ai::types::Model>) {
-        self.filtered = if query.is_empty() {
-            self.all_models.clone()
+        let active = self.active_models();
+        let filtered = if query.is_empty() {
+            active.to_vec()
         } else {
-            pi_tui::fuzzy::fuzzy_filter(&self.all_models, query, |model| {
-                get_model_selector_search_text(&model.id, &model.provider, &model.name)
-            })
+            let mut filtered = pi_tui::fuzzy::fuzzy_filter(active, query, |model| {
+                let default_text = if self.is_default_model(model) {
+                    " default"
+                } else {
+                    ""
+                };
+                format!(
+                    "{}{}",
+                    get_model_selector_search_text(&model.id, &model.provider, &model.name),
+                    default_text
+                )
+            });
+            // `model-selector.ts:298-303`: a short "default" query puts the
+            // configured default first, ahead of fuzzy rank.
+            if Self::is_default_search(query) {
+                let defaults: Vec<pi_ai::types::Model> = active
+                    .iter()
+                    .filter(|model| self.is_default_model(model))
+                    .cloned()
+                    .collect();
+                filtered.retain(|model| {
+                    !defaults
+                        .iter()
+                        .any(|item| item.provider == model.provider && item.id == model.id)
+                });
+                filtered.splice(0..0, defaults);
+            }
+            filtered
         };
+        self.filtered = filtered;
         // Keep the preferred model selected if it is still listed; otherwise
         // a query moves the selector to the top row, and clearing the query
         // keeps the position clamped (`model-selector.ts:304-311`).
@@ -207,8 +362,13 @@ impl ModelSelectorComponent {
                 None => String::new(),
             };
             let provider_badge = theme.fg(ThemeColor::Muted, &format!("[{}]", item.provider));
+            let default_badge = if self.is_default_model(item) {
+                theme.fg(ThemeColor::Muted, " · default")
+            } else {
+                String::new()
+            };
             self.list_lines.push(format!(
-                "{cursor}{current_marker}{model_text}{name_text} {provider_badge}"
+                "{cursor}{current_marker}{model_text}{name_text} {provider_badge}{default_badge}"
             ));
         }
 
@@ -240,18 +400,23 @@ impl ModelSelectorComponent {
     }
 }
 
-/// `sortModels` (`model-selector.ts:237-252`): current model first, then by
-/// provider. (The default-model slot lands with settings persistence.)
+/// `sortModels` (`model-selector.ts:237-252`): current first, default second,
+/// then by provider.
 fn sort_models(
     mut models: Vec<pi_ai::types::Model>,
     current_provider: &str,
     current_id: &str,
+    default: Option<&(String, String)>,
 ) -> Vec<pi_ai::types::Model> {
+    let is_default = |model: &pi_ai::types::Model| {
+        default.is_some_and(|(provider, id)| *provider == model.provider && *id == model.id)
+    };
     models.sort_by(|a, b| {
         let a_is_current = a.provider == current_provider && a.id == current_id;
         let b_is_current = b.provider == current_provider && b.id == current_id;
         b_is_current
             .cmp(&a_is_current)
+            .then_with(|| is_default(b).cmp(&is_default(a)))
             .then_with(|| a.provider.cmp(&b.provider))
     });
     models
@@ -263,10 +428,14 @@ impl Component for ModelSelectorComponent {
         let border = theme.fg_styler(ThemeColor::BorderMuted);
         let mut lines = vec![border(&"─".repeat(width.max(1)))];
         lines.push(String::new());
-        lines.push(theme.fg(
-            ThemeColor::Warning,
-            "Only showing models from configured providers. Use /login to add providers.",
-        ));
+        if self.scoped_models.is_empty() {
+            lines.push(theme.fg(
+                ThemeColor::Warning,
+                "Only showing models from configured providers. Use /login to add providers.",
+            ));
+        } else {
+            lines.extend(self.scope_lines());
+        }
         lines.push(String::new());
         lines.extend(self.search_input.render(width));
         lines.push(String::new());
@@ -281,6 +450,13 @@ impl Component for ModelSelectorComponent {
         // Tab toggles all/scoped; with no scoped models it is consumed unused
         // (`model-selector.ts:376-385`).
         if keybindings::matches(data, action::INPUT_TAB) {
+            if !self.scoped_models.is_empty() {
+                let next = match self.scope {
+                    ModelScope::All => ModelScope::Scoped,
+                    ModelScope::Scoped => ModelScope::All,
+                };
+                self.set_scope(next);
+            }
             return Some(ComponentMutation { consume: true });
         }
         if keybindings::matches(data, action::SELECT_UP) {
@@ -373,9 +549,25 @@ mod tests {
             model("anthropic", "a2", ""),
         ];
         let current = model("anthropic", "a2", "");
-        let sorted = sort_models(models, &current.provider, &current.id);
+        let sorted = sort_models(models, &current.provider, &current.id, None);
         assert_eq!(sorted[0].id, "a2");
         assert_eq!(sorted[1].provider, "anthropic");
+        assert_eq!(sorted[2].provider, "zebra");
+    }
+
+    /// `model-selector.ts:236-252`: the default sorts right after the current.
+    #[test]
+    fn sort_puts_default_after_current() {
+        let models = vec![
+            model("zebra", "z1", ""),
+            model("openai", "gpt-5", ""),
+            model("anthropic", "a2", ""),
+        ];
+        let current = model("anthropic", "a2", "");
+        let default = ("openai".to_string(), "gpt-5".to_string());
+        let sorted = sort_models(models, &current.provider, &current.id, Some(&default));
+        assert_eq!(sorted[0].id, "a2");
+        assert_eq!(sorted[1].id, "gpt-5");
         assert_eq!(sorted[2].provider, "zebra");
     }
 
@@ -465,5 +657,70 @@ mod tests {
             Some("M3".to_string())
         );
         assert_eq!(get_distinct_model_name("m3", "M3"), None);
+    }
+
+    /// `model-selector.ts:376-385,190-205`: Tab flips the scope row when the
+    /// host supplied scoped models, and the list follows the active scope.
+    #[test]
+    fn tab_toggles_the_all_scoped_scope() {
+        let current = model("a", "one", "");
+        let (component, events) =
+            selector(vec![model("a", "one", ""), model("b", "two", "")], &current);
+        let mut component = component.with_scoped_models(vec![model("b", "two", "")]);
+        let _events = events;
+        assert_eq!(component.scope(), ModelScope::Scoped);
+        let text = plain(&component);
+        assert!(text.contains("Scope:"), "{text}");
+        assert!(text.contains("two"), "{text}");
+        assert!(!text.contains("Only showing models"), "{text}");
+
+        component.handle_input("\t");
+        assert_eq!(component.scope(), ModelScope::All);
+        let text = plain(&component);
+        assert!(text.contains("one"), "{text}");
+        assert!(text.contains("two"), "{text}");
+
+        component.handle_input("\t");
+        assert_eq!(component.scope(), ModelScope::Scoped);
+    }
+
+    #[test]
+    fn tab_is_consumed_without_scoped_models() {
+        let current = model("a", "one", "");
+        let (mut component, _events) = selector(vec![model("a", "one", "")], &current);
+        assert_eq!(component.scope(), ModelScope::All);
+        component.handle_input("\t");
+        assert_eq!(component.scope(), ModelScope::All);
+        assert_eq!(component.search_input.value(), "");
+    }
+
+    /// `model-selector.ts:315-371,285-313`: default badge and search boost.
+    #[test]
+    fn default_model_badge_and_search_ranking() {
+        let current = model("anthropic", "claude-a", "");
+        let models = vec![
+            model("zebra", "z1", ""),
+            model("openai", "gpt-5", "GPT-5"),
+            model("anthropic", "claude-a", ""),
+        ];
+        let (component, _events) = selector(models.clone(), &current);
+        let component = component.with_default_model(Some(("openai".into(), "gpt-5".into())));
+        let text = plain(&component);
+        assert!(text.contains("· default"), "{text}");
+        let rows: Vec<&str> = text.lines().filter(|line| line.contains('[')).collect();
+        assert!(rows[0].contains("claude-a"), "{rows:?}");
+        assert!(rows[1].contains("gpt-5"), "{rows:?}");
+
+        let (component, _events) = selector(models, &current);
+        let mut component = component.with_default_model(Some(("openai".into(), "gpt-5".into())));
+        for ch in "def".chars() {
+            component.handle_input(&ch.to_string());
+        }
+        let text = plain(&component);
+        let first = text
+            .lines()
+            .find(|line| line.contains('['))
+            .expect("a model row");
+        assert!(first.contains("gpt-5"), "{text}");
     }
 }

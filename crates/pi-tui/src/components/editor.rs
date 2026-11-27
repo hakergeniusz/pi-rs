@@ -161,37 +161,47 @@ fn parse_marker(segment: &str) -> Option<u64> {
 }
 
 /// Merge whole paste markers into single segments. `editor.ts:48-103`.
-/// Segment positions are char indices.
+/// Segment positions are char indices (the port's cursor unit); upstream uses
+/// UTF-16 code-unit offsets.
 fn segment_with_markers(text: &str, valid_ids: &BTreeMap<u64, String>) -> Vec<(usize, String)> {
     let base = char_segments(text);
     if valid_ids.is_empty() || !text.contains("[paste #") {
         return base;
     }
-    // Byte offset of each char index, so markers can be sliced out of `text`.
+    // Grapheme ordinals index these two tables: byte offsets slice `text`,
+    // char offsets are what callers use for cursor and chunk arithmetic.
     let mut byte_of: Vec<usize> = Vec::with_capacity(base.len() + 1);
+    let mut char_of: Vec<usize> = Vec::with_capacity(base.len() + 1);
     let mut byte = 0usize;
+    let mut char_index = 0usize;
     for (_, grapheme) in &base {
         byte_of.push(byte);
+        char_of.push(char_index);
         byte += grapheme.len();
+        char_index += grapheme.chars().count();
     }
     byte_of.push(byte);
+    char_of.push(char_index);
 
     let mut result: Vec<(usize, String)> = Vec::new();
-    let mut char_cursor = 0usize;
-    while char_cursor < base.len() {
-        let byte_start = byte_of[char_cursor];
+    let mut segment_cursor = 0usize;
+    while segment_cursor < base.len() {
+        let byte_start = byte_of[segment_cursor];
         if marker_at(text, byte_start, valid_ids).is_some() {
             let byte_end = marker_end(text, byte_start);
-            let mut char_end = char_cursor;
-            while char_end < base.len() && byte_of[char_end] < byte_end {
-                char_end += 1;
+            let mut segment_end = segment_cursor;
+            while segment_end < base.len() && byte_of[segment_end] < byte_end {
+                segment_end += 1;
             }
-            result.push((char_cursor, text[byte_start..byte_end].to_string()));
-            char_cursor = char_end;
+            result.push((
+                char_of[segment_cursor],
+                text[byte_start..byte_end].to_string(),
+            ));
+            segment_cursor = segment_end;
             continue;
         }
-        result.push(base[char_cursor].clone());
-        char_cursor += 1;
+        result.push(base[segment_cursor].clone());
+        segment_cursor += 1;
     }
     result
 }
@@ -290,7 +300,7 @@ pub fn word_wrap_line(
         if g_width > max_width {
             // An atomic segment wider than the width: re-wrap it visually.
             // pi pushes every sub-chunk *except the last*, then carries the
-            // last one as the chunk in progress — pushing all of them emits
+            // last one as the chunk in progress - pushing all of them emits
             // the tail twice, once here and once in the following chunk.
             // `editor.ts:177-184`.
             let sub_chunks = word_wrap_line(grapheme, max_width, &char_segments(grapheme));
@@ -336,10 +346,18 @@ pub fn word_wrap_line(
 }
 
 /// One segment per grapheme, positioned by char index.
+///
+/// A grapheme may be several chars (`e\u{301}` is one grapheme, two chars),
+/// so the position is accumulated from `chars().count()` rather than taken
+/// from the grapheme's ordinal. `segment_with_markers`/`word_wrap_line`
+/// slice the line by these positions and would otherwise split a combining
+/// sequence in half.
 fn char_segments(text: &str) -> Vec<(usize, String)> {
     let mut result = Vec::new();
-    for (index, grapheme) in text.graphemes(true).enumerate() {
+    let mut index = 0usize;
+    for grapheme in text.graphemes(true) {
         result.push((index, grapheme.to_string()));
+        index += grapheme.chars().count();
     }
     result
 }
@@ -1693,19 +1711,22 @@ impl Editor {
         self.push_undo_snapshot();
         let decoded = decode_csi_u_control(pasted);
         let clean = Self::normalize_text(&decoded);
+        // `charCodeAt(0) >= 32` keeps DEL (0x7f) and the C1 range (0x80-0x9f):
+        // upstream filters only C0 controls. Newlines are kept explicitly.
         let filtered: String = clean
             .chars()
-            .filter(|c| *c == '\n' || *c != '\u{7f}' && !c.is_control())
+            .filter(|c| *c == '\n' || (*c as u32) >= 32)
             .collect();
         let mut filtered = filtered;
-        // A path-like paste after a word character gets a leading space.
+        // A path-like paste after a JS `\w` character gets a leading space.
+        // `\w` is ASCII-only: a preceding Unicode letter does not count.
         if filtered.starts_with(['/', '~', '.']) {
             let line = self.line(self.state.cursor_line).to_string();
             let before = char_slice(&line, 0, self.state.cursor_col)
                 .unwrap_or("")
                 .to_string();
             if let Some(last) = before.chars().last()
-                && (last.is_alphanumeric() || last == '_')
+                && (last.is_ascii_alphanumeric() || last == '_')
             {
                 filtered.insert(0, ' ');
             }
@@ -1807,17 +1828,17 @@ impl Editor {
     }
 
     fn try_trigger_autocomplete(&mut self) {
-        self.request_autocomplete(false);
+        self.request_autocomplete(false, false);
     }
 
     fn update_autocomplete(&mut self) {
         let force = self.autocomplete_state == Some(AutocompleteState::Force);
-        self.request_autocomplete(force);
+        self.request_autocomplete(force, false);
     }
 
     /// pi's `requestAutocomplete` (`editor.ts:2297-2316`), minus the debounce
     /// and the abort token: the provider is synchronous here.
-    fn request_autocomplete(&mut self, force: bool) {
+    fn request_autocomplete(&mut self, force: bool, explicit_tab: bool) {
         let Some(provider) = self.provider.clone() else {
             return;
         };
@@ -1838,6 +1859,12 @@ impl Editor {
         );
         match suggestions {
             Some(suggestions) if !suggestions.items.is_empty() => {
+                // `editor.ts:2403`: an explicit Tab on a forced file request
+                // with exactly one hit applies it instead of opening a picker.
+                if force && explicit_tab && suggestions.items.len() == 1 {
+                    self.apply_completion(&suggestions.items[0], &suggestions.prefix);
+                    return;
+                }
                 let layout = if suggestions.prefix.starts_with('/') {
                     crate::components::select_list::SelectListLayout {
                         min_primary_column_width: Some(12),
@@ -1885,13 +1912,25 @@ impl Editor {
     }
 
     fn apply_autocomplete_selection(&mut self) {
+        let Some(selected) = self
+            .autocomplete_list
+            .as_ref()
+            .and_then(|list| list.selected_item().cloned())
+        else {
+            return;
+        };
+        let prefix = self.autocomplete_prefix.clone();
+        self.apply_completion(&selected, &prefix);
+    }
+
+    /// The shared apply path for a picker selection and upstream's
+    /// single-suggestion Tab shortcut (`editor.ts:2403-2420`).
+    fn apply_completion(
+        &mut self,
+        item: &crate::components::select_list::SelectItem,
+        prefix: &str,
+    ) {
         let Some(provider) = self.provider.clone() else {
-            return;
-        };
-        let Some(list) = &self.autocomplete_list else {
-            return;
-        };
-        let Some(selected) = list.selected_item().cloned() else {
             return;
         };
         self.push_undo_snapshot();
@@ -1900,8 +1939,8 @@ impl Editor {
             &self.state.lines,
             self.state.cursor_line,
             self.state.cursor_col,
-            &selected,
-            &self.autocomplete_prefix,
+            item,
+            prefix,
         );
         self.state.lines = lines;
         self.state.cursor_line = cursor_line;
@@ -2116,7 +2155,11 @@ impl Editor {
                 self.cancel_autocomplete();
                 return;
             }
-            if matches(data, action::SELECT_UP) || matches(data, action::SELECT_DOWN) {
+            if matches(data, action::SELECT_UP)
+                || matches(data, action::SELECT_DOWN)
+                || matches(data, action::SELECT_PAGE_UP)
+                || matches(data, action::SELECT_PAGE_DOWN)
+            {
                 if let Some(list) = &mut self.autocomplete_list {
                     list.handle_input(data);
                 }
@@ -2385,9 +2428,9 @@ impl Editor {
         }
         let before = self.before_cursor();
         if self.is_in_slash_command_context(&before) && !before.trim_start().contains(' ') {
-            self.request_autocomplete(false);
+            self.request_autocomplete(false, true);
         } else {
-            self.request_autocomplete(true);
+            self.request_autocomplete(true, true);
         }
     }
 }
@@ -3383,5 +3426,143 @@ mod tests {
             !lines.iter().any(|line| line.contains("src/lib.rs")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn char_segments_use_char_offsets_not_grapheme_ordinals() {
+        let segments = char_segments("e\u{301}abc");
+        assert_eq!(
+            segments
+                .iter()
+                .map(|(index, grapheme)| (*index, grapheme.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "e\u{301}"), (2, "a"), (3, "b"), (4, "c")]
+        );
+    }
+
+    /// A multi-char grapheme must stay whole when wrapping slices by index.
+    #[test]
+    fn wrapping_does_not_split_a_combining_sequence() {
+        let text = "e\u{301}abc";
+        let segments = char_segments(text);
+        let chunks = word_wrap_line(text, 1, &segments);
+        assert_eq!(chunks[0].text, "e\u{301}");
+        assert_eq!(chunks[0].end_index, 2);
+        let reconstructed: String = chunks
+            .iter()
+            .map(|chunk| {
+                char_slice(text, chunk.start_index, chunk.end_index).expect("char indices in range")
+            })
+            .collect();
+        assert_eq!(reconstructed, text);
+    }
+
+    #[test]
+    fn paste_markers_keep_char_offsets_after_a_multi_char_grapheme() {
+        let ids = BTreeMap::from([(1, String::new())]);
+        let text = "e\u{301}[paste #1 3 chars]";
+        let segments = segment_with_markers(text, &ids);
+        assert_eq!(segments[0].0, 0);
+        assert_eq!(segments[1].0, 2);
+        assert_eq!(segments[1].1, "[paste #1 3 chars]");
+    }
+
+    /// `editor.ts:2119-2128` and `:695-996`: an open picker owns page keys.
+    #[test]
+    fn page_keys_move_the_open_autocomplete_selection() {
+        let mut e = editor();
+        e.set_autocomplete_provider(Some(Arc::new(FileProvider)));
+        type_text(&mut e, "@");
+        assert!(e.is_showing_autocomplete());
+        assert_eq!(
+            e.autocomplete_list.as_ref().expect("list").selected_index(),
+            0
+        );
+        e.handle_input("\x1b[6~"); // pageDown
+        assert_eq!(
+            e.autocomplete_list.as_ref().expect("list").selected_index(),
+            2,
+            "pageDown parks on the last item"
+        );
+        e.handle_input("\x1b[5~"); // pageUp
+        assert_eq!(
+            e.autocomplete_list.as_ref().expect("list").selected_index(),
+            0
+        );
+        assert!(e.is_showing_autocomplete());
+    }
+
+    struct SingleFileProvider;
+
+    impl AutocompleteProvider for SingleFileProvider {
+        fn suggest(
+            &self,
+            _lines: &[String],
+            _line: usize,
+            _col: usize,
+            force: bool,
+        ) -> Option<Suggestions> {
+            if !force {
+                return None;
+            }
+            Some(Suggestions {
+                items: vec![SelectItem::new("README.md", "README.md")],
+                prefix: "RE".to_string(),
+            })
+        }
+
+        fn apply_completion(
+            &self,
+            lines: &[String],
+            cursor_line: usize,
+            cursor_col: usize,
+            item: &SelectItem,
+            prefix: &str,
+        ) -> (Vec<String>, usize, usize) {
+            let mut next = lines.to_vec();
+            let current = &next[cursor_line];
+            let kept: String = current
+                .chars()
+                .take(cursor_col.saturating_sub(prefix.chars().count()))
+                .collect();
+            let col = kept.chars().count() + item.value.chars().count() + 1;
+            next[cursor_line] = format!("{kept}{} ", item.value);
+            (next, cursor_line, col)
+        }
+    }
+
+    /// `editor.ts:2403-2420`: `force && explicitTab && items.length === 1`.
+    #[test]
+    fn tab_with_a_single_forced_suggestion_applies_it_without_a_picker() {
+        let mut e = editor();
+        e.set_autocomplete_provider(Some(Arc::new(SingleFileProvider)));
+        type_text(&mut e, "RE");
+        e.handle_input("\t");
+        assert!(!e.is_showing_autocomplete());
+        assert_eq!(e.get_text(), "README.md ");
+        // Typed "RE" coalesces into one unit; the apply adds its own snapshot.
+        assert_eq!(e.undo_stack_depth(), 2);
+    }
+
+    /// `editor.ts:1259-1273`: upstream keeps every char with `charCodeAt(0) >= 32`.
+    #[test]
+    fn paste_keeps_del_and_c1_but_drops_c0_controls() {
+        let mut e = editor();
+        e.handle_input("\x1b[200~a\u{1}\u{7f}\u{80}b\x1b[201~");
+        assert_eq!(e.get_text(), "a\u{7f}\u{80}b");
+    }
+
+    /// `editor.ts:1275-1282`: `/\w/` is ASCII-only in JavaScript.
+    #[test]
+    fn path_paste_leading_space_uses_the_ascii_word_rule() {
+        let mut e = editor();
+        type_text(&mut e, "a");
+        e.handle_input("\x1b[200~/tmp/x\x1b[201~");
+        assert_eq!(e.get_text(), "a /tmp/x");
+
+        let mut e = editor();
+        type_text(&mut e, "ż");
+        e.handle_input("\x1b[200~/tmp/x\x1b[201~");
+        assert_eq!(e.get_text(), "ż/tmp/x");
     }
 }

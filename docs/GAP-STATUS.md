@@ -71,9 +71,28 @@ deliberate scope decision, not a claim of full 1:1 parity.
   upstream's exact error strings). The wasm `Stats`/`HMAC`/WHATWG URL shims are
   unported, and codemode tools/`ModelRuntime` stay synchronous.
 - **Image tails:** `blockImages` is re-read per call in interactive and RPC but
-  still snapshotted once at startup in print/JSON; clipboard-image paste needs a
-  host clipboard-read hook; the live image-setting sweep and `afterToolCall`
-  tool/MCP image normalization are wired in interactive mode only.
+  still snapshotted once at startup in print/JSON; clipboard-image paste is
+  wired in interactive via `wl-paste`/`xclip`/Termux; the live image-setting
+  sweep and `afterToolCall` tool/MCP image normalization are wired in
+  interactive mode only. Tool-result image labels now sit inside the text body
+  when images are hidden/unsupported, matching upstream.
+- **2026-11-27 parity wave (newly closed):** interactive mode now installs
+  `ExtensionLoopHooks` inside its worker thread (`input`, `before_agent_start`,
+  `message_end`, boundary) and dispatches extension `/command` handlers;
+  `pi.setModel` has a real host op; `mcp.json` servers connect at startup;
+  `setTimeout`/`clearTimeout` are host-pumped; `ctx.sessionManager` reads and
+  `appendMessage` have host ops; `classify`/`generateImages` call the real wire
+  paths. TUI: regular mode stays on the main screen, terminal restore is
+  installed on exit/panic, `clearOnShrink` comes from settings, code fences use
+  the subset highlighter, tool rows honour `outputPad = 0`, image fallback
+  labels sit inside the box, bash preview dropped its extra hint row, thinking
+  toggles per run, branch summaries are boxed, autocomplete handles page keys
+  and single-Tab completion, editor key resolution uses `keybindings.json`, and
+  the model selector has scope/default support. Caveats: model changes apply
+  at RPC boundaries, appended messages get a placeholder id until the next
+  host sync, no `setInterval`, highlighter is a six-language subset, and some
+  component mouse/toggle plumbing uses direct handlers instead of
+  `MouseRegion`.
 - **MCP mechanism tails:** `StartupWait` is still one-shot once its bound
   elapses (late connections now survive via a per-server readiness queue), and
   the stdio stderr tail still uses a temp-file sink. Log/progress/cancellation

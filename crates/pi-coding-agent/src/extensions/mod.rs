@@ -363,6 +363,269 @@ fn mcp_attention_diagnostic(reports: &[pi_ext_js::runner::McpServerReport]) -> O
     })
 }
 
+/// Wires the host-owned non-chat model operations into the extension engine.
+/// Without this the JS `modelRegistry` view can only return canned errors;
+/// with it `classify`/`generateImages` reach the real `pi_ai` wire adapters,
+/// and a missing credential or unsupported API comes back as the upstream
+/// normalized error result instead of a thrown JS exception.
+#[cfg(feature = "ext-js")]
+fn install_wire_actions(runner: &mut pi_ext_js::ExtensionRunner) {
+    let mut core = runner.core().lock().expect("host core mutex poisoned");
+    core.actions.classify = Box::new(host_classify);
+    core.actions.generate_images = Box::new(host_generate_images);
+}
+
+/// First configured wire credential for `provider`, as a plain key string.
+#[cfg(feature = "ext-js")]
+fn wire_credential(provider: &str) -> Option<String> {
+    use crate::modes::print_mode::WireCredential;
+
+    crate::modes::print_mode::resolve_wire_credential(
+        provider,
+        None,
+        &crate::config::get_auth_path(),
+    )
+    .map(|(credential, _)| match credential {
+        WireCredential::ApiKey(key) | WireCredential::AccessToken(key) => key,
+    })
+}
+
+/// Runs one non-chat wire call on a short-lived worker thread with its own
+/// thread-local tokio runtime (see [`crate::runtime`]). A JS op can be
+/// entered from inside the agent loop's own `block_on`, where a second
+/// `block_on` on the host thread would panic; a scoped thread keeps the
+/// host's runtime untouched while still yielding synchronously to the op.
+#[cfg(feature = "ext-js")]
+fn wire_block_on<T, F>(work: F) -> T
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    std::thread::scope(|scope| scope.spawn(work).join().expect("model wire thread"))
+}
+
+#[cfg(feature = "ext-js")]
+fn json_string(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[cfg(feature = "ext-js")]
+fn json_headers(value: &Value) -> std::collections::BTreeMap<String, Option<String>> {
+    value
+        .get("headers")
+        .and_then(Value::as_object)
+        .map(|headers| {
+            headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        Some(value.as_str().unwrap_or_default().to_string()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "ext-js")]
+fn host_classify(model: &Value, context: &Value, options: &Value) -> Value {
+    use pi_ai::providers::classifier::{ClassifierContext, ClassifierOptions, ClassifierResult};
+
+    let mut typed_model: pi_ai::types::ClassifierModel =
+        serde_json::from_value(model.clone()).unwrap_or_default();
+    if typed_model.api.is_empty() {
+        typed_model.api = json_string(model, "api");
+    }
+    if typed_model.provider.is_empty() {
+        typed_model.provider = json_string(model, "provider");
+    }
+    if typed_model.id.is_empty() {
+        typed_model.id = json_string(model, "id");
+    }
+    let typed_context: ClassifierContext = match serde_json::from_value(context.clone()) {
+        Ok(context) => context,
+        Err(error) => {
+            return serde_json::to_value(ClassifierResult::error_result(
+                &typed_model,
+                format!("invalid classifier context: {error}"),
+                false,
+            ))
+            .unwrap_or_default();
+        }
+    };
+    let typed_options = ClassifierOptions {
+        api_key: options
+            .get("apiKey")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| wire_credential(&typed_model.provider)),
+        temperature: options.get("temperature").and_then(Value::as_f64),
+        max_retries: options
+            .get("maxRetries")
+            .and_then(Value::as_u64)
+            .map(|retries| retries as u32),
+        max_retry_delay_ms: options.get("maxRetryDelayMs").and_then(Value::as_u64),
+        headers: json_headers(options),
+    };
+    let result = wire_block_on(|| {
+        crate::runtime::block_on(pi_ai::providers::classifier::classify(
+            &typed_model,
+            &typed_context,
+            &typed_options,
+        ))
+    });
+    serde_json::to_value(result).unwrap_or_default()
+}
+
+#[cfg(feature = "ext-js")]
+fn host_generate_images(model: &Value, context: &Value, options: &Value) -> Value {
+    use pi_ai::providers::images::{AssistantImages, ImagesContext, ImagesOptions};
+
+    let mut typed_model: pi_ai::types::ImageModel =
+        serde_json::from_value(model.clone()).unwrap_or_default();
+    if typed_model.api.is_empty() {
+        typed_model.api = json_string(model, "api");
+    }
+    if typed_model.provider.is_empty() {
+        typed_model.provider = json_string(model, "provider");
+    }
+    if typed_model.id.is_empty() {
+        typed_model.id = json_string(model, "id");
+    }
+    if typed_model.base_url.is_empty() {
+        typed_model.base_url = json_string(model, "baseUrl");
+    }
+    let typed_context: ImagesContext = match serde_json::from_value(context.clone()) {
+        Ok(context) => context,
+        Err(error) => {
+            return serde_json::to_value(AssistantImages::error_result(
+                &typed_model,
+                format!("invalid images context: {error}"),
+                false,
+            ))
+            .unwrap_or_default();
+        }
+    };
+    let typed_options = ImagesOptions {
+        api_key: options
+            .get("apiKey")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| wire_credential(&typed_model.provider)),
+        max_retries: options
+            .get("maxRetries")
+            .and_then(Value::as_u64)
+            .map(|retries| retries as u32),
+        max_retry_delay_ms: options.get("maxRetryDelayMs").and_then(Value::as_u64),
+        headers: json_headers(options),
+        metadata: options.get("metadata").and_then(Value::as_object).cloned(),
+    };
+    let result = wire_block_on(|| {
+        crate::runtime::block_on(pi_ai::providers::images::generate_images(
+            &typed_model,
+            &typed_context,
+            &typed_options,
+        ))
+    });
+    serde_json::to_value(result).unwrap_or_default()
+}
+
+/// Registers the `mcp.json` servers (global, plus the project file when the
+/// project is trusted) in the extension runner before its MCP startup tick.
+/// Extension-registered servers already in the registry win on name clashes,
+/// matching the ownership rule of `pi.registerMcpServer`; config errors are
+/// warnings so one bad entry never blocks the others.
+#[cfg(feature = "ext-js")]
+fn register_configured_mcp_servers(
+    runner: &mut pi_ext_js::ExtensionRunner,
+    agent_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let loaded = crate::mcp_config::load_mcp_config(&crate::mcp_config::LoadMcpConfigOptions {
+        agent_dir: agent_dir.to_path_buf(),
+        cwd: cwd.to_path_buf(),
+        project_trusted,
+    });
+    for error in &loaded.errors {
+        diagnostics.push(warning(format!("MCP config: {error}")));
+    }
+    let mut core = runner.core().lock().expect("host core mutex poisoned");
+    for entry in &loaded.servers {
+        if core
+            .mcp
+            .list()
+            .iter()
+            .any(|server| server.name == entry.name)
+        {
+            continue;
+        }
+        let owner = format!("mcp.json:{}", entry.source);
+        if let Err(error) =
+            core.mcp
+                .register(&entry.name, &owner, Value::Object(entry.config.clone()))
+        {
+            diagnostics.push(warning(format!("MCP server \"{}\": {error}", entry.name)));
+        }
+    }
+}
+
+/// Refreshes the read-only session snapshot the extension engine reads and
+/// writes any `ctx.sessionManager.appendMessage` calls the dispatch queued.
+/// Called by the RPC host before each command so a handler sees the current
+/// transcript; headless hosts can skip it.
+#[cfg(feature = "ext-js")]
+pub fn sync_extension_session(
+    runner: Option<&Arc<Mutex<pi_ext_js::ExtensionRunner>>>,
+    session: &mut crate::session::store::SessionManager,
+) -> Result<(), String> {
+    let Some(runner) = runner else {
+        return Ok(());
+    };
+    let messages = session
+        .build_session_context()
+        .map_err(|error| error.to_string())?
+        .messages;
+    let entries: Vec<Value> = session
+        .get_entries()
+        .iter()
+        .map(|entry| Value::Object(entry.to_record().into_object()))
+        .collect();
+    let session_id = session.get_session_id().to_string();
+    let leaf_id = session.get_leaf_id().map(str::to_string);
+    let runner = runner.lock().expect("extension runner mutex poisoned");
+    let pending = runner.take_session_messages();
+    {
+        let mut core = runner.core().lock().expect("host core mutex poisoned");
+        let state = &mut core.session_state;
+        state.session_id = Some(session_id);
+        state.leaf_id = leaf_id;
+        state.entries.clear();
+        for entry in &entries {
+            if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                state.entries.insert(id.to_string(), entry.clone());
+            }
+        }
+        state.messages = messages
+            .iter()
+            .map(|message| serde_json::to_value(message).unwrap_or(Value::Null))
+            .collect();
+    }
+    for message in pending {
+        let message = pi_agent::AgentMessage::from_value(&message)?;
+        session
+            .append_message(message)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 /// What a `user_bash` interception decided (`UserBashEventResult`,
 /// `extensions/types.ts:1487-1494`). Not engine-gated: the interactive
 /// host's interception seam references it in both builds and answers
@@ -952,8 +1215,17 @@ pub fn reload(
 
     // The MCP reconnect (`reportUnhandledMcpServers`,
     // `agent-session.ts:3872`): the extension closed its connections on
-    // `session_shutdown`. Connections start in the background and the host
-    // drives the bounded wait before the first prompt after the reload.
+    // `session_shutdown`. Configured `mcp.json` entries are re-read here too,
+    // so an edited config takes effect on `/reload`. Connections start in
+    // the background and the host drives the bounded wait before the first
+    // prompt after the reload.
+    register_configured_mcp_servers(
+        &mut runner,
+        agent_dir,
+        cwd,
+        project_trusted,
+        &mut diagnostics,
+    );
     match runner.connect_mcp_servers() {
         Ok(_) => match settle_mcp_startup(&mut runner) {
             Ok(notice) => {
@@ -1041,6 +1313,9 @@ fn load_with_engine(
         ..Default::default()
     })
     .map_err(|err| format!("Failed to initialize the extension runtime: {err}"))?;
+    // The non-chat model operations run on the host's pi-ai wire paths; the
+    // engine only knows the JSON boundary.
+    install_wire_actions(&mut runner);
 
     // The pre-trust pass runs only when trust actually needs resolving
     // (`main.ts:804-808`): no `--approve` override and trust-requiring
@@ -1145,12 +1420,23 @@ fn load_with_engine(
     // The reason is "startup"; the "reload" path arrives with the
     // session-reload work. `resources_discover` is P5.
 
+    // `mcp.json` configured servers are registered before the startup tick
+    // (`index.ts:1112-1149`, the config half alongside `pi.registerMcpServer`).
+    // An extension-registered server of the same name wins the ownership
+    // check; a bad config entry is one warning, never a startup failure.
+    register_configured_mcp_servers(
+        &mut runner,
+        agent_dir,
+        cwd,
+        project_trusted,
+        &mut diagnostics,
+    );
+
     // The MCP servers registered through `pi.registerMcpServer` start
-    // connecting on session_start (`index.ts:1112-1149`, the registered-
-    // servers half — `mcp.json` entries are P5). Connections are background
-    // work; the first prompt's bounded wait is driven by the host below,
-    // and the tools of settled connections register on that tick. Failed
-    // connections are values: one attention notice (`reportProblems`,
+    // connecting on session_start (`index.ts:1112-1149`). Connections are
+    // background work; the first prompt's bounded wait is driven by the host
+    // below, and the tools of settled connections register on that tick.
+    // Failed connections are values: one attention notice (`reportProblems`,
     // `index.ts:641-653`) and no tools for the affected server.
     match runner.connect_mcp_servers() {
         Ok(_) => match settle_mcp_startup(&mut runner) {
@@ -1617,5 +1903,38 @@ export default function (pi) {
                 .contains("second"),
             "the handler reversed the conversation"
         );
+    }
+
+    #[cfg(feature = "ext-js")]
+    #[test]
+    fn configured_mcp_servers_are_registered_before_the_startup_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("mcp.json"),
+            r#"{"mcpServers":{"fromConfig":{"command":"echo","args":["x"]}}}"#,
+        )
+        .expect("write config");
+        let mut runner = pi_ext_js::ExtensionRunner::new(pi_ext_js::HostCore {
+            cwd: dir.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .expect("runner");
+        let mut diagnostics = Vec::new();
+        register_configured_mcp_servers(
+            &mut runner,
+            dir.path(),
+            dir.path(),
+            false,
+            &mut diagnostics,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let core = runner.core().lock().expect("core");
+        let names: Vec<&str> = core
+            .mcp
+            .list()
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["fromConfig"]);
     }
 }

@@ -47,6 +47,29 @@ toolchains/libc headers and are **not** promised assets. Source, reasons and
 CI evidence: [`docs/PLATFORM-BUILDS.md`](docs/PLATFORM-BUILDS.md). Installers
 and the npm wrapper recognise every asset name.
 
+## 2026-11-27: parity fix wave
+
+Five agents closed the highest-value extension and TUI disparities found by
+the ten-agent audit fleet:
+
+- **Extensions:** interactive agent-loop events (`input`, `before_agent_start`,
+  `message_end`, boundary) now fire from the worker thread; extension
+  `/command` handlers execute in interactive and RPC; `pi.setModel` has a real
+  host op; `mcp.json` servers connect at startup; `setTimeout`/`clearTimeout`
+  are host-pumped; `ctx.sessionManager` reads/writes and
+  `classify`/`generateImages` use host ops and real wire paths.
+- **TUI:** regular mode stays on the main screen; terminal restore runs on
+  exit/panic; `clearOnShrink` comes from settings; message code fences use the
+  subset highlighter; compaction counts use thousands separators; tool rows
+  honour `outputPad = 0`; image fallback labels sit inside the box; bash
+  preview lost its extra hint row; thinking toggles per run; branch summaries
+  are boxed; autocomplete handles page keys and single-Tab completion; editor
+  key resolution honours `keybindings.json`; the model selector gained scope
+  and default support.
+
+Full gate: **2839 passed, 0 failed, 3 ignored**. Honest caveats are listed in
+`docs/GAP-STATUS.md` under the 2026-11-27 bullet.
+
 ## Goal
 Rewrite upstream pi (TypeScript coding-agent harness, ~236K LOC) in Rust with
 **1:1 behavioral and on-disk fidelity** (session JSONL v3, print/JSON/RPC

@@ -16,7 +16,7 @@ use pi_ai::providers;
 use pi_ai::types::ImageContent;
 use pi_coding_agent::changelog::ChangelogEntry;
 use pi_coding_agent::cli::args::{
-    Args, DiagnosticKind, ExtensionFlagInfo, Mode, parse_args, print_help,
+    Args, DiagnosticKind, ExtensionFlagInfo, Mode, TuiMode, parse_args, print_help,
 };
 use pi_coding_agent::cli::file_processor::process_file_arguments;
 use pi_coding_agent::cli::project_trust::{DefaultProjectTrust, ProjectTrustStore};
@@ -47,6 +47,7 @@ use pi_coding_agent::tools::index::ToolRegistry;
 /// mode dispatch (`main.ts:1013-1064`).
 #[allow(clippy::too_many_lines)] // mirrors the TS main dispatch; split when extending
 fn main() {
+    install_terminal_panic_hook();
     let raw: Vec<String> = std::env::args().skip(1).collect();
 
     // `pi auth <command>` routes before argument parsing (`main.ts:622`,
@@ -239,6 +240,10 @@ fn main() {
         AppMode::Print => run_print(&args, &cwd, &cwd_string, stdin_content.as_deref(), session),
         AppMode::Interactive => run_interactive(&args, &cwd, &cwd_string, session),
     };
+    // `process::exit` skips destructors, so an exit that bypassed `Tui::stop`
+    // (an early error from `mode.run`) needs the same restore the panic hook
+    // installs. No-op after a clean stop and in every headless mode.
+    pi_tui::terminal::restore_terminal_if_active();
     match outcome {
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -246,6 +251,18 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// A panic unwinds past the interactive mode's `Tui::stop`, so restore the
+/// terminal modes before the default hook prints the panic. Headless runs have
+/// no live `CrosstermTerminal`, so [`pi_tui::terminal::restore_terminal_if_active`]
+/// writes nothing there.
+fn install_terminal_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        pi_tui::terminal::restore_terminal_if_active();
+        previous(info);
+    }));
 }
 
 /// App mode (`AppMode`, `core/project-trust.ts:13`).
@@ -908,22 +925,28 @@ fn run_interactive(
     // decided through the `project_trust` hook.
     let project_trusted = runtime.project_trusted;
     let agent_dir = config::get_agent_dir();
+    let settings = SettingsManager::create(
+        cwd,
+        &agent_dir,
+        SettingsManagerCreateOptions {
+            project_trusted: Some(project_trusted),
+        },
+    );
     // The theme setting seeds the controller: `--use-theme` wins, else
     // settings.json's `theme` (upstream passes the settings manager into the
     // mode; the port funnels the resolved setting through options).
     let theme_name = args.use_theme.clone().or_else(|| {
-        let settings = SettingsManager::create(
-            cwd,
-            &agent_dir,
-            SettingsManagerCreateOptions {
-                project_trusted: Some(project_trusted),
-            },
-        );
         settings
             .get("theme")
             .and_then(|value| value.as_str())
             .map(str::to_string)
     });
+    // Regular mode renders on the main screen; fullscreen's alt screen is
+    // owned by `Tui::enter_alt_screen`. Setting the terminal-level preference
+    // here (before `run_interactive_mode` constructs the backend) keeps the
+    // regular renderer out of the alternate screen and leaves fullscreen on it.
+    let tui_mode = args.tui_mode.unwrap_or_else(|| settings.get_tui_mode());
+    pi_tui::terminal::set_default_use_alternate_screen(tui_mode == TuiMode::Fullscreen);
     let options = pi_coding_agent::modes::interactive::interactive_mode::InteractiveOptions {
         version: env!("CARGO_PKG_VERSION").to_string(),
         theme_name,

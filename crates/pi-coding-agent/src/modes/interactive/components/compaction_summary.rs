@@ -18,6 +18,20 @@ use super::super::theme;
 use super::markdown_transform::MarkdownTransformCtx;
 use std::sync::Arc;
 
+/// `tokensBefore.toLocaleString()` (`compaction-summary-message.ts:51`): the
+/// summary row uses grouped digits, unlike the footer's compact `1.2k` form.
+fn format_token_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
 /// The compaction summary row (`compaction-summary-message.ts:12-99`).
 pub struct CompactionSummaryMessageComponent {
     expanded: bool,
@@ -91,7 +105,7 @@ impl CompactionSummaryMessageComponent {
     /// transformer) keeps the port's combined header+summary text — the
     /// identical render.
     fn wrap_with_header(tokens_before: u64, inner: MarkdownTransform) -> MarkdownTransform {
-        let token_str = crate::modes::interactive::components::footer::format_tokens(tokens_before);
+        let token_str = format_token_count(tokens_before);
         let header = format!("**Compacted from {token_str} tokens**\n\n");
         Arc::new(move |markdown: &str, width: usize| format!("{header}{}", inner(markdown, width)))
     }
@@ -105,7 +119,7 @@ impl CompactionSummaryMessageComponent {
         transform: Option<MarkdownTransform>,
     ) -> Markdown {
         let theme = theme::theme();
-        let token_str = crate::modes::interactive::components::footer::format_tokens(tokens_before);
+        let token_str = format_token_count(tokens_before);
         let header = format!("**Compacted from {token_str} tokens**\n\n");
         let style = DefaultTextStyle {
             color: Some(theme.fg_styler(ThemeColor::CustomMessageText)),
@@ -134,8 +148,7 @@ impl CompactionSummaryMessageComponent {
 
     fn update_display(&mut self) {
         let theme = theme::theme();
-        let token_str =
-            crate::modes::interactive::components::footer::format_tokens(self.tokens_before);
+        let token_str = format_token_count(self.tokens_before);
         let pad = " ".repeat(self.output_pad);
         // `theme.fg("customMessageLabel", bold("[compaction]"))`.
         let label = format!(
@@ -209,9 +222,19 @@ mod tests {
         assert!(plain[0].contains("[compaction]"), "{plain:?}");
         let joined = plain.join("\n");
         assert!(
-            joined.contains("Compacted from 1.2k tokens (ctrl+o to expand)"),
+            joined.contains("Compacted from 1,234 tokens (ctrl+o to expand)"),
             "{joined}"
         );
+        assert!(!joined.contains("1.2k"), "{joined}");
+    }
+
+    #[test]
+    fn token_counts_use_locale_style_grouping() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(1000), "1,000");
+        assert_eq!(format_token_count(12_345), "12,345");
+        assert_eq!(format_token_count(1_234_567), "1,234,567");
     }
 
     #[test]
