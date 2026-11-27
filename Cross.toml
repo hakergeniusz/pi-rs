@@ -1,4 +1,0 @@
-# cross forwards only a small environment allowlist into build containers.
-# NetBSD's cross gcc needs LIBRARY_PATH to find libexecinfo in its sysroot.
-[build.env]
-passthrough = ["LIBRARY_PATH"]

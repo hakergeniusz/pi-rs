@@ -86,17 +86,17 @@ different program.
 | Windows ARM64 | `pi-windows-aarch64.exe` | native ARM64 runner |
 | Linux RISC-V 64 | `pi-linux-riscv64` | cross-built with `cross` |
 | FreeBSD x86-64 | `pi-freebsd-x86_64` | cross-built with `cross` |
-| FreeBSD ARM64 | `pi-freebsd-aarch64` | cross-built with `cross` |
-| NetBSD x86-64 | `pi-netbsd-x86_64` | cross-built with `cross` |
-| NetBSD ARM64 | `pi-netbsd-aarch64` | tier-3, best effort (nightly + zig) |
-| OpenBSD x86-64 | `pi-openbsd-x86_64` | tier-3, best effort (nightly + zig) |
-| OpenBSD ARM64 | `pi-openbsd-aarch64` | tier-3, best effort (nightly + zig) |
+| FreeBSD ARM64 | `pi-freebsd-aarch64` | best effort, tier-3 job (nightly + zig) |
+| NetBSD x86-64 | `pi-netbsd-x86_64` | best effort, tier-3 job (nightly + zig) |
+| NetBSD ARM64 | `pi-netbsd-aarch64` | best effort, tier-3 job (nightly + zig) |
+| OpenBSD x86-64 | `pi-openbsd-x86_64` | best effort, tier-3 job (nightly + zig) |
+| OpenBSD ARM64 | `pi-openbsd-aarch64` | best effort, tier-3 job (nightly + zig) |
 
-The first five are native-runner builds; the cross and tier-3 rows are built
-and checksum-verified by the tag workflow (tier-3 failures never block a
-release). `install.sh`, `install.ps1` and the npm wrapper recognise every row.
-Source-level platform gates live in the crates; see
-[`docs/GAP-STATUS.md`](docs/GAP-STATUS.md) for the per-feature matrix.
+The first eight are verified by CI; the remaining rows are attempted on each
+tag but may not produce an asset when the tier-3 toolchain cannot build the
+dependency tree. Failures there never block a release. See
+[`docs/PLATFORM-BUILDS.md`](docs/PLATFORM-BUILDS.md) for the exact status and
+reasons. `install.sh`, `install.ps1` and the npm wrapper recognise every row.
 
 ---
 

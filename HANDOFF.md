@@ -35,6 +35,18 @@ live catalog that released v1.6.0 clients fetch from `pi.dev` does contain it.
 - `catalog.rs` tests updated for the new counts and a hydrogen resolution test
   added. Full diff inventory: [`docs/MODEL-CATALOG-DIFF.md`](docs/MODEL-CATALOG-DIFF.md).
 
+## 2026-11-27: wider release targets
+
+Release matrix extended with Windows ARM64 (native), Linux riscv64 and FreeBSD
+x86_64 (cross). All three build cleanly in CI; riscv64 needs `-latomic` for
+quickjs atomics and FreeBSD needs rquickjs's Linux bindings seeded because
+upstream ships no BSD bindings. Five further rows (FreeBSD ARM64, NetBSD
+x86_64/aarch64, OpenBSD x86_64/aarch64) are attempted only on tags by a
+`continue-on-error` tier-3 job; they currently fail on missing BSD cross
+toolchains/libc headers and are **not** promised assets. Source, reasons and
+CI evidence: [`docs/PLATFORM-BUILDS.md`](docs/PLATFORM-BUILDS.md). Installers
+and the npm wrapper recognise every asset name.
+
 ## Goal
 Rewrite upstream pi (TypeScript coding-agent harness, ~236K LOC) in Rust with
 **1:1 behavioral and on-disk fidelity** (session JSONL v3, print/JSON/RPC
