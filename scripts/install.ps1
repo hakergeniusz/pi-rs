@@ -14,14 +14,14 @@
 #     -UseBasicParsing into a scratch directory and are never executed,
 #     sourced, or piped into any shell.
 #   * SHA-256 is verified with Get-FileHash against the published
-#     pi-windows-x86_64.exe.sha256 BEFORE anything is written to the prefix.
+#     pi-windows-<arch>.exe.sha256 BEFORE anything is written to the prefix.
 #     A mismatch aborts with the prefix untouched.
 #   * All installs write ONLY inside -Prefix, apart from the scratch directory
 #     under the system temp path (removed on exit), and the opt-in -AddToPath
 #     switch which appends the prefix to the *user* PATH (never machine PATH).
 #   * No admin rights, no machine-wide writes, no services, no registry writes
 #     other than the user PATH when -AddToPath is given.
-#   * x86-64 (AMD64) only; any other architecture aborts with a clear message.
+#   * x86-64 (AMD64) and ARM64 are supported; anything else aborts clearly.
 
 param(
   # Release tag to install. Use 'latest' for the newest release.
@@ -37,8 +37,10 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $Repo             = 'hakergeniusz/pi-rs'
-$Asset            = 'pi-windows-x86_64.exe'
-$SumAsset         = "$Asset.sha256"
+# Architecture is resolved below; the asset name follows the release matrix
+# (`pi-windows-x86_64.exe` / `pi-windows-aarch64.exe`).
+$Asset            = ''
+$SumAsset         = ''
 $TargetName       = 'pi-rs.exe'
 $InstallerVersion = '1.0.0'
 
@@ -71,13 +73,23 @@ $Prefix = [System.IO.Path]::GetFullPath($Prefix)
 # ------------------------------------------------------------ architecture
 # PROCESSOR_ARCHITECTURE is the native architecture of the OS/process;
 # PROCESSOR_ARCHITEW6432 is set when a 32-bit PowerShell runs on 64-bit
-# Windows. Either one reporting AMD64 means we can run the x86-64 binary.
+# Windows. AMD64 selects the x86-64 binary, ARM64 the aarch64 binary.
 $arch = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE')
 $wowArch = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITEW6432')
 if (-not [string]::IsNullOrEmpty($wowArch)) { $arch = $wowArch }
-if ($arch -ne 'AMD64' -and $arch -ne 'x86_64') {
-  Fail "unsupported CPU architecture '$arch': only x86_64 (AMD64) Windows is supported."
+switch ($arch) {
+  { $_ -eq 'AMD64' -or $_ -eq 'x86_64' } {
+    $assetArch = 'x86_64'
+  }
+  { $_ -eq 'ARM64' -or $_ -eq 'aarch64' } {
+    $assetArch = 'aarch64'
+  }
+  default {
+    Fail "unsupported CPU architecture '$arch': only x86_64 (AMD64) and aarch64 (ARM64) Windows are supported."
+  }
 }
+$Asset    = "pi-windows-${assetArch}.exe"
+$SumAsset = "$Asset.sha256"
 
 # --------------------------------------------------------------- scratch dir
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("pi-rs-install-" + [guid]::NewGuid().ToString('N'))

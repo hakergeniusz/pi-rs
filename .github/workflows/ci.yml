@@ -150,6 +150,10 @@ jobs:
             os: windows
             arch: x86_64
             target: x86_64-pc-windows-msvc
+          - runner: windows-latest
+            os: windows
+            arch: aarch64
+            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     env:
       CARGO_PROFILE_RELEASE_DEBUG: 0
@@ -197,13 +201,129 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # Targets without a hosted runner. `cross` supplies both the Rust std and a
+  # C toolchain (rquickjs compiles quickjs-ng C sources, so a bare
+  # `cargo build --target` on ubuntu-latest is not enough).
+  build-cross-release-assets:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: riscv64
+            target: riscv64gc-unknown-linux-gnu
+          - os: freebsd
+            arch: x86_64
+            target: x86_64-unknown-freebsd
+          - os: freebsd
+            arch: aarch64
+            target: aarch64-unknown-freebsd
+          - os: netbsd
+            arch: x86_64
+            target: x86_64-unknown-netbsd
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: 0
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cross
+      - name: Build release binary with cross
+        run: cross build --release --target "${{ matrix.target }}"
+      - name: Stage binary and checksum
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p dist
+          asset="pi-${{ matrix.os }}-${{ matrix.arch }}"
+          cp "target/${{ matrix.target }}/release/pi" "dist/$asset"
+          cd dist
+          sha256sum "$asset" > "$asset.sha256"
+          cat "$asset.sha256"
+      - name: Upload assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Tier-3 targets: no prebuilt Rust std and no upstream cross image. Build
+  # std from source with nightly and use zig as the C compiler/linker. This
+  # job is best effort: a broken tier-3 toolchain must not hold up a release,
+  # and whichever assets it stages are published alongside the others.
+  build-tier3-bsd-assets:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'pull_request'
+    continue-on-error: true
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: openbsd
+            arch: x86_64
+            target: x86_64-unknown-openbsd
+            zig_target: x86_64-openbsd
+          - os: openbsd
+            arch: aarch64
+            target: aarch64-unknown-openbsd
+            zig_target: aarch64-openbsd
+          - os: netbsd
+            arch: aarch64
+            target: aarch64-unknown-netbsd
+            zig_target: aarch64-netbsd
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: 0
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+      - name: Build release binary with build-std + zig
+        env:
+          ZIG_TARGET: ${{ matrix.zig_target }}
+        run: |
+          set -eu
+          export CC="zig cc -target $ZIG_TARGET"
+          export CXX="zig c++ -target $ZIG_TARGET"
+          export AR="zig ar"
+          export RANLIB="zig ranlib"
+          cargo +nightly zigbuild -Z build-std=std,panic_abort --release \
+            --target "${{ matrix.target }}"
+      - name: Stage binary and checksum
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p dist
+          asset="pi-${{ matrix.os }}-${{ matrix.arch }}"
+          cp "target/${{ matrix.target }}/release/pi" "dist/$asset"
+          cd dist
+          sha256sum "$asset" > "$asset.sha256"
+          cat "$asset.sha256"
+      - name: Upload assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
   # One job creates/updates the Release so the matrix jobs cannot race. Run
   # even if an optional macOS/Windows row failed so a missing asset there
   # cannot block the Linux ones; the check below only demands that whatever
   # binaries were uploaded have a matching checksum.
   publish-release:
     if: ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled() }}
-    needs: build-release-assets
+    needs:
+      - build-release-assets
+      - build-cross-release-assets
+      - build-tier3-bsd-assets
     runs-on: ubuntu-latest
     permissions:
       contents: write

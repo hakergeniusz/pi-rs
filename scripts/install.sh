@@ -21,7 +21,7 @@
 #     bash/zsh-only parameter expansion. Everything is quoted so zsh's
 #     different word-splitting/globbing rules cannot change behavior.
 #   * Reads no data from stdin, so `curl ... | sh` cannot consume the script.
-#   * Detects Linux/Darwin and x86_64/aarch64 with `uname`.
+#   * Detects Linux/Darwin/FreeBSD/NetBSD/OpenBSD and x86_64/aarch64/riscv64 with `uname`.
 #   * Verifies a SHA-256 checksum before touching the install prefix.
 #   * Writes ONLY inside the chosen prefix, plus a temp dir under TMPDIR that
 #     is removed on EXIT/INT/TERM. No system-wide writes by default;
@@ -124,16 +124,20 @@ done
 # ------------------------------------------------------------- host mapping
 os=$(uname -s)
 case "$os" in
-  Linux)  os=linux ;;
-  Darwin) os=darwin ;;
-  *) die "unsupported operating system: $os (expected Linux or Darwin)" ;;
+  Linux)   os=linux ;;
+  Darwin)  os=darwin ;;
+  FreeBSD) os=freebsd ;;
+  NetBSD)  os=netbsd ;;
+  OpenBSD) os=openbsd ;;
+  *) die "unsupported operating system: $os (expected Linux, Darwin, FreeBSD, NetBSD or OpenBSD)" ;;
 esac
 
 machine=$(uname -m)
 case "$machine" in
-  x86_64|amd64)   arch=x86_64 ;;
-  aarch64|arm64)  arch=aarch64 ;;
-  *) die "unsupported CPU architecture: $machine (expected x86_64 or aarch64)" ;;
+  x86_64|amd64)       arch=x86_64 ;;
+  aarch64|arm64)      arch=aarch64 ;;
+  riscv64)            arch=riscv64 ;;
+  *) die "unsupported CPU architecture: $machine (expected x86_64, aarch64 or riscv64)" ;;
 esac
 
 asset="${ASSET_PREFIX}-${os}-${arch}"

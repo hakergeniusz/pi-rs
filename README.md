@@ -3,7 +3,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.1.1-brightgreen)](https://github.com/hakergeniusz/pi-rs/releases)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](https://github.com/hakergeniusz/pi-rs/releases)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20BSD%20%7C%20RISC--V-lightgrey)](https://github.com/hakergeniusz/pi-rs/releases)
 [![Parity](https://img.shields.io/badge/parity-almost%201%3A1%20%F0%9F%8F%AE%201.5.2-purple)](docs/GAP-STATUS.md)
 
 > A Rust rewrite of [Pi](https://github.com/earendil-works/pi), the minimal,
@@ -83,9 +83,19 @@ different program.
 | macOS x86-64   | `pi-darwin-x86_64`      | Intel runners               |
 | macOS aarch64  | `pi-darwin-aarch64`     | Apple Silicon               |
 | Windows x86-64 | `pi-windows-x86_64.exe` | executable asset on release |
+| Windows ARM64 | `pi-windows-aarch64.exe` | native ARM64 runner |
+| Linux RISC-V 64 | `pi-linux-riscv64` | cross-built with `cross` |
+| FreeBSD x86-64 | `pi-freebsd-x86_64` | cross-built with `cross` |
+| FreeBSD ARM64 | `pi-freebsd-aarch64` | cross-built with `cross` |
+| NetBSD x86-64 | `pi-netbsd-x86_64` | cross-built with `cross` |
+| NetBSD ARM64 | `pi-netbsd-aarch64` | tier-3, best effort (nightly + zig) |
+| OpenBSD x86-64 | `pi-openbsd-x86_64` | tier-3, best effort (nightly + zig) |
+| OpenBSD ARM64 | `pi-openbsd-aarch64` | tier-3, best effort (nightly + zig) |
 
-All five are built and checksum-verified by the tag workflow. Source-level
-platform gates live in the crates; see
+The first five are native-runner builds; the cross and tier-3 rows are built
+and checksum-verified by the tag workflow (tier-3 failures never block a
+release). `install.sh`, `install.ps1` and the npm wrapper recognise every row.
+Source-level platform gates live in the crates; see
 [`docs/GAP-STATUS.md`](docs/GAP-STATUS.md) for the per-feature matrix.
 
 ---

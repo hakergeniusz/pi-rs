@@ -23,6 +23,14 @@ function assetFor(platform, arch) {
     'darwin-x64': 'pi-darwin-x86_64',
     'darwin-arm64': 'pi-darwin-aarch64',
     'win32-x64': 'pi-windows-x86_64.exe',
+    'win32-arm64': 'pi-windows-aarch64.exe',
+    'linux-riscv64': 'pi-linux-riscv64',
+    'freebsd-x64': 'pi-freebsd-x86_64',
+    'freebsd-arm64': 'pi-freebsd-aarch64',
+    'netbsd-x64': 'pi-netbsd-x86_64',
+    'netbsd-arm64': 'pi-netbsd-aarch64',
+    'openbsd-x64': 'pi-openbsd-x86_64',
+    'openbsd-arm64': 'pi-openbsd-aarch64',
   };
   const asset = table[`${platform}-${arch}`];
   if (!asset) {
