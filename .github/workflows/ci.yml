@@ -213,18 +213,22 @@ jobs:
             arch: riscv64
             target: riscv64gc-unknown-linux-gnu
             rustflags: -C link-arg=-latomic
+            bindgen_args: ""
           - os: freebsd
             arch: x86_64
             target: x86_64-unknown-freebsd
             rustflags: ""
+            bindgen_args: --sysroot=/usr/local/x86_64-unknown-freebsd13
           - os: freebsd
             arch: aarch64
             target: aarch64-unknown-freebsd
             rustflags: ""
+            bindgen_args: --sysroot=/usr/local/aarch64-unknown-freebsd13
           - os: netbsd
             arch: x86_64
             target: x86_64-unknown-netbsd
-            rustflags: -C link-arg=-L/usr/lib -C link-arg=-L/usr/local/lib
+            rustflags: -C link-arg=-L/usr/local/x86_64-unknown-netbsd/usr/lib
+            bindgen_args: --sysroot=/usr/local/x86_64-unknown-netbsd
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_RELEASE_DEBUG: 0
@@ -238,6 +242,7 @@ jobs:
       - name: Build release binary with cross
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+          BINDGEN_EXTRA_CLANG_ARGS: ${{ matrix.bindgen_args }}
         run: cross build --release --target "${{ matrix.target }}"
       - name: Stage binary and checksum
         shell: bash
@@ -261,7 +266,9 @@ jobs:
   # job is best effort: a broken tier-3 toolchain must not hold up a release,
   # and whichever assets it stages are published alongside the others.
   build-tier3-bsd-assets:
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'pull_request'
+    # Experimental: only attempt on a tag so PR CI stays fast. Failure never
+    # blocks the release; whichever assets stage are published.
+    if: startsWith(github.ref, 'refs/tags/v')
     continue-on-error: true
     timeout-minutes: 45
     strategy:
