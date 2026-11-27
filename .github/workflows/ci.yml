@@ -212,15 +212,19 @@ jobs:
           - os: linux
             arch: riscv64
             target: riscv64gc-unknown-linux-gnu
+            rustflags: -C link-arg=-latomic
           - os: freebsd
             arch: x86_64
             target: x86_64-unknown-freebsd
+            rustflags: ""
           - os: freebsd
             arch: aarch64
             target: aarch64-unknown-freebsd
+            rustflags: ""
           - os: netbsd
             arch: x86_64
             target: x86_64-unknown-netbsd
+            rustflags: -C link-arg=-L/usr/lib -C link-arg=-L/usr/local/lib
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_RELEASE_DEBUG: 0
@@ -228,8 +232,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@cross
       - name: Build release binary with cross
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cross build --release --target "${{ matrix.target }}"
       - name: Stage binary and checksum
         shell: bash
