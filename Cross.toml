@@ -1,0 +1,4 @@
+# cross by default forwards only a small allowlist of environment variables.
+# BSD bindgen needs the target sysroot argument inside the build container.
+[build.env]
+passthrough = ["BINDGEN_EXTRA_CLANG_ARGS", "RUSTFLAGS"]
